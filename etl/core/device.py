@@ -14,7 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from .errors import DeviceError
+import numpy as np
+
+from .errors import DeviceError, ShapeError
 
 if TYPE_CHECKING:  # avoid a runtime import cycle: tensor.py imports device.py
     from .tensor import Tensor
@@ -47,6 +49,17 @@ class Device:
         return f"Device(kind={self.kind!r}, index={self.index})"
 
 
+def _tensor(data: np.ndarray, device: Device) -> "Tensor":
+    """Build a :class:`Tensor` from data + device (deferred import).
+
+    ``tensor.py`` imports ``device.py`` at module level, so ``Tensor`` is
+    imported lazily inside this helper to keep the import graph acyclic.
+    """
+    from .tensor import Tensor  # deferred: avoids a runtime import cycle
+
+    return Tensor(data, device=device)
+
+
 def devices(kind: Optional[str] = None) -> List[Device]:
     """Enumerate the devices actually available to this process.
 
@@ -65,9 +78,20 @@ def devices(kind: Optional[str] = None) -> List[Device]:
     Raises:
         DeviceError: If ``kind`` is not a recognized device kind.
     """
-    raise NotImplementedError(
-        "devices() is not implemented yet (architecture phase); "
-        "it will enumerate cpu always + cuda only when a CUDA runtime is detectable."
+    if kind == "cpu":
+        return [Device("cpu", 0)]
+    if kind == "cuda":
+        try:
+            import torch  # lazy: torch is an optional interop extra
+        except ImportError:
+            return []
+        if torch.cuda.is_available():
+            return [Device("cuda", i) for i in range(torch.cuda.device_count())]
+        return []
+    if kind is None:
+        return [Device("cpu", 0)] + devices("cuda")
+    raise DeviceError(
+        f"Unknown device kind {kind!r}; recognized kinds are 'cpu' and 'cuda'."
     )
 
 
@@ -93,10 +117,25 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
         ShapeError: If ``tensor.shape[axis]`` is not divisible by
             ``len(devices)``.
     """
-    raise NotImplementedError(
-        "split_tensor is not implemented yet (architecture phase); "
-        "it will be pure data slicing with device tagging (no communication)."
-    )
+    if not devices:
+        raise DeviceError("split_tensor requires at least one device")
+    ndim = tensor.data.ndim
+    normalized = axis + ndim if axis < 0 else axis
+    if normalized < 0 or normalized >= ndim:
+        raise DeviceError(
+            f"split_tensor axis {axis} is out of range for a tensor with "
+            f"{ndim} dimension(s)"
+        )
+    dim_size = tensor.shape[normalized]
+    if dim_size % len(devices) != 0:
+        raise ShapeError(
+            f"Cannot split tensor of shape {tensor.shape} along axis {axis} "
+            f"into {len(devices)} chunks: dimension size {dim_size} is not "
+            f"divisible by {len(devices)}"
+        )
+    # np.split returns views of the input — no copies, just device tagging.
+    chunks = np.split(tensor.data, len(devices), axis=normalized)
+    return [_tensor(chunk, device) for chunk, device in zip(chunks, devices)]
 
 
 def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
@@ -116,7 +155,7 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
     Raises:
         DeviceError: If ``devices`` is empty.
     """
-    raise NotImplementedError(
-        "replicate_tensor is not implemented yet (architecture phase); "
-        "it will tag the same buffer with each device (no copies, no communication)."
-    )
+    if not devices:
+        raise DeviceError("replicate_tensor requires at least one device")
+    # The SAME ndarray object tagged with each device — no copies.
+    return [_tensor(tensor.data, device) for device in devices]

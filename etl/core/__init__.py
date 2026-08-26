@@ -26,9 +26,8 @@ Contents:
 (``register_operator_handlers``) that ``etl.ops`` populates at import time —
 this is what keeps the import DAG acyclic.
 
-Status: architecture phase — public interfaces and pure data types are in
-place; behavioral bodies raise ``NotImplementedError`` pending the
-implementation phase.
+Status: implementation phase complete — all value-model behaviors are
+implemented (no stubs remain).
 """
 
 from .dtypes import (

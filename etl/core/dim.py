@@ -6,9 +6,10 @@ knowing every concrete size. ``Dim`` is a *named* symbolic dimension
 ``Dim``/``DimExpr``/``int`` operands supporting ``+ - * // % min max``.
 
 Design: construction of expressions (the arithmetic dunders) is pure data
-building and is implemented here; *evaluation* (``DimExpr.evaluate``) and
-comparisons ("constraint-free evaluation where possible") are the algorithmic
-part and are stubbed for the implementation phase.
+building — nothing is evaluated at construction time. *Evaluation*
+(``DimExpr.evaluate``) is explicit; comparisons ("constraint-free evaluation
+where possible") resolve both sides using known sizes only and raise
+:class:`ShapeError` rather than guessing unresolved dims.
 
 ``core`` owns the type definitions only — shape inference (via ``DimExpr``
 arithmetic) is ``ir``/``ops``'s job.
@@ -17,6 +18,7 @@ arithmetic) is ``ir``/``ops``'s job.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Mapping, Optional, Union
 
 from .errors import ShapeError
@@ -37,12 +39,71 @@ def _as_dim_operand(value: Any) -> _DimOperand:
     )
 
 
+def _resolve_operand(
+    operand: _DimOperand, dim_sizes: Optional[Mapping[str, int]]
+) -> int:
+    """Resolve one operand of an expression to a concrete int.
+
+    ``int`` → itself; ``DimExpr`` → recursive :meth:`DimExpr.evaluate`;
+    ``Dim`` → the binding in ``dim_sizes`` (explicit bindings take
+    precedence), else the Dim's own known ``size``.
+
+    Raises:
+        ShapeError: If a dimension has no known size and no binding, or a
+            binding is not an integer.
+    """
+    if isinstance(operand, int):
+        return operand
+    if isinstance(operand, DimExpr):
+        return operand.evaluate(dim_sizes)
+    # Dim
+    if dim_sizes is not None and operand.name in dim_sizes:
+        size = dim_sizes[operand.name]
+        if not isinstance(size, Integral):
+            raise ShapeError(
+                f"Binding for dimension {operand.name!r} must be an integer, "
+                f"got {size!r}"
+            )
+        return int(size)
+    if operand.size is not None:
+        return operand.size
+    raise ShapeError(
+        f"Cannot evaluate {operand!r}: dimension {operand.name!r} has no "
+        "known size and no binding in dim_sizes."
+    )
+
+
+def _evaluate_known(value: _DimOperand) -> int:
+    """Evaluate ``value`` to an int using known sizes only (no bindings).
+
+    Used by comparisons ("constraint-free evaluation where possible"): an
+    ``int`` evaluates to itself; a ``Dim`` to its own known ``size``; a
+    ``DimExpr`` recursively. An unresolved dimension raises :class:`ShapeError`
+    — comparisons never guess.
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Dim):
+        if value.size is None:
+            raise ShapeError(
+                f"Cannot compare unresolved dimension {value!r}: it has no "
+                "known size (call DimExpr.evaluate(dim_sizes) to resolve it)."
+            )
+        return value.size
+    return value.evaluate()
+
+
 class _DimArithmeticMixin:
     """Arithmetic dunders shared by :class:`Dim` and :class:`DimExpr`.
 
     Every binary operation constructs a :class:`DimExpr` node — expression
     building is pure data construction (no evaluation happens here; call
     :meth:`DimExpr.evaluate` explicitly).
+
+    Ordering comparisons (``< <= > >=``) are *not* expression building: they
+    evaluate both sides using known sizes only and return a Python ``bool``.
+    Comparing unresolved symbolic values raises :class:`ShapeError` instead of
+    guessing.
     """
 
     __slots__ = ()
@@ -84,6 +145,29 @@ class _DimArithmeticMixin:
     def max(self, other: Any) -> "DimExpr":
         """Build ``max(self, other)`` as a DimExpr node (no evaluation)."""
         return DimExpr("max", self, _as_dim_operand(other))
+
+    # --- Ordering comparisons: "constraint-free evaluation where possible" ---
+    # These are NOT expression builders: both sides are evaluated using known
+    # sizes only (there is no dim_sizes mapping available to comparisons) and
+    # compared as ints. An invalid operand type raises TypeError (via
+    # _as_dim_operand); unresolved symbolic operands raise ShapeError rather
+    # than guessing.
+
+    def __lt__(self, other: Any) -> bool:
+        operand = _as_dim_operand(other)
+        return _evaluate_known(self) < _evaluate_known(operand)
+
+    def __le__(self, other: Any) -> bool:
+        operand = _as_dim_operand(other)
+        return _evaluate_known(self) <= _evaluate_known(operand)
+
+    def __gt__(self, other: Any) -> bool:
+        operand = _as_dim_operand(other)
+        return _evaluate_known(self) > _evaluate_known(operand)
+
+    def __ge__(self, other: Any) -> bool:
+        operand = _as_dim_operand(other)
+        return _evaluate_known(self) >= _evaluate_known(operand)
 
 
 @dataclass(frozen=True)
@@ -163,39 +247,27 @@ class DimExpr(_DimArithmeticMixin):
             ShapeError: If a dimension is unresolved, or arithmetic is
                 invalid (e.g. division by zero, non-integer division).
         """
-        raise NotImplementedError(
-            "DimExpr.evaluate is not implemented yet (architecture phase); "
-            "shape-inference evaluation lands with the implementation phase."
-        )
-
-    # --- Comparisons: "constraint-free evaluation where possible" ---
-    # Stubbed: they must evaluate both sides (substituting known sizes) and
-    # only then compare; comparing unresolved symbolic values raises
-    # ShapeError rather than guessing.
-
-    def __lt__(self, other: Any) -> bool:
-        raise NotImplementedError(
-            "DimExpr comparisons are not implemented yet (architecture phase); "
-            "they will compare via constraint-free evaluation."
-        )
-
-    def __le__(self, other: Any) -> bool:
-        raise NotImplementedError(
-            "DimExpr comparisons are not implemented yet (architecture phase); "
-            "they will compare via constraint-free evaluation."
-        )
-
-    def __gt__(self, other: Any) -> bool:
-        raise NotImplementedError(
-            "DimExpr comparisons are not implemented yet (architecture phase); "
-            "they will compare via constraint-free evaluation."
-        )
-
-    def __ge__(self, other: Any) -> bool:
-        raise NotImplementedError(
-            "DimExpr comparisons are not implemented yet (architecture phase); "
-            "they will compare via constraint-free evaluation."
-        )
+        left = _resolve_operand(self.left, dim_sizes)
+        right = _resolve_operand(self.right, dim_sizes)
+        if self.op == "add":
+            return left + right
+        if self.op == "sub":
+            return left - right
+        if self.op == "mul":
+            return left * right
+        if self.op == "floordiv":
+            if right == 0:
+                raise ShapeError(f"Division by zero in DimExpr {self!r}")
+            return left // right
+        if self.op == "mod":
+            if right == 0:
+                raise ShapeError(f"Modulo by zero in DimExpr {self!r}")
+            return left % right
+        if self.op == "min":
+            return min(left, right)
+        if self.op == "max":
+            return max(left, right)
+        raise ValueError(f"Unknown DimExpr op: {self.op!r}")  # unreachable
 
     def __bool__(self) -> bool:
         raise ShapeError(
