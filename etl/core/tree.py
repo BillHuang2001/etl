@@ -147,8 +147,15 @@ def _flatten_into(obj: Any, leaves: List[Any]) -> TreeSpec:
     if isinstance(obj, tuple) and hasattr(obj_type, "_fields"):
         child_specs = tuple(_flatten_into(child, leaves) for child in obj)
         return TreeSpec(type=obj_type, children=child_specs, node_data=obj_type._fields)
-    # 3. dataclass instances (never the class itself).
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    # 3. dataclass instances (never the class itself). etl's own value types
+    #    (SymbolicTensor, TensorSpec, Tensor, Dim/DimExpr, Device, Group,
+    #    Location, ...) are dataclasses too, but they are LEAVES — only
+    #    user-defined dataclasses act as pytree containers.
+    if (
+        dataclasses.is_dataclass(obj)
+        and not isinstance(obj, type)
+        and not obj_type.__module__.split(".")[0] == "etl"
+    ):
         fields = dataclasses.fields(obj)
         child_specs = tuple(
             _flatten_into(getattr(obj, field.name), leaves) for field in fields

@@ -168,10 +168,12 @@ class SymbolicTensor:
         object.__setattr__(self, "dtype", dtype(self.dtype))
         shape = tuple(self.shape)
         for entry in shape:
+            if entry is None:
+                continue  # runtime-dynamic dim (matches TensorSpec/ValueType)
             if not isinstance(entry, (Dim, DimExpr, int)):
                 raise TypeError(
-                    "SymbolicTensor.shape entries must be Dim | DimExpr | int, "
-                    f"got {entry!r}"
+                    "SymbolicTensor.shape entries must be Dim | DimExpr | int "
+                    f"| None, got {entry!r}"
                 )
         object.__setattr__(self, "shape", shape)
 

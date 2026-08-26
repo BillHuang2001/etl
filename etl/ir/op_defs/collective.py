@@ -53,6 +53,7 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group "
                     "(None = world group, size unknown at trace time).",
                 ),
@@ -80,6 +81,7 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group (for shape "
                     "inference; None = world group, size unknown at trace time).",
                 ),
@@ -112,6 +114,7 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group (for shape "
                     "inference; None = world group, size unknown at trace time).",
                 ),
@@ -144,6 +147,7 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group (for shape "
                     "inference; None = world group, size unknown at trace time).",
                 ),
@@ -163,8 +167,15 @@ def _register_collectives() -> None:
             attributes=(
                 AttrSpec(name="group", type=ATTR_STR, description="Group name."),
                 AttrSpec(
+                    name="src_rank",
+                    type=ATTR_INT,
+                    default=0,
+                    description="Source rank the tensor is broadcast from.",
+                ),
+                AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group "
                     "(None = world group, size unknown at trace time).",
                 ),
@@ -191,6 +202,7 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
+                    default=None,
                     description="Number of ranks in the group "
                     "(None = world group, size unknown at trace time).",
                 ),
