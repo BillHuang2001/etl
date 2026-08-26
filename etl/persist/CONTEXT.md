@@ -126,11 +126,15 @@ failed write), cache hit/miss/recompute-on-corrupt/clear, key determinism
 
 ## Status
 
-Architecture complete. Algorithmic bodies are `NotImplementedError` stubs
-with full algorithm docstrings; trivial plumbing is implemented
-(`LoadedObject`, `register_codec`, `Cache` ABC + `get_or_compute`,
-`FileCache.__init__`/`_path_for_key`). Implementation lands in Phase 2
-(Manager).
+Architecture complete. `codec.py` is fully implemented: 18 built-in codec
+pairs (see the module docstring registry table), envelope dispatch with
+exact-type + qualified-name fallback, cycle detection for list/tuple/dict,
+read-only decoded arrays, idempotent `_install_builtin_codecs()` run
+unconditionally at import time. `container.py` and `cache.py` algorithmic
+bodies are still `NotImplementedError` stubs with full algorithm docstrings;
+trivial plumbing is implemented (`LoadedObject`, `register_codec`,
+`Cache` ABC + `get_or_compute`, `FileCache.__init__`/`_path_for_key`).
+Their implementation lands in the remaining Phase 2 work.
 
 ## Notes for agents
 
