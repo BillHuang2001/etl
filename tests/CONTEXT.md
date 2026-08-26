@@ -10,14 +10,17 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 
 - `tests/pipeline_test.py` — end-to-end staging pipeline (trace→lower→compile→load→run), bind, build, evaluate
 - `tests/test_spec_compliance.py` — design-principle compliance:
-  - closure-captured Tensor in ops → TraceError; `etl.constant` opt-in works (with warning)
-  - `SymbolicTensor` has no `.numpy()` / `__dlpack__`
-  - `etl.build`/`evaluate` = documented shorthand (same result as explicit pipeline)
+  - no implicit tracing/eager mode: ops outside a trace → TraceError; direct `Defn` call raises helpfully
+  - closure-captured Tensor in ops → TraceError; `etl.constant` opt-in works (warns above `ETL_LARGE_CONSTANT_BYTES`)
+  - `SymbolicTensor` has no `.numpy()` / `__dlpack__`; `bool(symbolic)` → TraceError
+  - `etl.build`/`evaluate` = documented shorthand (same result as explicit pipeline); stage types distinct, wrong stage → TypeError
   - `bind` never alters graph/compile; missing/wrong-named binding fails
   - `vmap(f, in_axes, out_axes)` ≡ `vectorize` on the traced function (same IR up to naming)
-  - direct `Defn` call with concrete tensors raises with helpful message
+  - concrete creators (`etl.zeros`) return Tensors with DLPack (+ torch interop via importorskip); `enp.zeros` inside defn produces a graph op
   - serialization round-trips for Graph/LoweredProgram/CompiledArtifact; corrupt file fails
-  - concrete creators (`etl.zeros`) return Tensors with DLPack; `enp.zeros` inside defn produces a graph op
+  - Python values → Python semantics (static specialization; `if etl.sum(x) > 0` fails at trace)
+  - collectives (`etl.dist.*`) are explicit IR ops only — no implicit insertion
+  - error messages include source locations (`file.py:line`); shape errors currently lack them (BUG-marked tests)
 
 ## Constraints
 
