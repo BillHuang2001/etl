@@ -164,17 +164,11 @@ in `printer.py`.
 ## Constraints
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
-<<<<<<< .merge_file_xKaWfb
-- Architecture phase: data structures, registry, and `pretty_print` are
-  implemented; the remaining behavioral bodies (`Builder`, `verify`,
-  `serialize_module/deserialize_module`, shape-inference hooks in
-  `inference.py`) raise `NotImplementedError` — Phase 2 (implementation)
-  fills them.
-=======
-- Architecture phase: data structures, registry, and shape-inference hooks
-  (`inference.py`, 23 hooks) are implemented; behavioral bodies (`Builder`,
-  `verify`, `serialize_module/deserialize_module`, `pretty_print`) raise
-  `NotImplementedError` — Phase 2 (implementation) fills them.
+- Architecture phase: data structures, registry, shape-inference hooks
+  (`inference.py`, 23 hooks), and `pretty_print` are implemented; the
+  remaining behavioral bodies (`Builder`, `verify`,
+  `serialize_module/deserialize_module`) raise `NotImplementedError` —
+  Phase 2 (implementation) fills them.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
   resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);
   `None` dims are runtime-dynamic and yield `None`; element-count checks
@@ -183,7 +177,6 @@ in `printer.py`.
   `np.result_type`; reduction dtypes follow numpy per `reduce_op` (the
   `reduce_*` OpDefs carry a `reduce_op` attribute: 'sum'|'max'|'min'|'mean'|
   'prod').
->>>>>>> .merge_file_4FKFFk
 - Files < ~1000 lines; op_defs split by category (done).
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
