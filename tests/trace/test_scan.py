@@ -111,15 +111,6 @@ def test_scan_running_max(run_graph, as_numpy):
 # --- length override ----------------------------------------------------------
 
 
-# BUG(etl): `etl.scan` rejects an explicit length SMALLER than xs's static
-# leading dim ("explicit length 2 does not match xs's static leading dim 4").
-# The contract (trace/CONTEXT.md: "STATIC length only (int, or derived from
-# xs's static leading dim)") requires a static length to OVERRIDE the scan
-# length: only the first `length` steps run (prefix scan). Only a length
-# LARGER than the static dim must raise (there is no xs[4] to gather).
-# Minimal repro:
-#     etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), 2)
-# raises TraceError before any graph is built.
 def test_scan_length_override_shortens_xs(run_graph, as_numpy):
     xs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     graph = etl.trace(cumsum_scan_with_length, etl.TensorSpec((4,), etl.float32), 2)

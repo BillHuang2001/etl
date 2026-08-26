@@ -66,9 +66,6 @@ def test_defn_of_defn_is_idempotent():
         return etl.add(x, x)
 
     d = etl.defn(f)
-    # BUG(etl): `etl.defn(existing_defn)` builds a NEW Defn instead of
-    # returning the same object, violating the contract "applying `defn`
-    # to an existing `Defn` returns it unchanged" (defn.py docstring).
     again = etl.defn(d)
 
     assert again is d
