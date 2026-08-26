@@ -5,6 +5,21 @@ invariants, type agreement, attribute schemas, SSA well-formedness, and v1
 restrictions, raising ``VerificationError`` (owned by ``etl.core``,
 re-exported by this package) with a source-location-annotated message on the
 FIRST violation (no silent recovery, no partial reporting in v1).
+
+Attribute-validation policy (binding; identical tag-for-tag to the Builder's
+acceptance rules — see ``builder.py``, "Attribute-validation details"):
+
+* ``ATTR_DTYPE`` values accept anything ``etl.core.dtype`` accepts (numpy
+  dtype objects, name strings, scalar types, objects exposing ``.dtype``; the
+  Builder normalizes them to the name string).
+* ``ATTR_INT``/``ATTR_INTS`` accept ``None`` only for attributes whose
+  ``AttrSpec`` declares ``default=None`` (the documented nullable attrs, e.g.
+  ``argmax.axis``, ``transpose.permutation``, ``slice.strides``,
+  ``conv.strides``/``input_dilation``/``kernel_dilation``).
+* ``ATTR_FLOAT`` accepts ints and floats (bools rejected); the sequence tags
+  (``INTS``/``FLOATS``/``STRS``/``NESTED_INTS``/``SHAPE``) accept tuples or
+  lists; ``ATTR_NESTED_INTS`` entries must be NON-EMPTY int sequences;
+  ``ATTR_SHAPE`` entries must be ``int | Dim | DimExpr | None``.
 """
 
 from __future__ import annotations
@@ -13,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from etl.core import Dim, DimExpr, ShapeError, VerificationError
+from etl.core import DTypeError, Dim, DimExpr, ShapeError, VerificationError, dtype
 
 from .block import Block
 from .function import Function
@@ -33,6 +48,7 @@ from .op_defs import (
     ATTR_SHAPE,
     ATTR_STR,
     ATTR_STRS,
+    AttrSpec,
     OpDef,
     opdef,
 )
@@ -78,7 +94,10 @@ def verify(module: Module) -> None:
     - Operand count within the ``OpDef`` arity; region count matches; result
       count within the declared ``result_count`` (when not None).
     - Attributes match the schema: no unknown keys, all required keys present,
-      each value's type matches its ``AttrSpec`` tag.
+      each value's type matches its ``AttrSpec`` tag — acceptance policy
+      identical to the Builder's (see module docstring; in particular
+      ``ATTR_INT``/``ATTR_INTS`` values may be ``None`` only when the
+      ``AttrSpec`` declares ``default=None``).
     - Results are ``Value``s owned by this op, with module-unique ids.
     - Result types agree with ``OpDef.shape_fn(input_types, attributes)`` when
       ``shape_fn`` is not None (ops with ``shape_fn=None`` must record
@@ -472,46 +491,59 @@ def _verify_attrs(opdef_obj: OpDef, op: Op, where: str, loc: Location | None) ->
         if spec.required and spec.name not in attributes:
             _fail(f"{where}: missing required attribute '{spec.name}'", loc)
     for key, value in attributes.items():
-        if not _attr_matches(schema[key].type, value):
+        spec = schema[key]
+        if not _attr_matches(spec, value):
             _fail(
-                f"{where}: attribute '{key}' must be {schema[key].type}, got "
+                f"{where}: attribute '{key}' must be {spec.type}, got "
                 f"{_value_desc(value)}",
                 loc,
             )
 
 
-def _attr_matches(tag: str, value: Any) -> bool:
-    """True if ``value``'s type matches the ``AttrSpec`` tag.
+def _attr_matches(spec: AttrSpec, value: Any) -> bool:
+    """True if ``value`` matches ``spec`` (tag + nullable-default rule).
 
-    Tag interpretation (kept in sync with the Builder):
-    - ``bool``: Python bool; ``int``: int or None (bool excluded); ``float``:
-      int or float (bool excluded); ``str``: str; ``dtype``: a numpy dtype
-      NAME (string that ``np.dtype`` accepts); ``ints``/``floats``/``strs``:
-      tuple/list of the base kind; ``nested_ints``: tuple/list of tuple/list
-      of ints; ``shape``: tuple/list of int | Dim | DimExpr | None;
-      ``ndarray``: numpy array; ``any``: anything.
+    Tag interpretation (binding; kept in sync with the Builder's
+    ``_check_attr_value`` — the two must agree tag-for-tag):
+    - ``bool``: Python bool.
+    - ``int``: int or None (bool excluded); ``None`` accepted ONLY when
+      ``spec.default is None`` (the documented nullable attrs, e.g.
+      ``argmax.axis``).
+    - ``float``: int or float (bool excluded).
+    - ``str``: str.
+    - ``dtype``: anything ``etl.core.dtype`` accepts (numpy dtype object,
+      name string, scalar type, object exposing ``.dtype``).
+    - ``ints``: tuple/list of ints (bool excluded); ``None`` accepted ONLY
+      when ``spec.default is None`` (e.g. ``transpose.permutation``).
+    - ``floats``/``strs``: tuple/list of the base kind.
+    - ``nested_ints``: tuple/list of NON-EMPTY tuple/list of ints.
+    - ``shape``: tuple/list of int | Dim | DimExpr | None.
+    - ``ndarray``: numpy array.
+    - ``any``: anything.
     """
+    tag = spec.type
     if tag == ATTR_ANY:
         return True
     if tag == ATTR_BOOL:
         return isinstance(value, bool)
     if tag == ATTR_INT:
-        return value is None or (isinstance(value, int) and not isinstance(value, bool))
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            value is None and spec.default is None
+        )
     if tag == ATTR_FLOAT:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if tag == ATTR_STR:
         return isinstance(value, str)
     if tag == ATTR_DTYPE:
-        if not isinstance(value, str):
-            return False
         try:
-            np.dtype(value)
-        except TypeError:
+            dtype(value)
+        except DTypeError:
             return False
         return True
     if tag == ATTR_INTS:
-        return isinstance(value, (tuple, list)) and all(
-            isinstance(v, int) and not isinstance(v, bool) for v in value
+        return (value is None and spec.default is None) or (
+            isinstance(value, (tuple, list))
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
         )
     if tag == ATTR_FLOATS:
         return isinstance(value, (tuple, list)) and all(
@@ -524,6 +556,7 @@ def _attr_matches(tag: str, value: Any) -> bool:
     if tag == ATTR_NESTED_INTS:
         return isinstance(value, (tuple, list)) and all(
             isinstance(v, (tuple, list))
+            and len(v) > 0
             and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
             for v in value
         )
