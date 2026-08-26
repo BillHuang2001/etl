@@ -20,8 +20,8 @@ errors), stdlib, and numpy. Lower layers (``ops``, ``trace``, ``backends``,
 decisions, invariants, and the effect model.
 
 Note: this is the ARCHITECTURE-PHASE skeleton — data structures, the registry,
-and ``pretty_print`` are real; the remaining behavioral bodies (builder,
-verify, serialize, shape inference) raise ``NotImplementedError`` pending
+shape inference, ``pretty_print``, and ``verify`` are real; the remaining
+behavioral bodies (builder, serialize) raise ``NotImplementedError`` pending
 Phase 2 implementation.
 """
 

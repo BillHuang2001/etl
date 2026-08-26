@@ -164,9 +164,9 @@ in `printer.py`.
 ## Constraints
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
-- Architecture phase: data structures, registry, shape-inference hooks
-  (`inference.py`, 23 hooks), and `pretty_print` are implemented; the
-  remaining behavioral bodies (`Builder`, `verify`,
+- Implementation status: data structures, registry, shape-inference hooks
+  (`inference.py`, 23 hooks), `pretty_print`, and `verify` are implemented;
+  the remaining behavioral bodies (`Builder`,
   `serialize_module/deserialize_module`) raise `NotImplementedError` —
   Phase 2 (implementation) fills them.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
@@ -193,7 +193,7 @@ in `printer.py`.
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
 | `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
 | `./builder.py` | Op-construction API (stub) |
-| `./verify.py` | Structural/type/attribute verification (stub) |
+| `./verify.py` | Structural/type/attribute verification (implemented) |
 | `./serialize.py` | IR payload serialization (stub) |
 | `./printer.py` | SSA text printing (implemented) |
 
@@ -214,6 +214,8 @@ terminators). CPU only.
 ## Status
 
 Phase 2 in progress: SSA data model, op registry (75 ops), shape-inference
-hooks (`inference.py`, 23 hooks), and `pretty_print` are implemented. The
-remaining behavioral bodies (Builder, verify, serialize) are
-`NotImplementedError` stubs being filled by Phase 2 (delegated to a Manager).
+hooks (`inference.py`, 23 hooks), `pretty_print`, and `verify` (the full
+invariant set — module/function/region/op/value levels, SSA dominance, use
+bookkeeping, shape_fn result-type agreement) are implemented. The remaining
+behavioral bodies (Builder, serialize) are `NotImplementedError` stubs being
+filled by Phase 2 (delegated to a Manager).
