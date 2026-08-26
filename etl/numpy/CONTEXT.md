@@ -116,4 +116,4 @@ Siblings: `../ops/`, `../core/`, `../ir/` (read-only from here — ops-contract 
 
 ## Status
 
-Architecture phase complete (stubs raise `NotImplementedError`): CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`, all `py_compile`-clean. Phase 2 fills bodies per the mapping table; `solve/tril/triu/cumsum` blocked on ops-contract additions (see conflicts).
+Architecture phase complete: CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`. Phase 2 in progress: `shape.py` implemented — 1:1 forwards for `reshape`/`transpose`/`broadcast_to`/`concatenate`/`pad` (constant mode)/`tril`/`triu`; documented `ops.reshape`/`ops.slice`/`ops.concatenate` compositions for `expand_dims`/`squeeze`/`stack`/`split`; static validation with `ShapeError`/`TraceError` per the mapping table. Other modules land per the mapping table.
