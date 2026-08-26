@@ -8,9 +8,10 @@ time.
 
 Import-time side effect: ``_registration.register_operator_handlers()``
 populates ``core``'s operator-hook dict so ``SymbolicTensor`` arithmetic
-(``x + y``, ``x @ y``, ``x[i]``, ...) works without import cycles. During the
-implementation phase, ``_opdefs.register_all()`` additionally registers the
-frontend op definitions into ``etl.ir``'s registry.
+(``x + y``, ``x @ y``, ``x[i]``, ...) works without import cycles. The
+canonical op definitions (op names, arities, attributes, effects) live in
+``etl.ir``'s registry — ``ops`` consumes them via ``ir.opdef()`` and keeps no
+parallel op-definition table.
 
 Unified semantics (binding, summarized — see CONTEXT.md for the full rules):
 
@@ -28,7 +29,6 @@ Unified semantics (binding, summarized — see CONTEXT.md for the full rules):
 from __future__ import annotations
 
 # Submodules first (they populate the operator-handler mapping).
-from . import _opdefs  # noqa: F401  (dialect declarations)
 from . import _registration
 from . import _utils  # noqa: F401  (shared helpers)
 from . import comparison
