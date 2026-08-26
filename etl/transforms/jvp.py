@@ -8,8 +8,10 @@ binding — see `./CONTEXT.md` "AD semantics".
 
 from __future__ import annotations
 
-from etl.trace import Graph
+from etl.trace import Graph, trace
 from etl.transforms._wrappers import TransformCallable
+from etl.transforms.autodiff import forward_sweep
+from etl.transforms.grad import _normalize_extra_pytree
 
 
 def jvp(fn_or_graph, tangents):
@@ -49,16 +51,23 @@ def jvp(fn_or_graph, tangents):
 
 def _jvp_graph(graph: Graph, tangents) -> Graph:
     """Validate/normalize the tangent spec tree against the graph inputs, run
-    the forward sweep, and build the result graph (primal+tangent inputs,
-    (primal, tangent) outputs) (stub)."""
-    raise NotImplementedError(
-        "_jvp_graph: implementation phase; see etl/transforms/CONTEXT.md"
+    the forward sweep, and return the sweep graph as-is — it already has the
+    required input/output structure: inputs = 2-tuple (original input tree,
+    flat tangent tuple tree), outputs = 2-tuple (primal outputs with the
+    original output tree, flat tangent tensors aligned with the flattened
+    tensor outputs)."""
+    flat_tangents = _normalize_extra_pytree(
+        tangents,
+        graph.input_specs,
+        graph.static_values,
+        graph.tensor_specs,
+        transform="jvp",
+        kind="tangent",
     )
+    return forward_sweep(graph, flat_tangents)
 
 
 def _jvp_fn(fn, args, tangents) -> Graph:
     """`jvp(f, tangents)(*specs)` — trace `fn` once via `etl.trace(fn, *args)`,
-    then apply `_jvp_graph` with the stored tangents (stub)."""
-    raise NotImplementedError(
-        "_jvp_fn: implementation phase; see etl/transforms/CONTEXT.md"
-    )
+    then apply `_jvp_graph` with the stored tangents."""
+    return _jvp_graph(trace(fn, *args), tangents)

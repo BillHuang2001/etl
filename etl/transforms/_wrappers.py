@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from etl.core import Tensor, TraceError, TreeSpec
+from etl.core import Tensor, TraceError, flatten
 from etl.trace import Graph
 
 
@@ -44,7 +44,7 @@ class TransformCallable:
         return self._build(*args)
 
     def _check_no_concrete_tensors(self, args) -> None:
-        flat, _ = TreeSpec.flatten(args)
+        flat, _ = flatten(args)
         for arg in flat:
             if isinstance(arg, Tensor):
                 raise TraceError(
