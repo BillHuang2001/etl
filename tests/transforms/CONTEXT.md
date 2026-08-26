@@ -12,7 +12,7 @@ Tests for `etl.transforms` (sibling binding contract: `../../etl/transforms/CONT
 - `test_grad.py` — reverse mode: analytic checks (x²+3x → 2x+3), argnums int/tuple/None (incl. static inputs excluded from numbering), non-scalar/multi-output → `ShapeError`, documented ZeroTangent zeros (argmax/equal), `runtime_call` → `TransformError`, Graph-form ≡ callable-form, argnums validation errors.
 - `test_jvp.py` — forward mode vs central directional differences, tangent normalization (bare spec / 1-tuple / bare None spellings; None = zero tangent), structure/shape/dtype mismatch → `TransformError`, Graph-form ≡ callable-form, concrete Tensor → `TraceError`, `runtime_call` → `TransformError`.
 - `test_vjp.py` — reverse mode: default scalar-one cotangent equals `grad` result, pullback == ct @ finite-difference Jacobian, multi-output cotangent pytrees, cotangent mismatch errors, non-scalar/multi-output with cotangents=None → `ShapeError`, stop_gradient → zero cotangent.
-- `test_autodiff_rules.py` — chain rule through composites vs finite differences: grad of dot (2D×2D; `etl.dot` requires rank ≥ 2 by design — 1D·1D inner product is composed as multiply+sum), sigmoid, reduce_sum(x²), reshape, transpose, broadcast (see Known Issues); jvp AND vjp through dot/sigmoid/reshape/transpose; stop_gradient blocks gradient flow; chained elementwise ops; deferred conv VJP → `TransformError`.
+- `test_autodiff_rules.py` — chain rule through composites vs finite differences: grad of dot (2D×2D; `etl.dot` requires rank ≥ 2 by design — 1D·1D inner product is composed as multiply+sum), sigmoid, reduce_sum(x²), reshape, transpose, broadcast; jvp AND vjp through dot/sigmoid/reshape/transpose; stop_gradient blocks gradient flow; chained elementwise ops; deferred conv VJP → `TransformError`.
 - `test_errors.py` — TransformError paths: axis errors (non-zero/out-of-range/mismatch/mapped-static), ruleless ops (`runtime_call`, collectives like `all_reduce`, control flow) under vmap/grad/jvp/vjp, argnums/tangent/cotangent validation, concrete-Tensor rejection for all four `TransformCallable` kinds, plus the documented zero-gradient behavior of argmax/equal (NOT errors).
 - `test_equivalence_meta.py` — transformed graphs are ordinary graphs: `verify()` passes, no banned transform op names anywhere in the module (walk all blocks/regions), every op resolves to a registered opdef, `main` has a `return` terminator; `TransformCallable.kind` values; input-graph non-mutation (serialize before == after) for all five graph-form transforms.
 - `test_vmap_control_flow.py` — v1 restriction behavior: vmap/vectorize over `cond`/`while_loop`/`scan` → `TransformError` ("cannot batch op 'if'/'while' … not vectorizable in v1"), grad/jvp/vjp over control flow → "no VJP/JVP rule for op 'if'"; plain `etl.trace` of the same functions still succeeds (restriction is transform-only).
@@ -23,21 +23,6 @@ Tests for `etl.transforms` (sibling binding contract: `../../etl/transforms/CONT
 - Runtime args mirror the transformed graph's input tree: jvp/vjp graphs take `(primal input tree, flat tangent/cotangent tuple)`; `None` tangent/cotangent entries are passed as `None` leaves at runtime; `grad` graphs keep the original input tree (static leaves included).
 - `grad` with an int argnum returns a bare tensor; `argnums=None`/tuple returns a tuple (even a 1-tuple).
 - Small shapes (≤ 5×4×4), CPU only, each file <2s; parametrize fns × dtypes instead of looping.
-
-## Known Issues
-
-- **etl BUG (kept as an intentionally failing test)**: `test_grad_through_broadcast` in `test_autodiff_rules.py` — binary elementwise VJP rules (`multiply` at `../../etl/transforms/rules.py:536`, same pattern in add/subtract/divide/power) do not reduce implicit broadcast dims back to the operand shape. Grad of `sum(x * b)` with `x` shape `(3,1)` and constant `b` shape `(1,4)` comes out shaped `(3,4)` with unreduced values 3.0 instead of `(3,1)` all-12.0. The explicit `broadcast` op's VJP reduces correctly, so the design intent is clear. Minimal repro:
-
-  ```python
-  import numpy as np, etl
-  spec = etl.TensorSpec((3, 1), etl.float64)
-  b = np.full((1, 4), 3.0)
-  def f(x):
-      return etl.sum(etl.multiply(x, etl.constant(etl.tensor(b))))
-  g = etl.grad(f, 0)(spec)
-  out = etl.run(etl.load(etl.compile(etl.lower(g))), np.ones((3, 1)))
-  out.numpy().shape  # (3, 4) — expected (3, 1), all 12.0
-  ```
 
 ## Notes for agents
 

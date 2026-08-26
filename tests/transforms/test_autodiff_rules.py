@@ -162,13 +162,6 @@ def test_grad_through_transpose(cfg):
 
 
 def test_grad_through_broadcast():
-    # BUG(etl): binary elementwise VJP rules (multiply, add, subtract,
-    # divide, power) do not reduce implicit broadcast dims back to the
-    # operand shape — the gradient comes out shaped like the broadcast
-    # result ((3, 4)) with unreduced values, instead of the input shape
-    # ((3, 1), all entries = sum(b) = 12). The explicit `broadcast` op's VJP
-    # reduces correctly; the implicit broadcast inside elementwise ops does
-    # not. This test fails until the rules reduce broadcast dims.
     spec = etl.TensorSpec((3, 1), np.float64)
     b = np.full((1, 4), 3.0)
     x = np.random.RandomState(7).uniform(0.2, 1.2, (3, 1))
