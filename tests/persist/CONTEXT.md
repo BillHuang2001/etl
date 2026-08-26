@@ -24,7 +24,7 @@ pytest suite validating `etl.persist` (sibling — see `../../etl/persist/CONTEX
 
 Two tests in `test_cache.py` fail against the current implementation and are BUG-marked (awaiting parent fix):
 
-1. **Dict insertion order changes cache keys** — `compute_key(({"name": "a", 1: 2},)) != compute_key(({1: 2, "name": "a"},))`. The "dict" codec stores items in insertion order and `json.dumps(sort_keys=True)` cannot sort list elements, violating the documented canonical-JSON keying contract. Failing tests: `test_dict_component_insertion_order_same_key` (and the dict part of `test_dict_component_insertion_order_same_key` covers the FileCache path).
+1. **Dict insertion order changes cache keys** — `compute_key(({"name": "a", 1: 2},)) != compute_key(({1: 2, "name": "a"},))`. The "dict" codec stores items in insertion order and `json.dumps(sort_keys=True)` cannot sort list elements, violating the documented canonical-JSON keying contract. Failing test: `test_dict_component_insertion_order_same_key` (asserts both the `compute_key` level and the `FileCache` get/put level).
 2. **Bare-string key_components collide with tuples** — `compute_key("a") == compute_key(("a",))` because `compute_key` iterates `key_components`, splitting a bare string into character components. Failing test: `test_distinct_keys_distinct_entries`.
 
 ## Notes for agents
