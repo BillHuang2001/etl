@@ -98,32 +98,47 @@ query `current_builder()` and build into the function body or the innermost
 control-flow region. `control_flow.py` swaps builders per region so user
 branch/body callables target the right region.
 
-## Control-flow region conventions (coordination contract with `etl/ir`)
+## Control-flow region conventions (binding — implemented against the real `etl/ir` registry)
 
-Region ops are built via `ir.opdef(name)` + the region `Builder` — this
-module NEVER imports `etl.ops` (ops imports trace — keep the DAG acyclic).
-Assumed ir API (coordinate with the ir architect; objective-sanctioned):
+Region ops are built via `ir.opdef(name)` + the `ir.Builder` — this module
+NEVER imports `etl.ops` (ops imports trace — keep the DAG acyclic). The
+conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
+(they differ from earlier architecture assumptions — `ir` is authoritative):
 
-- Ops have a `regions` attr: `list[Region]`; block args carry loop-carried
-  values. `ir.Builder` exposes creation of blocks-with-args inside a region
-  and a generic `create(opdef_name, operands=, attrs=, result_types=,
-  regions=)` (see `_region_builder` helper).
-- `if` op ("if", effects none, 2 regions): no operands; regions = then,
-  else — one block each, NO block args; each block's `return` terminator
-  yields the branch outputs (n SymbolicTensors, identical trees, unified
-  dtypes/shapes across branches); op results = selected branch's outputs.
-  Branch callables run once each at trace time under `with_builder(...)`.
-- `while` op ("while", effects none, 2 regions): operands = n initial
-  carried values; regions = condition, body — one block each with n block
-  args (the carried values). Condition region returns ONE scalar 0-d bool;
-  body region returns n next-carried values. Op results = final carried
-  values. cond_fn/body_fn run once each at trace time.
-- `return` op: terminator-only (operands = yielded values), valid only as a
-  block's last op.
-- Required registry op defs for `scan` desugaring: `add`, `less`, `slice`
-  (dynamic index), `expand_dims`, `concatenate` — built raw from
-  `ir.opdef(...)`. FINAL NAMES are owned by ir's op registry; Phase 2 must
-  verify against the implemented registry and adjust if names differ.
+- `ir.Builder` region workflow: `builder.build_region(input_types)` creates a
+  detached single-block region whose entry args are fresh Values; pass it via
+  `create(op_name, operands=..., regions=(...))` (wires `region.parent`);
+  build inside it with `builder.push_region(region)` / `builder.pop_region()`
+  under `with_builder(builder)` (same builder instance).
+- `if` op ("if", effects none, 2 regions, arity (1, None)): **operand 0 IS
+  the boolean predicate**; operands 1..n are the captured tensor values.
+  `ir.verify` binds EVERY operand (predicate included) to each region's
+  entry-block args — one arg per operand, identical count and types. Branch
+  callables therefore receive the REGION BLOCK ARGS (wrapped as
+  SymbolicTensor), not the enclosing captured values. Each block's `return`
+  terminator yields the branch outputs (identical trees, unified
+  dtypes/shapes across branches — mismatch raises `DTypeError`/`ShapeError`/
+  `TraceError`); explicit `result_types` are passed to `create`. Branch
+  callables run once each at trace time.
+- `while` op ("while", effects none, 2 regions, arity (1, None)):
+  operands = n initial carried values (≥1 — all-static init raises
+  `TraceError`); regions = condition, body — one block each with n block args
+  bound to the operands (same verify convention). `shape_fn=infer_identity`
+  → op results = operand types. Condition region returns ONE 0-d bool; body
+  region returns n next-carried values. Loop-carried types must stay constant
+  across iterations (checked at trace time). cond_fn/body_fn run once each.
+- `return` op: terminator-only (operands = yielded values), emitted via
+  `builder.set_terminator(block, "return", operands)` — it appends as the
+  last op (never via `create`).
+- `scan` desugaring uses these registered op defs (raw, via `ir.opdef`):
+  `constant` (int32 0/1/length scalars), `add` (counter increment), `less`
+  (counter < length), `gather` (`axes=(0,)` with a 0-d int32 counter — the
+  DYNAMIC index step; `slice` is static-int-only and unusable here),
+  `reshape` (leading 1-dim), `broadcast` + `scatter` (fixed-size stacking —
+  a grow-by-`concatenate` stack would change the carried type per
+  iteration, which a typed `while` op cannot carry). The registry has NO
+  `expand_dims`. Step 0 runs pre-loop via a static `slice` at index 0;
+  `length == 0` raises `TraceError` (v1).
 
 `scan` v1 scope: STATIC length only (int, or derived from xs's static
 leading dim). Symbolic length → `TraceError` (dynamic-scan region ops
@@ -187,6 +202,39 @@ pytest; mirror under `../tests/test_trace/` (or per-module files):
 
 ## Status
 
-Architecture complete (skeletons + contracts). Phase 2 (delegated to a
-Manager): implement `trace` algorithm, control-flow region building, Graph
-I/O + persistence delegation per the contracts above.
+Fully implemented (Phase 2 complete): `trace.py` (7-step tracer),
+`graph.py` (Graph I/O, validation, persistence), `control_flow.py`
+(cond/while_loop/scan region building), plus `builder.py`/`defn.py`
+(pre-existing). All graphs produced by `etl.trace` pass `ir.verify`;
+Graph save/load round-trips through the persist container.
+
+## Notes for agents
+
+- **Tree leaf markers**: `core.flatten` descends into EVERY dataclass (incl.
+  `SymbolicTensor`/`TensorSpec`), so trace trees cannot record such leaves
+  by their real type. `trace.py` records them via private non-dataclass
+  markers (`_TensorSpecLeaf`/`_SymbolicLeaf`) carrying the original object;
+  `graph.py` compares trees by container SKELETON (leaf types differ by
+  design) and normalizes dataclass leaf types before `core.unflatten`
+  (`_normalize_leaf_types`). Any code touching `Graph.input_specs`/
+  `output_tree` must respect this. `control_flow.py` has its own local
+  `_flatten_tree` with the same principle.
+- **`signature_info()` returns persist-ENCODED (JSON-safe) values** — it is
+  metadata for the persistence container. In-process consumers that need
+  live objects must use the Graph's live attributes (`input_specs`,
+  `tensor_specs`, `output_tree`) or `persist.decode_value` the entries.
+- **`flatten_inputs` accepts `core.Tensor` or `np.ndarray` only** — numpy
+  SCALARS (`np.float32(1)`) are rejected with `TraceError` (contract: wrap
+  via `core.from_numpy`, which also rejects scalars). Error messages carry
+  the pytree path and spec-vs-actual values.
+- **`etl.trace` attribute shadowing**: inside the package, `etl.trace` is
+  the FUNCTION after `etl/__init__.py` imports; the submodule is reachable
+  via `import etl.trace as mod` or `from etl.trace import ...` (see
+  `__init__.py` docstring).
+- Gaps found in lower layers (flagged to the package root): `core.flatten`
+  recursing into dataclass leaves (SymbolicTensor) is a footgun for
+  ops/backends that flatten SymbolicTensor trees; `core.Dim` has no
+  `evaluate()` (only `DimExpr`); registry has no `expand_dims` and no
+  dynamic-index `slice` (scan works around via gather/reshape); `ir.verify`
+  does not check `while` body-return types against operand types (checked
+  at trace time here instead).
