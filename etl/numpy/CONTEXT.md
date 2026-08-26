@@ -8,7 +8,7 @@ Binding parent contracts: root `../../CONTEXT.md` (principles 1–9, especially 
 
 ## API surface
 
-Re-exported from `__init__.py` (exact names; architecture phase — all bodies `raise NotImplementedError`):
+Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining modules land in Phase 2):
 
 - **Elementwise/arith** (`elementwise.py`): `abs, add, subtract, multiply, divide, power, maximum, minimum, negative, square, sqrt, exp, log, sin, cos, tanh, sign, clip, astype`
 - **Comparison/logic** (`logic.py`): `equal, not_equal, less, less_equal, greater, greater_equal, logical_and, logical_or, logical_not, where`
