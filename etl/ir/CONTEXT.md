@@ -164,11 +164,26 @@ in `printer.py`.
 ## Constraints
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
+<<<<<<< .merge_file_xKaWfb
 - Architecture phase: data structures, registry, and `pretty_print` are
   implemented; the remaining behavioral bodies (`Builder`, `verify`,
   `serialize_module/deserialize_module`, shape-inference hooks in
   `inference.py`) raise `NotImplementedError` — Phase 2 (implementation)
   fills them.
+=======
+- Architecture phase: data structures, registry, and shape-inference hooks
+  (`inference.py`, 23 hooks) are implemented; behavioral bodies (`Builder`,
+  `verify`, `serialize_module/deserialize_module`, `pretty_print`) raise
+  `NotImplementedError` — Phase 2 (implementation) fills them.
+- Shape-inference conventions (binding for `verify` agreement): broadcasting
+  resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);
+  `None` dims are runtime-dynamic and yield `None`; element-count checks
+  raise `ShapeError` only on definite mismatch; sum folds are
+  left-associative `DimExpr("add", ...)` chains. Dtype promotion uses
+  `np.result_type`; reduction dtypes follow numpy per `reduce_op` (the
+  `reduce_*` OpDefs carry a `reduce_op` attribute: 'sum'|'max'|'min'|'mean'|
+  'prod').
+>>>>>>> .merge_file_4FKFFk
 - Files < ~1000 lines; op_defs split by category (done).
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
@@ -183,11 +198,11 @@ in `printer.py`.
 | `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective) |
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
-| `./inference.py` | Shape-inference hooks referenced by OpDefs (stubs) |
+| `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
 | `./builder.py` | Op-construction API (stub) |
 | `./verify.py` | Structural/type/attribute verification (stub) |
 | `./serialize.py` | IR payload serialization (stub) |
-| `./printer.py` | SSA text printing (stub) |
+| `./printer.py` | SSA text printing (implemented) |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related
 writes to root).
@@ -195,7 +210,9 @@ writes to root).
 ## Test strategy (Phase 2+)
 
 pytest under `../tests/ir/`: registry completeness (every public op in the etl
-contract is declared; arities/attrs/effects correct); `verify()` invariants
+contract is declared; arities/attrs/effects correct); shape-inference hooks
+(static + symbolic dims per hook, broadcast/reshape/conv formulas, ShapeError
+cases); `verify()` invariants
 (valid modules + one test per violation class); serialization round-trips
 (shapes with symbolic dims, constants as base64 npy, tamper detection, version
 rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
@@ -203,7 +220,7 @@ terminators). CPU only.
 
 ## Status
 
-Architecture phase in progress: SSA data model, op registry (75 ops), and
-`pretty_print` are implemented. The remaining behavioral bodies (Builder,
-verify, serialize) and shape-inference hooks are `NotImplementedError` stubs —
-Phase 2 (implementation, delegated to a Manager) fills them.
+Phase 2 in progress: SSA data model, op registry (75 ops), shape-inference
+hooks (`inference.py`, 23 hooks), and `pretty_print` are implemented. The
+remaining behavioral bodies (Builder, verify, serialize) are
+`NotImplementedError` stubs being filled by Phase 2 (delegated to a Manager).
