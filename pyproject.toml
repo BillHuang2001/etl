@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etl"
+version = "0.1.0"
+description = "EvoX Tensor Library — a minimal, explicit, compiler-neutral tensor graph runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+interop = ["torch>=2.0"]  # DLPack interop tests only
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["etl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
