@@ -770,15 +770,6 @@ class TestErrorLocations:
             etl.trace(f, _SPEC3)
         assert "test_spec_compliance.py" in str(excinfo.value)
 
-    # BUG(etl): shape errors raised during op shape inference do NOT include
-    # the source location, although the failing op carries one. The root
-    # error strategy (CONTEXT.md) requires error messages to include a
-    # location like `model.py:83` whenever a graph location exists. Minimal
-    # repro:
-    #     @etl.defn
-    #     def f(a, b): return etl.add(a, b)
-    #     etl.trace(f, TensorSpec((2,), f32), TensorSpec((3,), f32))
-    #     -> ShapeError("cannot broadcast incompatible dims 2 and 3")  # no file:line
     @pytest.mark.parametrize("kind", ["add", "dot"])
     def test_shape_errors_include_source_location(self, kind):
         if kind == "add":
