@@ -79,7 +79,9 @@ authoritative registry table lives in codec.py's module docstring:
 value → `PersistenceError`. Extension: `register_codec` before any
 save/load that may hit the type; shadowing registered names is rejected.
 TreeSpec round-trip requires `core.TreeSpec` to be reconstructible from
-(treetype name, context, children).
+(treetype name, context, node_data, children) — the codec calls the
+dataclass constructor directly; treetype names must resolve (see Notes for
+agents).
 
 ## Cache (cache.py)
 
