@@ -19,10 +19,9 @@ errors), stdlib, and numpy. Lower layers (``ops``, ``trace``, ``backends``,
 ...) import from here — never the reverse. See ``./CONTEXT.md`` for design
 decisions, invariants, and the effect model.
 
-Note: Phase 2 is in progress — the data structures, the registry, shape
-inference (`inference`), `pretty_print`, the `Builder`, and `verify` are real;
-the remaining behavioral bodies (`serialize_module`/`deserialize_module`)
-raise ``NotImplementedError`` until Phase 2 fills them.
+Note: the data structures, the registry, shape inference (`inference`),
+`pretty_print`, the `Builder`, `verify`, and serialization
+(`serialize_module`/`deserialize_module`) are all implemented.
 """
 
 from etl.core import VerificationError  # owned by core; re-exported here

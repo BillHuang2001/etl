@@ -82,6 +82,20 @@ its own container (magic header etc.) — the payload already carries everything
 it needs, so the wrapper stays dumb. `IR_FORMAT_VERSION` (IR payload) is
 distinct from `ETL_FORMAT_VERSION` (persist container).
 
+Wire-format decisions (binding, documented in `serialize.py`): block op lists
+reference the flat ops table via `"ref"` = the op id as a decimal STRING;
+dims encode as `{"int"}` | `{"dim": name[, "size"]}` | `{"expr": {op, args}}`
+| `null` (decoded back to real `Dim`/`DimExpr`, preserving names/sizes);
+ndarray attr values move to the `constants` table (attr becomes
+`{"__etl_ndarray__": key}`); tuples are wrapped as `{"__etl_tuple__": [...]}`
+to survive the JSON round-trip; `runtime_call`/`block_call` `result_specs`
+are encoded as a list of type dicts and NORMALIZED back to `ValueType`
+instances on decode (so `verify`'s in-memory comparison still passes).
+Rebuilt modules keep their ORIGINAL ids and their `_op_ids`/`_value_ids`
+counters are fast-forwarded past the payload maximum, so post-load
+`Builder.create` calls never collide ids. `serialize_module` runs `verify`
+first; `deserialize_module` runs it on the result.
+
 ### 6. Result-type resolution
 `OpDef.shape_fn: (input_types, attributes) -> result_types` computes result
 types when the builder has no explicit `result_types`. `shape_fn=None` means
@@ -181,10 +195,8 @@ in `printer.py`.
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
 - Implementation status: data structures, registry, shape-inference hooks
-  (`inference.py`, 23 hooks), `pretty_print`, `verify`, and the `Builder`
-  are implemented; the remaining behavioral bodies
-  (`serialize_module/deserialize_module`) raise `NotImplementedError` —
-  Phase 2 (implementation) fills them.
+  (`inference.py`, 23 hooks), `pretty_print`, `verify`, the `Builder`, and
+  serialization (`serialize_module`/`deserialize_module`) are implemented.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
   resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);
   `None` dims are runtime-dynamic and yield `None`; element-count checks
@@ -210,7 +222,7 @@ in `printer.py`.
 | `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
 | `./builder.py` | Op-construction API (implemented) |
 | `./verify.py` | Structural/type/attribute verification (implemented) |
-| `./serialize.py` | IR payload serialization (stub) |
+| `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented) |
 | `./printer.py` | SSA text printing (implemented) |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related
@@ -229,10 +241,10 @@ terminators). CPU only.
 
 ## Status
 
-Phase 2 in progress: SSA data model, op registry (75 ops), shape-inference
-Phase 2 in progress: SSA data model, op registry (75 ops), shape-inference
-hooks (`inference.py`, 23 hooks), `pretty_print`, `verify` (the full
-invariant set — module/function/region/op/value levels, SSA dominance, use
-bookkeeping, shape_fn result-type agreement), and the `Builder` are
-implemented. The remaining behavioral bodies (serialize) are
-`NotImplementedError` stubs being filled by Phase 2 (delegated to a Manager).
+Phase 2 complete for this directory: SSA data model, op registry (75 ops),
+shape-inference hooks (`inference.py`, 23 hooks), `pretty_print`, `verify`
+(the full invariant set — module/function/region/op/value levels, SSA
+dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
+and serialization (`serialize_module`/`deserialize_module` — payload schema,
+integrity hash, round-trip rebuild with original ids and fast-forwarded
+counters) are implemented.
