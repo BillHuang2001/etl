@@ -940,9 +940,16 @@ def infer_all_gather(
     dtype."""
     t = _one(input_types, "all_gather")
     gs = attributes["group_size"]
+    if gs is None:
+        # World group: rank count unknown at trace time — result dim is
+        # runtime-dynamic; the backend validates it at run time.
+        axis = _normalize_axis(attributes["axis"], t.rank, "all_gather.axis")
+        out = list(t.shape)
+        out[axis] = None
+        return (ValueType(t.dtype, tuple(out)),)
     if not isinstance(gs, int) or gs <= 0:
         raise ShapeError(
-            f"all_gather: group_size must be a positive int, got {gs!r}"
+            f"all_gather: group_size must be a positive int or None, got {gs!r}"
         )
     axis = _normalize_axis(attributes["axis"], t.rank, "all_gather.axis")
     out = list(t.shape)
@@ -958,9 +965,18 @@ def infer_reduce_scatter(
     symbolic); input dtype."""
     t = _one(input_types, "reduce_scatter")
     gs = attributes["group_size"]
+    if gs is None:
+        # World group: rank count unknown at trace time — result dim is
+        # runtime-dynamic; the backend validates it at run time.
+        axis = _normalize_axis(
+            attributes["axis"], t.rank, "reduce_scatter.axis"
+        )
+        out = list(t.shape)
+        out[axis] = None
+        return (ValueType(t.dtype, tuple(out)),)
     if not isinstance(gs, int) or gs <= 0:
         raise ShapeError(
-            f"reduce_scatter: group_size must be a positive int, got {gs!r}"
+            f"reduce_scatter: group_size must be a positive int or None, got {gs!r}"
         )
     axis = _normalize_axis(attributes["axis"], t.rank, "reduce_scatter.axis")
     out = list(t.shape)
@@ -976,9 +992,9 @@ def infer_all_to_all(
     input dtype."""
     t = _one(input_types, "all_to_all")
     gs = attributes["group_size"]
-    if not isinstance(gs, int) or gs <= 0:
+    if gs is not None and (not isinstance(gs, int) or gs <= 0):
         raise ShapeError(
-            f"all_to_all: group_size must be a positive int, got {gs!r}"
+            f"all_to_all: group_size must be a positive int or None, got {gs!r}"
         )
     split = _normalize_axis(
         attributes["split_axis"], t.rank, "all_to_all.split_axis"
@@ -988,8 +1004,9 @@ def infer_all_to_all(
     )
     out = list(t.shape)
     if split != concat:
-        out[split] = _div_dim(out[split], gs, "all_to_all")
-        out[concat] = _mul_dim(out[concat], gs)
+        # World group (gs None): affected dims become runtime-dynamic.
+        out[split] = _div_dim(out[split], gs, "all_to_all") if gs is not None else None
+        out[concat] = _mul_dim(out[concat], gs) if gs is not None else None
     return (ValueType(t.dtype, tuple(out)),)
 
 
