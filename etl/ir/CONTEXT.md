@@ -247,16 +247,21 @@ terminators). CPU only.
 
 ## Known Issues
 
-- **ops-binding inference conflicts (coordinate when `../ops` lands):** the
-  registry registers `divide` with `infer_elementwise_binary` (plain
-  `np.result_type` — int/int stays int) and all unary math ops (`sqrt`,
-  `exp`, `log`, `log1p`, `sin`, `cos`, `tan`, `tanh`, `sigmoid`, `relu`,
-  `gelu`, `erf`) with `infer_elementwise_unary` (dtype-preserving). The
-  `../ops` binding contract requires true division (int/bool → float64) and
-  int/bool → float64 promotion for unary math ops; `cumsum` uses
-  `infer_identity` but the ops contract requires bool → int64. Fix in
-  `inference.py` + `op_defs/` with dedicated hooks (`infer_true_divide`,
-  `infer_unary_math`, `infer_cumsum`).
+- **Generic inference + ops-side compensation (sanctioned division of
+  labor):** the registry keeps generic hooks — `divide` →
+  `infer_elementwise_binary` (plain `np.result_type`, int/int stays int),
+  unary math ops (`sqrt`, `exp`, `log`, `log1p`, `sin`, `cos`, `tan`,
+  `tanh`, `sigmoid`, `relu`, `gelu`, `erf`) → `infer_elementwise_unary`
+  (dtype-preserving), `cumsum` → `infer_identity` — while `../ops` achieves
+  its binding dtype rules (true division int/bool → float64; int/bool →
+  float64 for unary math; bool cumsum → int64) by composing explicit
+  pre-cast ops — documented in `../ops/CONTEXT.md` as sanctioned transparent
+  sugar, not a bug. `abs` has its own dedicated `infer_abs` hook (complex →
+  real magnitude dtype), so no compensation is needed there. If dedicated
+  hooks (`infer_true_divide`, `infer_unary_math`, `infer_cumsum`) are ever
+  added here, the ops compositions may be removed — but only when registered
+  in `inference.py` + `op_defs/` (the numpy backend kernel must agree on
+  either form).
 - Builder attribute schema is stricter than inference in two places:
   `pad.padding_config` (ATTR_NESTED_INTS) requires `(lo, hi)` PAIR entries
   (bare int entries fail `VerificationError`, though `infer_pad` accepts

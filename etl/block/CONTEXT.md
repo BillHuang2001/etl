@@ -92,9 +92,10 @@ Real schema (as of the ir implementation):
   op's result types exactly).
 - attrs: `block_name` (str), `static_args` (ATTR_ANY, default `()`), and
   `result_specs` (ATTR_ANY). There are NO `effects`/`batching_policy` attrs
-  and the op's effect is fixed at `read` — **ir-side gaps flagged to the
-  parent** (the declared block's effects/policy do not yet ride on the op;
-  consumers must consult `get_block(block_name)` for them).
+  and the op's effect is fixed at `read` (optional ir-owned enhancements —
+  see "Remaining coordination with siblings" below): the declared block's
+  effects/policy do not ride on the op, so consumers must consult
+  `get_block(block_name)` for them.
 - `static_args` is a dict attribute-name → `{"kind": ..., "value": ...}` —
   a plain JSON-safe payload, never a `StaticValue` object (ir's ATTR_ANY
   serialization round-trips it; verified via save/load). `StaticValue` (in
