@@ -69,8 +69,6 @@ def test_clip_both_bounds_ir_is_max_of_min():
 
 
 def test_clip_upper_bound_only_is_minimum():
-    # BUG(etl): clip None-bound branches inverted — enp.clip(x, None, hi)
-    # builds maximum instead of minimum (and vice versa).
     a = np.array([[-1.5, 0.25, 2.0]], dtype=np.float32)
     hi = 1.0
     got = etl.evaluate(_clip_defn(None, hi), a).numpy()
@@ -78,8 +76,6 @@ def test_clip_upper_bound_only_is_minimum():
 
 
 def test_clip_lower_bound_only_is_maximum():
-    # BUG(etl): clip None-bound branches inverted — enp.clip(x, lo, None)
-    # builds minimum instead of maximum (and vice versa).
     a = np.array([[-1.5, 0.25, 2.0]], dtype=np.float32)
     lo = 0.0
     got = etl.evaluate(_clip_defn(lo, None), a).numpy()
@@ -216,9 +212,6 @@ def test_expand_dims_tuple_axis_numeric():
 
 
 def test_expand_dims_tuple_axis_ascending_numeric():
-    # BUG(etl): expand_dims validates tuple axes against the ORIGINAL rank —
-    # (1, 3) on a rank-2 array raises ShapeError instead of expanding
-    # (numpy accepts it: insert at 1, then at 3 of the expanded shape).
     a = np.arange(6, dtype=np.float32).reshape(2, 3)
     got = etl.evaluate(_expand_defn((1, 3)), a).numpy()
     np.testing.assert_array_equal(got, np.expand_dims(a, (1, 3)))
@@ -336,8 +329,6 @@ def test_pad_int_numeric(a):
 
 
 def test_pad_pair_rank1_numeric():
-    # BUG(etl): enp.pad(a, (1, 2)) on a rank-1 array raises ShapeError —
-    # numpy accepts a single (before, after) pair for the sole axis.
     a = np.arange(4, dtype=np.float32)
     got = etl.evaluate(_pad_defn((1, 2)), a).numpy()
     np.testing.assert_array_equal(got, np.pad(a, (1, 2)))
