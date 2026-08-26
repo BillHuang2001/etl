@@ -116,7 +116,9 @@ def _dot(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     a, b = operands
     aa, bb = a.numpy(), b.numpy()
     _check_dtypes("dot", aa, bb)
-    return core.Tensor(np.matmul(aa, bb))
+    # np.asarray normalizes a scalar result (vector . vector matmul) to the
+    # 0-d ndarray core.Tensor requires.
+    return core.Tensor(np.asarray(np.matmul(aa, bb)))
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,11 @@ Execution model (binding, parent CONTEXT.md):
   of shape rules.
 - **Control flow** (``if``/``while``/``scan``) is interpreted by recursively
   running region blocks through ``KernelContext.run_region`` — genuinely
-  dynamic runtime control flow, never specialized per iteration.
+  dynamic runtime control flow, never specialized per iteration. Region ops
+  may legally reference SSA values defined in ENCLOSING blocks (e.g.
+  ``etl.scan``'s desugared regions capture the length constant and the ``xs``
+  leaves — they are not while-op operands): operand resolution walks the
+  interpreter's env STACK (``_env_stack``) from innermost to outermost.
 - **Kernel dispatch** is the ``kernels`` table (``kernels.dispatch(op_name)``);
   the ``return`` terminator is special-cased in the loop, NOT dispatched.
 - **Output validation:** every kernel result is checked against the op's
@@ -343,6 +347,29 @@ class Interpreter:
             kernels.register_all()  # idempotent
         self.kernels_registered = True
         self._ctx: Optional[KernelContext] = None
+        #: Stack of value environments, innermost last. Nested region blocks
+        #: may legally reference SSA values defined in ENCLOSING blocks (e.g.
+        #: etl.scan's desugared regions capture the length constant and the
+        #: xs leaves — they are not while-op operands), so operand resolution
+        #: walks the stack from innermost to outermost.
+        self._env_stack: List[Dict[int, core.Tensor]] = []
+
+    def _resolve_value(self, value: ir.Value) -> core.Tensor:
+        """Resolve an operand value against the env stack (innermost first).
+
+        A value defined in an enclosing block falls through to the enclosing
+        frame. A miss (impossible for verified modules) raises
+        ``core.BackendError`` naming the value — never a silent skip.
+        """
+        for env in reversed(self._env_stack):
+            tensor = env.get(value.id)
+            if tensor is not None:
+                return tensor
+        raise core.BackendError(
+            f"cannot resolve value #{value.id} at run time — it is defined "
+            "in no enclosing block of the executing block (the module must "
+            "be invalid; verify should have rejected it)"
+        )
 
     # ------------------------------------------------------------------ run
 
@@ -430,12 +457,15 @@ class Interpreter:
         """Execute one block's ops in order; return the terminator's tensors.
 
         The value environment maps ``value.id`` (module-unique ints) to
-        computed ``core.Tensor``s. The ``return`` terminator is special-cased
-        in the loop (NOT dispatched). Every other op dispatches through
-        ``kernels.dispatch(op_name)``; results are normalized to a tuple and
-        validated against the op's declared result types (dtype exactly,
-        shape with ``None`` dims unchecked). Nested regions reuse the SAME
-        loop via ``KernelContext.run_region``.
+        computed ``core.Tensor``s. The block's env is pushed onto the
+        interpreter's env STACK for the duration of the block, so nested
+        regions can resolve values defined in ENCLOSING blocks (their block
+        args bind only the region-arg values). The ``return`` terminator is
+        special-cased in the loop (NOT dispatched). Every other op dispatches
+        through ``kernels.dispatch(op_name)``; results are normalized to a
+        tuple and validated against the op's declared result types (dtype
+        exactly, shape with ``None`` dims unchecked). Nested regions reuse
+        the SAME loop via ``KernelContext.run_region``.
         """
         ctx = self._ctx
         assert ctx is not None, "Interpreter._run_block requires an active KernelContext"
@@ -443,22 +473,32 @@ class Interpreter:
             argument.id: tensor
             for argument, tensor in zip(block.arguments, arg_tensors)
         }
-        for op in block.ops:
-            if op.name == "return":
-                return [env[value.id] for value in op.operands]
-            kernel = kernels.dispatch(op.name)
-            operands = tuple(env[value.id] for value in op.operands)
-            result = kernel(ctx, op, operands)
-            results = (result,) if isinstance(result, core.Tensor) else tuple(result)
-            if len(results) != len(op.results):
-                raise core.BackendError(
-                    f"kernel for op '{op.name}' produced {len(results)} "
-                    f"result(s), expected {len(op.results)}"
+        self._env_stack.append(env)
+        try:
+            for op in block.ops:
+                if op.name == "return":
+                    return [
+                        self._resolve_value(value) for value in op.operands
+                    ]
+                kernel = kernels.dispatch(op.name)
+                operands = tuple(
+                    self._resolve_value(value) for value in op.operands
                 )
-            for i, (tensor, value) in enumerate(zip(results, op.results)):
-                _validate_result(ctx, op, i, tensor, value)
-                env[value.id] = tensor
-        raise core.BackendError(
-            "block executed to completion without a 'return' terminator — "
-            "the module is invalid (verify should have rejected it)"
-        )
+                result = kernel(ctx, op, operands)
+                results = (
+                    (result,) if isinstance(result, core.Tensor) else tuple(result)
+                )
+                if len(results) != len(op.results):
+                    raise core.BackendError(
+                        f"kernel for op '{op.name}' produced {len(results)} "
+                        f"result(s), expected {len(op.results)}"
+                    )
+                for i, (tensor, value) in enumerate(zip(results, op.results)):
+                    _validate_result(ctx, op, i, tensor, value)
+                    env[value.id] = tensor
+            raise core.BackendError(
+                "block executed to completion without a 'return' terminator — "
+                "the module is invalid (verify should have rejected it)"
+            )
+        finally:
+            self._env_stack.pop()

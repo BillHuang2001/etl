@@ -69,25 +69,33 @@ def _binary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
 
     Both operands are arrays (the frontend promoted scalars to ``constant``
     ops), so numpy's ufunc broadcasting/result-type rules apply exactly.
+    Comparison/logical ufuncs return a numpy SCALAR (``np.bool_``) on 0-d
+    operands — ``np.asarray`` normalizes it to the 0-d ndarray ``core.Tensor``
+    requires (a no-op for real arrays; dtype never changes).
     """
 
     def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         a, b = operands
         a_arr, b_arr = a.numpy(), b.numpy()
         _check_supported(op.name, a_arr, b_arr)
-        return core.Tensor(np_fn(a_arr, b_arr))
+        return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
 
     return kernel
 
 
 def _unary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
-    """Kernel factory for one-operand shape/dtype-preserving ops."""
+    """Kernel factory for one-operand shape/dtype-preserving ops.
+
+    ``logical_not`` returns a numpy scalar (``np.bool_``) on 0-d operands —
+    ``np.asarray`` normalizes it to the 0-d ndarray ``core.Tensor`` requires
+    (a no-op for real arrays; dtype never changes).
+    """
 
     def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         (x,) = operands
         x_arr = x.numpy()
         _check_supported(op.name, x_arr)
-        return core.Tensor(np_fn(x_arr))
+        return core.Tensor(np.asarray(np_fn(x_arr)))
 
     return kernel
 
@@ -104,7 +112,7 @@ def _max_min(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
                 f"op '{op.name}': complex inputs are not supported (numpy "
                 "defines no ordering for complex numbers)"
             )
-        return core.Tensor(np_fn(a_arr, b_arr))
+        return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
 
     return kernel
 

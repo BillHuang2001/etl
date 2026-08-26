@@ -181,7 +181,9 @@ def _slice(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         slice(start, limit, stride)
         for start, limit, stride in zip(starts, limits, strides)
     )
-    return core.Tensor(arr[slices])
+    # np.asarray normalizes a 0-d result (numpy returns a scalar for
+    # ``arr[()]``) to the 0-d ndarray core.Tensor requires.
+    return core.Tensor(np.asarray(arr[slices]))
 
 
 def _gather(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
@@ -214,7 +216,9 @@ def _gather(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         result = np.take(arr, indices, axis=axis)
     except (ValueError, IndexError) as exc:
         raise _shape_error("gather", exc) from exc
-    return core.Tensor(result)
+    # np.asarray normalizes a scalar result (np.take with a 0-d index — the
+    # etl.scan step pattern) to the 0-d ndarray core.Tensor requires.
+    return core.Tensor(np.asarray(result))
 
 
 def _scatter(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
