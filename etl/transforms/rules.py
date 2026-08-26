@@ -29,7 +29,8 @@ from etl.transforms.batching import register_batching_rule
 from etl.transforms._metadata import MappedAxes, UNMAPPED
 
 # --- op categories (design record) --------------------------------------
-# Elementwise: result axes = union of operand mapped axes (unmapped operands get leading size-one dims inserted, i.e. broadcast).
+# Elementwise: result axes = union of operand mapped axes. Every operand is first reshaped to `own batch dims + left-padded per-row shape` so per-row
+# dims align on the right (numpy trailing broadcast) — an unmapped operand's leading dims are never consumed as another operand's batch dims.
 ELEMENTWISE_OPS = (
     "add", "subtract", "multiply", "divide", "power", "remainder", "maximum",
     "minimum", "abs", "negate", "square", "sqrt", "exp", "log", "log1p",
@@ -123,15 +124,30 @@ def _gelu_coeff(x: "core.SymbolicTensor") -> "core.SymbolicTensor":
 # --- batching rules -------------------------------------------------------
 
 def _pointwise_batching(op, operands, axes):
-    """Elementwise batching: align unmapped operands with leading size-one dims (broadcast) and rebuild; result axes = union of operand axes."""
+    """Elementwise batching: reshape every operand to the explicit target
+    `own batch dims + (1,)*pad + per-row shape` (per-row rank padded up to
+    the max per-row rank over operands) so per-row dims align on the right —
+    numpy trailing alignment — and a mapped operand's batch dims can never be
+    mistaken for an unmapped operand's per-row dims; then rebuild the op.
+    Result axes = union of operand mapped axes (longest leading tuple)."""
     name = op.name
     counts = [ax.count for ax in axes]
     mapped_count = max(counts) if counts else 0
-    values = [
-        ops.broadcast(_sym(value), (1,) * (mapped_count - count) + value.type.shape).value
-        if count < mapped_count else value
-        for value, count in zip(operands, counts)
-    ]
+    # Per-row rank = everything past the operand's own mapped batch dims.
+    row_ranks = [value.type.rank - count for value, count in zip(operands, counts)]
+    max_row_rank = max(row_ranks) if operands else 0
+    values = []
+    for value, count, row_rank in zip(operands, counts, row_ranks):
+        target = (
+            value.type.shape[:count]
+            + (1,) * (max_row_rank - row_rank)
+            + value.type.shape[count:]
+        )
+        if target == value.type.shape:
+            out = value  # already aligned: no reshape (common equal-rank case)
+        else:
+            out = ops.reshape(_sym(value), target).value
+        values.append(out)
     if name == "cast":
         out = ops.cast(_sym(values[0]), op.attributes["dtype"])
     elif name == "broadcast":
