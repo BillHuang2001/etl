@@ -6,7 +6,7 @@ Graph-time, explicit collective operations under the SPMD local-tensor model (ro
 
 - **`Group`** — static, named sets of ranks a collective operates over,
 - **the six collectives** — frontend functions that each build ONE IR op with effect kind `collective` into the active trace builder (same discipline as `etl/ops`: `trace.current_builder()` hook, SymbolicTensor-in / SymbolicTensor-out, `TraceError` on concrete tensors / outside a trace),
-- **`rank()` / `world_size()`** — scalar int32 graph values resolved from the runtime execution context by backends,
+- **`rank()` / `world_size()`** — scalar int64 graph values (effect `read`) resolved from the runtime execution context by backends,
 - **the collective-executor hook** (`set/get_collective_executor`).
 
 `dist` performs **no concrete computation** (no eager numerical duplication — root principle 9): the default single-process identity executor lives in the numpy backend and is installed via the hook at backend import time.
