@@ -220,9 +220,12 @@ Graph save/load round-trips through the persist container.
   `output_tree` must respect this. `control_flow.py` has its own local
   `_flatten_tree` with the same principle.
 - **`signature_info()` returns persist-ENCODED (JSON-safe) values** — it is
-  metadata for the persistence container. In-process consumers that need
-  live objects must use the Graph's live attributes (`input_specs`,
-  `tensor_specs`, `output_tree`) or `persist.decode_value` the entries.
+  metadata for the persistence container; its keys mirror the
+  `etl.backends.Signature` fields exactly (`input_tree`, `output_tree`,
+  `input_specs`, `output_specs`, `static_values`, `output_static_values`).
+  In-process consumers that need live objects must use the Graph's live
+  attributes (`input_specs`, `tensor_specs`, `output_tree`) or
+  `persist.decode_value` the entries.
 - **`flatten_inputs` accepts `core.Tensor` or `np.ndarray` only** — numpy
   SCALARS (`np.float32(1)`) are rejected with `TraceError` (contract: wrap
   via `core.from_numpy`, which also rejects scalars). Error messages carry

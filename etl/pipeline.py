@@ -33,8 +33,11 @@ Implementation notes (binding):
 - The signature's trace-time trees record tensor positions with
   ``_TensorSpecLeaf`` / ``_SymbolicLeaf`` markers (plain, non-dataclass
   classes — ``core.flatten``/``core.unflatten`` treat them as ordinary
-  leaves); static positions record the static value's own Python type. All
-  leaf classification in this module uses those markers.
+  leaves); static positions record the static value's own Python type.
+  Transform-built trees additionally mark tensor positions with the bare
+  dataclass types (``core.TensorSpec``/``core.SymbolicTensor``, e.g. jvp's
+  tangent trees) or with a ``type=None`` plain-leaf spec (grad/vjp output
+  trees). ``_is_tensor_leaf_spec`` unifies all of these.
 - ``caution``: ``etl.trace`` (the function) shadows the submodule attribute
   in ``etl``; this module imports trace pieces via ``from etl.trace import
   ...`` (import-system resolution) and ``etl.trace.trace`` directly.
@@ -137,15 +140,22 @@ class Executable:
             )
         recorded = backend_info["name"]
         if backend is not None:
-            resolved = _resolve_backend(backend)
-            if resolved.name != recorded:
+            if isinstance(backend, backends.Backend):
+                given_name = backend.name
+            elif isinstance(backend, str):
+                given_name = backend
+            else:
+                raise TypeError(
+                    f"backend must be a registered backend name (str) or a "
+                    f"Backend instance, got {type(backend).__name__}"
+                )
+            if given_name != recorded:
                 raise core.PersistenceError(
                     f"artifact records backend {recorded!r}; cannot load it "
-                    f"with backend {resolved.name!r} — never silently "
+                    f"with backend {given_name!r} — never silently "
                     f"recompile"
                 )
-        else:
-            resolved = backends.get(recorded)
+        resolved = backends.get(recorded)
         device = _normalize_device(device)
         artifact = backends.CompiledArtifact.load(path)
         backend_executable = resolved.load(artifact, device)
@@ -170,6 +180,16 @@ class BoundExecutable:
         self.executable = executable
         self.bindings = dict(bindings)
         self.bound_names = dict(bound_names) if bound_names else {}
+
+    @property
+    def signature(self):
+        """The wrapped executable's ``Signature``."""
+        return self.executable.signature
+
+    @property
+    def backend_executable(self):
+        """The wrapped executable's backend executable."""
+        return self.executable.backend_executable
 
     @property
     def functions(self):
@@ -281,15 +301,22 @@ def load(artifact, backend=None, device=None):
             f"etl.compile), got {type(artifact).__name__}"
         )
     if backend is not None:
-        resolved = _resolve_backend(backend)
-        if resolved.name != artifact.backend:
+        if isinstance(backend, backends.Backend):
+            given_name = backend.name
+        elif isinstance(backend, str):
+            given_name = backend
+        else:
+            raise TypeError(
+                f"backend must be a registered backend name (str) or a "
+                f"Backend instance, got {type(backend).__name__}"
+            )
+        if given_name != artifact.backend:
             raise core.PersistenceError(
                 f"artifact was produced by backend {artifact.backend!r}; "
-                f"cannot load it with backend {resolved.name!r} — never "
+                f"cannot load it with backend {given_name!r} — never "
                 f"silently recompile"
             )
-    else:
-        resolved = backends.get(artifact.backend)
+    resolved = backends.get(artifact.backend)
     device = _normalize_device(device)
     backend_executable = resolved.load(artifact, device)
     return Executable(backend_executable, artifact.signature)
@@ -311,6 +338,31 @@ def _format_path(path: Tuple[Any, ...]) -> str:
         else:
             parts.append(f"[{key}]")
     return "".join(parts)
+
+
+def _is_tensor_leaf_spec(leaf_spec: "core.TreeSpec") -> bool:
+    """True if a leaf spec marks a TENSOR position (input or output).
+
+    Leaf markers across the codebase (all mean "a tensor lives here"):
+    - ``_TensorSpecLeaf`` / ``_SymbolicLeaf`` — trace-built trees (``etl.trace``
+      records markers so ``core.flatten``/``core.unflatten`` treat the
+      etl dataclasses ``TensorSpec``/``SymbolicTensor`` as leaves);
+    - ``core.TensorSpec`` / ``core.SymbolicTensor`` — transform-built trees
+      (jvp's tangent-spec trees via ``core.flatten``; autodiff output trees);
+    - ``None`` (the ``TreeSpec.type`` FIELD is None) — the canonical
+      plain-leaf spec used by grad/vjp-built output trees.
+    Every other leaf type is a static position (trace records the static
+    value's own Python type, e.g. ``type(None)`` for a static ``None`` leaf).
+    """
+
+    leaf_type = leaf_spec.type
+    return (
+        leaf_type is _TensorSpecLeaf
+        or leaf_type is _SymbolicLeaf
+        or leaf_type is core.TensorSpec
+        or leaf_type is core.SymbolicTensor
+        or leaf_type is None
+    )
 
 
 def _walk_leaves(spec: "core.TreeSpec", prefix=(), counter=None):
@@ -383,7 +435,7 @@ def _reduce_tree(spec: "core.TreeSpec", bound: set, counter) -> "core.TreeSpec |
         and issubclass(spec.type, tuple)
         and hasattr(spec.type, "_fields")
     )
-    is_dataclass = (
+    is_dataclass_node = (
         isinstance(spec.type, type)
         and is_dataclass(spec.type)
         and not is_namedtuple
@@ -394,10 +446,10 @@ def _reduce_tree(spec: "core.TreeSpec", bound: set, counter) -> "core.TreeSpec |
         reduced = _reduce_tree(child, bound, counter)
         if reduced is not None:
             kept_children.append(reduced)
-            if is_dict or is_dataclass:
+            if is_dict or is_dataclass_node:
                 kept_keys.append(spec.node_data[i])
     node_data = spec.node_data
-    if is_dict or is_dataclass:
+    if is_dict or is_dataclass_node:
         node_data = type(node_data)(kept_keys) if node_data is not None else node_data
     return core.TreeSpec(
         type=spec.type,
@@ -526,7 +578,7 @@ def _prepare_flat_inputs(signature, bound: dict, args) -> list:
     tensor_specs = iter(signature.input_specs)
     static_values = iter(signature.static_values)
     for leaf_spec, leaf_index, path in _walk_leaves(input_tree):
-        if leaf_spec.type is _TensorSpecLeaf:
+        if _is_tensor_leaf_spec(leaf_spec):
             spec = next(tensor_specs)
             if leaf_index in bound:
                 tensors.append(bound[leaf_index])
@@ -580,7 +632,7 @@ def _unflatten_outputs(signature, flat_outputs) -> Any:
     """Wrap flat backend results as ``core.Tensor``\s and rebuild the
     structured output per ``signature.output_tree``.
 
-    Tensor leaves (``_SymbolicLeaf`` positions) consume the backend outputs
+    Tensor leaves (per ``_is_tensor_leaf_spec``) consume the backend outputs
     in order — ``core.Tensor`` passes through, numpy ``ndarray`` is wrapped
     via ``core.from_numpy``, anything else raises ``core.BackendError``
     naming the flat index. Static leaves consume
@@ -604,7 +656,7 @@ def _unflatten_outputs(signature, flat_outputs) -> Any:
     static_count = 0
     tensor_count = 0
     for leaf_spec, _, _ in _walk_leaves(output_tree):
-        if leaf_spec.type is _SymbolicLeaf:
+        if _is_tensor_leaf_spec(leaf_spec):
             tensor_count += 1
         else:
             static_count += 1
@@ -624,7 +676,7 @@ def _unflatten_outputs(signature, flat_outputs) -> Any:
     tensor_iter = iter(wrapped)
     static_iter = iter(signature.output_static_values)
     for leaf_spec, _, _ in _walk_leaves(output_tree):
-        if leaf_spec.type is _SymbolicLeaf:
+        if _is_tensor_leaf_spec(leaf_spec):
             leaves.append(next(tensor_iter))
         else:
             leaves.append(next(static_iter))
@@ -689,7 +741,7 @@ def bind(executable, **bindings):
     name_to_entry = {}
     tensor_specs = iter(signature.input_specs)
     for leaf_spec, leaf_index, _ in _walk_leaves(signature.input_tree):
-        if leaf_spec.type is not _TensorSpecLeaf:
+        if not _is_tensor_leaf_spec(leaf_spec):
             continue
         spec = next(tensor_specs)
         name = spec.name
@@ -742,6 +794,12 @@ def build(fn, *specs, backend=None, device=None, **options):
     """
     from etl.trace import trace as trace_fn
 
+    if not callable(fn) and not getattr(fn, "__etl_defn__", False):
+        raise TypeError(
+            f"build expects a callable or an @etl.defn function, got "
+            f"{type(fn).__name__} — to stage an already-traced Graph use the "
+            f"explicit lower/compile/load pipeline"
+        )
     graph = trace_fn(fn, *specs)
     lowered = lower(graph, backend=backend, **options)
     artifact = compile(lowered)
