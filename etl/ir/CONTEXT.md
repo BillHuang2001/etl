@@ -239,6 +239,25 @@ cases); `verify()` invariants
 rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
 terminators). CPU only.
 
+## Known Issues
+
+- **ops-binding inference conflicts (coordinate when `../ops` lands):** the
+  registry registers `divide` with `infer_elementwise_binary` (plain
+  `np.result_type` — int/int stays int) and all unary math ops (`sqrt`,
+  `exp`, `log`, `log1p`, `sin`, `cos`, `tan`, `tanh`, `sigmoid`, `relu`,
+  `gelu`, `erf`) with `infer_elementwise_unary` (dtype-preserving). The
+  `../ops` binding contract requires true division (int/bool → float64) and
+  int/bool → float64 promotion for unary math ops; `cumsum` uses
+  `infer_identity` but the ops contract requires bool → int64. Fix in
+  `inference.py` + `op_defs/` with dedicated hooks (`infer_true_divide`,
+  `infer_unary_math`, `infer_cumsum`).
+- Builder attribute schema is stricter than inference in two places:
+  `pad.padding_config` (ATTR_NESTED_INTS) requires `(lo, hi)` PAIR entries
+  (bare int entries fail `VerificationError`, though `infer_pad` accepts
+  them); `slice.limit_indices` is schema-required and can be neither `None`
+  nor contain `None` entries (the None-limit branch of `infer_slice` is
+  unreachable via the Builder).
+
 ## Status
 
 Phase 2 complete for this directory: SSA data model, op registry (75 ops),
