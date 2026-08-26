@@ -25,7 +25,8 @@ def register_kernels(table: dict) -> None:
     ``kernel(ctx, op, operands) -> Tensor | tuple[Tensor, ...]``. Control-flow
     kernels receive ``ctx`` (interpreter state) so they can run nested region
     blocks through the same dispatch loop.
+
+    Not yet implemented (follow-up agent): registers nothing so
+    ``register_all()`` assembles; the category fills in per-op kernels here.
     """
-    raise NotImplementedError(
-        "architecture stub: implement region execution + registration in the implementation phase"
-    )
+    return None

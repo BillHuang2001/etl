@@ -22,7 +22,8 @@ def register_kernels(table: dict) -> None:
 
     Kernel signature convention (see ``kernels/__init__.py``):
     ``kernel(ctx, op, operands) -> Tensor | tuple[Tensor, ...]``.
+
+    Not yet implemented (follow-up agent): registers nothing so
+    ``register_all()`` assembles; the category fills in per-op kernels here.
     """
-    raise NotImplementedError(
-        "architecture stub: implement indexing kernels + registration in the implementation phase"
-    )
+    return None

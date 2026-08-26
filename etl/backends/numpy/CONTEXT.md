@@ -20,17 +20,27 @@ Exports (re-exported via `etl/backends/__init__.py` and surfaced at `etl.backend
 | `NumpyBackend` | `__init__.py` | `Backend` ABC impl; `name="numpy"`; `capabilities`: `dynamic_shapes=True`, `dtypes=` all numpy dtypes (numpy.sctypes flattening + `bool_`), `collectives=True` (single-process simulation), `runtime_calls=True`, `custom_blocks=True`, `async_collectives=False` |
 | `NumpyExecutable` | `__init__.py` | satisfies the `Executable` protocol: attrs `functions` (module function names), `device`, `signature`, `artifact`; `run(flat_input_tensors) -> flat_outputs`, `save(path)`, classmethod `load(path, device=None)` |
 | `numpy_backend` | `__init__.py` | `NumpyBackend()` instance, registered via `..registry.register` at import time |
-| `CollectiveExecutor` | `collectives.py` | runtime-checkable Protocol: `all_reduce(tensor, group, op)`, `all_gather(tensor, axis, group)`, `reduce_scatter(tensor, axis, group)`, `all_to_all(tensor, axis, group)`, `broadcast(tensor, src_rank, group)`, `collective_permute(tensor, mapping, group)` — all `-> Tensor` (group/mapping are graph-constant objects) |
-| `SingleRankCollectiveExecutor` | `collectives.py` | DEFAULT executor: every collective returns the tensor unchanged (identity semantics on one rank) |
-| `set_collective_executor` / `get_collective_executor` | `collectives.py` | module-level hook; default installed unless set (tests simulate multi-rank in-process) |
-| `evaluate_dim_expr` / `evaluate_shape` | `shapes.py` | runtime `Dim`/`DimExpr` evaluation against name→int bindings |
-| `dispatch(op_name)` / `register_all()` / `KERNEL_TABLE` | `kernels/__init__.py` | op-name → kernel dispatch table |
+| `CollectiveExecutor` | `collectives.py` | runtime-checkable Protocol — CANONICAL home is `etl/dist/context.py` (`dist.context.CollectiveExecutor`); re-exported here as an alias: `all_reduce(tensor, group, op)`, `all_gather(tensor, axis, group)`, `reduce_scatter(tensor, axis, group)`, `all_to_all(tensor, axis, group)`, `broadcast(tensor, src_rank, group)`, `collective_permute(tensor, mapping, group)` — all `-> Tensor` (group/mapping are graph-constant objects) |
+| `SingleRankCollectiveExecutor` | `collectives.py` | DEFAULT executor: every collective returns the tensor unchanged (identity semantics on one rank); installed into the `dist.context` slot at `numpy/__init__` import time |
+| `set_collective_executor` / `get_collective_executor` | `etl/dist/context.py` (CANONICAL) | process-wide hook; numpy installs `SingleRankCollectiveExecutor()` at import (tests simulate multi-rank in-process) |
+| `evaluate_dim_expr` / `evaluate_shape` | `shapes.py` | runtime `Dim`/`DimExpr` evaluation against name→int bindings (free dims / div-by-zero / negative results ⇒ `ShapeError`) |
+| `KernelContext` / `Interpreter` / `entry_function` | `interpreter.py` | the execution engine (see "Implemented execution engine" below) |
+| `set_rank_context` / `get_rank_context` | `exec_context.py` | thread-local `RankContext` hook (default `RankContext(rank=0, world_size=1)`; per-run override on `NumpyExecutable.run(..., rank_context=...)`) |
+| `dispatch(op_name)` / `register_all()` / `KERNEL_TABLE` | `kernels/__init__.py` | op-name → kernel dispatch table; `register_all()` idempotent, duplicate keys across category modules ⇒ `BackendError` |
 
-Not public: `_register_block_impls` (import-time block-impl wiring; see Notes for agents), `_module_function_names` (single touch point for the `ir.Module` accessor, to be finalized with ir owners).
+Not public: `_register_block_impls` (documented no-op — block dispatch resolves via `etl.block.registry` at lower/load/run time), `_module_function_names` (single touch point for the `ir.Module` accessor), `_iter_ops` (bottom-up op walk incl. nested regions), `clone_ops_into` / `drop_op_uses` (`inline.py` — block_call portable splicing).
+
+## Implemented execution engine
+
+`interpreter.py` holds the engine the staging flow and every kernel build on:
+
+- **`KernelContext`** — per-execution context handed to kernels. Attributes: `.bindings` (dim name → int), `.rank_context` (from `exec_context.get_rank_context()`), `.module` (ir.Module). Methods: `.run_region(region, arg_tensors)` (bind entry-block arguments to tensors, extend `.bindings` positionally from region-arg types vs concrete shapes — Dim binds by name with conflict checking, DimExpr binds its Dim leaves, int must equal, None unchecked — then run the block ops and return the `return` terminator's operand tensors), `.compute_output_shapes(op, input_shapes, input_dtypes)` (evaluates `op.results[i].type.shape` against `.bindings`; None dims stay None — the IR result types were already inferred by ops-level inference at trace time, so this is the mandated shape-rule reuse, never a second copy of shape rules), `.resolve_callback(callback_id)` (lazy `etl.ops.constant._get_callback`; missing ⇒ `BackendError` naming the id), `.evaluate_shape(shape)` (convenience over `shapes.evaluate_shape`).
+- **`Interpreter`** — holds module + signature. `run(flat_input_tensors, rank_context=None)`: resolves the entry function (`module.get_function("main")`, fallback `module.main` when exactly one function); validates input count, per-input dtype (⇒ `DTypeError`) and per-input shape against spec shapes (Dim binds by name with conflict/known-size checks, DimExpr binds leaves then evaluates and compares, int must equal, None unchecked — ⇒ `ShapeError`); wraps the run in `exec_context.set_rank_context(rank_context)` with try/finally restore; executes the entry region; validates output count + dtype vs `signature.output_specs`.
+- **Op loop** (`_run_block`, used recursively for nested regions): env keyed by `value.id`; for each op in block order — `return` is special-cased as the terminator; otherwise `kernels.dispatch(op.name)` (unknown ⇒ `BackendError` naming the op), call `kernel(ctx, op, operands)`, normalize single `Tensor` → 1-tuple, validate result count, per-result dtype (exact match ⇒ `BackendError` — kernels never silently coerce) and per-result shape against evaluated `op.results[i].type.shape` with None dims unchecked (mismatch ⇒ `ShapeError`), store into env.
 
 ## Interpreter design (binding from parent)
 
-**Staging flow** (`NumpyBackend`; stubs raise `NotImplementedError` in this phase, docstrings encode the design):
+**Staging flow** (`NumpyBackend`; implemented):
 - `lower(graph)`: (1) `graph.verify()` (surfaces `core.VerificationError`); (2) capability pre-check (v1 numpy supports everything — the check pattern stays); (3) inline `block_call` portable decompositions as graph→graph expansion at LOWER time (block with neither portable decomposition nor registered numpy impl ⇒ `core.BackendError` naming the block); (4) record `Signature` from the Graph (input/output TreeSpec + per-leaf specs + static values — passed down, never re-derived); (5) payload = `ir.serialize_module(graph.module)`.
 - `compile(lowered)`: validate `lowered.backend == "numpy"` (else `BackendError`); record `required_custom_ops` + `runtime_dependencies` (self-describing); wrap serialized module as `CompiledArtifact(target="cpu")`. No machine code.
 - `load(artifact, device)`: validate backend/device (None or CPU; else `BackendError`/`DeviceError`), required custom ops availability; `ir.deserialize_module`; build `NumpyExecutable`. **Never re-compiles.**
@@ -58,23 +68,25 @@ Not public: `_register_block_impls` (import-time block-impl wiring; see Notes fo
 - **Import acyclicity (binding)**: top-level imports restricted to `etl.core` and `etl.ir`; `etl.ops` may be imported ONLY inside function bodies (`_register_block_impls` is the sole allowed site — lazy import); NEVER import `etl.pipeline` or `etl.persist` at top level (persist is lazy inside `save`/`load` bodies per `../program.py`).
 - **Files < ~1000 lines**: kernels are pre-split by category (`kernels/`); split along the declared category boundaries instead of growing files.
 - **CPU only in v1**: never requires or touches GPU.
-- **Architecture phase**: behavioral bodies raise `NotImplementedError`; only trivial pure-type code is live (capabilities declaration, `SingleRankCollectiveExecutor` identity bodies, collective hook, `NumpyExecutable` storage constructor).
 
 ## Routing table
 
 | Path | Area |
 |---|---|
-| `./__init__.py` | `NumpyBackend`, `NumpyExecutable`, `numpy_backend` + registration, `_register_block_impls`, re-exports |
-| `./collectives.py` | `CollectiveExecutor` protocol, `SingleRankCollectiveExecutor` (default), `set/get_collective_executor` hook |
+| `./__init__.py` | `NumpyBackend` (lower/compile/load — incl. lower-time block_call portable inlining via `etl.block.registry`: `get_impl("numpy")` → keep, `get_portable` → splice, neither → `BackendError`), `NumpyExecutable`, `numpy_backend` + registration, `_register_block_impls` (documented no-op), re-exports, import-time `dist.context.set_collective_executor(SingleRankCollectiveExecutor())` |
+| `./interpreter.py` | `KernelContext` (bindings, rank_context, module, run_region, compute_output_shapes, resolve_callback, evaluate_shape), `Interpreter` (run + `_run_block` op loop + entry-function resolution), `entry_function` |
+| `./exec_context.py` | thread-local `set_rank_context`/`get_rank_context` hook over `dist.context.RankContext` (default rank=0, world_size=1) |
+| `./inline.py` | `clone_ops_into` (portable block_call splicing with fresh ids + Use bookkeeping + output-type guards), `drop_op_uses` (required before `Block.erase` under strict `ir.verify`) |
+| `./collectives.py` | `CollectiveExecutor` alias of `dist.context.CollectiveExecutor` (CANONICAL home), `SingleRankCollectiveExecutor` (identity default) |
 | `./shapes.py` | `evaluate_dim_expr` / `evaluate_shape` — runtime `Dim`/`DimExpr` evaluation (shape-rule reuse) |
-| `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` — dispatch-table design |
+| `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules |
 | `./kernels/elementwise.py` | add/subtract/multiply/divide/power/remainder/maximum/minimum/abs/negate/square/sqrt/exp/log/log1p/sin/cos/tan/tanh/sigmoid/relu/gelu/erf/sign/bitwise_*/logical_*/cast/equal/not_equal/less/less_equal/greater/greater_equal/select/broadcast/stop_gradient |
 | `./kernels/reductions.py` | reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod + sum/max/min/mean/prod + argmax/argmin |
 | `./kernels/indexing.py` | reshape/transpose/slice/gather/scatter/concatenate/pad |
 | `./kernels/linalg.py` | dot/conv |
 | `./kernels/control_flow.py` | cond/while_loop/scan region execution (recursive region runs) |
-| `./kernels/collective.py` | dist collective ops dispatched through the `CollectiveExecutor` hook |
-| `./kernels/custom.py` | `runtime_call` (sync callback execution), `block_call` (registered numpy impl dispatch) |
+| `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
+| `./kernels/custom.py` | `constant` (registered now); `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time) and `block_call` (registered numpy impl dispatch) are follow-up work |
 
 Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry, StableHLO exporter.
 
@@ -91,8 +103,12 @@ Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from 
 
 ## Notes for agents
 
-- **Architecture phase now**: all behavioral bodies raise `NotImplementedError` (docstrings encode the binding design); trivial pure-type code is implemented. Implementation is delegated to `subagent_manager` at this node by the parent orchestrator.
-- `_register_block_impls()` is defined but NOT called at import time yet — the exact ops-level block-impl registration hook must be finalized with the `etl/ops` and `etl/block` owners during implementation (contract conflict noted in `../CONTEXT.md`); calling it now would break package imports.
-- `_module_function_names` is the single touch point for the `ir.Module` accessor API — update it once `etl/ir` lands.
+- **Implemented**: staging flow (lower/compile/load), interpreter loop, KernelContext, kernel contract, constant kernel. The 6 kernel category modules register nothing yet (no-op `register_kernels`) — follow-up agents fill them one category at a time; the table assembles now and grows per category.
+- `_register_block_impls()` is a documented no-op — block dispatch resolves via `etl.block.registry` at lower/load/run time (`get_impl(name, "numpy")` keeps the op; `get_portable(name)` is traced and spliced at lower; neither ⇒ `BackendError` naming the block). User blocks register via `BlockOp.impl("numpy")`/`.portable(...)`.
+- `_module_function_names` is the single touch point for the `ir.Module` accessor API (now finalized).
 - `Capabilities.dtypes` includes all `numpy.sctypes` entries (+`bool_`) per the binding contract, including non-numeric "others" dtypes — per-op kernels validate concrete dtype support at run time (no silent coercion).
-- Kernel call convention (to be finalized with the interpreter loop): `kernel(ctx, op, operands) -> Tensor | tuple[Tensor, ...]`; `ctx` carries interpreter state (shape-dim bindings, collective executor, runtime-call registry).
+- Kernel call convention (finalized, binding — see the docstring of `kernels/__init__.py`): `kernel(ctx, op, operands) -> Tensor | tuple[Tensor, ...]`; `ctx` is `KernelContext` (`.bindings`, `.rank_context`, `.module`, `.run_region`, `.compute_output_shapes`, `.resolve_callback`, `.evaluate_shape`). The interpreter validates outputs against `op.results` types (dtype exact; symbolic dims via `ctx.bindings`; None dims unchecked).
+- `runtime_call` callback resolution goes through `etl.ops.constant._get_callback` (via `ctx.resolve_callback`) — artifacts containing `runtime_call` require the same callback registrations at load time.
+- Collectives dispatch through `dist.context.get_collective_executor()`; the identity `SingleRankCollectiveExecutor` is installed at `numpy/__init__` import time. rank/world_size resolve from the per-execution `RankContext` (`exec_context.py`; override via `NumpyExecutable.run(..., rank_context=...)`).
+- `etl.dist` never imports backends, so `exec_context.py` and `__init__.py` may import `dist.context` at top level (acyclic). `etl.ops`, `etl.block`, `etl.trace`, `etl.persist` stay function-body-lazy.
+- `ir.verify` enforces strict use-bookkeeping: erase a spliced `block_call` only after `drop_op_uses` removes its `Use` records (`inline.py`).
