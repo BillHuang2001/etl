@@ -40,7 +40,7 @@ Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining m
 | `stack(arrays, axis=0)` | `expand_dims(each, axis)` + `concatenate(axis)` | |
 | `split(a, indices_or_sections, axis=0)` | composition of `ops.slice` | int sections resolved statically at trace time (divisibility checked) |
 | `pad(a, pad_width, mode="constant", constant_values=0)` | `ops.pad(...)` | v1: only `mode="constant"`; other modes raise `NotImplementedError` |
-| `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | |
 | `sum/mean/prod/max/min(a, axis=None, keepdims=False)` | `ops.sum/mean/prod/max/min` (→ `reduce_*` ops) | `axis=None` → all axes (rank known at trace time); `dtype≠None` composes `ops.cast` (sum/mean/prod/cumsum) |
 | `argmax/argmin(a, axis=None, keepdims=False)` | `ops.argmax/argmin` | |
 | `cumsum(a, axis=None, dtype=None)` | `ops.cumsum`; `axis=None` flattens first via `reshape` to 1-D, then `axis=0` | |
