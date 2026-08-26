@@ -67,12 +67,13 @@ REDUCTION_OPS = (
 )
 
 # Structural: per-op metadata rewriting — reshape preserves the mapped dims
-# in the target shape; transpose keeps mapped axes leading; slice shifts
-# start/limit indices (v1: a MAPPED slice operand is a TransformError — the
-# IR requires static int limit_indices); pad inserts leading zero padding;
-# concatenate broadcasts the batch dims and shifts the axis; gather/scatter
-# adjust axis arguments (mapped indices work; mapped-data/unmapped-indices
-# gathers are a v1 TransformError).
+# in the target shape; transpose keeps mapped axes leading; a mapped slice is
+# lowered to per-axis gathers over static int64 index constants (the IR
+# slice op requires static int limit_indices, which cannot express a
+# full-range pass through the symbolic batch dims); pad inserts leading zero
+# padding; concatenate broadcasts the batch dims and shifts the axis;
+# gather/scatter adjust axis arguments (mapped indices work;
+# mapped-data/unmapped-indices gathers are a v1 TransformError).
 STRUCTURAL_OPS = ("reshape", "transpose", "slice", "pad", "concatenate")
 
 # Dot/conv: batched matmul/convolution with the mapped dims broadcast across
@@ -314,25 +315,52 @@ def _transpose_batching(op, operands, axes):
 
 
 def _slice_batching(op, operands, axes):
-    """Slice batching: a full-range entry for a mapped dim would need a
-    symbolic limit_indices entry, which the IR slice op rejects (static ints
-    only) — mapped operands are a v1 TransformError; unmapped rebuild."""
-    if axes[0].count > 0:
+    """Slice batching: the IR slice op requires static int limit_indices and
+    cannot express a full-range pass through the symbolic batch dims, so a
+    mapped operand is lowered to a gather-based per-row slice — the
+    unvectorized per-axis index list `arange(start, limit, stride)` is
+    static, hence a static int64 Constant (unmapped/static per row,
+    batch-safe). The batch dims are never sliced (the frontend slice rank
+    excludes them) and pass through untouched: reshape to a single batch
+    axis, gather each sliced axis (shifted by one), reshape back to the
+    batch dims + the static sliced sizes. Full-range stride-1 slices over
+    static dims are skipped (gather would be the identity). Unmapped
+    operands rebuild the slice op unchanged."""
+    value = operands[0]
+    mapped = axes[0]
+    count = mapped.count
+    starts = tuple(op.attributes["start_indices"])
+    limits = tuple(op.attributes["limit_indices"])
+    strides = op.attributes["strides"]
+    if strides is None:
+        strides = (1,) * len(starts)
+    elif isinstance(strides, int):
+        strides = (strides,) * len(starts)
+    if count == 0:
+        lengths = tuple(l - s for s, l in zip(starts, limits))
+        out = ops.slice(_sym(value), starts, lengths, strides=strides)
+        return (out.value,), (mapped,)
+    batch = value.type.shape[:count]
+    dims = value.type.shape[count:]
+    batch_prod = _fold_product(batch)
+    if batch_prod is None:
         raise TransformError(
-            "vectorize: cannot batch op 'slice' with a mapped operand — the "
-            "IR slice op requires static int limit_indices, which cannot "
-            "express a full-range slice over the symbolic batch dim (v1 gap)"
+            "vectorize: cannot batch op 'slice' with a dynamic batch dim "
+            f"in {batch!r} (v1 gap)"
         )
-    starts = op.attributes["start_indices"]
-    limits = op.attributes["limit_indices"]
-    lengths = tuple(l - s for s, l in zip(starts, limits))
-    out = ops.slice(
-        _sym(operands[0]),
-        starts,
-        lengths,
-        strides=op.attributes["strides"] or 1,
-    )
-    return (out.value,), (axes[0],)
+    x = ops.reshape(_sym(value), (batch_prod,) + dims)
+    sliced = []
+    for i, (start, limit, stride) in enumerate(zip(starts, limits, strides)):
+        dim = dims[i]
+        if start == 0 and limit == dim and stride == 1 and isinstance(dim, int):
+            sliced.append(dim)  # full-range stride-1: gather would be identity
+            continue
+        index_array = np.arange(start, limit, stride, dtype=np.int64)
+        indices = ops.constant(core.tensor(index_array))
+        x = ops.gather(x, indices, axis=i + 1)
+        sliced.append(index_array.size)
+    out = ops.reshape(x, batch + tuple(sliced))
+    return (out.value,), (mapped,)
 
 
 def _pad_batching(op, operands, axes):
