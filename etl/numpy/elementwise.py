@@ -4,7 +4,8 @@ Every function here is 1:1 sugar over `etl.ops`: it builds exactly the same
 IR (same op kind, operands, attrs) as the mapped ops call, into the active
 builder. Concrete `Tensor` args raise the same `TraceError` as ops — there
 is no eager numpy fallback. `clip` is a documented composition (see
-CONTEXT.md). Architecture phase: stub bodies raise NotImplementedError.
+CONTEXT.md). All functions are implemented pure-sugar forwards: no extra
+validation, dtype logic, or error handling — ops' errors surface unchanged.
 """
 
 from __future__ import annotations
@@ -20,103 +21,106 @@ __all__ = [
 
 def abs(x):  # noqa: A001 — shadows builtin by design (numpy.abs)
     """numpy.abs(x) → ops.abs(x)."""
-    raise NotImplementedError("enp.abs: architecture stub — maps to ops.abs")
+    return ops.abs(x)
 
 
 def add(a, b):
     """numpy.add → ops.add(a, b). No ufunc kwargs (out/where/dtype) in v1."""
-    raise NotImplementedError("enp.add: architecture stub — maps to ops.add")
+    return ops.add(a, b)
 
 
 def subtract(a, b):
     """numpy.subtract → ops.subtract(a, b)."""
-    raise NotImplementedError(
-        "enp.subtract: architecture stub — maps to ops.subtract"
-    )
+    return ops.subtract(a, b)
 
 
 def multiply(a, b):
     """numpy.multiply → ops.multiply(a, b)."""
-    raise NotImplementedError(
-        "enp.multiply: architecture stub — maps to ops.multiply"
-    )
+    return ops.multiply(a, b)
 
 
 def divide(a, b):
     """numpy.divide → ops.divide(a, b)."""
-    raise NotImplementedError("enp.divide: architecture stub — maps to ops.divide")
+    return ops.divide(a, b)
 
 
 def power(a, b):
     """numpy.power → ops.power(a, b)."""
-    raise NotImplementedError("enp.power: architecture stub — maps to ops.power")
+    return ops.power(a, b)
 
 
 def maximum(a, b):
     """numpy.maximum → ops.maximum(a, b)."""
-    raise NotImplementedError("enp.maximum: architecture stub — maps to ops.maximum")
+    return ops.maximum(a, b)
 
 
 def minimum(a, b):
     """numpy.minimum → ops.minimum(a, b)."""
-    raise NotImplementedError("enp.minimum: architecture stub — maps to ops.minimum")
+    return ops.minimum(a, b)
 
 
 def negative(x):
     """numpy.negative → ops.negate(x)."""
-    raise NotImplementedError("enp.negative: architecture stub — maps to ops.negate")
+    return ops.negate(x)
 
 
 def square(x):
     """numpy.square → ops.square(x)."""
-    raise NotImplementedError("enp.square: architecture stub — maps to ops.square")
+    return ops.square(x)
 
 
 def sqrt(x):
     """numpy.sqrt → ops.sqrt(x)."""
-    raise NotImplementedError("enp.sqrt: architecture stub — maps to ops.sqrt")
+    return ops.sqrt(x)
 
 
 def exp(x):
     """numpy.exp → ops.exp(x)."""
-    raise NotImplementedError("enp.exp: architecture stub — maps to ops.exp")
+    return ops.exp(x)
 
 
 def log(x):
     """numpy.log → ops.log(x)."""
-    raise NotImplementedError("enp.log: architecture stub — maps to ops.log")
+    return ops.log(x)
 
 
 def sin(x):
     """numpy.sin → ops.sin(x)."""
-    raise NotImplementedError("enp.sin: architecture stub — maps to ops.sin")
+    return ops.sin(x)
 
 
 def cos(x):
     """numpy.cos → ops.cos(x)."""
-    raise NotImplementedError("enp.cos: architecture stub — maps to ops.cos")
+    return ops.cos(x)
 
 
 def tanh(x):
     """numpy.tanh → ops.tanh(x)."""
-    raise NotImplementedError("enp.tanh: architecture stub — maps to ops.tanh")
+    return ops.tanh(x)
 
 
 def sign(x):
     """numpy.sign → ops.sign(x)."""
-    raise NotImplementedError("enp.sign: architecture stub — maps to ops.sign")
+    return ops.sign(x)
 
 
 def clip(a, a_min, a_max):
     """numpy.clip → ops.maximum(ops.minimum(a, a_max), a_min).
 
     None bounds skip that side (numpy semantics): a_min=None applies the
-    maximum bound only; a_max=None applies the minimum bound only.
+    maximum bound only; a_max=None applies the minimum bound only. Both
+    bounds None raises ValueError (numpy parity).
     """
-    raise NotImplementedError(
-        "enp.clip: architecture stub — maps to "
-        "ops.maximum(ops.minimum(a, a_max), a_min)"
-    )
+    if a_min is None and a_max is None:
+        raise ValueError(
+            "clip: at least one of a_min or a_max must be specified "
+            "(both are None)"
+        )
+    if a_min is None:
+        return ops.maximum(a, a_max)
+    if a_max is None:
+        return ops.minimum(a, a_min)
+    return ops.maximum(ops.minimum(a, a_max), a_min)
 
 
 def astype(a, dtype):
@@ -124,4 +128,4 @@ def astype(a, dtype):
 
     numpy has no top-level astype; provided for enp ergonomics.
     """
-    raise NotImplementedError("enp.astype: architecture stub — maps to ops.cast")
+    return ops.cast(a, dtype)
