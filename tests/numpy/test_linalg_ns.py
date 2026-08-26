@@ -8,13 +8,12 @@ ops.solve. enp must build identical IR and produce numpy-matching numerics;
 it has no numerical kernels of its own.
 """
 
-import re
-
 import numpy as np
 import pytest
 
 import etl
 import etl.numpy as enp
+from _ir_utils import normalize_ir
 
 SPEC_A = etl.TensorSpec((3, 3), etl.float32)
 SPEC_B = etl.TensorSpec((3, 2), etl.float32)
@@ -23,19 +22,11 @@ SPEC_B = etl.TensorSpec((3, 2), etl.float32)
 # --- file-local helpers -----------------------------------------------------
 
 
-def _normalize_ir(text):
-    """Strip per-line `loc("file":line:col)` tokens so defns defined at
-    different callsites compare equal."""
-    return "\n".join(
-        re.sub(r"\s+loc\(.*?\)\s*$", "", line) for line in text.splitlines()
-    )
-
-
 def _trace_text(fn, *specs):
     """Trace fn, verify the module, and return normalized pretty-printed IR."""
     graph = etl.trace(fn, *specs)
     graph.verify()
-    return _normalize_ir(etl.ir.pretty_print(graph.module))
+    return normalize_ir(etl.ir.pretty_print(graph.module))
 
 
 # --- IR equivalence ---------------------------------------------------------

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import functools
 import operator
-import re
 
 import numpy as np
 import pytest
@@ -23,6 +22,7 @@ import pytest
 import etl
 import etl.numpy as enp
 from etl import ops
+from _ir_utils import normalize_ir
 
 F32 = etl.float32
 F64 = etl.float64
@@ -31,17 +31,9 @@ BOOL = etl.bool_
 
 # --- helpers ----------------------------------------------------------------
 
-# Per-op location tokens are call-site dependent (file:line:col differ
-# between the enp package files and this test file) — strip them per line.
-_LOC_RE = re.compile(r"\s+loc\(.*?\)\s*$")
-
 
 def _spec(shape, dtype=F32):
     return etl.TensorSpec(shape, dtype)
-
-
-def _normalize_ir(text):
-    return "\n".join(_LOC_RE.sub("", line) for line in text.splitlines()).strip()
 
 
 def _ir(body, *specs):
@@ -49,7 +41,7 @@ def _ir(body, *specs):
     into normalized SSA text (the entry func is always named `main`)."""
     graph = etl.trace(etl.defn(body), *specs)
     graph.verify()
-    return _normalize_ir(etl.ir.pretty_print(graph.module))
+    return normalize_ir(etl.ir.pretty_print(graph.module))
 
 
 def _assert_same_ir(enp_body, ops_body, *specs):

@@ -16,22 +16,12 @@ import pytest
 import etl
 import etl.ir
 import etl.numpy as enp
+from _ir_utils import normalize_ir
 
 F32 = etl.float32
 
 
 # --- file-local helpers -----------------------------------------------------
-
-
-def _strip_loc(text):
-    """Strip the trailing ``loc("file":line:col)`` from each pretty-print line.
-
-    Locations record the Python call site, which necessarily differs between
-    two traced defns — everything else must be identical.
-    """
-    return "\n".join(
-        re.sub(r"\s+loc\(.*?\)\s*$", "", line) for line in text.splitlines()
-    )
 
 
 def _op_names(text):
@@ -43,7 +33,7 @@ def _normalized_module(defn_fn, *specs):
     """Trace ``defn_fn`` and return its location-stripped pretty print."""
     graph = etl.trace(defn_fn, *specs)
     graph.verify()
-    return _strip_loc(etl.ir.pretty_print(graph.module))
+    return normalize_ir(etl.ir.pretty_print(graph.module))
 
 
 # --- clip -------------------------------------------------------------------

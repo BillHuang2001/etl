@@ -8,13 +8,12 @@ silently invents semantics. See ../etl/numpy/CONTEXT.md for the mapping table
 and the v1 deferral list.
 """
 
-import re
-
 import numpy as np
 import pytest
 
 import etl
 import etl.numpy as enp
+from _ir_utils import normalize_ir
 
 SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
 
@@ -22,19 +21,11 @@ SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
 # --- file-local helpers -----------------------------------------------------
 
 
-def _normalize_ir(text):
-    """Strip per-line `loc("file":line:col)` tokens so defns defined at
-    different callsites compare equal."""
-    return "\n".join(
-        re.sub(r"\s+loc\(.*?\)\s*$", "", line) for line in text.splitlines()
-    )
-
-
 def _trace_text(fn, *specs):
     """Trace fn, verify the module, and return normalized pretty-printed IR."""
     graph = etl.trace(fn, *specs)
     graph.verify()
-    return _normalize_ir(etl.ir.pretty_print(graph.module))
+    return normalize_ir(etl.ir.pretty_print(graph.module))
 
 
 # --- no eager fallback: concrete Tensors raise TraceError like ops ----------
