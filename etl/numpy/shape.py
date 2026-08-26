@@ -4,11 +4,17 @@
 numpy's semantics are richer than one op (`stack`, `split`, `expand_dims`,
 `squeeze`, `transpose(axes=None)`). All shape computation happens at trace
 time via `DimExpr` arithmetic (rank is always known). Concrete `Tensor` args
-raise `TraceError`. Architecture phase: stub bodies raise NotImplementedError.
+raise `TraceError`.
+
+Implemented: `reshape`/`transpose`/`broadcast_to`/`concatenate`/`pad`
+(constant mode)/`tril`/`triu` are 1:1 forwards to ops; `expand_dims`/
+`squeeze`/`stack` compose `ops.reshape` + `ops.concatenate`; `split` composes
+`ops.slice` with sections resolved statically at trace time.
 """
 
 from __future__ import annotations
 
+from .. import core  # ShapeError/TraceError — lower layer, allowed import
 from .. import ops  # etl.ops — lower layer, allowed import
 
 __all__ = [
@@ -23,7 +29,7 @@ def reshape(a, shape):
     One `-1` entry allowed (numpy semantics), resolved at trace time via
     DimExpr arithmetic over the known rank. `order` kwarg unsupported in v1.
     """
-    raise NotImplementedError("enp.reshape: architecture stub — maps to ops.reshape")
+    return ops.reshape(a, shape)
 
 
 def transpose(a, axes=None):
@@ -31,17 +37,12 @@ def transpose(a, axes=None):
 
     axes=None → reversed axes (numpy default; rank known at trace time).
     """
-    raise NotImplementedError(
-        "enp.transpose: architecture stub — maps to ops.transpose "
-        "(axes=None reverses all axes)"
-    )
+    return ops.transpose(a, axes)
 
 
 def broadcast_to(a, shape):
     """numpy.broadcast_to → ops.broadcast(a, shape)."""
-    raise NotImplementedError(
-        "enp.broadcast_to: architecture stub — maps to ops.broadcast"
-    )
+    return ops.broadcast(a, shape)
 
 
 def expand_dims(a, axis):
@@ -50,10 +51,20 @@ def expand_dims(a, axis):
     axis may be an int (negative normalized at trace time) or a tuple of
     ints (repeated expansion in ascending order).
     """
-    raise NotImplementedError(
-        "enp.expand_dims: architecture stub — maps to ops.reshape "
-        "with inserted 1-dims"
-    )
+    rank = len(a.shape)
+    if isinstance(axis, tuple):
+        axes = sorted(ax + rank + 1 if ax < 0 else ax for ax in axis)
+    else:
+        axes = [axis + rank + 1 if axis < 0 else axis]
+    for ax in axes:
+        if ax < 0 or ax > rank:
+            raise core.ShapeError(
+                f"enp.expand_dims: axis {ax} out of range for rank {rank}"
+            )
+    new_shape = list(a.shape)
+    for ax in axes:
+        new_shape.insert(ax, 1)
+    return ops.reshape(a, tuple(new_shape))
 
 
 def squeeze(a, axis=None):
@@ -63,10 +74,24 @@ def squeeze(a, axis=None):
     (None/dynamic) dim → TraceError. axis=None drops all statically-size-1
     dims; an explicit axis that is not statically 1 → TraceError.
     """
-    raise NotImplementedError(
-        "enp.squeeze: architecture stub — maps to ops.reshape "
-        "with size-1 dims dropped (static check at trace time)"
-    )
+    shape = tuple(a.shape)
+    if axis is None:
+        new_shape = tuple(d for d in shape if not (isinstance(d, int) and d == 1))
+    else:
+        if axis < 0:
+            axis += len(shape)
+        if axis < 0 or axis >= len(shape):
+            raise core.ShapeError(
+                f"enp.squeeze: axis {axis} out of range for rank {len(shape)}"
+            )
+        if not (isinstance(shape[axis], int) and shape[axis] == 1):
+            raise core.TraceError(
+                f"enp.squeeze: dim {shape[axis]!r} on axis {axis} is not "
+                "statically 1 (symbolic/unknown dims cannot be squeezed) — "
+                "squeeze requires a statically-known size-1 dim at trace time"
+            )
+        new_shape = shape[:axis] + shape[axis + 1:]
+    return ops.reshape(a, new_shape)
 
 
 def concatenate(arrays, axis=0):
@@ -74,17 +99,24 @@ def concatenate(arrays, axis=0):
 
     arrays is a list/tuple of SymbolicTensors.
     """
-    raise NotImplementedError(
-        "enp.concatenate: architecture stub — maps to ops.concatenate"
-    )
+    return ops.concatenate(arrays, axis=axis)
 
 
 def stack(arrays, axis=0):
     """numpy.stack → expand_dims(each array, axis) + concatenate(axis)."""
-    raise NotImplementedError(
-        "enp.stack: architecture stub — maps to "
-        "expand_dims(each, axis) + concatenate(axis)"
-    )
+    arrays = list(arrays)
+    if not arrays:
+        raise core.ShapeError("enp.stack: arrays must be a non-empty list/tuple")
+    rank = len(arrays[0].shape)
+    if axis < 0:
+        axis += rank + 1
+    if axis < 0 or axis > rank:
+        raise core.ShapeError(f"enp.stack: axis {axis} out of range for rank {rank}")
+    expanded = []
+    for x in arrays:
+        new_shape = x.shape[:axis] + (1,) + x.shape[axis:]
+        expanded.append(ops.reshape(x, new_shape))
+    return ops.concatenate(expanded, axis=axis)
 
 
 def split(a, indices_or_sections, axis=0):
@@ -93,10 +125,50 @@ def split(a, indices_or_sections, axis=0):
     indices_or_sections may be an int (equal sections; count/divisibility
     resolved statically at trace time) or an explicit list of split indices.
     """
-    raise NotImplementedError(
-        "enp.split: architecture stub — maps to a composition of ops.slice "
-        "(sections resolved at trace time)"
-    )
+    shape = tuple(a.shape)
+    rank = len(shape)
+    if axis < 0:
+        axis += rank
+    if axis < 0 or axis >= rank:
+        raise core.ShapeError(f"enp.split: axis {axis} out of range for rank {rank}")
+    size = shape[axis]
+    if not isinstance(size, int):
+        raise core.TraceError(
+            f"enp.split: dim {size!r} on axis {axis} is not a static int — "
+            "split sections must be resolved at trace time"
+        )
+    if isinstance(indices_or_sections, int):
+        n = indices_or_sections
+        if n <= 0:
+            raise core.ShapeError(
+                f"enp.split: number of sections must be positive, got {n}"
+            )
+        if size % n != 0:
+            raise core.ShapeError(
+                f"enp.split: axis {axis} has size {size}, which is not "
+                f"divisible into {n} equal sections"
+            )
+        boundaries = [i * (size // n) for i in range(n + 1)]
+    else:
+        indices = list(indices_or_sections)
+        prev = -1
+        for idx in indices:
+            if not isinstance(idx, int) or idx <= prev or idx < 0 or idx > size:
+                raise core.ShapeError(
+                    "enp.split: split indices must be strictly increasing "
+                    f"ints within [0, {size}], got {indices!r}"
+                )
+            prev = idx
+        boundaries = [0] + indices + [size]
+    result = []
+    for i in range(len(boundaries) - 1):
+        start = tuple(boundaries[i] if j == axis else 0 for j in range(rank))
+        lengths = tuple(
+            (boundaries[i + 1] - boundaries[i]) if j == axis else d
+            for j, d in enumerate(shape)
+        )
+        result.append(ops.slice(a, start, lengths))
+    return result
 
 
 def pad(a, pad_width, mode="constant", constant_values=0):
@@ -105,25 +177,66 @@ def pad(a, pad_width, mode="constant", constant_values=0):
     v1: only mode="constant" (with constant_values); other modes raise
     NotImplementedError (deferred to v2 — see CONTEXT.md).
     """
-    raise NotImplementedError(
-        "enp.pad: architecture stub — maps to ops.pad "
-        "(v1: constant mode only)"
-    )
+    if mode != "constant":
+        raise NotImplementedError(
+            "enp.pad: only mode='constant' is implemented in v1; "
+            f"mode={mode!r} is deferred to v2"
+        )
+    rank = len(a.shape)
+    if isinstance(pad_width, int):
+        config = (pad_width,) * rank
+    else:
+        try:
+            entries = tuple(pad_width)
+        except TypeError:
+            raise core.ShapeError(
+                "enp.pad: pad_width must be an int or a sequence of ints / "
+                f"(before, after) pairs, got {pad_width!r}"
+            )
+        if len(entries) == 1 and _is_pair(entries[0]):
+            config = (entries[0],) * rank
+        elif len(entries) == rank:
+            config = entries
+        else:
+            raise core.ShapeError(
+                f"enp.pad: pad_width has {len(entries)} entries but rank is "
+                f"{rank} (a length-1 (before, after) pair broadcasts to all axes)"
+            )
+    # Validate and canonicalize entries: int (symmetric) or (before, after)
+    # pair of non-negative ints.
+    normalized = []
+    for entry in config:
+        if isinstance(entry, int):
+            if entry < 0:
+                raise core.ShapeError(f"enp.pad: negative padding {entry}")
+            normalized.append(entry)
+        elif _is_pair(entry):
+            if entry[0] < 0 or entry[1] < 0:
+                raise core.ShapeError(f"enp.pad: negative padding {entry}")
+            normalized.append((entry[0], entry[1]))
+        else:
+            raise core.ShapeError(
+                f"enp.pad: malformed pad entry {entry!r} — expected an int or "
+                "a (before, after) pair of non-negative ints"
+            )
+    return ops.pad(a, tuple(normalized), value=constant_values)
 
 
 def tril(a, k=0):
-    """numpy.tril → ops.tril(a, k=k).
-
-    NOTE: ops.tril is not yet in the etl/ops public contract (see CONTEXT.md
-    conflicts) — stays NotImplementedError until ops publishes it.
-    """
-    raise NotImplementedError("enp.tril: architecture stub — maps to ops.tril")
+    """numpy.tril → ops.tril(a, k=k)."""
+    return ops.tril(a, k=k)
 
 
 def triu(a, k=0):
-    """numpy.triu → ops.triu(a, k=k).
+    """numpy.triu → ops.triu(a, k=k)."""
+    return ops.triu(a, k=k)
 
-    NOTE: ops.triu is not yet in the etl/ops public contract (see CONTEXT.md
-    conflicts) — stays NotImplementedError until ops publishes it.
-    """
-    raise NotImplementedError("enp.triu: architecture stub — maps to ops.triu")
+
+def _is_pair(entry):
+    """True if entry is a (before, after) pair of two ints."""
+    return (
+        isinstance(entry, (tuple, list))
+        and len(entry) == 2
+        and isinstance(entry[0], int)
+        and isinstance(entry[1], int)
+    )
