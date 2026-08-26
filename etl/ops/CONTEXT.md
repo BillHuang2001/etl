@@ -64,8 +64,8 @@ Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, 
 ## Cross-module expectations (what ops REQUIRES — coordinate at implementation time)
 
 - `core.register_operator_handlers(kind, handler)` (per-kind, idempotent); `SymbolicTensor` fields `value`/`dtype`/`shape`/`location`; `SymbolicTensor` dunders delegate to the registered hooks and reflected calls pass the tensor as first argument.
-- `ir.Builder.create(name, operands=..., attrs=...)` validating against the canonical registered opdefs (`ir.opdef(name)`); `ir.Location` constructible with `file=`/`line=`/`col=` + an `unknown()` sentinel. The canonical op-definition table lives in `etl.ir` — `ops` consumes it, never duplicates it.
-- `trace.current_builder()` returning `None` outside traces. `trace` must NEVER import `ops` (strict one-way dependency).
+- `ir.Builder.create(name, operands=..., attributes=...)` (kwarg is `attributes`, NOT `attrs`) validating against the canonical registered opdefs (`ir.opdef(name)`); result types are READ BACK from `op.result.type` (dtype/shape) — `ops` never passes explicit `result_types`, so `ir.verify`'s shape_fn agreement always holds. `ir.Location` constructible with `file=`/`line=`/`col=` + an `unknown()` sentinel. The canonical op-definition table lives in `etl.ir` — `ops` consumes it, never duplicates it.
+- `trace.current_builder()` RAISES `core.TraceError` (with the directing message) outside traces — `check_in_trace` simply delegates. `trace` must NEVER import `ops` (strict one-way dependency).
 
 ## Constraints
 
