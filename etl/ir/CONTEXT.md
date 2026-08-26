@@ -267,7 +267,7 @@ terminators). CPU only.
 ## Status
 
 Phase 2 complete for this directory: SSA data model, op registry (75 ops),
-shape-inference hooks (`inference.py`, 23 hooks), `pretty_print`, `verify`
+shape-inference hooks (`inference.py`, 24 hooks), `pretty_print`, `verify`
 (the full invariant set — module/function/region/op/value levels, SSA
 dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
 and serialization (`serialize_module`/`deserialize_module` — payload schema,

@@ -489,6 +489,22 @@ def infer_elementwise_unary(
     return (ValueType(t.dtype, t.shape),)
 
 
+def infer_abs(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``abs``: numpy semantics — the magnitude of a complex
+    value is REAL (complex64 → float32, complex128 → float64); every other
+    dtype is preserved. Shape preserved."""
+    t = _one(input_types, "abs")
+    if t.dtype == np.dtype("complex64"):
+        out_dtype = np.dtype("float32")
+    elif t.dtype == np.dtype("complex128"):
+        out_dtype = np.dtype("float64")
+    else:
+        out_dtype = t.dtype
+    return (ValueType(out_dtype, t.shape),)
+
+
 def infer_cast(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:
