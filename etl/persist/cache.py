@@ -15,6 +15,7 @@ import abc
 import hashlib
 import json
 import os
+import shutil
 
 from etl.core import PersistenceError
 
@@ -52,10 +53,12 @@ def compute_key(key_components):
     silently unsound — callers assemble the list explicitly; persist never
     guesses components.
     """
-    raise NotImplementedError(
-        "persist.cache.compute_key: architecture stub — "
-        "implementation lands in Phase 2"
-    )
+    encoded_components = [encode_value(component) for component in key_components]
+    structure = [ETL_FORMAT_VERSION, encoded_components]
+    json_bytes = json.dumps(
+        structure, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(json_bytes).hexdigest()
 
 
 class Cache(abc.ABC):
@@ -75,8 +78,7 @@ class Cache(abc.ABC):
           * corrupt entry, no compute_fn -> treated as a miss (None)
         """
         raise NotImplementedError(
-            "persist.cache.Cache.get: architecture stub — "
-            "implementation lands in Phase 2"
+            "persist.cache.Cache.get: abstract method — subclasses must override"
         )
 
     @abc.abstractmethod
@@ -86,8 +88,7 @@ class Cache(abc.ABC):
         Overwrites any existing entry atomically (temp file + rename).
         """
         raise NotImplementedError(
-            "persist.cache.Cache.put: architecture stub — "
-            "implementation lands in Phase 2"
+            "persist.cache.Cache.put: abstract method — subclasses must override"
         )
 
     @abc.abstractmethod
@@ -97,16 +98,14 @@ class Cache(abc.ABC):
         Existence check only — no integrity validation (documented O(1)).
         """
         raise NotImplementedError(
-            "persist.cache.Cache.contains: architecture stub — "
-            "implementation lands in Phase 2"
+            "persist.cache.Cache.contains: abstract method — subclasses must override"
         )
 
     @abc.abstractmethod
     def clear(self):
         """Remove ALL entries from this cache instance."""
         raise NotImplementedError(
-            "persist.cache.Cache.clear: architecture stub — "
-            "implementation lands in Phase 2"
+            "persist.cache.Cache.clear: abstract method — subclasses must override"
         )
 
     def get_or_compute(self, key_components, compute_fn):
@@ -155,10 +154,27 @@ class FileCache(Cache):
         ``compute_fn()`` followed by ``put`` (which atomically replaces the
         bad file).
         """
-        raise NotImplementedError(
-            "persist.cache.FileCache.get: architecture stub — "
-            "implementation lands in Phase 2"
-        )
+        key = compute_key(key_components)
+        path = self._path_for_key(key)
+        if not os.path.isfile(path):
+            # Miss: recompute only when a compute_fn is supplied.
+            if compute_fn is None:
+                return None
+            value = compute_fn()
+            self.put(key_components, value)
+            return value
+        try:
+            loaded = load_object(path, expected_payload_type=_CACHE_PAYLOAD_TYPE)
+            value = loaded.payload["value"]
+        except (PersistenceError, OSError, KeyError, TypeError, ValueError):
+            # Corrupt / version-mismatched / type-mismatched entry: treat
+            # as a miss. Never propagate corrupt-file errors.
+            if compute_fn is None:
+                return None
+            value = compute_fn()
+            self.put(key_components, value)  # atomically replaces the bad file
+            return value
+        return value
 
     def put(self, key_components, value):
         """``save_object(_path_for_key(compute_key(key_components)),
@@ -167,9 +183,10 @@ class FileCache(Cache):
         The parent shard directory is created as needed; overwrite is
         atomic (temp + ``os.replace``).
         """
-        raise NotImplementedError(
-            "persist.cache.FileCache.put: architecture stub — "
-            "implementation lands in Phase 2"
+        save_object(
+            self._path_for_key(compute_key(key_components)),
+            _CACHE_PAYLOAD_TYPE,
+            {"value": value},
         )
 
     def contains(self, key_components):
@@ -177,15 +194,10 @@ class FileCache(Cache):
 
         Existence check only — no integrity validation (documented O(1)).
         """
-        raise NotImplementedError(
-            "persist.cache.FileCache.contains: architecture stub — "
-            "implementation lands in Phase 2"
-        )
+        return os.path.isfile(self._path_for_key(compute_key(key_components)))
 
     def clear(self):
         """Delete every ``*.etlcache`` entry under the cache directory and
         recreate the directory empty. Not safe for concurrent use."""
-        raise NotImplementedError(
-            "persist.cache.FileCache.clear: architecture stub — "
-            "implementation lands in Phase 2"
-        )
+        shutil.rmtree(self._directory, ignore_errors=True)
+        os.makedirs(self._directory, exist_ok=True)
