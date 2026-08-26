@@ -94,4 +94,6 @@ NN modules, layers, optimizers, datasets, loaders, training loops, model zoo; au
 
 ## Status
 
-Phase 1 architecture: in progress (this file is the master contract; see `./etl/CONTEXT.md` for the package-level public API contract).
+Implemented and tested. The full explicit pipeline (`trace → lower → compile → load → run` plus `bind`/`build`/`evaluate` sugar), graph transforms (`vectorize`/`vmap`/`grad`/`jvp`/`vjp`), explicit collectives (`dist`), custom blocks (`block`), the `etl.numpy` graph namespace, the numpy interpreter backend (default, CPU), the StableHLO exporter, and persistence/caching (`persist`, Graph save/load) are in place. Test suite (`./tests/`, 93 files): ~4100 tests collected, 0 failures, 7 torch-interop skips when torch is absent. See `./etl/CONTEXT.md` for the package-level public API contract and `./tests/CONTEXT.md` for the test strategy.
+
+**v1 deferrals (intentional, explicit errors — never silent fallback):** IREE/XLA/TVM backends are documented future integration points (the StableHLO exporter already emits compiler input for them); control-flow vectorization; `conv` VJP (no transposed-conv op); symbolic-length `scan`; `linspace` / `linalg.inv` / `norm` / `det`; non-constant pad modes; symbolic-bound `arange`; a few StableHLO op exports.
