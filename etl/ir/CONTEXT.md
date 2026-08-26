@@ -153,7 +153,11 @@ signature; `if`: operand types of both branches' `return` terminators, which
 must agree; `runtime_call`/`block_call`: `result_specs` entries — `ValueType`
 | core `TensorSpec` | `{"dtype", "shape"}` dict — converted to `ValueType`);
 anything else with `shape_fn=None` demands explicit types. `ShapeError` from a
-`shape_fn` propagates unchanged. Attributes are validated eagerly against the
+`shape_fn` propagates unchanged. NOTE: the `result_specs` conversion applies
+to result-TYPE RESOLUTION only — the stored attribute is NOT rewritten, and
+`verify` requires the stored `result_specs` to be a sequence of `ValueType`
+instances. Frontends must pass `ValueType`s (not `TensorSpec`/dict entries)
+to pass verification. Attributes are validated eagerly against the
 schema (unknown keys / missing required / wrong tag → `VerificationError`),
 stored as a copy with defaults applied: `dtype` values normalize to the
 dtype-name string, sequence tags normalize to tuples, `int` tags accept `None`
