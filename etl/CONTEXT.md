@@ -80,7 +80,7 @@ Formats versioned via constants (`ETL_FORMAT_VERSION`). Artifacts are self-descr
 | `./transforms/` | `vectorize`, `vmap`, `grad`, `jvp`, `vjp` + rule registries |
 | `./backends/` | Backend interface, registry, numpy interpreter, stablehlo exporter |
 | `./dist/` | Groups + explicit collectives |
-| `./pipeline.py` | Stage types + `lower/compile/load/run/bind/build/evaluate` |
+| `./pipeline.py` | Orchestration: `lower/compile/load/run/bind/build/evaluate` + user-facing `Executable` wrapper |
 | `./persist/` | Save/load container format, explicit cache |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related writes to root).
