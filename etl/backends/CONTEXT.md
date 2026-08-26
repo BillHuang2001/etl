@@ -55,7 +55,7 @@ Must-expose names (re-exported from `etl/backends/__init__.py` and from `etl`):
 - **rank/world_size**: `rank`/`world_size` graph scalars are resolved at RUN time from a per-execution `dist.context.RankContext` (default rank 0 / world_size 1; overridable per run via `numpy/exec_context.py`'s thread-local `set_rank_context` or the `run(..., rank_context=...)` kwarg) — never constant-folded at lower/compile time.
 - **`NumpyExecutable` persistence**: `.save(path)` saves the underlying `CompiledArtifact` (documented: the executable is reconstructed explicitly at `load` — device handles are never serialized).
 
-**Kernel split** (`numpy/kernels/`): `elementwise.py` (arith/activations/comparisons/select/cast/broadcast), `reductions.py` (reduce_*, argmax/argmin), `indexing.py` (reshape/transpose/slice/concat/pad/gather/scatter), `linalg.py` (dot/conv), `control_flow.py` (cond/while/scan region execution), `collective.py` (collective op dispatch via the hook), `custom.py` (`runtime_call`, `block_call` dispatch). Dispatch table assembled in `kernels/__init__.py` (op name → kernel).
+**Kernel split** (`numpy/kernels/`): `elementwise.py` (arith/activations/comparisons/select/cast/broadcast), `reductions.py` (reduce_*, argmax/argmin), `indexing.py` (reshape/transpose/slice/concat/pad/gather/scatter/tril/triu/cumsum), `linalg.py` (dot/conv/solve), `control_flow.py` (if/while/call region execution), `collective.py` (collective op dispatch via the hook + rank/world_size), `custom.py` (`runtime_call`, `block_call`, `constant`). Dispatch table assembled in `kernels/__init__.py` (op name → kernel); coverage = every registered IR op name except `return` (special-cased by the loop). The interpreter loop itself lives in `numpy/interpreter.py` (block-op-order execution, value env, output validation, `KernelContext`); the per-execution rank context in `numpy/exec_context.py`; block_call portable-splicing in `numpy/inline.py`.
 
 ## StableHLO exporter — v1 scope
 
@@ -77,14 +77,13 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | cast | `stablehlo.convert` |
 | select / broadcast / reshape / transpose / slice / concatenate / pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
 | reduce_sum/max/min/mean/prod | `stablehlo.reduce` (mean: reduce-sum then divide) |
-| argmax / argmin | `stablehlo.argmax/argmin` |
 | dot / conv | `stablehlo.dot_general` / `stablehlo.convolution` |
 | constant | `stablehlo.constant` |
 | cond / while_loop | `stablehlo.if` / `stablehlo.while` |
-| collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
+| collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast_collective/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
 | symbolic dims | `?` dynamic dims in tensor types, e.g. `tensor<?xNxf32>` |
 
-**Deferred in v1** (⇒ `core.BackendError` naming the op, message suggests decomposition or a future adapter): `gather`, `scatter`, `scan`, `runtime_call`, `block_call` (blocks with no portable decomposition), `dist.rank()`/`dist.world_size()` graph scalars, complex-number elementwise beyond cast.
+**Deferred in v1** (⇒ `core.BackendError` naming the op, message suggests decomposition or a future adapter): `gather`, `scatter`, `scan`, `runtime_call`, `block_call` (blocks with no portable decomposition), `dist.rank()`/`dist.world_size()` graph scalars, `erf`, `gelu`, `argmax`, `argmin`, `call`, `tril`/`triu`/`cumsum`/`solve`, complex-number elementwise beyond cast. Mnemonics were verified against the official StableHLO spec at implementation time: `stablehlo.erf` and `stablehlo.argmax/argmin` do NOT exist in the StableHLO opset (erf is a CHLO op; ArgMax/ArgMin are open feature requests), so those ops are deferred rather than emitted with invented mnemonics. The unlisted data-movement ops (tril/triu/cumsum/solve/call) have no v1 mapping and fail explicitly.
 
 Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i8, int16→i16, int32→i32, int64→i64, uint8→ui8, uint16→ui16, uint32→ui32, uint64→ui64, bool→i1, complex64→`complex<f32>`, complex128→`complex<f64>`.
 
@@ -107,11 +106,14 @@ Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i
 | `./backend.py` | `Capabilities`, `Backend` ABC, `Executable` protocol |
 | `./program.py` | `Signature`, `LoweredProgram`, `CompiledArtifact` (owned by backends) |
 | `./registry.py` | `register`/`get` |
-| `./numpy/` | Reference numpy CPU interpreter: `NumpyBackend`, `NumpyExecutable`, `kernels/` (per-category kernels), `shapes.py` (DimExpr evaluation), `collectives.py` (CollectiveExecutor hook) |
+| `./numpy/` | Reference numpy CPU interpreter: `NumpyBackend`, `NumpyExecutable`, `interpreter.py` (execution loop + KernelContext), `exec_context.py` (per-run RankContext), `inline.py` (block_call portable splicing), `kernels/` (per-category kernels), `shapes.py` (DimExpr evaluation), `collectives.py` (default executor; canonical hook lives in `etl.dist.context`) |
 | `./stablehlo/` | StableHLO MLIR export utility: `export`, `ops.py` (mapping table data), `writer.py` (MLIR text emission) |
 
 ## Notes for agents
 
-- **Architecture phase**: all behavioral bodies raise `NotImplementedError`; only trivial pure-type code (dataclasses, protocols, mapping data, registry) is implemented. Implementation is delegated to `subagent_manager` at this node by the parent orchestrator.
-- Contract conflicts found while architecting: the cross-module bullet says backends import `etl.ops` (not `etl.block`) for block-impl registration — the registration pathway must be finalized with the `ops`/`block` owners during implementation (`numpy/__init__.py::_register_block_impls` lazy-imports `etl.ops` inside the function body per the letter of the contract).
+- **Implementation status: complete.** All behavioral bodies in `backend.py`, `program.py`, `numpy/`, and `stablehlo/` are implemented; no `NotImplementedError` stubs remain in this node. `etl.pipeline` (orchestration above this package) and sibling test suites are handled elsewhere.
+- The IR op names for control flow are `if`/`while` (trace lowers `cond`/`while_loop`/`scan` into them) and the dist broadcast collective is `broadcast_collective` — frontend names differ from IR names; kernels and the stablehlo writer dispatch on IR names.
+- `runtime_call` carries its callback as a STRING registry id (resolved via `etl.ops.constant._get_callback` at run time) — artifacts with `runtime_call` require the same callback registrations at load time; callbacks are never serialized.
+- Block-impl convention (finalized with `etl.block`): the interpreter invokes registered numpy impls as `impl(*numpy_arrays, **static_args) -> ndarray | tuple[ndarray]`; portable decompositions are spliced into the graph at `lower()` time via `etl.block.registry`.
+- Collective protocol limitation: `dist.context.CollectiveExecutor` has a single `axis` param for `all_to_all` (kernel forwards `split_axis`) and no `reduce_op` for `reduce_scatter` — documented in `numpy/kernels/collective.py`.
 - `../../tests/` is a sibling: read-only, escalate writes to root.
