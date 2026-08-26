@@ -21,7 +21,6 @@ from . import (
     ATTR_INTS,
     ATTR_NESTED_INTS,
     ATTR_SHAPE,
-    ATTR_STR,
     AttrSpec,
     OpDef,
     register_opdef,
@@ -160,16 +159,11 @@ def _register_structure() -> None:
             effect=EFFECT_PURE,
             attributes=(
                 AttrSpec(
-                    name="mode",
-                    type=ATTR_STR,
-                    default="update",
-                    description="Combining mode: 'update' | 'add' | 'max' | 'min'.",
-                ),
-                AttrSpec(
-                    name="axes",
-                    type=ATTR_INTS,
-                    default=(0,),
-                    description="Tensor axes scattered over.",
+                    name="axis",
+                    type=ATTR_INT,
+                    default=0,
+                    description="Axis of the tensor being scattered along "
+                    "(numpy put-along-axis semantics).",
                 ),
             ),
             shape_fn=infer_scatter,
