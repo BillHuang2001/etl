@@ -41,7 +41,7 @@ get_collective_executor() -> CollectiveExecutor
 
 - Groups are **static Python values** (value model, root CONTEXT.md): resolved at trace time, they specialize the graph. Immutable + hashable; equality over `(name, ranks, backend)`; treat as frozen after construction.
 - `ranks` is validated at construction: non-empty, unique, non-negative ints (bools rejected) → `ValueError`. `ranks=None` ⇔ the **world group** (`WORLD_GROUP`, name `"world"`): all ranks of the runtime execution context — membership only known at run time. `Group.size(world_size)` resolves it.
-- Collective ops record the group in attributes **by name + ranks** (`group_name` + `group_ranks`, `None` for world) — serialization is self-describing, no Python objects in artifacts.
+- Collective ops record the group in attributes **by name + size** (`group: str` + `group_size: int | None`, `None` for world) — serialization is self-describing, no Python objects in artifacts.
 - **Coordination:** `etl/trace` static-value snapshotting must handle `Group` by duck-typing its `name`/`ranks`/`backend` attributes — trace MUST NOT import dist (dist imports trace; a trace→dist import would cycle).
 
 ## Local-shape semantics (worked examples)
