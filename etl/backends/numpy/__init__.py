@@ -60,16 +60,25 @@ __all__ = [
 
 
 def _all_numpy_dtypes() -> frozenset:
-    """All numpy dtype objects: ``numpy.sctypes`` flattening plus ``bool_``.
+    """All numpy dtype objects: numeric sctypes + ``bool_``.
 
     Per the binding parent contract the numpy backend declares support for ALL
     numpy dtypes (``Capabilities.dtypes``). Per-op kernels validate concrete
     dtype support at run time (e.g. arithmetic on object dtypes is rejected by
     the kernel — never silently coerced).
+
+    Note: ``numpy.sctypes`` was removed in NumPy 2.0 — the numeric type
+    groups are enumerated explicitly (mirrors sctypes: int/uint/float/
+    complex).
     """
     dtypes = {np.dtype(np.bool_)}
-    for dtype_list in np.sctypes.values():
-        dtypes.update(np.dtype(dtype) for dtype in dtype_list)
+    for group in (
+        np.int8, np.int16, np.int32, np.int64,
+        np.uint8, np.uint16, np.uint32, np.uint64,
+        np.float16, np.float32, np.float64,
+        np.complex64, np.complex128,
+    ):
+        dtypes.add(np.dtype(group))
     return frozenset(dtypes)
 
 

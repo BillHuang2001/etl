@@ -64,7 +64,7 @@ Cross-references: none yet (sibling dirs are read-only — escalate writes to pa
 
 **Import acyclicity (strict):** dependency layers, each importing only lower layers:
 `core` ← `ir` ← `ops` ← {`trace`, `numpy`(enp)} ← {`block`, `transforms`, `backends`, `dist`, `pipeline`, `persist`}.
-Details: `core` imports nothing from etl (numpy only). `ir` imports `core`. `ops` imports `core`, `ir`, `trace` (for the active-builder hook — `trace` must NOT import `ops`). `trace` imports `core`, `ir`. `block` imports `core`, `ir`, `ops`, `trace`. `transforms` imports `ir`, `ops`, `trace`. `backends` imports `core`, `ir` (plus `ops` only for block-impl registration). `dist` imports `core`, `ir`, `ops`. `pipeline` imports `trace`, `backends`, `core`. `persist` imports `core`, `pipeline` types.
+Details: `core` imports nothing from etl (numpy only). `ir` imports `core`. `ops` imports `core`, `ir`, `trace` (for the active-builder hook — `trace` must NOT import `ops`). `trace` imports `core`, `ir`. `block` imports `core`, `ir`, `ops`, `trace` (lazily for portable tracing). `transforms` imports `core`, `ir`, `ops`, `trace`. `backends` imports `core`, `ir` (plus lazy `ops`/`block` access for block-impl registration). `dist` imports `core`, `ir`, `trace`. `pipeline` imports `trace`, `backends`, `core`. `persist` imports `core` only.
 
 **Key shared contracts** (defined in `./etl/CONTEXT.md` and owned by the listed module):
 - `core`: dtypes, `Dim`/`DimExpr` (symbolic shapes), `TensorSpec`, `Tensor`, `SymbolicTensor`, `Device`, TreeSpec (pytree flatten/unflatten), device helpers (`devices`, `split_tensor`, `replicate_tensor`), plus a **registration hook** so `ops` can install `SymbolicTensor` operator handlers without import cycles.

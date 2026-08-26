@@ -177,4 +177,10 @@ def decode_value(encoded):
 
 
 # Install the built-in registry exactly once, at import time.
-_install_builtin_codecs()
+# Phase 1 note: the installer is still an architecture stub, so tolerate its
+# absence during the skeleton phase; Phase 2 removes this guard (the
+# installer must run unconditionally once implemented).
+try:
+    _install_builtin_codecs()
+except NotImplementedError:
+    pass
