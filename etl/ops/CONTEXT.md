@@ -77,7 +77,7 @@ Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, 
 
 ## Test strategy
 
-Mirror in `../../tests/ops/`: `test_elementwise.py`, `test_comparison.py`, `test_indexing.py`, `test_reductions.py`, `test_linalg.py`, `test_constant.py`, `test_opdefs.py`, `test_operator_handlers.py`, `test_utils.py`. Cover: scalar promotion incl. NEP-50 weak cases (int+float32→float32, float+float32→float64, float+complex64→complex64); TraceError for Tensor operands / no-trace / symbolic getitem; symbolic broadcasting (`DimExpr.max`, static int-vs-int ShapeError); per-op dtype rules; opdef table ↔ `__all__` 1:1 coverage; handler registration completeness; location capture + `ETL_DISABLE_LOCATIONS=1`; constant warning threshold; runtime_call effect annotation. CPU only.
+Mirror in `../../tests/ops/`: `test_elementwise.py`, `test_comparison.py`, `test_indexing.py`, `test_reductions.py`, `test_linalg.py`, `test_constant.py`, `test_operator_handlers.py`, `test_utils.py` (opdef coverage lives in `../../tests/ir/` — the registry is owned by `ir`). Cover: scalar promotion incl. NEP-50 weak cases (int+float32→float32, float+float32→float64, float+complex64→complex64); TraceError for Tensor operands / no-trace / symbolic getitem; symbolic broadcasting (`DimExpr.max`, static int-vs-int ShapeError); per-op dtype rules; handler registration completeness; location capture + `ETL_DISABLE_LOCATIONS=1`; constant warning threshold; runtime_call effect annotation. CPU only.
 
 ## Notes for agents
 
