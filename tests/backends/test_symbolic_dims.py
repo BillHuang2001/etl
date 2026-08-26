@@ -159,10 +159,6 @@ def test_mixed_symbolic_concrete_size_mismatch_raises_etl_error():
         etl.TensorSpec((3,), etl.float32),
     )
 
-    # BUG(etl): a symbolic-vs-concrete size mismatch (B=4 vs 3) escapes the
-    # numpy interpreter as a raw builtins.ValueError ("operands could not be
-    # broadcast together with shapes (4,) (3,)") instead of an etl.ShapeError
-    # — every public error must derive from ETLError.
     with pytest.raises(etl.ShapeError):
         etl.run(
             exe,
