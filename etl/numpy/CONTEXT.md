@@ -49,7 +49,7 @@ Re-exported from `__init__.py` (exact names; architecture phase — all bodies `
 | `empty(shape, dtype=float32)` | Constant op (uninitialized array) | values unspecified (numpy semantics); warns like any large constant |
 | `arange(start, stop=None, step=1, dtype=None)` | Constant op with `numpy.arange(...)` data | concrete bounds/step required at trace time; symbolic bounds deferred |
 | `matmul(a, b)` / `dot(a, b)` | `ops.dot(a, b)` | v1: `dot` is an alias of `matmul`; numpy's 1-D `dot` vector semantics not special-cased |
-| `linalg.solve(a, b)` | `ops.solve(a, b)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `linalg.solve(a, b)` | `ops.solve(a, b)` | |
 
 ## Constraints
 
@@ -117,4 +117,4 @@ Siblings: `../ops/`, `../core/`, `../ir/` (read-only from here — ops-contract 
 
 ## Status
 
-Architecture phase complete (stubs raise `NotImplementedError`): CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`, all `py_compile`-clean. Phase 2 fills bodies per the mapping table; `solve/tril/triu/cumsum` blocked on ops-contract additions (see conflicts).
+Architecture phase complete: CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`, all `py_compile`-clean. Phase 2 in progress per the mapping table. Implemented: `reductions.py` (sum/mean/prod/max/min/argmax/argmin/cumsum → ops reduce family with dtype-cast composition and flatten-first cumsum) and `_linalg.py` (matmul/dot → `ops.dot`, solve → `ops.solve`). Remaining modules (`elementwise`, `logic`, `shape`, `creation`) are still architecture stubs.
