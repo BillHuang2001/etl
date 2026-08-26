@@ -49,9 +49,8 @@ structured pytree I/O — not incidental implementation behavior.
 - **BUG(etl) protocol**: tests that expose real contract violations in `etl`
   are KEPT FAILING with a `# BUG(etl): <desc>` comment + minimal repro. Never
   fix `etl` from this directory and never weaken such tests — the package
-  root owns fixes. The suite is expected to show exactly the failures listed
-  in Known Issues; any OTHER failure is a regression in either etl or the
-  tests.
+  root owns fixes. The suite is currently expected to be fully green; any
+  failure is a regression in either etl or the tests.
 - **Tree leaf markers**: trace-time `input_specs`/`output_tree` use private
   `_TensorSpecLeaf`/`_SymbolicLeaf` marker types by design (dataclass leaves
   would be recursed into). Compare tree SKELETONS (type/node_data/children,
