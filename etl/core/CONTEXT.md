@@ -33,12 +33,12 @@ All names below are re-exported from `etl/core/__init__.py` (see also `../CONTEX
 |---|---|
 | `errors.py` | `ETLError` hierarchy (fully implemented) |
 | `dtypes.py` | dtype constants + `dtype()` normalizer (implemented) |
-| `dim.py` | `Dim`, `DimExpr` expression construction, `dim()`; `evaluate`/comparisons stubbed |
+| `dim.py` | `Dim`, `DimExpr` expression construction + `evaluate`/comparisons, `dim()` (implemented) |
 | `spec.py` | `TensorSpec` (frozen dataclass + validation, implemented) |
-| `tensor.py` | `Tensor` data holder + DLPack passthrough (implemented); creators/`from_numpy`/`from_dlpack` stubbed |
-| `symbolic.py` | `SymbolicTensor` + operator-handler registry + `constant` hook (dispatch implemented; op building lives in `../ops/`) |
-| `device.py` | `Device` (implemented); `devices`/`split_tensor`/`replicate_tensor` stubbed |
-| `tree.py` | `TreeSpec` + pytree registry (implemented); `flatten`/`unflatten` stubbed |
+| `tensor.py` | `Tensor` data holder + DLPack passthrough (implemented); creators/`from_numpy`/`from_dlpack` implemented |
+| `symbolic.py` | `SymbolicTensor` + operator-handler registry + `constant` hook (implemented; op building lives in `../ops/`) |
+| `device.py` | `Device` (implemented); `devices`/`split_tensor`/`replicate_tensor` implemented |
+| `tree.py` | `TreeSpec` + pytree registry (implemented); `flatten`/`unflatten` implemented |
 
 Cross-references: `../ops/` registers operator handlers + the constant builder into `core` at import time; `../ir/` provides the real `Value`/`Location` types that `SymbolicTensor.value`/`.location` duck-type; `../../tests/core/` is the test mirror (sibling — read-only from here, escalate writes to root).
 
@@ -47,7 +47,7 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 - **Operator-handler dispatch**: `SymbolicTensor.__add__` etc. call `_get_operator_handler(kind)(...)`. Kinds: `add, sub, mul, matmul, truediv, pow, neg, lt, gt, le, ge, eq, getitem`. Calling convention: binary `handler(left, right)`; `neg` `handler(operand)`; `getitem` `handler(obj, key)`. Missing handler (e.g. `etl.ops` not imported) → `TraceError` naming the kind and the fix. Reflected dunders (`__radd__`, ..., `__rpow__`) dispatch with swapped operands. `__eq__` returns a symbolic `equal` op (graph semantics), never a Python bool; `__bool__` raises `TraceError` pointing to `etl.cond`/`while_loop`/`scan`; `__hash__ = None` (unhashable, since `__eq__` is not a bool). `!=` is intentionally not defined (Python inverts `__eq__` → hits `__bool__` → clear `TraceError`).
 - **`constant` hook**: `etl.constant` is listed under core's value model in the package contract, but building a Constant op requires `ops`. Resolved by the same hook pattern as operators: `ops` registers a builder via `register_constant_builder`; `core.constant` calls it or raises `TraceError`.
 - **`bool_` naming**: the dtype constant is `bool_`, not `bool` (the package contract's `etl.bool` would shadow the builtin inside every consumer — see contract conflicts below).
-- **`Dim`/`DimExpr` as pure ASTs**: arithmetic dunders only construct nodes (shared `_DimArithmeticMixin`); `evaluate(dim_sizes)` does substitution/arithmetic (stubbed). `==` on dims/exprs is structural; comparisons (`< <= > >=`) evaluate "constraint-free" and raise `ShapeError` when unresolved (stubbed); `bool()` on symbolic dims raises `ShapeError`. `dim(5)` → `Dim(name="dim_5", size=5)` (deterministic name, known size ⇒ exact evaluation).
+- **`Dim`/`DimExpr` as pure ASTs**: arithmetic dunders only construct nodes (shared `_DimArithmeticMixin`); `evaluate(dim_sizes)` does substitution/arithmetic with explicit bindings taking precedence over known sizes. `==` on dims/exprs is structural; comparisons (`< <= > >=`) evaluate "constraint-free" (known sizes only, no bindings) and raise `ShapeError` when unresolved; `bool()` on symbolic dims raises `ShapeError`. `dim(5)` → `Dim(name="dim_5", size=5)` (deterministic name, known size ⇒ exact evaluation).
 - **DLPack zero-copy**: `Tensor.__dlpack__` delegates to the ndarray (same memory); `from_dlpack` must consume capsules without copies. `.numpy()` returns the underlying array reference (no copy). `Tensor` is unhashable (like ndarray) and compares structurally (dtype+shape+device+`array_equal`).
 - **`TensorSpec` normalization**: shape tuple-ified and element-validated; dtype normalized via `dtype()`; rank always known. `SymbolicTensor.shape` additionally accepts `Dim` entries (callers resolve to `DimExpr`).
 - **TreeSpec invariants**: pre-order leaves; `unflatten(flatten(x))` ≡ `x`; dict keys sorted; namedtuple/dataclass metadata in `node_data`; custom types via registry `{type: (flatten_fn, unflatten_fn)}`.
@@ -59,9 +59,12 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 
 ## Status
 
-**Architecture phase complete** — all public interfaces, docstrings, and pure data types are in place and validated (`py_compile` clean, import acyclicity verified, smoke tests pass). **Stubbed (raise `NotImplementedError`) pending implementation phase:** `DimExpr.evaluate` + comparisons, `devices`, `split_tensor`, `replicate_tensor`, creators (`tensor/zeros/ones/full/empty/from_numpy/from_dlpack`), `flatten`, `unflatten`.
+**Implementation phase complete** — every value-model behavior is implemented and validated (`py_compile` clean, `import etl` clean, inline validation of dim evaluation/comparisons, pytree round-trips, all concrete creators incl. DLPack zero-copy round-trip, device enumeration/split/replicate, symbolic dispatch audit). No `NotImplementedError` stubs remain in `etl/core/*.py`.
+
+## Notes for agents
+
+- **numpy-2.x DLPack gotcha**: numpy >= 2.0 requires the keyword-only `max_version` argument on `ndarray.__dlpack__` (numpy < 2.0 rejects it). `Tensor.__dlpack__` therefore tries the plain `self.data.__dlpack__(stream=stream)` call first and retries with `max_version=(1, 0)` on `TypeError`. Do not "simplify" this back to a single call — that breaks on one numpy generation or the other.
 
 ## Known issues (current state)
 
-- Dim/DimExpr comparisons and `evaluate` are stubbed ⇒ comparing `TensorSpec`s whose shapes contain `DimExpr`s raises `NotImplementedError` until implemented.
 - Contract conflict noted for the root/parent docs: package contract says dtype constant `etl.bool`; implemented as `bool_` (safer, per this node's architecture directive) — parent docs should be updated to `etl.bool_`. `VerificationError` lives here per the root error strategy (not in the parent's API-surface list).

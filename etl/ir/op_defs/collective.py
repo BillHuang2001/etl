@@ -3,8 +3,9 @@
 All communication collectives carry effect ``collective`` (functional results,
 but device-synchronization side effects; see CONTEXT.md effect model).
 ``rank``/``world_size`` observe process configuration and carry effect
-``read``. Every collective names its ``group``; ops whose result shape depends
-on it also record ``group_size`` (needed for static shape inference).
+``read``. Every collective names its ``group`` and records ``group_size``
+(None for the world group, whose size is only known at run time); ops whose
+result shape depends on it use it for static shape inference.
 
 Note: the IR name is ``broadcast_collective`` — the frontend shape op
 ``broadcast`` already owns that name.
@@ -49,6 +50,12 @@ def _register_collectives() -> None:
                     description="Reduction kind: 'sum' | 'max' | 'min' | 'prod'.",
                 ),
                 AttrSpec(name="group", type=ATTR_STR, description="Group name."),
+                AttrSpec(
+                    name="group_size",
+                    type=ATTR_INT,
+                    description="Number of ranks in the group "
+                    "(None = world group, size unknown at trace time).",
+                ),
             ),
             shape_fn=infer_identity,
         )
@@ -73,7 +80,8 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
-                    description="Number of ranks in the group (for shape inference).",
+                    description="Number of ranks in the group (for shape "
+                    "inference; None = world group, size unknown at trace time).",
                 ),
             ),
             shape_fn=infer_all_gather,
@@ -104,7 +112,8 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
-                    description="Number of ranks in the group (for shape inference).",
+                    description="Number of ranks in the group (for shape "
+                    "inference; None = world group, size unknown at trace time).",
                 ),
             ),
             shape_fn=infer_reduce_scatter,
@@ -135,7 +144,8 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
-                    description="Number of ranks in the group (for shape inference).",
+                    description="Number of ranks in the group (for shape "
+                    "inference; None = world group, size unknown at trace time).",
                 ),
             ),
             shape_fn=infer_all_to_all,
@@ -155,7 +165,8 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
-                    description="Number of ranks in the group.",
+                    description="Number of ranks in the group "
+                    "(None = world group, size unknown at trace time).",
                 ),
             ),
             shape_fn=infer_identity,
@@ -180,7 +191,8 @@ def _register_collectives() -> None:
                 AttrSpec(
                     name="group_size",
                     type=ATTR_INT,
-                    description="Number of ranks in the group.",
+                    description="Number of ranks in the group "
+                    "(None = world group, size unknown at trace time).",
                 ),
             ),
             shape_fn=infer_identity,

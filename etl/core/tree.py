@@ -19,8 +19,9 @@ Invariants (binding):
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Tuple
 
 __all__ = ["TreeSpec", "flatten", "unflatten", "register_pytree_node"]
 
@@ -51,10 +52,16 @@ class TreeSpec:
 
     @property
     def num_leaves(self) -> int:
-        """Number of leaves described by this spec (1 for a leaf)."""
+        """Number of leaves described by this spec (1 for a leaf; 0 for an
+        empty container node)."""
         if not self.children:
-            return 1
+            return 0 if _is_container_spec(self) else 1
         return sum(child.num_leaves for child in self.children)
+
+    @property
+    def children_specs(self) -> Tuple["TreeSpec", ...]:
+        """The child :class:`TreeSpec`\\s of this node (alias of ``children``)."""
+        return self.children
 
     def __repr__(self) -> str:
         if not self.children:
@@ -85,6 +92,25 @@ def register_pytree_node(
     _PYTREE_NODE_REGISTRY[node_type] = (flatten_fn, unflatten_fn)
 
 
+def _is_container_spec(spec: TreeSpec) -> bool:
+    """True if ``spec`` describes a container node (never a leaf).
+
+    ``flatten`` never produces a leaf with one of these types, so a childless
+    spec of such a type is an *empty container* (0 leaves) rather than a leaf
+    (1 leaf). Needed by :attr:`TreeSpec.num_leaves`, since both have empty
+    ``children`` tuples.
+    """
+    spec_type = spec.type
+    if spec_type in _PYTREE_NODE_REGISTRY:
+        return True
+    if isinstance(spec_type, type):
+        if issubclass(spec_type, (tuple, list, dict)):
+            return True
+        if dataclasses.is_dataclass(spec_type):
+            return True
+    return False
+
+
 def flatten(obj: Any) -> Tuple[List[Any], TreeSpec]:
     """Flatten a pytree into ``(leaves, treespec)``.
 
@@ -101,11 +127,49 @@ def flatten(obj: Any) -> Tuple[List[Any], TreeSpec]:
         values in pre-order and ``treespec`` the :class:`TreeSpec`
         describing the structure.
     """
-    raise NotImplementedError(
-        "flatten is not implemented yet (architecture phase); "
-        "it will traverse tuple/list/dict/namedtuple/dataclass/registered types "
-        "in pre-order (dict keys sorted)."
-    )
+    leaves: List[Any] = []
+    return leaves, _flatten_into(obj, leaves)
+
+
+def _flatten_into(obj: Any, leaves: List[Any]) -> TreeSpec:
+    """Recursive pre-order flattening: append leaves, return the spec node."""
+    obj_type = type(obj)
+    # 1. Registered custom types (walk the MRO so registered base classes
+    #    catch subclasses; exact type first).
+    for base in obj_type.__mro__:
+        registered = _PYTREE_NODE_REGISTRY.get(base)
+        if registered is not None:
+            flatten_fn, _ = registered
+            children, context = flatten_fn(obj)
+            child_specs = tuple(_flatten_into(child, leaves) for child in children)
+            return TreeSpec(type=base, children=child_specs, context=context)
+    # 2. namedtuple instances (checked before plain tuples).
+    if isinstance(obj, tuple) and hasattr(obj_type, "_fields"):
+        child_specs = tuple(_flatten_into(child, leaves) for child in obj)
+        return TreeSpec(type=obj_type, children=child_specs, node_data=obj_type._fields)
+    # 3. dataclass instances (never the class itself).
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        fields = dataclasses.fields(obj)
+        child_specs = tuple(
+            _flatten_into(getattr(obj, field.name), leaves) for field in fields
+        )
+        return TreeSpec(
+            type=obj_type, children=child_specs, node_data=[field.name for field in fields]
+        )
+    # 4-6. Plain containers: tuple, list, dict (keys sorted for determinism).
+    if isinstance(obj, tuple):
+        child_specs = tuple(_flatten_into(child, leaves) for child in obj)
+        return TreeSpec(type=obj_type, children=child_specs)
+    if isinstance(obj, list):
+        child_specs = tuple(_flatten_into(child, leaves) for child in obj)
+        return TreeSpec(type=obj_type, children=child_specs)
+    if isinstance(obj, dict):
+        keys = sorted(obj)
+        child_specs = tuple(_flatten_into(obj[key], leaves) for key in keys)
+        return TreeSpec(type=obj_type, children=child_specs, node_data=keys)
+    # Leaf: anything else (None, scalars, ndarrays, ...).
+    leaves.append(obj)
+    return TreeSpec(type=obj_type)
 
 
 def unflatten(leaves: List[Any], treespec: TreeSpec) -> Any:
@@ -124,7 +188,46 @@ def unflatten(leaves: List[Any], treespec: TreeSpec) -> Any:
     Raises:
         ValueError: If the number of leaves does not match the spec.
     """
-    raise NotImplementedError(
-        "unflatten is not implemented yet (architecture phase); "
-        "it will rebuild the container from the spec, consuming leaves in order."
-    )
+    if len(leaves) != treespec.num_leaves:
+        raise ValueError(
+            f"unflatten: treespec describes {treespec.num_leaves} leaves, "
+            f"but {len(leaves)} were given"
+        )
+    # Iterate (not pop) so the caller's list is never mutated.
+    return _unflatten_into(iter(leaves), treespec)
+
+
+def _unflatten_into(leaves: Iterator[Any], spec: TreeSpec) -> Any:
+    """Recursive pre-order rebuilding: consume leaves, return the object."""
+    if not spec.children:
+        if _is_container_spec(spec):
+            # Empty container node: rebuild without consuming leaves.
+            return _rebuild_container(spec, [])
+        return next(leaves)
+    children = [_unflatten_into(leaves, child) for child in spec.children]
+    return _rebuild_container(spec, children)
+
+
+def _rebuild_container(spec: TreeSpec, children: List[Any]) -> Any:
+    """Reconstruct a container node from its (rebuilt) children."""
+    registered = _PYTREE_NODE_REGISTRY.get(spec.type)
+    if registered is not None:
+        _, unflatten_fn = registered
+        return unflatten_fn(spec.context, children)
+    if (
+        isinstance(spec.type, type)
+        and issubclass(spec.type, tuple)
+        and hasattr(spec.type, "_fields")
+    ):
+        # namedtuple: rebuild positionally in recorded field order.
+        return spec.type(*children)
+    if isinstance(spec.type, type) and dataclasses.is_dataclass(spec.type):
+        # dataclass: rebuild by recorded field name.
+        return spec.type(**dict(zip(spec.node_data, children)))
+    if isinstance(spec.type, type) and issubclass(spec.type, tuple):
+        return spec.type(children)
+    if isinstance(spec.type, type) and issubclass(spec.type, list):
+        return spec.type(children)
+    if isinstance(spec.type, type) and issubclass(spec.type, dict):
+        return spec.type(zip(spec.node_data, children))
+    raise TypeError(f"unflatten: no reconstruction rule for TreeSpec node type {spec.type!r}")

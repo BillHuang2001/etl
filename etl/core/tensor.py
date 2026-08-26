@@ -21,7 +21,8 @@ from typing import Any, Optional, Tuple
 import numpy as np
 
 from .device import Device
-from .dtypes import dtype
+from .dtypes import dtype as _dtype
+from .errors import DeviceError
 
 __all__ = ["Tensor", "from_numpy", "from_dlpack", "tensor", "zeros", "ones", "full", "empty"]
 
@@ -52,7 +53,7 @@ class Tensor:
     @property
     def dtype(self) -> np.dtype:
         """The tensor dtype (a :class:`numpy.dtype`)."""
-        return dtype(self.data.dtype)
+        return _dtype(self.data.dtype)
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -81,7 +82,12 @@ class Tensor:
         Returns:
             A DLPack capsule (``PyCapsule``).
         """
-        return self.data.__dlpack__(stream=stream)
+        try:
+            return self.data.__dlpack__(stream=stream)
+        except TypeError:
+            # numpy >= 2.0 requires the keyword-only ``max_version`` argument
+            # (numpy < 2.0 rejects it — hence the plain call above first).
+            return self.data.__dlpack__(stream=stream, max_version=(1, 0))
 
     def __eq__(self, other: Any) -> bool:
         """Structural equality: identity of metadata + value.
@@ -117,10 +123,11 @@ def from_numpy(array: np.ndarray) -> Tensor:
     Returns:
         The new :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "from_numpy is not implemented yet (architecture phase); "
-        "it will wrap the array in a Tensor with no copy."
-    )
+    if not isinstance(array, np.ndarray):
+        raise TypeError(
+            f"from_numpy expects a numpy ndarray, got {type(array).__name__}"
+        )
+    return Tensor(array)
 
 
 def from_dlpack(obj: Any) -> Tensor:
@@ -140,10 +147,18 @@ def from_dlpack(obj: Any) -> Tensor:
         DeviceError: If ``obj`` has no ``__dlpack__`` or the capsule cannot
             be consumed.
     """
-    raise NotImplementedError(
-        "from_dlpack is not implemented yet (architecture phase); "
-        "it will consume the DLPack capsule with numpy (zero-copy)."
-    )
+    if not callable(getattr(obj, "__dlpack__", None)):
+        raise DeviceError(
+            "from_dlpack requires an object exposing a __dlpack__ method, "
+            f"got {type(obj).__name__}"
+        )
+    try:
+        array = np.from_dlpack(obj)
+    except (TypeError, RuntimeError, BufferError, ValueError) as exc:
+        raise DeviceError(
+            f"Failed to consume the DLPack capsule from {type(obj).__name__}: {exc}"
+        ) from exc
+    return Tensor(array, device=Device("cpu", 0))
 
 
 def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = None) -> Tensor:
@@ -162,10 +177,11 @@ def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
     Returns:
         The new concrete :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "tensor() is not implemented yet (architecture phase); "
-        "it will wrap array-like data into a Tensor."
-    )
+    if dtype is None:
+        array = np.asarray(data)
+    else:
+        array = np.asarray(data, dtype=_dtype(dtype))
+    return Tensor(array, device=device)
 
 
 def zeros(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = None) -> Tensor:
@@ -179,10 +195,8 @@ def zeros(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
     Returns:
         The new concrete :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "zeros() is not implemented yet (architecture phase); "
-        "it will create a zero-filled Tensor (default dtype float64, numpy convention)."
-    )
+    array = np.zeros(shape, dtype=None if dtype is None else _dtype(dtype))
+    return Tensor(array, device=device)
 
 
 def ones(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = None) -> Tensor:
@@ -196,10 +210,8 @@ def ones(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = Non
     Returns:
         The new concrete :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "ones() is not implemented yet (architecture phase); "
-        "it will create a one-filled Tensor (default dtype float64, numpy convention)."
-    )
+    array = np.ones(shape, dtype=None if dtype is None else _dtype(dtype))
+    return Tensor(array, device=device)
 
 
 def full(
@@ -217,10 +229,8 @@ def full(
     Returns:
         The new concrete :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "full() is not implemented yet (architecture phase); "
-        "it will create a fill_value-filled Tensor (dtype inferred from the value, numpy convention)."
-    )
+    array = np.full(shape, fill_value, dtype=None if dtype is None else _dtype(dtype))
+    return Tensor(array, device=device)
 
 
 def empty(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = None) -> Tensor:
@@ -237,7 +247,5 @@ def empty(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
     Returns:
         The new (uninitialized) concrete :class:`Tensor`.
     """
-    raise NotImplementedError(
-        "empty() is not implemented yet (architecture phase); "
-        "it will create an uninitialized Tensor (default dtype float64, numpy convention)."
-    )
+    array = np.empty(shape, dtype=None if dtype is None else _dtype(dtype))
+    return Tensor(array, device=device)

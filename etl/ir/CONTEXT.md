@@ -82,6 +82,20 @@ its own container (magic header etc.) — the payload already carries everything
 it needs, so the wrapper stays dumb. `IR_FORMAT_VERSION` (IR payload) is
 distinct from `ETL_FORMAT_VERSION` (persist container).
 
+Wire-format decisions (binding, documented in `serialize.py`): block op lists
+reference the flat ops table via `"ref"` = the op id as a decimal STRING;
+dims encode as `{"int"}` | `{"dim": name[, "size"]}` | `{"expr": {op, args}}`
+| `null` (decoded back to real `Dim`/`DimExpr`, preserving names/sizes);
+ndarray attr values move to the `constants` table (attr becomes
+`{"__etl_ndarray__": key}`); tuples are wrapped as `{"__etl_tuple__": [...]}`
+to survive the JSON round-trip; `runtime_call`/`block_call` `result_specs`
+are encoded as a list of type dicts and NORMALIZED back to `ValueType`
+instances on decode (so `verify`'s in-memory comparison still passes).
+Rebuilt modules keep their ORIGINAL ids and their `_op_ids`/`_value_ids`
+counters are fast-forwarded past the payload maximum, so post-load
+`Builder.create` calls never collide ids. `serialize_module` runs `verify`
+first; `deserialize_module` runs it on the result.
+
 ### 6. Result-type resolution
 `OpDef.shape_fn: (input_types, attributes) -> result_types` computes result
 types when the builder has no explicit `result_types`. `shape_fn=None` means
@@ -132,6 +146,22 @@ position=None)`, `set_terminator(block, op_name, ...)`,
 metadata=None)`. The frontend `ops` module obtains the active builder from
 `trace.current_builder()`; ALL IR mutation funnels through Builder.
 
+**Implementation notes (binding for `verify` agreement):** result types
+resolve in order — explicit `result_types` → `OpDef.shape_fn` → op-specific
+rules (`constant`: dtype/shape from the payload; `call`: callee output
+signature; `if`: operand types of both branches' `return` terminators, which
+must agree; `runtime_call`/`block_call`: `result_specs` entries — `ValueType`
+| core `TensorSpec` | `{"dtype", "shape"}` dict — converted to `ValueType`);
+anything else with `shape_fn=None` demands explicit types. `ShapeError` from a
+`shape_fn` propagates unchanged. Attributes are validated eagerly against the
+schema (unknown keys / missing required / wrong tag → `VerificationError`),
+stored as a copy with defaults applied: `dtype` values normalize to the
+dtype-name string, sequence tags normalize to tuples, `int` tags accept `None`
+only where the spec's `default is None`. Region count must equal
+`OpDef.regions` exactly. `set_terminator` appends (last by construction),
+never uses the insertion point, and rejects non-terminator names and blocks
+that already have a terminator.
+
 ## verify(module)
 
 First-violation-wins, `VerificationError` with source location when available.
@@ -164,10 +194,17 @@ in `printer.py`.
 ## Constraints
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
-- Architecture phase: data structures + registry are implemented; behavioral
-  bodies (`Builder`, `verify`, `serialize_module/deserialize_module`,
-  `pretty_print`, shape-inference hooks in `inference.py`) raise
-  `NotImplementedError` — Phase 2 (implementation) fills them.
+- Implementation status: data structures, registry, shape-inference hooks
+  (`inference.py`, 23 hooks), `pretty_print`, `verify`, the `Builder`, and
+  serialization (`serialize_module`/`deserialize_module`) are implemented.
+- Shape-inference conventions (binding for `verify` agreement): broadcasting
+  resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);
+  `None` dims are runtime-dynamic and yield `None`; element-count checks
+  raise `ShapeError` only on definite mismatch; sum folds are
+  left-associative `DimExpr("add", ...)` chains. Dtype promotion uses
+  `np.result_type`; reduction dtypes follow numpy per `reduce_op` (the
+  `reduce_*` OpDefs carry a `reduce_op` attribute: 'sum'|'max'|'min'|'mean'|
+  'prod').
 - Files < ~1000 lines; op_defs split by category (done).
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
@@ -182,11 +219,11 @@ in `printer.py`.
 | `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective) |
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
-| `./inference.py` | Shape-inference hooks referenced by OpDefs (stubs) |
-| `./builder.py` | Op-construction API (stub) |
-| `./verify.py` | Structural/type/attribute verification (stub) |
-| `./serialize.py` | IR payload serialization (stub) |
-| `./printer.py` | SSA text printing (stub) |
+| `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
+| `./builder.py` | Op-construction API (implemented) |
+| `./verify.py` | Structural/type/attribute verification (implemented) |
+| `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented) |
+| `./printer.py` | SSA text printing (implemented) |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related
 writes to root).
@@ -194,7 +231,9 @@ writes to root).
 ## Test strategy (Phase 2+)
 
 pytest under `../tests/ir/`: registry completeness (every public op in the etl
-contract is declared; arities/attrs/effects correct); `verify()` invariants
+contract is declared; arities/attrs/effects correct); shape-inference hooks
+(static + symbolic dims per hook, broadcast/reshape/conv formulas, ShapeError
+cases); `verify()` invariants
 (valid modules + one test per violation class); serialization round-trips
 (shapes with symbolic dims, constants as base64 npy, tamper detection, version
 rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
@@ -202,7 +241,10 @@ terminators). CPU only.
 
 ## Status
 
-Architecture phase complete: SSA data model, op registry (75 ops), Builder/
-verify/serialize/pretty_print interfaces, and this contract. Behavioral bodies
-are `NotImplementedError` stubs — Phase 2 (implementation, delegated to a
-Manager) fills them.
+Phase 2 complete for this directory: SSA data model, op registry (75 ops),
+shape-inference hooks (`inference.py`, 23 hooks), `pretty_print`, `verify`
+(the full invariant set — module/function/region/op/value levels, SSA
+dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
+and serialization (`serialize_module`/`deserialize_module` — payload schema,
+integrity hash, round-trip rebuild with original ids and fast-forwarded
+counters) are implemented.

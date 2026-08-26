@@ -23,6 +23,16 @@ from . import (
 _CATEGORY = "control"
 
 
+def _return_shape_fn(input_types, attributes):
+    """Shape hook for the ``return`` terminator: zero results.
+
+    ``return``'s operands ARE the region's yielded values — the op itself has
+    no results, so result-type inference is the empty tuple. (Kept local:
+    ``inference.py`` hosts hooks for result-producing ops only.)
+    """
+    return ()
+
+
 def _register_control() -> None:
     register_opdef(
         OpDef(
@@ -75,10 +85,11 @@ def _register_control() -> None:
         OpDef(
             name="while",
             category=_CATEGORY,
-            description="Loop: operands are the loop-carried initial values; "
-            "regions (cond, body) are bound to them via entry-block args; "
-            "results are the final carried values (types = operand types).",
-            arity=(0, None),
+            description="Loop: operands are the loop-carried initial values "
+            "(at least one); regions (cond, body) are bound to them via "
+            "entry-block args; results are the final carried values (types = "
+            "operand types).",
+            arity=(1, None),
             result_count=None,
             effect=EFFECT_PURE,
             shape_fn=infer_identity,
@@ -149,6 +160,12 @@ def _register_control() -> None:
                     default=(),
                     description="JSON-able static arguments (specialize the op).",
                 ),
+                AttrSpec(
+                    name="result_specs",
+                    type=ATTR_ANY,
+                    description="Declared result ValueTypes (serialized "
+                    "structurally).",
+                ),
             ),
         )
     )
@@ -162,6 +179,7 @@ def _register_control() -> None:
             arity=(0, None),
             result_count=0,
             effect=EFFECT_PURE,
+            shape_fn=_return_shape_fn,
             is_terminator=True,
         )
     )

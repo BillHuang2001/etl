@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..effects import EFFECT_PURE
 from ..inference import infer_arg_reduction, infer_identity, infer_reduction
-from . import ATTR_BOOL, ATTR_INT, ATTR_INTS, AttrSpec, OpDef, register_opdef
+from . import ATTR_BOOL, ATTR_INT, ATTR_INTS, ATTR_STR, AttrSpec, OpDef, register_opdef
 
 _CATEGORY = "reduction"
 
@@ -27,6 +27,12 @@ _REDUCE_ATTRS = (
         type=ATTR_BOOL,
         default=False,
         description="Keep reduced axes as size-1 dims.",
+    ),
+    AttrSpec(
+        name="reduce_op",
+        type=ATTR_STR,
+        description="Reduction kind: 'sum' | 'max' | 'min' | 'mean' | 'prod' "
+        "(drives the result-dtype rule in infer_reduction).",
     ),
 )
 
