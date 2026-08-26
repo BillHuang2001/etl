@@ -20,13 +20,6 @@ pytest suite validating `etl.persist` (sibling — see `../../etl/persist/CONTEX
 - Read-only access to `etl/` — never modify the package here (bug fixes belong to the parent).
 - Tests assert the documented contract. When etl contradicts its own contract, keep the test FAILING with a `# BUG(etl): <description>` comment — do not weaken/skip/xfail.
 
-## Known Issues
-
-Two tests in `test_cache.py` fail against the current implementation and are BUG-marked (awaiting parent fix):
-
-1. **Dict insertion order changes cache keys** — `compute_key(({"name": "a", 1: 2},)) != compute_key(({1: 2, "name": "a"},))`. The "dict" codec stores items in insertion order and `json.dumps(sort_keys=True)` cannot sort list elements, violating the documented canonical-JSON keying contract. Failing test: `test_dict_component_insertion_order_same_key` (asserts both the `compute_key` level and the `FileCache` get/put level).
-2. **Bare-string key_components collide with tuples** — `compute_key("a") == compute_key(("a",))` because `compute_key` iterates `key_components`, splitting a bare string into character components. Failing test: `test_distinct_keys_distinct_entries`.
-
 ## Notes for agents
 
 - Custom classes defined inside test functions are not importable by qualname — TreeSpec codec tests only use built-in container node types (tuple/list/dict) + python leaves.
