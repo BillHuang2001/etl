@@ -73,28 +73,35 @@ attributes; positional static values bind to the next unfilled attribute in
 schema order. Python values in block calls are ALWAYS static (no scalar→tensor
 auto-promotion; promote scalars at the ops level instead).
 
-**Status:** architecture stubs complete (this phase). All algorithmic bodies
-(`BlockOp.__call__`, `_ensure_ir_opdef`, fallback rule wrappers) raise
-NotImplementedError — implementation is delegated to the Manager phase.
+**Status:** implemented — `BlockOp.__call__` builds `block_call` ops, the
+fallback rule wrappers inline portable decompositions, and `_ensure_ir_opdef`
+verifies ir's canonical def. `decl.py`/`registry.py`/`errors.py` complete.
 
 ## BlockCall IR op layout (coordinate with etl/ir)
 
-`BLOCK_CALL_OPDEF` (in `op.py`) is registered into ir's op registry lazily by
-`_ensure_ir_opdef()` (Phase 2; exact ir hook finalized at integration):
+The CANONICAL op def lives in `etl/ir/op_defs/control.py` (ir owns op defs).
+`_ensure_ir_opdef()` (in `op.py`) only VERIFIES it lazily before the first op
+is built (missing def or mismatched attr schema → `BlockError` pointing at
+`etl/ir/op_defs/control.py`) — block never registers a conflicting def.
+
+Real schema (as of the ir implementation):
 
 - name `"block_call"`; operands: variadic ir Values in `input_specs` order;
-  results: one per `output_spec`, typed from dtype + dims (DimExpr dims stay
-  symbolic, None dims are runtime-dynamic).
-- attrs: `block_name` (str), `static` (dict attribute-name → `StaticValue`
-  payload), `effects` (ir effect kind), `batching_policy` (str). The op's
-  effect = the `effects` attr.
-- `static` values specialize the op (like static values specialize a traced
-  graph): they participate in op identity, cache keys, and serialization.
-  `StaticValue` (in `decl.py`) is a JSON-safe tagged encoding with kinds
+  results: one per `output_spec`, resolved by the Builder from the
+  `result_specs` attr (ir.verify requires the ValueType entries to equal the
+  op's result types exactly).
+- attrs: `block_name` (str), `static_args` (ATTR_ANY, default `()`), and
+  `result_specs` (ATTR_ANY). There are NO `effects`/`batching_policy` attrs
+  and the op's effect is fixed at `read` — **ir-side gaps flagged to the
+  parent** (the declared block's effects/policy do not yet ride on the op;
+  consumers must consult `get_block(block_name)` for them).
+- `static_args` is a dict attribute-name → `{"kind": ..., "value": ...}` —
+  a plain JSON-safe payload, never a `StaticValue` object (ir's ATTR_ANY
+  serialization round-trips it; verified via save/load). `StaticValue` (in
+  `decl.py`) is the tagged encoder with kinds
   `none|bool|int|float|complex|str|slice|dtype|enum`; anything else is a
-  `BlockError` at call time — never silent pickling.
-- `batching_policy` rides on the op so transforms can handle elementwise /
-  map_over_batch ops without importing block or consulting its registry.
+  `BlockError` at call time — never silent pickling. Optional attributes
+  left unset are NOT recorded (their defaults are fixed by the schema).
 
 ## Batching policy semantics
 
@@ -151,11 +158,41 @@ meets the block_call — the exact call signature is finalized with
 
 - batching rules → `transforms.batching_rules`
 - vjp rules → `transforms.vjp_rules` (per etl/CONTEXT.md)
-- jvp rules → `transforms.jvp_rules` (coordination item: transforms must
-  provide this dict, or derive jvp from vjp when absent)
+- jvp rules → `transforms.jvp_rules` (transforms provides this dict; the
+  portable diff fallback registers ONLY the vjp rule and transforms derives
+  jvp from vjp when no jvp rule exists)
 - fallbacks (registered by decl when a portable exists): batching fallback
   only when the resolved policy is `batching_rule`; derivative fallback
-  always. The fallback wrappers inline the decomposition (Phase 2).
+  always. The fallback wrappers inline the decomposition.
+
+Frozen transforms rule signatures (binding — see `../transforms/CONTEXT.md`):
+
+- batching: `rule(op, operands, axes) -> (new_values, new_axes)` —
+  `operands`: tuple of ir.Value; `axes`: aligned `MappedAxes` (from
+  `transforms._metadata`); `new_values` aligned with `op.results`;
+  `new_axes` aligned with `new_values`.
+- vjp: `rule(op, cotangents, primals) -> input_cotangents` — `cotangents`
+  aligned with `op.results`, `primals` = `op.operands`; entries may be
+  `ir.Value | None | ZeroTangent` (`transforms.autodiff`); returns aligned
+  with `op.operands`.
+- jvp: `rule(op, tangents) -> output_tangents`.
+
+Fallback semantics (implemented in `rules.py`):
+
+- **Batching fallback** traces the portable over the (batched) operand
+  values in the active transform builder, tracks `MappedAxes` through the
+  inlined ops in creation order (result axes = union of operand axes — the
+  longest contiguous leading tuple; constant ops are unmapped), and returns
+  the decomposition's outputs + their axes. Union semantics = the
+  decomposition is polymorphic in leading batch dims (elementwise-style);
+  transforms' vectorize consumes the returned values directly. Missing
+  portable → `TransformError` (never guesses).
+- **VJP fallback** short-circuits to all-`ZeroTangent` when every cotangent
+  is None/ZeroTangent; otherwise traces the portable over the primals and
+  runs a LOCAL reverse sweep over ONLY the inlined ops (reverse creation
+  order): per-result cotangents accumulate (`etl.ops.add`), rules are looked
+  up from the PUBLIC registries (`transforms.autodiff.require_vjp_rule`),
+  and nested `block_call`s resolve via their own `block:<name>` keys.
 
 ## Error behavior
 
@@ -171,10 +208,11 @@ meets the block_call — the exact call signature is finalized with
 
 - Imports: `etl.core`/`etl.ir` at module level are OK; ALL imports of
   `etl.ops`, `etl.trace`, `etl.transforms` are LAZY (inside function bodies).
+  Import the trace submodule via the direct form (`from etl.trace import
+  current_builder`) — `from etl import trace` yields the trace *function*
+  attribute (shadowed in `etl/__init__.py`), not the module.
 - Files < ~1000 lines; split along the boundaries below.
-- No algorithms in this phase: bodies raise NotImplementedError with the full
-  semantics in docstrings.
-- No `etl/__init__.py` in this phase (root-owned).
+- No `etl/__init__.py` in this node (root-owned).
 
 ## Test strategy
 
@@ -183,8 +221,8 @@ escalate test writes to root). Planned coverage:
 - declaration: factory + decorator forms, spec derivation from annotations,
   duplicate/invalid names, invalid effects/policies, attribute schema
   normalization (type vs default), required-vs-optional attributes;
-- call semantics (Phase 2): block_call op construction + attrs, operand
-  dtype/shape errors, static specialization, TraceError outside a trace;
+- call semantics: block_call op construction + attrs, operand dtype/shape
+  errors, static specialization, TraceError outside a trace;
 - examples: flash_attention declaration (`opaque_batched`), swish portable
   decorator (decomposition fallbacks registered under `block:swish`);
 - rules: keys land in transforms registries; fallback registration only for
@@ -197,9 +235,9 @@ escalate test writes to root). Planned coverage:
 | File | Area |
 |---|---|
 | `./decl.py` | `block()` factory (both forms), name/spec/schema/effects/policy validation, StaticValue encoding |
-| `./op.py` | `BlockOp` class, BLOCK_CALL_OPDEF, `_ensure_ir_opdef` (lazy ir registration) |
+| `./op.py` | `BlockOp` class, BLOCK_CALL_OPDEF (informational mirror), `_ensure_ir_opdef` (lazy ir verification), `_get_location` |
 | `./registry.py` | `get_block`, BlockOp/impl/portable registries |
-| `./rules.py` | bridges into transforms rule registries + decomposition fallback wrappers |
+| `./rules.py` | bridges into transforms rule registries + decomposition fallback wrappers (batching/vjp) |
 | `./errors.py` | `BlockError` |
 
 ## Notes for agents
@@ -210,6 +248,15 @@ escalate test writes to root). Planned coverage:
 - The decorator form requires `@etl.defn` (portable impls are traced graphs).
 - `attribute_schema` and `attributes` are the same thing (contract name vs
   objective name) — keep both properties in sync.
-- Phase 2 coordination: ir's op-def registration hook, transforms' rule
-  callback signatures + `jvp_rules` dict, backends' numpy impl signature,
-  persist's JSON encoding of StaticValue payloads.
+- `StaticValue.decode` for `enum` resolves the longest importable prefix of
+  the dotted path as the module and walks the remainder as attributes
+  (naive `rpartition(".")` mis-splits `module.qualname.NAME`).
+- `BlockOp.__call__` positional statics bind in SCHEMA order; a positional
+  whose next schema-ordered slot was already supplied by keyword raises
+  `BlockError` (no double-fill).
+- Remaining coordination with siblings: ir should add op-level
+  `effects`/`batching_policy` attrs to `block_call` (currently fixed at
+  `read`); transforms must consume the fallback rules per the frozen
+  signatures; backends need the numpy impl signature for `block_call`
+  lowering; persist must encode `static_args` payloads through its envelope
+  codec (currently handled by ir's generic attribute encoding).
