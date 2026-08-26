@@ -8,7 +8,7 @@ Binding parent contracts: root `../../CONTEXT.md` (principles 1–9, especially 
 
 ## API surface
 
-Re-exported from `__init__.py` (exact names; architecture phase — all bodies `raise NotImplementedError`):
+Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining modules land in Phase 2):
 
 - **Elementwise/arith** (`elementwise.py`): `abs, add, subtract, multiply, divide, power, maximum, minimum, negative, square, sqrt, exp, log, sin, cos, tanh, sign, clip, astype`
 - **Comparison/logic** (`logic.py`): `equal, not_equal, less, less_equal, greater, greater_equal, logical_and, logical_or, logical_not, where`
@@ -40,16 +40,16 @@ Re-exported from `__init__.py` (exact names; architecture phase — all bodies `
 | `stack(arrays, axis=0)` | `expand_dims(each, axis)` + `concatenate(axis)` | |
 | `split(a, indices_or_sections, axis=0)` | composition of `ops.slice` | int sections resolved statically at trace time (divisibility checked) |
 | `pad(a, pad_width, mode="constant", constant_values=0)` | `ops.pad(...)` | v1: only `mode="constant"`; other modes raise `NotImplementedError` |
-| `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | |
 | `sum/mean/prod/max/min(a, axis=None, keepdims=False)` | `ops.sum/mean/prod/max/min` (→ `reduce_*` ops) | `axis=None` → all axes (rank known at trace time); `dtype≠None` composes `ops.cast` (sum/mean/prod/cumsum) |
 | `argmax/argmin(a, axis=None, keepdims=False)` | `ops.argmax/argmin` | |
-| `cumsum(a, axis=None, dtype=None)` | `ops.cumsum`; `axis=None` flattens first via `reshape` to 1-D, then `axis=0` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `cumsum(a, axis=None, dtype=None)` | `ops.cumsum`; `axis=None` flattens first via `reshape` to 1-D, then `axis=0` | |
 | `zeros/ones(shape, dtype=float32)` | Constant op (zeros/ones-filled array) | graph ops — same op kind as `etl.constant`; large-constant warning applies |
 | `full(shape, fill_value, dtype=None)` | Constant op | `dtype=None` → numpy dtype inference of static `fill_value` at trace time |
 | `empty(shape, dtype=float32)` | Constant op (uninitialized array) | values unspecified (numpy semantics); warns like any large constant |
 | `arange(start, stop=None, step=1, dtype=None)` | Constant op with `numpy.arange(...)` data | concrete bounds/step required at trace time; symbolic bounds deferred |
 | `matmul(a, b)` / `dot(a, b)` | `ops.dot(a, b)` | v1: `dot` is an alias of `matmul`; numpy's 1-D `dot` vector semantics not special-cased |
-| `linalg.solve(a, b)` | `ops.solve(a, b)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `linalg.solve(a, b)` | `ops.solve(a, b)` | |
 
 ## Constraints
 
@@ -57,7 +57,7 @@ Re-exported from `__init__.py` (exact names; architecture phase — all bodies `
 - **No new op kinds**: if a mapping needs an op that doesn't exist, defer the enp function (documented) — do not build workarounds out of existing ops.
 - **TraceError passthrough**: enp functions never catch errors; concrete-`Tensor` args raise `TraceError` exactly like ops.
 - **Files < ~1000 lines**; if a module grows, split along the routing-table boundaries.
-- **Architecture phase**: stub bodies `raise NotImplementedError` — algorithms land in Phase 2 via `subagent_manager`.
+- **Phase 2 in progress**: unimplemented module bodies raise `NotImplementedError` until their algorithms land (via `subagent_manager`); implemented modules build IR per the mapping table.
 
 ## Design decisions
 
@@ -81,9 +81,8 @@ Re-exported from `__init__.py` (exact names; architecture phase — all bodies `
 
 ## Known contract conflicts (escalated to root — see parent report)
 
-1. **`ops.solve`, `ops.tril`, `ops.triu`, `ops.cumsum` are missing from the `ops` bullet in `../CONTEXT.md`.** The enp objective requires them. Until ops implements and publishes them (contract + `etl/__init__.py`), the corresponding enp functions stay `NotImplementedError` (they are stubbed with conflict notes in docstrings).
-2. **Unspecified ops signatures** — implementation phase must confirm against the actual ops module: `ops.select` argument order (assumed `(cond, x, y)`), `ops.concatenate`/`ops.pad`/`ops.broadcast`/`ops.reduce_*` kwarg names (assumed `axis=`/`pad_width=`/`shape=`/`keepdims=`), and the **Constant-op construction path** creators should reuse (assumed: the same path `etl.constant` uses). enp mirrors whatever ops defines.
-3. **Large creation constants warn by design** (creation embeds full arrays; `ETL_LARGE_CONSTANT_BYTES` applies). The root contract is silent on creators specifically — noted so test authors don't treat the warning as a bug.
+1. **Unspecified ops signatures** — implementation phase must confirm against the actual ops module: `ops.select` argument order (assumed `(cond, x, y)`), `ops.reduce_*` kwarg names (assumed `axis=`/`keepdims=`), and the **Constant-op construction path** creators should reuse (assumed: the same path `etl.constant` uses). enp mirrors whatever ops defines. (shape.py's ops signatures are confirmed frozen: `ops.reshape(x, shape)`, `ops.transpose(x, axes=None)`, `ops.broadcast(x, shape)`, `ops.concatenate(tensors, axis=0)`, `ops.pad(x, config, value=0)`, `ops.slice(x, start, lengths, strides=1)`, `ops.tril/triu(x, k=0)`.)
+2. **Large creation constants warn by design** (creation embeds full arrays; `ETL_LARGE_CONSTANT_BYTES` applies). The root contract is silent on creators specifically — noted so test authors don't treat the warning as a bug.
 
 ## Test strategy
 
@@ -117,4 +116,4 @@ Siblings: `../ops/`, `../core/`, `../ir/` (read-only from here — ops-contract 
 
 ## Status
 
-Architecture phase complete (stubs raise `NotImplementedError`): CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`, all `py_compile`-clean. Phase 2 fills bodies per the mapping table; `solve/tril/triu/cumsum` blocked on ops-contract additions (see conflicts).
+Architecture phase complete: CONTEXT.md, `_map.py`, 7 module skeletons + `__init__.py`. Phase 2 in progress: `shape.py` implemented — 1:1 forwards for `reshape`/`transpose`/`broadcast_to`/`concatenate`/`pad` (constant mode)/`tril`/`triu`; documented `ops.reshape`/`ops.slice`/`ops.concatenate` compositions for `expand_dims`/`squeeze`/`stack`/`split`; static validation with `ShapeError`/`TraceError` per the mapping table. Other modules land per the mapping table.
