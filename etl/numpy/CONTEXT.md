@@ -57,7 +57,7 @@ Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining m
 - **No new op kinds**: if a mapping needs an op that doesn't exist, defer the enp function (documented) — do not build workarounds out of existing ops.
 - **TraceError passthrough**: enp functions never catch errors; concrete-`Tensor` args raise `TraceError` exactly like ops.
 - **Files < ~1000 lines**; if a module grows, split along the routing-table boundaries.
-- **Architecture phase**: stub bodies `raise NotImplementedError` — algorithms land in Phase 2 via `subagent_manager`.
+- **Phase 2 in progress**: unimplemented module bodies raise `NotImplementedError` until their algorithms land (via `subagent_manager`); implemented modules build IR per the mapping table.
 
 ## Design decisions
 
