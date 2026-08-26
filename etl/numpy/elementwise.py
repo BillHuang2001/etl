@@ -108,8 +108,8 @@ def clip(a, a_min, a_max):
     """numpy.clip → ops.maximum(ops.minimum(a, a_max), a_min).
 
     None bounds skip that side (numpy semantics): a_min=None applies the
-    maximum bound only; a_max=None applies the minimum bound only. Both
-    bounds None raises ValueError (numpy parity).
+    upper bound only (minimum); a_max=None applies the lower bound only
+    (maximum). Both bounds None raises ValueError (numpy parity).
     """
     if a_min is None and a_max is None:
         raise ValueError(
@@ -117,9 +117,9 @@ def clip(a, a_min, a_max):
             "(both are None)"
         )
     if a_min is None:
-        return ops.maximum(a, a_max)
+        return ops.minimum(a, a_max)
     if a_max is None:
-        return ops.minimum(a, a_min)
+        return ops.maximum(a, a_min)
     return ops.maximum(ops.minimum(a, a_max), a_min)
 
 

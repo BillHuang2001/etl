@@ -49,17 +49,27 @@ def expand_dims(a, axis):
     """numpy.expand_dims → ops.reshape with size-1 dims inserted at axis.
 
     axis may be an int (negative normalized at trace time) or a tuple of
-    ints (repeated expansion in ascending order).
+    ints; each tuple entry is normalized against the FINAL ndim
+    (rank + len(tuple)), sorted, and inserted in ascending order.
+    Repeated (duplicate) axes raise ShapeError (numpy parity).
     """
     rank = len(a.shape)
     if isinstance(axis, tuple):
-        axes = sorted(ax + rank + 1 if ax < 0 else ax for ax in axis)
+        out_ndim = rank + len(axis)
+        axes = sorted(ax + out_ndim if ax < 0 else ax for ax in axis)
     else:
-        axes = [axis + rank + 1 if axis < 0 else axis]
+        out_ndim = rank + 1
+        axes = [axis + out_ndim if axis < 0 else axis]
     for ax in axes:
-        if ax < 0 or ax > rank:
+        if ax < 0 or ax >= out_ndim:
             raise core.ShapeError(
-                f"enp.expand_dims: axis {ax} out of range for rank {rank}"
+                f"enp.expand_dims: axis {ax} out of range for final ndim {out_ndim}"
+            )
+    for prev, ax in zip(axes, axes[1:]):
+        if prev == ax:
+            raise core.ShapeError(
+                f"enp.expand_dims: repeated axis {ax} — each axis may be "
+                "expanded only once"
             )
     new_shape = list(a.shape)
     for ax in axes:
@@ -176,6 +186,11 @@ def pad(a, pad_width, mode="constant", constant_values=0):
 
     v1: only mode="constant" (with constant_values); other modes raise
     NotImplementedError (deferred to v2 — see CONTEXT.md).
+
+    pad_width forms: int (symmetric on all axes); per-axis sequence of ints
+    or (before, after) pairs; length-1 (before, after) pair (broadcast to
+    all axes); bare (before, after) pair on a rank-1 array (pads axis 0,
+    numpy parity).
     """
     if mode != "constant":
         raise NotImplementedError(
@@ -197,6 +212,10 @@ def pad(a, pad_width, mode="constant", constant_values=0):
             config = (entries[0],) * rank
         elif len(entries) == rank:
             config = entries
+        elif rank == 1 and _is_pair(entries):
+            # numpy parity: a bare (before, after) pair on a rank-1 array
+            # pads the sole axis.
+            config = (entries,)
         else:
             raise core.ShapeError(
                 f"enp.pad: pad_width has {len(entries)} entries but rank is "

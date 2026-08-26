@@ -34,12 +34,12 @@ Re-exported from `__init__.py` (exact names; all implemented as sugar over `etl.
 | `reshape(a, shape)` | `ops.reshape(a, shape)` | one `-1` allowed (ops resolves it); numpy `order` kwarg unsupported |
 | `transpose(a, axes=None)` | `ops.transpose(a, axes)` | `axes=None` → reversed axes (handled by ops) |
 | `broadcast_to(a, shape)` | `ops.broadcast(a, shape)` | |
-| `expand_dims(a, axis)` | `ops.reshape(a, shape_with_inserted_1s)` | int (negative normalized by rank+1) or tuple (normalized, sorted, inserted ascending) |
+| `expand_dims(a, axis)` | `ops.reshape(a, shape_with_inserted_1s)` | int (negative normalized at trace time) or tuple (each entry normalized against the FINAL ndim = rank + len(tuple), sorted, inserted ascending; repeated axes → `ShapeError`) |
 | `squeeze(a, axis=None)` | `ops.reshape(a, shape_without_1s)` | dropped dims must be statically size-1 (plain Python int `== 1`) at trace time; explicit axis on a symbolic/unknown dim → `TraceError`; `axis=None` keeps symbolic dims (only statically-1 dropped) |
 | `concatenate(arrays, axis=0)` | `ops.concatenate(arrays, axis=axis)` | arrays: list/tuple of SymbolicTensors |
 | `stack(arrays, axis=0)` | `expand_dims(each, axis)` + `concatenate(axis)` | |
 | `split(a, indices_or_sections, axis=0)` | composition of `ops.slice` | int sections resolved statically at trace time (divisibility checked → `ShapeError`; symbolic axis dim → `TraceError`); list form requires strictly increasing ints within `[0, size]` |
-| `pad(a, pad_width, mode="constant", constant_values=0)` | `ops.pad(a, config, value=constant_values)` | v1: only `mode="constant"`; other modes raise `NotImplementedError`. `pad_width` int (all-axes symmetric) / per-axis seq / length-1 `(before, after)` pair (broadcast) → ops `config` |
+| `pad(a, pad_width, mode="constant", constant_values=0)` | `ops.pad(a, config, value=constant_values)` | v1: only `mode="constant"`; other modes raise `NotImplementedError`. `pad_width` int (all-axes symmetric) / per-axis seq / length-1 `(before, after)` pair (broadcast) / bare `(before, after)` pair on a rank-1 tensor (pads axis 0, numpy parity) → ops `config` |
 | `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | implemented — ops.linalg publishes them |
 | `sum/mean/prod/max/min(a, axis=None, keepdims=False)` | `ops.sum/mean/prod/max/min(a, axes=axis, keepdims=keepdims)` | `axis=None` → `axes=None` = all axes (ops normalizes); `dtype≠None` (sum/mean/prod only) composes `ops.cast(result, dtype)` AFTER the reduction |
 | `argmax/argmin(a, axis=None, keepdims=False)` | `ops.argmax/argmin(a, axis=axis, keepdims=keepdims)` | `axis` singular (ops signature) |
@@ -74,7 +74,6 @@ Re-exported from `__init__.py` (exact names; all implemented as sugar over `etl.
 ## Known deviations from numpy (v1, intentional — fail loudly, never silently)
 
 - `split` list indices must be strictly increasing and within `[0, size]` — numpy clips out-of-range indices and sorts; enp raises `ShapeError`.
-- `expand_dims` with a tuple containing negative axes normalizes each entry independently (ascending insertion) — exotic negative-tuple orders may differ from numpy.
 - `pad` with a length-1 sequence of a bare int (e.g. `[2]` on rank 2) raises `ShapeError` — numpy pads only the first axis; use the int form (`pad(a, 2)`) for all-axes symmetric padding.
 - `clip` with both bounds `None` raises `ValueError` (numpy parity).
 - `cumsum(axis=None)` computes numel as a `DimExpr` product; with symbolic dims the flatten is symbolic (ops resolves at runtime).
