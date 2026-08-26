@@ -132,6 +132,22 @@ position=None)`, `set_terminator(block, op_name, ...)`,
 metadata=None)`. The frontend `ops` module obtains the active builder from
 `trace.current_builder()`; ALL IR mutation funnels through Builder.
 
+**Implementation notes (binding for `verify` agreement):** result types
+resolve in order — explicit `result_types` → `OpDef.shape_fn` → op-specific
+rules (`constant`: dtype/shape from the payload; `call`: callee output
+signature; `if`: operand types of both branches' `return` terminators, which
+must agree; `runtime_call`/`block_call`: `result_specs` entries — `ValueType`
+| core `TensorSpec` | `{"dtype", "shape"}` dict — converted to `ValueType`);
+anything else with `shape_fn=None` demands explicit types. `ShapeError` from a
+`shape_fn` propagates unchanged. Attributes are validated eagerly against the
+schema (unknown keys / missing required / wrong tag → `VerificationError`),
+stored as a copy with defaults applied: `dtype` values normalize to the
+dtype-name string, sequence tags normalize to tuples, `int` tags accept `None`
+only where the spec's `default is None`. Region count must equal
+`OpDef.regions` exactly. `set_terminator` appends (last by construction),
+never uses the insertion point, and rejects non-terminator names and blocks
+that already have a terminator.
+
 ## verify(module)
 
 First-violation-wins, `VerificationError` with source location when available.
@@ -165,8 +181,8 @@ in `printer.py`.
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
 - Architecture phase: data structures, registry, shape-inference hooks
-  (`inference.py`, 23 hooks), and `pretty_print` are implemented; the
-  remaining behavioral bodies (`Builder`, `verify`,
+  (`inference.py`, 23 hooks), `pretty_print`, and the `Builder` are
+  implemented; the remaining behavioral bodies (`verify`,
   `serialize_module/deserialize_module`) raise `NotImplementedError` —
   Phase 2 (implementation) fills them.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
@@ -192,7 +208,7 @@ in `printer.py`.
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
 | `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
-| `./builder.py` | Op-construction API (stub) |
+| `./builder.py` | Op-construction API (implemented) |
 | `./verify.py` | Structural/type/attribute verification (stub) |
 | `./serialize.py` | IR payload serialization (stub) |
 | `./printer.py` | SSA text printing (implemented) |
@@ -214,6 +230,6 @@ terminators). CPU only.
 ## Status
 
 Phase 2 in progress: SSA data model, op registry (75 ops), shape-inference
-hooks (`inference.py`, 23 hooks), and `pretty_print` are implemented. The
-remaining behavioral bodies (Builder, verify, serialize) are
+hooks (`inference.py`, 23 hooks), `pretty_print`, and the `Builder` are
+implemented. The remaining behavioral bodies (verify, serialize) are
 `NotImplementedError` stubs being filled by Phase 2 (delegated to a Manager).
