@@ -18,8 +18,9 @@ still ``verify``'s job):
   ``shape_fn`` → op-specific resolution (``constant``/``call``/``if``/
   ``runtime_call``/``block_call`` — see ``inference.py``), else
   ``VerificationError`` demanding explicit types;
-* a ``ShapeError`` raised by a ``shape_fn`` propagates unchanged (it is a
-  precise inference failure, not a structural violation).
+* a ``ShapeError`` raised by a ``shape_fn`` propagates with the op's source
+  location appended to its message (when a real location is known) — it is a
+  precise inference failure, not a structural violation.
 
 Attribute-validation details (binding for ``verify``'s agreement checks):
 
@@ -46,7 +47,15 @@ from typing import Any, Optional
 
 import numpy as np
 
-from etl.core import DTypeError, Dim, DimExpr, TensorSpec, VerificationError, dtype
+from etl.core import (
+    DTypeError,
+    Dim,
+    DimExpr,
+    ShapeError,
+    TensorSpec,
+    VerificationError,
+    dtype,
+)
 
 from .block import Block
 from .function import Function
@@ -452,10 +461,13 @@ class Builder:
         attrs: dict[str, Any],
         regions: tuple[Region, ...],
         explicit: tuple[ValueType, ...] | None,
+        location: Location | None,
     ) -> tuple[ValueType, ...]:
         """Resolve result types: explicit → shape_fn → op-specific → error.
 
-        A ``ShapeError`` raised by a ``shape_fn`` propagates unchanged.
+        A ``ShapeError`` raised by a ``shape_fn`` propagates with the op's
+        source location appended to its message (when a real location is
+        known — never for ``Location.unknown()``).
         """
         if explicit is not None:
             types = tuple(explicit)
@@ -467,7 +479,18 @@ class Builder:
             return types
         if definition.shape_fn is not None:
             input_types = tuple(operand.type for operand in operands)
-            return tuple(definition.shape_fn(input_types, attrs))
+            try:
+                return tuple(definition.shape_fn(input_types, attrs))
+            except ShapeError as exc:
+                if (
+                    location is not None
+                    and location.line > 0
+                    and location.file != "<unknown>"
+                ):
+                    suffix = f" (at {location})"
+                    if suffix not in exc.args[0]:
+                        exc.args = (f"{exc.args[0]}{suffix}",) + exc.args[1:]
+                raise
         if op_name == "constant":
             return (self._constant_result_type(attrs),)
         if op_name == "call":
@@ -622,7 +645,7 @@ class Builder:
             )
         attrs = self._validate_attributes(definition, attributes)
         resolved = self._resolve_result_types(
-            definition, op_name, ops, attrs, regs, result_types
+            definition, op_name, ops, attrs, regs, result_types, location
         )
         if (
             isinstance(definition.result_count, int)
