@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from ..effects import EFFECT_PURE
 from ..inference import (
+    infer_abs,
     infer_cast,
     infer_compare,
     infer_elementwise_binary,
@@ -36,7 +37,6 @@ _BINARY_OPS = {
 }
 
 _UNARY_OPS = {
-    "abs": "Elementwise absolute value.",
     "negate": "Elementwise negation.",
     "square": "Elementwise square.",
     "sqrt": "Elementwise square root.",
@@ -95,6 +95,20 @@ def _register_unary() -> None:
         )
 
 
+def _register_abs() -> None:
+    register_opdef(
+        OpDef(
+            name="abs",
+            category=_CATEGORY,
+            description="Elementwise absolute value (numpy magnitude semantics).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            shape_fn=infer_abs,
+        )
+    )
+
+
 def _register_cast() -> None:
     register_opdef(
         OpDef(
@@ -133,5 +147,6 @@ def _register_comparisons() -> None:
 
 _register_binary()
 _register_unary()
+_register_abs()
 _register_cast()
 _register_comparisons()
