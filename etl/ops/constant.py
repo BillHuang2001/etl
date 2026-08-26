@@ -14,8 +14,12 @@
 """
 from __future__ import annotations
 
+import itertools
 import os
-from typing import Tuple, Union
+import warnings
+from typing import Callable, Dict, Optional, Tuple, Union
+
+import numpy as np
 
 from etl import core
 from etl import ir
@@ -42,6 +46,58 @@ def _large_constant_bytes() -> int:
 ETL_LARGE_CONSTANT_BYTES: int = _large_constant_bytes()
 
 
+# --- runtime callback registry (internal) -----------------------------------
+#
+# IR attributes must serialize, so ``runtime_call`` carries its callback as a
+# JSON-safe STRING attribute — a registered identifier. This module-level
+# registry maps ids back to the Python callables. Internal contract: the
+# numpy interpreter backend resolves the op's ``callback`` attribute through
+# ``_get_callback`` at run time; backends that cannot represent callbacks
+# reject the op with ``BackendError`` (never silently drop or reorder it).
+_CALLBACKS: Dict[str, Callable] = {}
+_CALLBACK_IDS: Dict[int, str] = {}  # id(callback) -> registered id (dedupe)
+_ID_COUNTER = itertools.count()
+
+
+def _register_callback(callback: Callable) -> str:
+    """Register ``callback`` and return its stable string identifier.
+
+    The same callback object (identity) reuses its id, so repeated
+    ``runtime_call``s with one callable share a single registry entry.
+    """
+    key = id(callback)
+    callback_id = _CALLBACK_IDS.get(key)
+    if callback_id is None:
+        callback_id = f"callback_{next(_ID_COUNTER)}"
+        _CALLBACK_IDS[key] = callback_id
+        _CALLBACKS[callback_id] = callback
+    return callback_id
+
+
+def _get_callback(callback_id: str) -> Optional[Callable]:
+    """The callable registered under ``callback_id`` (``None`` if unknown).
+
+    Internal contract: the numpy interpreter backend uses this lookup to
+    resolve the ``runtime_call`` op's string attribute at run time.
+    """
+    return _CALLBACKS.get(callback_id)
+
+
+def _wrap_result(op, loc) -> "core.SymbolicTensor":
+    """Wrap an op's single result value in a ``SymbolicTensor``.
+
+    The dtype/shape are READ BACK from the IR value's inferred type (never
+    recomputed frontend-side) so the wrapper always agrees with ``ir.verify``.
+    """
+    result = op.result
+    return core.SymbolicTensor(
+        value=result,
+        dtype=result.type.dtype,
+        shape=result.type.shape,
+        location=loc,
+    )
+
+
 def constant(tensor) -> "core.SymbolicTensor":
     """Embed a concrete ``Tensor`` into the graph as a Constant op.
 
@@ -66,7 +122,36 @@ def constant(tensor) -> "core.SymbolicTensor":
         core.TraceError: no active trace; ``tensor`` is a
             ``SymbolicTensor`` (already a graph value) or not a ``Tensor``.
     """
-    raise NotImplementedError
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    if isinstance(tensor, core.SymbolicTensor):
+        raise core.TraceError(
+            "etl.constant expects a concrete Tensor to embed, got a "
+            "SymbolicTensor — it is already a graph value: pass it directly "
+            "to ops instead of embedding it"
+        )
+    if not isinstance(tensor, core.Tensor):
+        raise core.TraceError(
+            f"etl.constant expects a concrete core.Tensor, got "
+            f"{type(tensor).__name__} — only concrete tensor data can be "
+            "embedded into a graph"
+        )
+    # SNAPSHOT the data: copy the underlying buffer so later mutation of the
+    # source tensor cannot change the graph.
+    payload = np.array(tensor.numpy(), copy=True)
+    if payload.nbytes > ETL_LARGE_CONSTANT_BYTES:
+        warnings.warn(
+            f"Embedding a tensor of {payload.nbytes} bytes as a graph "
+            f"constant (threshold {ETL_LARGE_CONSTANT_BYTES} bytes, set via "
+            "ETL_LARGE_CONSTANT_BYTES); prefer passing it as an explicit "
+            "input instead.",
+            UserWarning,
+            stacklevel=2,
+        )
+    op = builder.create(
+        "constant", attributes={"value": payload}, location=loc
+    )
+    return _wrap_result(op, loc)
 
 
 def constant_like(value, tensor) -> "core.SymbolicTensor":
@@ -85,7 +170,19 @@ def constant_like(value, tensor) -> "core.SymbolicTensor":
     Returns:
         0-d ``SymbolicTensor`` constant.
     """
-    raise NotImplementedError
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    if not isinstance(tensor, core.SymbolicTensor):
+        raise TypeError(
+            f"constant_like expects a SymbolicTensor, got "
+            f"{type(tensor).__name__}"
+        )
+    dtype = _utils.weak_scalar_dtype(value, tensor.dtype)
+    payload = np.asarray(value, dtype=dtype)
+    op = builder.create(
+        "constant", attributes={"value": payload}, location=loc
+    )
+    return _wrap_result(op, loc)
 
 
 def runtime_call(callback, *operands, result) -> Union[
@@ -114,7 +211,60 @@ def runtime_call(callback, *operands, result) -> Union[
         core.TraceError: no active trace; concrete ``Tensor`` operand.
         TypeError: ``result`` is not a TensorSpec or tuple of TensorSpecs.
     """
-    raise NotImplementedError
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    if not callable(callback):
+        raise TypeError(
+            f"runtime_call: callback must be callable, got "
+            f"{type(callback).__name__}"
+        )
+    if isinstance(result, core.TensorSpec):
+        single = True
+        specs = (result,)
+    elif isinstance(result, (tuple, list)):
+        if not result or not all(
+            isinstance(spec, core.TensorSpec) for spec in result
+        ):
+            raise TypeError(
+                "runtime_call: result must be a TensorSpec or a non-empty "
+                "tuple/list of TensorSpecs"
+            )
+        single = False
+        specs = tuple(result)
+    else:
+        raise TypeError(
+            f"runtime_call: result must be a TensorSpec or a tuple/list of "
+            f"TensorSpecs, got {type(result).__name__}"
+        )
+    callback_id = _register_callback(callback)
+    # The IR requires result_specs to be a sequence of ValueType instances
+    # EXACTLY equal to the op's result types (ir.verify enforces this).
+    result_specs = tuple(
+        ir.ValueType(dtype=spec.dtype, shape=tuple(spec.shape))
+        for spec in specs
+    )
+    op_operands = tuple(
+        _utils.as_operand(operand, location=loc).value for operand in operands
+    )
+    op = builder.create(
+        "runtime_call",
+        operands=op_operands,
+        attributes={
+            "callback": callback_id,
+            "result_specs": result_specs,
+        },
+        location=loc,
+    )
+    results = tuple(
+        core.SymbolicTensor(
+            value=value,
+            dtype=value.type.dtype,
+            shape=value.type.shape,
+            location=loc,
+        )
+        for value in op.results
+    )
+    return results[0] if single else results
 
 
 def stop_gradient(x) -> "core.SymbolicTensor":
@@ -133,4 +283,17 @@ def stop_gradient(x) -> "core.SymbolicTensor":
     Returns:
         ``SymbolicTensor`` identical in shape and dtype to ``x``.
     """
-    raise NotImplementedError
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    x_sym = _utils.as_operand(x, location=loc)
+    op = builder.create(
+        "stop_gradient", operands=(x_sym.value,), location=loc
+    )
+    return _wrap_result(op, loc)
+
+
+# Register the ``etl.constant`` builder hook at import time: ``core.constant``
+# (the public ``etl.constant`` entry point) delegates to this module's
+# ``constant`` so it can build the Constant op without ``core`` importing
+# ``ops`` (import acyclicity; see ``core.symbolic.register_constant_builder``).
+core.register_constant_builder(constant)

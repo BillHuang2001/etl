@@ -153,7 +153,11 @@ signature; `if`: operand types of both branches' `return` terminators, which
 must agree; `runtime_call`/`block_call`: `result_specs` entries — `ValueType`
 | core `TensorSpec` | `{"dtype", "shape"}` dict — converted to `ValueType`);
 anything else with `shape_fn=None` demands explicit types. `ShapeError` from a
-`shape_fn` propagates unchanged. Attributes are validated eagerly against the
+`shape_fn` propagates unchanged. NOTE: the `result_specs` conversion applies
+to result-TYPE RESOLUTION only — the stored attribute is NOT rewritten, and
+`verify` requires the stored `result_specs` to be a sequence of `ValueType`
+instances. Frontends must pass `ValueType`s (not `TensorSpec`/dict entries)
+to pass verification. Attributes are validated eagerly against the
 schema (unknown keys / missing required / wrong tag → `VerificationError`),
 stored as a copy with defaults applied: `dtype` values normalize to the
 dtype-name string, sequence tags normalize to tuples, `int` tags accept `None`
@@ -238,6 +242,25 @@ cases); `verify()` invariants
 (shapes with symbolic dims, constants as base64 npy, tamper detection, version
 rejection); `pretty_print` golden output; Builder wiring (uses, ids, regions,
 terminators). CPU only.
+
+## Known Issues
+
+- **ops-binding inference conflicts (coordinate when `../ops` lands):** the
+  registry registers `divide` with `infer_elementwise_binary` (plain
+  `np.result_type` — int/int stays int) and all unary math ops (`sqrt`,
+  `exp`, `log`, `log1p`, `sin`, `cos`, `tan`, `tanh`, `sigmoid`, `relu`,
+  `gelu`, `erf`) with `infer_elementwise_unary` (dtype-preserving). The
+  `../ops` binding contract requires true division (int/bool → float64) and
+  int/bool → float64 promotion for unary math ops; `cumsum` uses
+  `infer_identity` but the ops contract requires bool → int64. Fix in
+  `inference.py` + `op_defs/` with dedicated hooks (`infer_true_divide`,
+  `infer_unary_math`, `infer_cumsum`).
+- Builder attribute schema is stricter than inference in two places:
+  `pad.padding_config` (ATTR_NESTED_INTS) requires `(lo, hi)` PAIR entries
+  (bare int entries fail `VerificationError`, though `infer_pad` accepts
+  them); `slice.limit_indices` is schema-required and can be neither `None`
+  nor contain `None` entries (the None-limit branch of `infer_slice` is
+  unreachable via the Builder).
 
 ## Status
 

@@ -8,7 +8,7 @@ The frontend tensor-operation namespace: every numerical op that can appear in a
 
 1. **Operands.** `SymbolicTensor` or Python scalars (`bool`/`int`/`float`/`complex`), the latter auto-promoted to 0-d Constant ops (transparent sugar) via `_utils.as_operand`. A concrete `Tensor` operand → `core.TraceError` with the mandated three-option message: (1) make it an explicit input, (2) embed explicitly with `etl.constant`, (3) etl has no eager mode — use `etl.evaluate`. Any other operand kind (list, ndarray, str, None) → `TypeError`. At least one operand of a binary op must be a `SymbolicTensor`.
 2. **Trace requirement.** Every op calls `_utils.check_in_trace()` FIRST; no active trace → `core.TraceError` mentioning `etl.trace` / `@etl.defn` / `etl.evaluate`.
-3. **Construction.** Build via `builder.create(op_name, ...)` on the active builder; op names, arities, attrs, and effects are declared in `_opdefs.py`. Attach a call-site `Location` (`_utils.get_location`) to every op; env `ETL_DISABLE_LOCATIONS=1` disables capture (then `ir.Location.unknown()`).
+3. **Construction.** Build via `builder.create(op_name, ...)` on the active builder; op names, arities, attrs, and effects are declared in `etl.ir`'s op registry (the canonical table — `ops` keeps no parallel op-definition table; `_opdefs.py` is deleted). Attach a call-site `Location` (`_utils.get_location`) to every op; env `ETL_DISABLE_LOCATIONS=1` disables capture (then `ir.Location.unknown()`).
 4. **Results.** Wrap the IR result value in `core.SymbolicTensor(value=..., dtype=..., shape=..., location=...)`. Shape is always statically computed (`DimExpr` arithmetic) at build time; runtime numpy enforces exact semantics.
 5. **Static values.** All non-tensor parameters (axes, shapes, padding, `k`, dtype, callback) are static Python values that specialize the graph. Changing one = a different op; no hidden guards.
 6. **Sugar rule.** `sum`/`max`/`min`/`mean`/`prod` are documented shorthand for `reduce_*` with the same kwargs — nothing else is sugar.
@@ -39,7 +39,7 @@ Reductions: `_utils.normalize_axes` (None=all, negatives shifted, sorted, dedupe
 
 ## IR op definitions (ownership decision — binding)
 
-The generic SSA machinery and the op **registry** live in `etl.ir`; the frontend **dialect** (which ops exist, their arities/attrs/effects) is declared in `_opdefs.py` here in `ops` — `ir` must not import `ops` (layering `core ← ir ← ops`). `_opdefs.register_all()` (stub) will register all entries into `ir`'s registry at ops import time during the implementation phase, once `etl/ir/CONTEXT.md` fixes its registration API. **Effect policy:** all frontend ops are `pure` except `runtime_call` (`callback`). Ops are functional SSA dataflow (`scatter`/`constant`/`pad` produce new values, no `write` effect); `write`/`read`/`collective` kinds are reserved for other layers (e.g. `dist`).
+The generic SSA machinery and the op **registry** live in `etl.ir`, and the canonical op-definition table (which ops exist, their arities/attrs/effects) lives there too — `ir` must not import `ops` (layering `core ← ir ← ops`), and `ops` must NOT maintain a parallel table (`_opdefs.py` was deleted as superseded; `Builder.create` validates against `ir.opdef()`). Any missing arity/attr spec is fixed in `ir`, not duplicated here. **Effect policy:** all frontend ops are `pure` except `runtime_call` (`callback`). Ops are functional SSA dataflow (`scatter`/`constant`/`pad` produce new values, no `write` effect); `write`/`read`/`collective` kinds are reserved for other layers (e.g. `dist`).
 
 ## Error semantics
 
@@ -57,7 +57,6 @@ The generic SSA machinery and the op **registry** live in `etl.ir`; the frontend
 | `reductions.py` | `reduce_sum reduce_max reduce_min reduce_mean reduce_prod sum max min mean prod argmax argmin` |
 | `linalg.py` | `dot conv tril triu cumsum solve` |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `ETL_LARGE_CONSTANT_BYTES`, `constant_like`) |
-| `_opdefs.py` | `OpDef` dataclass, `OPDEFS` dialect table, `register_all` (stub) |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
 
 Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, TensorSpec, register_operator_handlers hook), `../ir/` (Builder, Location, Value, op registry — sibling, read-only: expectations are listed below), `../trace/` (`current_builder` ONLY — never import anything else), `../../tests/ops/` (test suite — sibling, read-only; escalate test writes to root).
@@ -65,8 +64,8 @@ Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, 
 ## Cross-module expectations (what ops REQUIRES — coordinate at implementation time)
 
 - `core.register_operator_handlers(kind, handler)` (per-kind, idempotent); `SymbolicTensor` fields `value`/`dtype`/`shape`/`location`; `SymbolicTensor` dunders delegate to the registered hooks and reflected calls pass the tensor as first argument.
-- `ir.Builder.create(name, operands=..., attrs=...)` validating against registered opdefs; `ir.Location` constructible with `file=`/`line=` + an `unknown()` sentinel; `ir` registry lookup `ir.opdef(name)`; an ir-side registration API for `_opdefs.register_all()`.
-- `trace.current_builder()` returning `None` outside traces. `trace` must NEVER import `ops` (strict one-way dependency).
+- `ir.Builder.create(name, operands=..., attributes=...)` (kwarg is `attributes`, NOT `attrs`) validating against the canonical registered opdefs (`ir.opdef(name)`); result types are READ BACK from `op.result.type` (dtype/shape) — `ops` never passes explicit `result_types`, so `ir.verify`'s shape_fn agreement always holds. `ir.Location` constructible with `file=`/`line=`/`col=` + an `unknown()` sentinel. The canonical op-definition table lives in `etl.ir` — `ops` consumes it, never duplicates it.
+- `trace.current_builder()` RAISES `core.TraceError` (with the directing message) outside traces — `check_in_trace` simply delegates. `trace` must NEVER import `ops` (strict one-way dependency).
 
 ## Constraints
 
@@ -78,11 +77,13 @@ Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, 
 
 ## Test strategy
 
-Mirror in `../../tests/ops/`: `test_elementwise.py`, `test_comparison.py`, `test_indexing.py`, `test_reductions.py`, `test_linalg.py`, `test_constant.py`, `test_opdefs.py`, `test_operator_handlers.py`, `test_utils.py`. Cover: scalar promotion incl. NEP-50 weak cases (int+float32→float32, float+float32→float64, float+complex64→complex64); TraceError for Tensor operands / no-trace / symbolic getitem; symbolic broadcasting (`DimExpr.max`, static int-vs-int ShapeError); per-op dtype rules; opdef table ↔ `__all__` 1:1 coverage; handler registration completeness; location capture + `ETL_DISABLE_LOCATIONS=1`; constant warning threshold; runtime_call effect annotation. CPU only.
+Mirror in `../../tests/ops/`: `test_elementwise.py`, `test_comparison.py`, `test_indexing.py`, `test_reductions.py`, `test_linalg.py`, `test_constant.py`, `test_operator_handlers.py`, `test_utils.py` (opdef coverage lives in `../../tests/ir/` — the registry is owned by `ir`). Cover: scalar promotion incl. NEP-50 weak cases (int+float32→float32, float+float32→float64, float+complex64→complex64); TraceError for Tensor operands / no-trace / symbolic getitem; symbolic broadcasting (`DimExpr.max`, static int-vs-int ShapeError); per-op dtype rules; handler registration completeness; location capture + `ETL_DISABLE_LOCATIONS=1`; constant warning threshold; runtime_call effect annotation. CPU only.
 
 ## Notes for agents
 
-- Stub bodies currently `raise NotImplementedError` — this node is Phase-1 architecture only; implementation is delegated to a Manager during Phase 2.
-- Sibling modules (`core`/`ir`/`trace`) are also mid-architecture; `import etl.ops` fails until they land. Validate with `python3 -m py_compile etl/ops/*.py`.
-- When implementing, keep docstrings authoritative — they ARE the per-op contract (dtype rule, shape rule, errors). Update `_opdefs.py` in the same change as any signature change.
+- Implementation status: all op bodies are implemented (no stubs). `etl.ops` imports cleanly and builds verifiable, serializable IR against `etl.ir`; validate with `python3 -c "import etl"`.
+- **Semantic composition compensations (do NOT "clean up")**: the canonical `etl.ir` inference hooks are generic (plain `np.result_type`, dtype-preserving unary, identity cumsum, equality-only dot k), so `ops` achieves its documented dtype/shape rules by composing explicit primitive ops — this is sanctioned transparent sugar, not a bug: `divide` pre-casts integral-promoted operands to float64 (true division); unary math pre-casts int/bool → float64; `cumsum` pre-casts bool → int64; `abs` of complex post-casts to the real magnitude dtype; `dot` inserts a `broadcast` op when one k dim is 1 and the other is not. If the parent later adds dedicated inference hooks (`infer_true_divide`/`infer_unary_math`/`infer_cumsum`/1-aware dot k), these compositions may be removed — but only when `etl/ir` registers them (the numpy backend kernel must agree on either form).
+- `runtime_call` carries the callback as a JSON-safe registered-id STRING: `constant.py` keeps a module-level `_CALLBACKS` registry + `_get_callback(id)` (documented for the future numpy backend, which executes callbacks). Its `result_specs` attr MUST be a tuple of `ir.types.ValueType` instances (converted from user TensorSpecs) — `ir.verify` requires ValueType entries exactly equal to the result types.
+- `etl.trace.trace` (the high-level tracer) is not implemented yet; graphs are built via the hand-rolled pattern: `mod = ir.Module(); b = ir.Builder(mod); b.build_function("main", (ir.types.ValueType(dtype, shape), ...))`; wrap block-argument `Value`s in `core.SymbolicTensor`; call ops inside `with trace.builder.with_builder(b):`; finish with `b.set_terminator(b.current_block, "return", operands=(...))`; then `ir.verify(mod)` + `ir.serialize_module/deserialize_module`.
+- Docstrings are authoritative — they ARE the per-op contract (dtype rule, shape rule, errors). Op signatures are mirrored by the opdefs in `etl.ir`'s registry — any signature change must update the matching `ir` opdef in the same change (never a parallel table here).
 - `constant_like` is internal (scalar-promotion helper); `getitem` is internal-but-registered; both intentionally excluded from `__all__`.

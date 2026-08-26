@@ -6,7 +6,7 @@ Graph-time, explicit collective operations under the SPMD local-tensor model (ro
 
 - **`Group`** — static, named sets of ranks a collective operates over,
 - **the six collectives** — frontend functions that each build ONE IR op with effect kind `collective` into the active trace builder (same discipline as `etl/ops`: `trace.current_builder()` hook, SymbolicTensor-in / SymbolicTensor-out, `TraceError` on concrete tensors / outside a trace),
-- **`rank()` / `world_size()`** — scalar int32 graph values resolved from the runtime execution context by backends,
+- **`rank()` / `world_size()`** — scalar int64 graph values (effect `read`) resolved from the runtime execution context by backends,
 - **the collective-executor hook** (`set/get_collective_executor`).
 
 `dist` performs **no concrete computation** (no eager numerical duplication — root principle 9): the default single-process identity executor lives in the numpy backend and is installed via the hook at backend import time.
@@ -30,8 +30,8 @@ broadcast(tensor, src_rank=0, group=None) -> SymbolicTensor
 collective_permute(tensor, source_target_pairs, group=None) -> SymbolicTensor
 
 # execution context + executor hook (context.py)
-rank() -> SymbolicTensor             # scalar int32, shape ()
-world_size() -> SymbolicTensor       # scalar int32, shape ()
+rank() -> SymbolicTensor             # scalar int64, shape ()
+world_size() -> SymbolicTensor       # scalar int64, shape ()
 RankContext(rank: int, world_size: int)     # frozen dataclass, validated
 set_collective_executor(executor | None) -> None
 get_collective_executor() -> CollectiveExecutor
@@ -41,7 +41,7 @@ get_collective_executor() -> CollectiveExecutor
 
 - Groups are **static Python values** (value model, root CONTEXT.md): resolved at trace time, they specialize the graph. Immutable + hashable; equality over `(name, ranks, backend)`; treat as frozen after construction.
 - `ranks` is validated at construction: non-empty, unique, non-negative ints (bools rejected) → `ValueError`. `ranks=None` ⇔ the **world group** (`WORLD_GROUP`, name `"world"`): all ranks of the runtime execution context — membership only known at run time. `Group.size(world_size)` resolves it.
-- Collective ops record the group in attributes **by name + ranks** (`group_name` + `group_ranks`, `None` for world) — serialization is self-describing, no Python objects in artifacts.
+- Collective ops record the group in attributes **by name + size** (`group: str` + `group_size: int | None`, `None` for world) — serialization is self-describing, no Python objects in artifacts.
 - **Coordination:** `etl/trace` static-value snapshotting must handle `Group` by duck-typing its `name`/`ranks`/`backend` attributes — trace MUST NOT import dist (dist imports trace; a trace→dist import would cycle).
 
 ## Local-shape semantics (worked examples)
@@ -68,33 +68,46 @@ Shape rules (explicit groups → trace-time DimExpr arithmetic; world group → 
 
 ## IR op attribute layout (coordination with etl/ir)
 
-`etl/ir` must register these op defs. All collectives: effect kind **`collective`**, 1 operand, 1 result, and always carry `group_name: str` + `group_ranks: tuple[int, ...] | None` attrs.
+Canonical op defs live in `etl/ir/op_defs/collective.py` — **the registry wins over this file**. Op names have NO `dist.` prefix. All six communication collectives: effect kind **`collective`**, 1 operand, 1 result, and always carry `group: str` (required) + `group_size: int | None` (required — `None` for the world group).
 
 | ir op name | extra attrs | result shape |
 |---|---|---|
-| `dist.all_reduce` | `reduction: str` ("sum"\|"max"\|"min"\|"prod") | same local shape/dtype |
-| `dist.all_gather` | `axis: int` | axis dim × group size (or `None`) |
-| `dist.reduce_scatter` | `reduction: str`, `axis: int` | axis dim ÷ group size (or `None`) |
-| `dist.all_to_all` | `split_axis: int`, `concat_axis: int` | split dim ÷ g, concat dim × g (or `None`/`None`) |
-| `dist.broadcast` | `src_rank: int` | same local shape/dtype |
-| `dist.collective_permute` | `source_target_pairs: tuple[(int, int), ...]` | same local shape/dtype |
-| `dist.rank` | — | scalar int32, shape `()`, effect **`pure`** |
-| `dist.world_size` | — | scalar int32, shape `()`, effect **`pure`** |
+| `all_reduce` | `reduce_op: str` ("sum"\|"max"\|"min"\|"prod") | same local shape/dtype |
+| `all_gather` | `axis: int` (default 0) | axis dim × group size (or `None`) |
+| `reduce_scatter` | `reduce_op: str`, `axis: int` (default 0) | axis dim ÷ group size (or `None`) |
+| `all_to_all` | `split_axis: int`, `concat_axis: int` | split dim ÷ g, concat dim × g (or `None`/`None`) |
+| `broadcast_collective` | — (the shape op `broadcast` owns its name) | same local shape/dtype |
+| `collective_permute` | `source_target_pairs: tuple[(int, int), ...]` | same local shape/dtype |
+| `rank` | `group: str` (required — dist passes `"world"`) | scalar int64, shape `()` |
+| `world_size` | `group: str` (required — dist passes `"world"`) | scalar int64, shape `()` |
 
-`dist.rank` / `dist.world_size` are effect-`pure` (constant during one execution ⇒ safe to CSE) but backends MUST resolve them at run time from the execution context and MUST NOT constant-fold them at lower/compile time.
+`rank` / `world_size` carry effect **`read`** (not `pure`) — backends MUST resolve them at run time from the execution context and MUST NOT constant-fold them at lower/compile time.
+
+Result shapes come from the op defs' `shape_fn`s (`infer_identity`, `infer_all_gather`, `infer_reduce_scatter`, `infer_all_to_all`, `infer_scalar_int64` in `etl/ir/inference.py`) applied automatically by `Builder.create()` — dist reads result dtypes/shapes from the result value's type and never recomputes them. dist still performs its own explicit divisibility checks (reduce_scatter / all_to_all, static int dims, explicit groups) before building, for clear `ShapeError`s.
+
+**Known ir-side gaps (binding: do NOT patch ir from the dist node):**
+- `broadcast_collective` declares NO `src_rank` attr — dist validates `src_rank` (non-bool int ≥ 0; membership in explicit groups) and omits it from the attrs (extra attrs would fail verification).
+- The Builder's `ATTR_INT` check rejects `group_size=None` (the AttrSpecs lack `default=None`) even though the OpDef docstrings and `infer_*` support `None` — so world-group collectives currently fail with `VerificationError` at trace time. dist already passes `group="world"`, `group_size=None` (verified by spy-builder validation); the fix (AttrSpec `default=None` or relaxing the ATTR_INT check) belongs upstream in `etl/ir`. Until fixed, world-group tracing of the six collectives is blocked; `rank`/`world_size` are unaffected (no `group_size` attr).
 
 ## Collective executor hook contract
 
 ```
-CollectiveExecutor: (op_kind: str, tensor: Tensor, group: Group,
-                     params: Mapping[str, object], rank_context: RankContext) -> Tensor
+CollectiveExecutor (runtime_checkable Protocol, context.py) — one method per
+collective op (the numpy backend's SingleRankCollectiveExecutor structurally
+satisfies it):
+  all_reduce(tensor: Tensor, group: Group, op) -> Tensor
+  all_gather(tensor: Tensor, axis: int, group: Group) -> Tensor
+  reduce_scatter(tensor: Tensor, axis: int, group: Group) -> Tensor
+  all_to_all(tensor: Tensor, axis: int, group: Group) -> Tensor
+  broadcast(tensor: Tensor, src_rank: int, group: Group) -> Tensor
+  collective_permute(tensor: Tensor, mapping, group: Group) -> Tensor
 ```
 
-- `op_kind` ∈ `{"all_reduce", "all_gather", "reduce_scatter", "all_to_all", "broadcast", "collective_permute"}`.
-- `tensor`: the local concrete `Tensor`; `group`: the static `Group`; `params`: the op's attrs (`reduction`, `axis`, `split_axis`, `concat_axis`, `src_rank`, `source_target_pairs`); `rank_context`: `RankContext(rank, world_size)`.
+- `tensor`: the local concrete `Tensor`; `group` / `mapping` / `op` are graph-constant objects (the `dist.Group` descriptor / permutation mapping / reduction kind).
 - Returns the LOCAL result tensor. Executors may coordinate across ranks in-process (multi-rank simulation in tests) or delegate to a real transport.
-- Hook is process-global and starts **unset**: `get_collective_executor()` → `BackendError` ("no collective executor registered; load a backend that provides one (e.g. numpy_backend)"). `set_collective_executor(None)` resets.
-- **Coordination:** `etl/backends` (numpy) installs its default single-process identity executor at import — rank 0 / world size 1, every collective returns its input unchanged (`collective_permute` requires pairs ⊆ `{(0,0)}`, else `BackendError`). The numpy interpreter must also (a) resolve `dist.rank`/`dist.world_size` from its execution context (0/1 default), and (b) accept an optional execution-context override at run time so multi-rank tests can resolve the scalars per simulated rank.
+- `RankContext(rank, world_size)` is exported for multi-rank simulations; it is NOT part of the v1 protocol parameters.
+- Hook is process-global and starts **unset** (a clean `import etl` installs nothing): `get_collective_executor()` → `BackendError` ("no collective executor registered; load a backend that provides one (e.g. numpy_backend)"). `set_collective_executor(None)` resets; anything else that is not structurally a `CollectiveExecutor` raises `TypeError` (runtime-checkable).
+- **Coordination:** `etl/backends` (numpy) installs its default single-process identity executor at import (rank 0 / world size 1, every collective returns its input unchanged) — backend implementation phase. The numpy interpreter must also (a) resolve `rank`/`world_size` from its execution context (0/1 default), and (b) accept an optional execution-context override at run time so multi-rank tests can resolve the scalars per simulated rank.
 
 ## Error behavior
 
@@ -112,7 +125,7 @@ CollectiveExecutor: (op_kind: str, tensor: Tensor, group: Group,
 
 ## Constraints
 
-- **Imports:** `dist` imports `etl.core`, `etl.ir`, `etl.trace` only (root contract lists `core`/`ir`/`ops`; `trace` is used instead of `ops` for the same active-builder hook — collectives build IR directly, so `ops` adds nothing; importing `trace` is acyclic because trace imports only `core`/`ir`). No `backends`/`pipeline`/`persist` imports. `backends` may import `dist` (hook install); `trace` and `persist` must NOT (see Group coordination note — use duck typing).
+- **Imports:** `_op_utils.py` imports `etl.core`, `etl.ir`, and `etl.dist.group`; `collectives.py` / `context.py` import `_op_utils`, `etl.core`, and `from etl.trace import current_builder`. The trace import MUST be the direct submodule form — `from etl import trace` yields the trace *function* attribute (shadowed in `etl/__init__.py`), not the module. No `backends`/`pipeline`/`persist` imports. `backends` may import `dist` (hook install); `trace` and `persist` must NOT (see Group coordination note — use duck typing).
 - **No concrete computation in dist** — no numpy numerics; executor implementations live in backends (or tests).
 - **v1 collectives are single-tensor** (1 operand → 1 result); multi-tensor collectives are future extensions.
 - Files < ~1000 lines; new collectives = ir op def + frontend function + shape rule — the executor hook protocol stays unchanged.
@@ -123,7 +136,7 @@ pytest under `../tests/dist/` (sibling — read-only from here; escalate test wr
 
 - `test_group.py`: validation errors, equality/hash, world-group semantics, static-value-ness.
 - `test_collectives.py`: graph construction — op attrs (group name/ranks, params), effect kind `collective`, local shapes per the worked-examples table, `TraceError` on eager calls, world-group `None` dims.
-- `test_context.py`: `rank()`/`world_size()` scalar int32 ops; hook unset → `BackendError`; install/clear round-trip.
+- `test_context.py`: `rank()`/`world_size()` scalar int64 ops (effect `read`, attr `group="world"`); hook unset → `BackendError`; install/clear round-trip.
 - **Multi-rank simulation:** install a custom in-process executor; run the same executable once per simulated rank with distinct local inputs; the executor buffers contributions (keyed by op instance + group) until all ranks contributed, then computes numpy semantics. Assert all_gather concatenation, all_reduce sum/max/min/prod, reduce_scatter chunking, all_to_all transposition, broadcast, collective_permute routing, plus rank/world_size resolution per simulated rank.
 - Default numpy backend: identity semantics (rank 0 / world 1 → copy).
 - Serialization: graph save/load round-trips group name+ranks attrs; no Python objects in artifacts.
@@ -133,13 +146,14 @@ pytest under `../tests/dist/` (sibling — read-only from here; escalate test wr
 
 | Path | Area |
 |---|---|
+| `./_op_utils.py` | private shared helpers: operand normalization (`_require_symbolic_tensor`), location capture (`_get_location`), result wrapping (`_wrap_result` incl. the None-shape core-gap workaround), group/reduction/axis/pairs validation, `REDUCTIONS` |
 | `./group.py` | `Group`, `group()`, `WORLD_GROUP` — static group values + validation |
-| `./collectives.py` | the six collectives + `REDUCTIONS` — graph-time op builders |
-| `./context.py` | `rank()`, `world_size()`, `RankContext`, executor hook |
+| `./collectives.py` | the six collectives + `REDUCTIONS` (re-exported from `_op_utils`) — graph-time op builders |
+| `./context.py` | `rank()`, `world_size()`, `RankContext`, executor hook (`CollectiveExecutor` protocol + `set/get_collective_executor`) |
 | `./__init__.py` | re-exports the public surface |
 
 Siblings (read-only — escalate writes to parent): `../core/` (SymbolicTensor, Tensor, errors), `../ir/` (op defs, builder, shape inference), `../trace/` (active-builder hook, static snapshotting), `../ops/` (frontend-op discipline reference), `../backends/` (installs the default executor), `../../tests/` (test suite).
 
 ## Status
 
-Architecture phase complete: public API stubs in place (`Group`/`RankContext` trivial types implemented; collective/context function bodies raise `NotImplementedError`). Implementation (op building, shape inference, validation, hook slot) is delegated to a Manager in Phase 2.
+Implementation complete: all six collectives build canonical IR ops (registry op names, `reduce_op`/`group`/`group_size` attrs, effect `collective`), `rank()`/`world_size()` build scalar int64 `read`-effect ops, and the executor hook slot (`CollectiveExecutor` protocol + `set/get_collective_executor`) is live. Validated via throwaway scripts (explicit-group shapes/attrs/serialization round-trip, world-group attrs + documented ir blocker, error paths, executor hook). Open item: world-group tracing of the six collectives is blocked upstream by the ir ATTR_INT/`group_size=None` issue (see "IR op attribute layout") — not fixable from this node.

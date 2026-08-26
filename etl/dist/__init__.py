@@ -7,8 +7,8 @@ Public surface (full semantics in this directory's CONTEXT.md):
 - ``all_reduce``, ``all_gather``, ``reduce_scatter``, ``all_to_all``,
   ``broadcast``, ``collective_permute`` — graph-time collectives building
   ``collective``-effect IR ops with local-tensor shapes.
-- ``rank()`` / ``world_size()`` — scalar int32 graph values resolved from
-  the runtime execution context by backends.
+- ``rank()`` / ``world_size()`` — scalar int64 graph values (effect
+  ``read``) resolved from the runtime execution context by backends.
 - ``set_collective_executor`` / ``get_collective_executor`` — pluggable
   executor hook; the default single-process identity executor is provided
   by the numpy reference backend.
