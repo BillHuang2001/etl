@@ -107,7 +107,7 @@ Sibling: `../../tests/transforms/` → test suite for this module (read-only fro
 - Rules must NEVER fall back to Python loops or silently no-op. If a cotangent is `None`/`ZeroTangent`, every returned input cotangent may be zero.
 - `etl.trace` the ATTRIBUTE is the trace function (shadows the submodule) — inside scripts use `from etl.trace import trace as trace_fn`.
 - `ir.verify` does NOT detect foreign-module value references — a rule that builds ops over `op.operands` (originals) can pass verify via id collisions while producing a semantically broken graph. Always build over the values the machinery passes.
-- Zero-materialization is `ops.multiply(primal, 0)` + `ops.cast` when needed — `0.0` would NEP-50-promote float32→float64.
+- Zero-materialization is `ops.multiply(primal, 0)` + `ops.cast` when needed — an int `0` is weak toward float dtypes per the NEP-50 rules in `ops`.
 - The mini IR interpreter used for numerical validation lives at `$TMPDIR/etl_numval/interp.py` (throwaway, not in the repo) — reuse it for numerical checks until the numpy backend lands.
 - When adding a public name here, update `__init__.py`, this CONTEXT.md, and the parent contract `../CONTEXT.md` together.
 - `etl/__init__.py` (parent-owned) must re-export this surface: `vectorize`, `vmap`, `grad`, `jvp`, `vjp`, the three registries + register functions, `TransformCallable`.

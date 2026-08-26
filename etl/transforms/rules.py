@@ -75,7 +75,7 @@ def _zero_of(value: ir.Value) -> ir.Value:
         return ops.cast(zero, value.type.dtype).value
     return zero.value
 def _c(dtype, value: float) -> "core.SymbolicTensor":
-    """A 0-d constant of exactly `dtype` (avoids NEP-50 float scalar upcasts)."""
+    """A 0-d constant of exactly `dtype` (int 0 promotes per NEP-50 weak rules)."""
     return ops.constant(core.tensor(np.asarray(value, dtype=dtype)))
 def _sum_terms(terms) -> ir.Value:
     """Sum a non-empty list of ir.Values (single term returns as-is)."""
