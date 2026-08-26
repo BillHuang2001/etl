@@ -106,7 +106,9 @@ def _is_container_spec(spec: TreeSpec) -> bool:
     if isinstance(spec_type, type):
         if issubclass(spec_type, (tuple, list, dict)):
             return True
-        if dataclasses.is_dataclass(spec_type):
+        # etl's own dataclass value types are leaves (see _flatten_into);
+        # only user-defined dataclasses act as containers.
+        if dataclasses.is_dataclass(spec_type) and not spec_type.__module__.split(".")[0] == "etl":
             return True
     return False
 
