@@ -126,15 +126,15 @@ failed write), cache hit/miss/recompute-on-corrupt/clear, key determinism
 
 ## Status
 
-Architecture complete. `codec.py` is fully implemented: 18 built-in codec
-pairs (see the module docstring registry table), envelope dispatch with
-exact-type + qualified-name fallback, cycle detection for list/tuple/dict,
-read-only decoded arrays, idempotent `_install_builtin_codecs()` run
-unconditionally at import time. `container.py` and `cache.py` algorithmic
-bodies are still `NotImplementedError` stubs with full algorithm docstrings;
-trivial plumbing is implemented (`LoadedObject`, `register_codec`,
-`Cache` ABC + `get_or_compute`, `FileCache.__init__`/`_path_for_key`).
-Their implementation lands in the remaining Phase 2 work.
+Fully implemented — no stubs remain anywhere in this directory (the only
+`NotImplementedError` bodies are the four intentional `Cache` ABC abstract
+methods). `codec.py` (18 built-in codec pairs, envelope dispatch with
+exact-type + qualified-name fallback, cycle detection, read-only decoded
+arrays), `container.py` (byte-layout save/load, atomic writes, strict
+validation), `cache.py` (`compute_key`, `FileCache`). Validated end-to-end
+(codec→container→cache round-trips, tamper detection, version mismatch,
+atomicity, recompute-on-corrupt) via inline scripts; the pytest suite in
+`../tests/persist/` does not exist yet (owned by root).
 
 ## Notes for agents
 
@@ -143,7 +143,18 @@ Their implementation lands in the remaining Phase 2 work.
   package-level bullet in `../CONTEXT.md` currently shows an older
   argument order — pipeline-type `.save()` methods must be written against
   the signature here.
-- Requires `etl.core` to exist first (`Dim`/`DimExpr`/`Device`/`TensorSpec`/
-  `TreeSpec`/`PersistenceError`). Phase 2 ordering: core → persist.
-- `_install_builtin_codecs()` runs at import time; importing `etl.persist`
-  before core is implemented will fail.
+- `_install_builtin_codecs()` runs unconditionally at import time
+  (idempotent) — importing `etl.persist` requires `etl.core` to be
+  importable.
+- TreeSpec codec: the `type` field is stored as a name — `tuple`/`list`/
+  `dict` short names or `"<module>.<qualname>"` resolved via importlib.
+  Consequently a TreeSpec whose type is a namedtuple/dataclass/custom class
+  defined inside a function (non-importable qualname) encodes fine but
+  fails to DECODE with `PersistenceError` — keep pytree node types
+  module-level if artifacts must round-trip.
+- Decoded numpy arrays are read-only and never alias the file bytes;
+  `numpy.generic` decodes back to the numpy scalar (not an array).
+- FileCache corrupt entries are never propagated — treated as a miss
+  (recompute + atomic overwrite when `compute_fn` is given, else `None`).
+  This is the only place errors are "swallowed", and it is the documented
+  cache policy, not silent magic.
