@@ -3,9 +3,11 @@
 Static Python values (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/
 `slice` — the `_is_static_value` predicate in `etl/trace/trace.py`)
 specialize the graph at TRACE time and are validated at RUN time
-(`Graph.flatten_inputs`). Anything else is NOT static in v1 and must be
-rejected. These tests pin specialization, run-time validation, trace-time
-snapshotting, and rejection of non-static values.
+(`Graph.flatten_inputs`). A fully-static dataclass config object is also
+legitimate static specialization: the tracer descends into dataclass pytree
+containers, so every static field becomes a specializing leaf. Non-static
+leaf values are still rejected. These tests pin specialization, run-time
+validation, trace-time snapshotting, and rejection of non-static values.
 """
 
 import dataclasses
@@ -24,9 +26,22 @@ class Mode(enum.Enum):
 
 @dataclasses.dataclass
 class Config:
-    """A plain config dataclass — NOT a static value in v1."""
+    """A fully-static config dataclass — legitimate static specialization.
+
+    All fields are static Python values, so the tracer descends into the
+    dataclass pytree container and records each field as a specializing
+    leaf (validated at run time like any other static value).
+    """
 
     lr: float
+
+
+@dataclasses.dataclass
+class MixedConfig:
+    """A config dataclass with a non-static leaf — still rejected in v1."""
+
+    lr: float
+    extra: object
 
 
 class PlainConfig:
@@ -152,8 +167,13 @@ def test_flatten_inputs_rejects_changed_static_value():
 
 @pytest.mark.parametrize(
     "bad",
-    [PlainConfig(0.1), np.float32(1.0), object()],
-    ids=["plain-object", "numpy-scalar", "generic-object"],
+    [PlainConfig(0.1), np.float32(1.0), object(), MixedConfig(0.1, object())],
+    ids=[
+        "plain-object",
+        "numpy-scalar",
+        "generic-object",
+        "dataclass-with-non-static-leaf",
+    ],
 )
 def test_non_static_specs_are_rejected(bad):
     with pytest.raises(
@@ -162,20 +182,46 @@ def test_non_static_specs_are_rejected(bad):
         etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), bad)
 
 
-# BUG(etl): a plain dataclass config object must be REJECTED as a trace spec
-# ("is neither a core.TensorSpec nor a static" — `trace._is_static_value`
-# documents that "arbitrary config objects are NOT static in v1"), but
-# `etl.trace` silently ACCEPTS it: `core.flatten` descends into every
-# dataclass, so `Config(lr=0.1)` is exploded into a static-float leaf and the
-# graph silently specializes on 0.1 as if the config object had been a plain
-# float. Minimal repro:
-#     etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), Config(0.1))
-# builds a graph instead of raising TraceError.
-def test_dataclass_config_spec_is_rejected():
-    with pytest.raises(
-        etl.TraceError, match="is neither a core.TensorSpec nor a static"
-    ):
-        etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), Config(0.1))
+# --- dataclass config static specialization -----------------------------------
+
+
+def _scale_fn(x, cfg):
+    return etl.multiply(
+        x, etl.constant(etl.tensor(float(cfg.lr), dtype=etl.float32))
+    )
+
+
+def test_dataclass_config_spec_specializes(run_graph, as_numpy):
+    x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    spec = etl.TensorSpec((3,), etl.float32)
+
+    # both traces succeed — a fully-static dataclass is a valid trace spec
+    g_small = etl.trace(_scale_fn, spec, Config(0.5))
+    g_large = etl.trace(_scale_fn, spec, Config(2.0))
+
+    # each static field of the dataclass becomes a recorded specializing leaf
+    assert len(g_small.static_values) == 1
+    assert g_small.static_values[0].value == 0.5
+    assert g_small.static_values[0].kind == "float"
+
+    # specialization is baked into the IR, like the slice test
+    np.testing.assert_array_equal(
+        g_small.module.main.entry_block.ops[0].attributes["value"],
+        np.array(0.5, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        g_large.module.main.entry_block.ops[0].attributes["value"],
+        np.array(2.0, dtype=np.float32),
+    )
+
+    # a matching config runs fine and scales as baked at trace time
+    np.testing.assert_array_equal(
+        as_numpy(run_graph(g_small, x, Config(0.5))), 0.5 * x
+    )
+
+    # a mismatched config is rejected at run time, like any other static value
+    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+        run_graph(g_small, x, Config(0.25))
 
 
 # --- run-time static validation via flatten_inputs ----------------------------

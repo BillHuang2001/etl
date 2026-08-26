@@ -157,10 +157,10 @@ ELEMENTWISE_CASES = [
                  lambda x: ops.maximum(ops.minimum(x, 0.9), 0.1),
                  [_spec((2, 3))], id="clip"),
     pytest.param(lambda x: enp.clip(x, None, 0.9),
-                 lambda x: ops.maximum(x, 0.9),
+                 lambda x: ops.minimum(x, 0.9),
                  [_spec((2, 3))], id="clip-upper-only"),
     pytest.param(lambda x: enp.clip(x, 0.1, None),
-                 lambda x: ops.minimum(x, 0.1),
+                 lambda x: ops.maximum(x, 0.1),
                  [_spec((2, 3))], id="clip-lower-only"),
 ]
 

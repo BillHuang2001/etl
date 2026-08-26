@@ -167,10 +167,10 @@ class TestSplitTensor:
             split_tensor(t, axis, self.TWO)
 
     def test_non_int_axis_in_range_raises(self):
-        # Source does not type-validate axis: an in-range non-int axis slips
-        # through the range check and numpy raises the TypeError.
         t = tensor(np.arange(4))
-        with pytest.raises(TypeError):
+        with pytest.raises(
+            DeviceError, match="not a valid axis: expected an integer, got float"
+        ):
             split_tensor(t, 0.5, self.TWO)
 
     @pytest.mark.parametrize(
@@ -186,8 +186,7 @@ class TestSplitTensor:
             split_tensor(t, 0, target_devices)
 
     def test_non_tensor_raises(self):
-        # Source has no explicit type check: attribute access fails.
-        with pytest.raises(AttributeError):
+        with pytest.raises(DeviceError, match="split_tensor expects a Tensor, got list"):
             split_tensor([1, 2, 3, 4], 0, self.TWO)
 
 
@@ -233,7 +232,7 @@ class TestReplicateTensor:
             replicate_tensor(tensor(np.arange(6)), [])
 
     def test_non_tensor_raises(self):
-        # An ndarray slips through attribute access (its `.data` is a
-        # memoryview) and Tensor() rejects it.
-        with pytest.raises(TypeError, match="must be a numpy ndarray"):
+        with pytest.raises(
+            DeviceError, match="replicate_tensor expects a Tensor, got ndarray"
+        ):
             replicate_tensor(np.arange(6), self.TWO)

@@ -20,7 +20,7 @@ structured pytree I/O — not incidental implementation behavior.
 | `test_cond.py` | `etl.cond`: runtime branch selection, `if`-op IR structure, pred validation, branch unification errors |
 | `test_while_loop.py` | `etl.while_loop`: iteration counts, structured state, `while`-op IR, carried-type/static-leaf errors |
 | `test_scan.py` | `etl.scan`: cumsum/max vs numpy, length override, structured xs/init, desugared IR, v1 static-length errors |
-| `test_static_snapshot.py` | static dtype/Enum/slice/bool specialization, trace-time snapshotting, run-time static validation |
+| `test_static_snapshot.py` | static dtype/Enum/slice/bool + dataclass-config specialization, trace-time snapshotting, run-time static validation |
 | `conftest.py` | shared fixtures (below) |
 
 ## Shared fixtures (conftest.py)
@@ -49,33 +49,14 @@ structured pytree I/O — not incidental implementation behavior.
 - **BUG(etl) protocol**: tests that expose real contract violations in `etl`
   are KEPT FAILING with a `# BUG(etl): <desc>` comment + minimal repro. Never
   fix `etl` from this directory and never weaken such tests — the package
-  root owns fixes. The suite is expected to show exactly the failures listed
-  in Known Issues; any OTHER failure is a regression in either etl or the
-  tests.
+  root owns fixes. The suite is currently expected to be fully green; any
+  failure is a regression in either etl or the tests.
 - **Tree leaf markers**: trace-time `input_specs`/`output_tree` use private
   `_TensorSpecLeaf`/`_SymbolicLeaf` marker types by design (dataclass leaves
   would be recursed into). Compare tree SKELETONS (type/node_data/children,
   ignoring leaf types) — never full TreeSpec equality against live objects.
 - Nested `etl.trace` inside a trace is unspecified by the contract — no
   assertion is made for it (see test_builder_context.py docstring).
-
-## Known Issues (etl contract violations, kept as failing tests)
-
-1. `test_defn.py::test_defn_of_defn_is_idempotent` — `etl.defn(existing_defn)`
-   builds a NEW `Defn` instead of returning the same object (contract:
-   "applying `defn` to an existing `Defn` returns it unchanged"). Fix in
-   `etl/trace/defn.py::defn`.
-2. `test_scan.py::test_scan_length_override_shortens_xs` — `etl.scan` rejects
-   an explicit `length` SMALLER than xs's static leading dim; the contract's
-   static-length override requires a prefix scan (only `length > dim` should
-   raise). Fix in `etl/trace/control_flow.py::scan` (one-sided check).
-3. `test_static_snapshot.py::test_dataclass_config_spec_is_rejected` — a plain
-   dataclass config object as a trace spec is silently exploded into static
-   leaves instead of raising `TraceError` (`_is_static_value` documents
-   "arbitrary config objects are NOT static in v1"). NOTE: the root
-   value-model table lists "config objects" among static values — the two
-   contracts disagree; the package root must decide the intended behavior and
-   align `etl/trace/trace.py::_flatten_trace_into` accordingly.
 
 ## Test strategy
 

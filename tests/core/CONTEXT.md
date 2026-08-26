@@ -30,4 +30,3 @@ pytest mirror of `../../etl/core/` (the etl value-model foundation: errors, dtyp
 - `Dim` has no `evaluate` (only `DimExpr` does); `bool()` on dims raises ShapeError even for known sizes — both are source behaviors asserted as-is.
 - The `bool_` dtype constant's numpy canonical `.name` is `"bool"` (identifier is `bool_`).
 - `replicate_tensor` deliberately tags the SAME ndarray buffer with each device (no copies) — don't "fix" the test to expect distinct buffers.
-- Minor undocumented robustness gaps in `etl/core/device.py` (non-int axis leaks numpy TypeError, non-Tensor input leaks AttributeError) are asserted per-source with comments in `test_device.py` — see that file before re-litigating them.

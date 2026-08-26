@@ -22,16 +22,6 @@ pytest suite validating the `etl.numpy` (alias `enp`) sugar namespace against it
 - Numeric checks go through `etl.evaluate` (all args must be tensors/ndarrays — a Python scalar arg raises TypeError; pass runtime bounds as 0-d arrays or capture them as static closure values) and compare against numpy references.
 - Constraints: small shapes (≤ ~16 elements), CPU only, <2s per file, parametrize with ids, `pytest.raises(..., match=...)`.
 
-## Known Issues
-
-**Three real etl bugs (contract violations, all in `etl/numpy/`, kept as deliberately-failing tests marked `# BUG(etl):` — do NOT fix in etl from here, do NOT weaken/xfail/skip the tests; fixes must be escalated to root):**
-
-1. `enp.clip` None-bound branches are inverted (`etl/numpy/elementwise.py`): `clip(a, None, hi)` builds `ops.maximum(a, hi)` but the contract ("None skips that side", numpy parity) requires `minimum(a, hi)`; `clip(a, lo, None)` builds `minimum(a, lo)` but requires `maximum(a, lo)`. Two-bound form is correct. Failing: `test_clip_upper_bound_only_is_minimum`, `test_clip_lower_bound_only_is_maximum`.
-2. `enp.expand_dims` validates tuple axes against the ORIGINAL rank (`etl/numpy/shape.py`), but numpy normalizes each tuple entry against the FINAL ndim (rank + len(tuple)): `enp.expand_dims(rank-2, (1, 3))` raises ShapeError while `np.expand_dims` returns shape `(2, 1, 2, 1)`. Failing: `test_expand_dims_tuple_axis_ascending_numeric`.
-3. `enp.pad` rejects a bare `(before, after)` pair on a rank-1 array (`enp.pad(a, (1, 2))` → ShapeError; numpy pads 1 before / 2 after the sole axis). Only the length-1 *sequence* form (`((1, 2),)`) broadcasts. Failing: `test_pad_pair_rank1_numeric`.
-
-The suite therefore exits non-zero with exactly these 4 known failures (269 passing) until the bugs are fixed in etl — after fixing each, delete the `# BUG(etl)` comment and this Known Issues entry.
-
 ## Notes for agents
 
 - `from tests.numpy._ir_utils import normalize_ir` — test dirs are packages (have `__init__.py`), so helper imports must be package-qualified.

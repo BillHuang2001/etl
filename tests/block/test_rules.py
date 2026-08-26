@@ -230,11 +230,6 @@ def _batched_x():
 
 def test_vmap_via_portable_fallback():
     """vmap of a block with only a portable == per-row unvectorized run."""
-    # BUG(etl): vectorize looks batching rules up under the RAW op name
-    # ("block_call") instead of the "block:<name>" namespace where etl.block
-    # registers them (batching_rules["block:rule_swish"] IS present, as is
-    # the pre-registered decomposition fallback) — so vmap on ANY block_call
-    # raises TransformError("no batching rule for op 'block_call'").
     tf = etl.vmap(rule_swish_fn)
     graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
     out = _run(graph, _batched_x())
@@ -253,8 +248,6 @@ def test_explicit_batching_rule_registers_and_wins_over_unsupported_policy():
     assert transforms.batching_rules["block:rule_explicit"] is rule_explicit_batch
 
     x = _batched_x()
-    # BUG(etl): same block_call dispatch gap as test_vmap_via_portable_fallback
-    # — the explicit rule exists but vectorize never looks it up.
     graph = etl.vmap(rule_explicit_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), 2 * x)
@@ -267,8 +260,6 @@ def test_explicit_rule_overrides_portable_decomposition():
     assert np.allclose(etl.evaluate(rule_override_fn, x4).numpy(), 2 * x4)
 
     x = _batched_x()
-    # BUG(etl): same block_call dispatch gap — the explicit rule computing
-    # 3*x exists but vectorize raises before consulting any block:<name> rule.
     graph = etl.vmap(rule_override_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), 3 * x)
@@ -278,9 +269,6 @@ def test_vmap_without_rule_raises_transform_error_naming_the_block():
     """No rule + no portable -> TransformError at the tf(spec) call."""
     tf = etl.vmap(rule_none_fn)
     # The rule lookup happens during vectorize, i.e. when calling tf(...).
-    # BUG(etl): the raised TransformError names the raw op 'block_call'
-    # instead of the block ('rule_none') because vectorize never maps
-    # block_call ops to their block:<name> registry key.
     with pytest.raises(etl.TransformError, match="rule_none"):
         tf(etl.TensorSpec((BATCH, DIM), etl.float32))
 
@@ -288,10 +276,6 @@ def test_vmap_without_rule_raises_transform_error_naming_the_block():
 def test_elementwise_policy_passes_batch_dims_through():
     """elementwise policy: batch dims pass through safely without a rule."""
     x = _batched_x()
-    # BUG(etl): transforms never honor the batching policy — vectorize raises
-    # TransformError("no batching rule for op 'block_call'") before any
-    # policy handling (there is none in transforms). The policy contract says
-    # an elementwise block is safe to vmap without a rule.
     graph = etl.vmap(rule_ew_fn)(etl.TensorSpec((BATCH, DIM), etl.float32))
     out = _run(graph, x)
     assert np.allclose(out.numpy(), x)
@@ -336,10 +320,6 @@ def test_grad_via_portable_decomposition():
     expected = _swish_deriv(x)
 
     graph = etl.grad(rule_portgrad_loss)(etl.TensorSpec((DIM,), etl.float32))
-    # BUG(etl): the portable vjp fallback (block/rules.py) seeds the incoming
-    # cotangent on the block_call RESULT values but the inlined decomposition
-    # produces NEW values — the local reverse sweep never sees the seed, so
-    # grad-via-portable returns all zeros instead of the analytic derivative.
     (grad_out,) = _run(graph, x)
     assert np.allclose(grad_out.numpy(), expected, rtol=1e-5, atol=1e-5)
 
@@ -350,12 +330,7 @@ def test_jvp_derived_from_portable_vjp_fallback():
     dx = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     expected = _swish_deriv(x) * dx
 
-    tf = etl.jvp(rule_portgrad_loss, etl.TensorSpec((DIM,), etl.float32))
-    # BUG(etl): transforms never derives jvp from the vjp rule (block/op.py
-    # documents "when absent, transforms derives jvp from the vjp rule" but
-    # autodiff.require_jvp_rule consults only jvp_rules) — jvp of a
-    # portable-only block raises TransformError("no JVP rule for op
-    # 'block:rule_portgrad'").
+    tf = etl.jvp(rule_portgrad, etl.TensorSpec((DIM,), etl.float32))
     graph = tf(etl.TensorSpec((DIM,), etl.float32))
     out = _run(graph, (x,), (dx,))
     primal, (tangent,) = out

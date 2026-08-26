@@ -201,9 +201,6 @@ class TestSliceIndex:
         np.testing.assert_array_equal(run_numpy(f, ARR), ARR[::-1])
 
     def test_zero_step_slice_malformed_param_error(self):
-        # BUG(etl): getitem with slice step 0 leaks a raw ValueError
-        # ('slice step cannot be zero') from numpy instead of the documented
-        # TypeError for malformed static params (ops/CONTEXT.md error semantics).
         def f(x):
             return x[::0]
 

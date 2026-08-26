@@ -20,17 +20,6 @@ pytest suite asserting the op contracts in `../../etl/ops/CONTEXT.md` and `../..
 | `test_errors.py` | per-op table (all 67 public ops): no-trace → TraceError, concrete-Tensor operand → TraceError (three-option message), wrong dtype → DTypeError, static broadcast mismatch → ShapeError, both-scalars → TraceError, unsupported operand kinds → TypeError |
 | `test_dunders.py` | dunder ≡ op-function transparency: identical `ir.pretty_print` (with `ETL_DISABLE_LOCATIONS=1`) for `+ - * / ** < <= > >= == @`, unary `-`, reflected scalar-left forms; `bool(x)`/`x != y` raise TraceError |
 
-## Known failing tests (etl bugs — parent delegates fixes)
-
-7 tests fail intentionally, each tagged `# BUG(etl): ...` in code. When the parent fixes an etl bug, the corresponding test goes green — then DELETE the BUG comment there and remove the entry below (do not annotate as fixed):
-
-1. `test_elementwise::test_runtime_broadcast_conflict_raises_shape_error` — symbolic broadcast conflict at run time leaks raw numpy `ValueError` instead of `ShapeError`.
-2. `test_elementwise::test_abs_complex_numerics_give_real_magnitude` — `abs` of complex crashes at run time (kernel produces real dtype, interpreter expects complex64 → `BackendError`).
-3. `test_linalg::test_cumsum_reverse_scans_from_the_end` — `cumsum(reverse=True)` missing pre-cumsum flip (computes `flip(cumsum(x))` instead of `flip(cumsum(flip(x)))`).
-4. `test_getitem::TestSliceIndex::test_zero_step_slice_malformed_param_error` — `x[::0]` leaks raw numpy `ValueError` instead of documented `TypeError`.
-5. `test_errors::test_no_trace_message_mentions_defn` — no-active-trace message omits `@etl.defn` (contract requires mentioning all three entry points).
-6. `test_errors::test_shape_error_message_includes_call_site_location[plain-fn]` / `[defn]` — static broadcast `ShapeError` carries no call-site location although the op's Location is captured (also true of logical/bitwise/gather `DTypeError`s).
-
 ## Notes for agents
 
 - Keep tests small/fast (CPU only, shapes ≤ ~256×256); `pytest.raises(..., match=...)`, `pytest.warns`/`recwarn`, heavy parametrization.

@@ -855,7 +855,7 @@ class TestLinalg:
             )
             ref = np.cumsum(x, axis=axis)
             if reverse:
-                ref = np.flip(ref, axis=axis)
+                ref = np.flip(np.cumsum(np.flip(x, axis=axis), axis=axis), axis=axis)
             assert_close(as_np(out), ref)
 
     def test_cumsum_int32_preserves_dtype(self):

@@ -102,10 +102,6 @@ def test_distinct_keys_distinct_entries(tmp_path):
 
     # Every variation derives a distinct key...
     keys = [compute_key(c) for c in variants]
-    # BUG(etl): compute_key iterates key_components with a list
-    # comprehension, so a bare string component ("a") is split into its
-    # characters and derives the SAME key as the tuple ("a",) — the two
-    # variations collide into one entry instead of two.
     assert len(set(keys)) == len(variants)
 
     # ...and each key stores/returns its own value.
@@ -126,11 +122,6 @@ def test_dict_component_insertion_order_same_key(tmp_path):
     # Canonical JSON keying means dict insertion order must not matter.
     d1 = {"name": "a", 1: 2}
     d2 = {1: 2, "name": "a"}
-    # BUG(etl): the "dict" codec keeps items in insertion order and
-    # compute_key's json.dumps(sort_keys=True) cannot sort list elements,
-    # so {name-first} and {1-first} derive DIFFERENT keys — violating the
-    # documented canonical-key contract (cache.py compute_key docstring /
-    # etl/persist/CONTEXT.md).
     assert compute_key((d1,)) == compute_key((d2,))
 
     cache = FileCache(tmp_path / "cache")
