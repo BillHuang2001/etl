@@ -20,8 +20,9 @@ from typing import Callable, Dict, Optional, Tuple
 
 from etl import core
 from etl import ir
+from etl import ops
 from etl.core import TransformError
-from etl.trace import Graph, with_builder
+from etl.trace import Graph, current_builder, with_builder
 from etl.transforms._metadata import MappedAxes, UNMAPPED, ValueEnv
 
 # Binding rule signature (see ./CONTEXT.md):
@@ -73,6 +74,137 @@ def require_batching_rule(op_name: str) -> BatchingRule:
             f"Python-loop fallback."
         )
     return rule
+
+
+def _sym(value: ir.Value) -> "core.SymbolicTensor":
+    """Wrap an `ir.Value` as a `core.SymbolicTensor` (dtype/shape from its type)."""
+    return core.SymbolicTensor(
+        value=value, dtype=value.type.dtype, shape=value.type.shape
+    )
+
+
+def block_call_pass_through_rule() -> BatchingRule:
+    """Built-in batching rule for elementwise/map_over_batch block calls.
+
+    Both policies make batch dims pass through untouched — `elementwise`
+    blocks act per-element on ALL dims, `map_over_batch` blocks map over
+    their leading batch dims internally — so vectorizing them is safe
+    WITHOUT a registered rule. The rule therefore only
+
+    1. aligns operands exactly like the pointwise batching rule: reshape
+       each operand to `own batch dims + (1,)*(max_row_rank − row_rank) +
+       per-row shape` (skipped when already aligned) so per-row dims align
+       on the right and a mapped operand's batch dims can never be mistaken
+       for an unmapped operand's per-row dims;
+    2. prepends the common batch dims — the leading `mapped_count` shape
+       slice of the operand with the most mapped axes (the first one when
+       several tie) — to every ORIGINAL result type; per-row result dims
+       are unchanged;
+    3. rebuilds the `block_call` over the aligned operands through the
+       active transform builder (`result_specs` and the op's result types
+       must be the very same `ir.ValueType` tuple — `ir.verify` requires
+       exact equality).
+
+    Result axes = union of the operand mapped axes (leading-contiguous, as
+    `_validate_rule_result` requires). `etl/block` may pre-register this
+    factory's product for blocks declared with an `elementwise` or
+    `map_over_batch` batching policy.
+    """
+    def rule(op, operands, axes):
+        counts = [ax.count for ax in axes]
+        mapped_count = max(counts) if counts else 0
+        # Per-row rank = everything past the operand's own mapped batch dims.
+        row_ranks = [value.type.rank - count for value, count in zip(operands, counts)]
+        max_row_rank = max(row_ranks) if operands else 0
+        values = []
+        for value, count, row_rank in zip(operands, counts, row_ranks):
+            target = (
+                value.type.shape[:count]
+                + (1,) * (max_row_rank - row_rank)
+                + value.type.shape[count:]
+            )
+            if target == value.type.shape:
+                out = value  # already aligned: no reshape (common equal-rank case)
+            else:
+                out = ops.reshape(_sym(value), target).value
+            values.append(out)
+        if mapped_count == 0:
+            batch_dims = ()
+        else:
+            # The first operand with the most mapped axes supplies the batch
+            # dims (guaranteed to exist: mapped_count IS some operand's count).
+            batch_dims = next(
+                value.type.shape[:mapped_count]
+                for value, count in zip(values, counts)
+                if count == mapped_count
+            )
+        result_types = tuple(
+            ir.ValueType(
+                dtype=result.type.dtype, shape=batch_dims + tuple(result.type.shape)
+            )
+            for result in op.results
+        )
+        builder = current_builder()
+        new_op = builder.create(
+            "block_call",
+            operands=tuple(values),
+            attributes={
+                "block_name": op.attributes["block_name"],
+                "static_args": op.attributes["static_args"],
+                "result_specs": result_types,
+            },
+            result_types=result_types,
+            location=op.location,
+        )
+        result_axes = MappedAxes(tuple(range(mapped_count)))
+        return tuple(new_op.results), (result_axes,) * len(op.results)
+
+    return rule
+
+
+def _rule_key(op: ir.Op) -> str:
+    """Registry key for `op` (block calls are keyed ``block:<block_name>``)."""
+    if op.name == "block_call":
+        return f"block:{op.attributes['block_name']}"
+    return op.name
+
+
+#: Batching policies whose block calls are safe to vectorize WITHOUT a
+#: registered rule: the block acts per-element on all dims (`elementwise`) or
+#: maps over its leading batch dims internally (`map_over_batch`) — batch dims
+#: pass through untouched. Every other policy (`opaque_batched`,
+#: `unsupported`, `batching_rule`, `broadcast_batch`) or a missing policy
+#: attribute requires an explicitly registered rule — never a silent
+#: pass-through.
+_PASS_THROUGH_POLICIES = ("elementwise", "map_over_batch")
+
+
+def _resolve_batching_rule(op: ir.Op) -> BatchingRule:
+    """The rule vectorizing `op`.
+
+    Lookup order: the registry first — block calls under the namespaced key
+    `block:<block_name>` (exactly like autodiff's `_rule_name`; an explicitly
+    registered rule always wins over the policy) — then, for block calls with
+    no registered rule, the built-in pass-through when the op carries an
+    `elementwise`/`map_over_batch` `batching_policy` attribute (the attribute
+    is optional; today `etl/block` does not emit it). No rule + no safe
+    policy ⇒ `TransformError` naming the op/block.
+    """
+    rule = batching_rules.get(_rule_key(op))
+    if rule is not None:
+        return rule
+    if op.name == "block_call":
+        block_name = op.attributes["block_name"]
+        policy = op.attributes.get("batching_policy")
+        if policy in _PASS_THROUGH_POLICIES:
+            return block_call_pass_through_rule()
+        raise TransformError(
+            f"vectorize: no batching rule for block '{block_name}' — "
+            f"register one with register_batching_rule('block:{block_name}', fn) "
+            f"(custom blocks: BlockOp.batching_rule); there is no silent "
+            f"Python-loop fallback."
+        )
+    return require_batching_rule(op.name)
 
 
 def vectorize_graph(graph: Graph, axes) -> Graph:
@@ -307,7 +439,7 @@ def _rewrite_op(op: ir.Op, env, builder, remap, source_locations, graph):
 
     Returns the rule's `(new_values, new_axes)` pair.
     """
-    rule = require_batching_rule(op.name)
+    rule = _resolve_batching_rule(op)
     rewritten_operands = tuple(
         _rewritten_operand(operand, remap) for operand in op.operands
     )
