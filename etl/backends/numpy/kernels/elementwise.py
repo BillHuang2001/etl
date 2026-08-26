@@ -37,6 +37,7 @@ import numpy as np
 from etl import core
 
 from ..shapes import evaluate_dim_expr
+from .indexing import _shape_error
 
 __all__ = ["register_kernels"]
 
@@ -64,6 +65,19 @@ def _erf_array(x: np.ndarray) -> np.ndarray:
     return _ERF_UFUNC(x).astype(x.dtype)
 
 
+def _check_broadcast(op_name: str, *shapes: tuple) -> None:
+    """Fail with ``core.ShapeError`` when the operand shapes cannot broadcast.
+
+    numpy raises a raw ``ValueError`` on incompatible broadcasts; the backend
+    contract requires ``core.ShapeError`` instead (the message names the op
+    and embeds numpy's description, which lists every offending shape).
+    """
+    try:
+        np.broadcast_shapes(*shapes)
+    except ValueError as exc:
+        raise _shape_error(f"op '{op_name}'", exc) from exc
+
+
 def _binary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
     """Kernel factory for two-operand broadcasting ops.
 
@@ -78,6 +92,7 @@ def _binary(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
         a, b = operands
         a_arr, b_arr = a.numpy(), b.numpy()
         _check_supported(op.name, a_arr, b_arr)
+        _check_broadcast(op.name, a_arr.shape, b_arr.shape)
         return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
 
     return kernel
@@ -112,6 +127,7 @@ def _max_min(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
                 f"op '{op.name}': complex inputs are not supported (numpy "
                 "defines no ordering for complex numbers)"
             )
+        _check_broadcast(op.name, a_arr.shape, b_arr.shape)
         return core.Tensor(np.asarray(np_fn(a_arr, b_arr)))
 
     return kernel
@@ -188,6 +204,7 @@ def _select(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     pred, on_true, on_false = operands
     pred_arr, true_arr, false_arr = pred.numpy(), on_true.numpy(), on_false.numpy()
     _check_supported(op.name, pred_arr, true_arr, false_arr)
+    _check_broadcast(op.name, pred_arr.shape, true_arr.shape, false_arr.shape)
     return core.Tensor(np.where(pred_arr, true_arr, false_arr))
 
 
