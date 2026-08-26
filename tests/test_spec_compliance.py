@@ -19,8 +19,8 @@ contract in `../etl/CONTEXT.md`). Groups (one class per group, in file order):
 12. `TestErrorLocations`     — error messages carry `file.py:line` locations.
 
 Conventions: small shapes, CPU only, fast. Tests assert the documented
-contract; where the implementation contradicts it, the test stays failing and
-is marked with a `# BUG(etl): ...` comment (see group 12).
+contract; a test exposing a contract violation stays failing with a
+`# BUG(etl): ...` marker (see `tests/CONTEXT.md`).
 """
 
 from __future__ import annotations
