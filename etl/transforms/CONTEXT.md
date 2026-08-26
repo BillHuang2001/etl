@@ -93,9 +93,21 @@ Sibling: `../../tests/transforms/` → test suite for this module (read-only fro
 
 `../../tests/transforms/`: `test_vectorize.py` (per-op batching, metadata propagation, `TransformError` for missing rules), `test_vmap.py` (sugar semantics, once-only tracing, out_axes incl. size-one insertion and `None` mismatch, nested vmap), `test_grad.py` / `test_jvp.py` / `test_vjp.py` (numerical checks vs finite differences), `test_vmap_vectorize_equivalence.py` (IR equality per the equivalence contract), `test_block_rules.py` (`block:<name>` namespacing). Spec-compliance additions live in `../../tests/test_spec_compliance.py` (vmap≡vectorize sugar, unsupported-op errors, transformed graphs contain only ordinary ops). CPU only, pytest.
 
+## Known Issues
+
+- **Rule-level v1 deferrals (raise `TransformError`, never silent)**: `gather` batching with mapped data + unmapped indices; multi-axis gather/scatter transforms; `solve` batching/AD with `left_side=False`; `conv` VJP (the IR has no transposed-convolution op — needs an opdef addition to close); `mean` VJP, `concatenate` VJP segment splits, and `pad` VJP inverses over symbolic dims (static dims work); `vmap(vjp(f))`/`vmap(jvp(f))` composition (their callables produce extended input trees the outer axes normalization cannot address yet — plain `vmap(vmap(f))` and `vmap(grad(f))` compose fine).
+- **Nested vmap batch-dim naming**: each `vectorize` pass creates fresh `Dim`s all named `batch`/`batch_N`. Single transforms are per contract, but don't rely on dim NAMES to identify nesting levels — `vmap`'s output-mappedness detection uses Dim object identity (from the mapped input specs), not names.
+- **Pointwise batching alignment**: every operand is reshaped to `own_batch_dims + (1,)*(max_row_rank − row_rank) + per_row_shape` before the op rebuild — do NOT regress to leading-1s-only insertion (that misaligns mapped rows against unmapped leading dims, e.g. `(batch,3)×(4,3)` would become `max(batch,4)` instead of `(batch,4,3)`).
+- **`broadcast` batching edge (non-issue)**: an unvectorized `broadcast` whose operand rank is smaller than its target rank without expandable dims is statically invalid at trace time, so the batched rebuild `broadcast(x, batch_dims + original_target)` is always reachable/semantically correct.
+- **Mapped `slice` is lowered, not shifted**: the IR slice op needs static int limits, so the batching rule lowers to `reshape → constant(arange) → gather → reshape` (batch dims folded through one symbolic-product reshape). `slice` VJP uses scatter into `primal·0` with static arange indices for strided axes.
+- **Splicing ops into an existing module** (needed by `_rearrange_outputs`/`grad`): `ir.Builder` has no public API to position an insertion point at a block's end — use `InsertionPoint(block, len(block.ops))` pushed onto the private `builder._insertion_stack`; when replacing a `return` op's operands, first clear the stale `Use` records of its old operands (`value.uses[:] = [u for u in value.uses if u.owner is not ret]`) or `ir.verify` fails — the Use-check runs both directions.
+
 ## Notes for agents
 
-- Rules must NEVER fall back to Python loops or silently no-op.
-- Skeleton stubs reference sibling modules (`core`/`ir`/`ops`/`trace`) by their **contracted export names only** (from `../CONTEXT.md`); during implementation, reconcile concrete signatures (e.g. `Graph`'s prebuilt-module constructor, the function terminator op, `Value` identity) with the landed APIs of those modules.
+- Rules must NEVER fall back to Python loops or silently no-op. If a cotangent is `None`/`ZeroTangent`, every returned input cotangent may be zero.
+- `etl.trace` the ATTRIBUTE is the trace function (shadows the submodule) — inside scripts use `from etl.trace import trace as trace_fn`.
+- `ir.verify` does NOT detect foreign-module value references — a rule that builds ops over `op.operands` (originals) can pass verify via id collisions while producing a semantically broken graph. Always build over the values the machinery passes.
+- Zero-materialization is `ops.multiply(primal, 0)` + `ops.cast` when needed — `0.0` would NEP-50-promote float32→float64.
+- The mini IR interpreter used for numerical validation lives at `$TMPDIR/etl_numval/interp.py` (throwaway, not in the repo) — reuse it for numerical checks until the numpy backend lands.
 - When adding a public name here, update `__init__.py`, this CONTEXT.md, and the parent contract `../CONTEXT.md` together.
 - `etl/__init__.py` (parent-owned) must re-export this surface: `vectorize`, `vmap`, `grad`, `jvp`, `vjp`, the three registries + register functions, `TransformCallable`.
