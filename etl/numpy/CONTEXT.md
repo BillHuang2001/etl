@@ -101,7 +101,7 @@ pytest, CPU only, in sibling `../../tests/numpy/` (read-only from here — escal
 
 ## Notes for agents
 
-- **Validation while ops is stubbed**: `etl.ops` bodies are implemented in parallel with frozen signatures — enp implementation was validated via mock argument-flow tests (monkeypatch recorders onto `etl.ops`, assert exact forwarded args/composition sequences). Once ops lands, run the end-to-end equivalence tests above (throwaway `$TMPDIR` scripts, `import etl` must stay clean). Note: running python with a script located in `/tmp` puts `/tmp` on `sys.path` (shadowing stdlib modules) — run via `python3 - < script` from the repo root instead.
+- **Validation**: enp behavior is validated end-to-end by the equivalence tests in `../../tests/numpy/` (sibling — read-only; implemented and passing) against the fully implemented `etl.ops`; `import etl` must stay clean. Note: running python with a script located in `/tmp` puts `/tmp` on `sys.path` (shadowing stdlib modules) — run via `python3 - < script` from the repo root instead.
 - `core.DimExpr` equality is structural: `n * 2 != 2 * n` — build expected values in the same operand order as the implementation (`functools.reduce(operator.mul, shape, 1)` → `2 * n`).
 - If a numpy function is missing here, check the deferral list first — it may be intentionally out of v1 scope.
 - When adding a public name: update `__init__.py`, `__all__`, `_map.py` (if 1:1), and the mapping table above together.
