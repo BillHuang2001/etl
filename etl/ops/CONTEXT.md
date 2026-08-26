@@ -81,7 +81,7 @@ Mirror in `../../tests/ops/`: `test_elementwise.py`, `test_comparison.py`, `test
 
 ## Notes for agents
 
-- Stub bodies currently `raise NotImplementedError` — this node is Phase-1 architecture only; implementation is delegated to a Manager during Phase 2.
-- Sibling modules (`core`/`ir`/`trace`) are also mid-architecture; `import etl.ops` fails until they land. Validate with `python3 -m py_compile etl/ops/*.py`.
-- When implementing, keep docstrings authoritative — they ARE the per-op contract (dtype rule, shape rule, errors). Op signatures are mirrored by the opdefs in `etl.ir`'s registry — any signature change must update the matching `ir` opdef in the same change (never a parallel table here).
+- Implementation status: all op bodies are implemented (no stubs). `etl.ops` imports cleanly and builds verifiable, serializable IR against `etl.ir`; validate with `python3 -c "import etl"`.
+- `etl.trace.trace` (the high-level tracer) is not implemented yet; graphs are built via the hand-rolled pattern: `mod = ir.Module(); b = ir.Builder(mod); b.build_function("main", (ir.types.ValueType(dtype, shape), ...))`; wrap block-argument `Value`s in `core.SymbolicTensor`; call ops inside `with trace.builder.with_builder(b):`; finish with `b.set_terminator(b.current_block, "return", operands=(...))`; then `ir.verify(mod)` + `ir.serialize_module/deserialize_module`.
+- Docstrings are authoritative — they ARE the per-op contract (dtype rule, shape rule, errors). Op signatures are mirrored by the opdefs in `etl.ir`'s registry — any signature change must update the matching `ir` opdef in the same change (never a parallel table here).
 - `constant_like` is internal (scalar-promotion helper); `getitem` is internal-but-registered; both intentionally excluded from `__all__`.
