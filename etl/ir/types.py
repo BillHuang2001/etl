@@ -22,10 +22,10 @@ from typing import Union
 
 import numpy as np
 
-from etl.core import DimExpr  # symbolic shape components (owned by core)
+from etl.core import Dim, DimExpr  # symbolic shape components (owned by core)
 
-#: One dimension of a shape: static int, symbolic DimExpr, or None (dynamic).
-ShapeDim = Union[int, DimExpr, None]
+#: One dimension of a shape: static int, symbolic Dim/DimExpr, or None (dynamic).
+ShapeDim = Union[int, Dim, DimExpr, None]
 
 #: A shape: tuple of dims; length (rank) is always known at trace time.
 Shape = tuple[ShapeDim, ...]
@@ -45,6 +45,15 @@ _DTYPE_ABBREV = {
     "float64": "f64",
     "complex64": "c64",
     "complex128": "c128",
+}
+
+#: Infix spellings for DimExpr operators (matches core.DimExpr's op names).
+_DIMEXPR_SYMBOLS = {
+    "add": "+",
+    "sub": "-",
+    "mul": "*",
+    "floordiv": "//",
+    "mod": "%",
 }
 
 
@@ -70,8 +79,10 @@ class ValueType:
         return len(self.shape)
 
     def __str__(self) -> str:
-        dims = "x".join("?" if d is None else str(d) for d in self.shape)
-        return f"tensor<{dims}x{_dtype_str(self.dtype)}>"
+        dims = "x".join(_dim_str(d) for d in self.shape)
+        if dims:
+            dims += "x"
+        return f"tensor<{dims}{_dtype_str(self.dtype)}>"
 
     def __repr__(self) -> str:
         return f"ValueType(dtype=np.dtype('{self.dtype.name}'), shape={self.shape!r})"
@@ -80,3 +91,24 @@ class ValueType:
 def _dtype_str(dtype: np.dtype) -> str:
     """Compact dtype spelling for printing, e.g. float32 -> f32."""
     return _DTYPE_ABBREV.get(dtype.name, dtype.name)
+
+
+def _dim_str(dim: ShapeDim) -> str:
+    """Compact dimension spelling: ``3``, ``B``, ``B * 2``, or ``?`` (None).
+
+    Compound expressions parenthesize their sub-expressions so nesting is
+    unambiguous: ``(B * 2) + 1``; ``min``/``max`` print in call form.
+    """
+    if dim is None:
+        return "?"
+    if isinstance(dim, Dim):
+        return str(dim)  # the dimension's name
+    if isinstance(dim, DimExpr):
+        left = f"({_dim_str(dim.left)})" if isinstance(dim.left, DimExpr) else _dim_str(dim.left)
+        right = (
+            f"({_dim_str(dim.right)})" if isinstance(dim.right, DimExpr) else _dim_str(dim.right)
+        )
+        if dim.op in ("min", "max"):
+            return f"{dim.op}({left}, {right})"
+        return f"{left} {_DIMEXPR_SYMBOLS[dim.op]} {right}"
+    return str(dim)  # static int

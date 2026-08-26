@@ -164,10 +164,11 @@ in `printer.py`.
 ## Constraints
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
-- Architecture phase: data structures + registry are implemented; behavioral
-  bodies (`Builder`, `verify`, `serialize_module/deserialize_module`,
-  `pretty_print`, shape-inference hooks in `inference.py`) raise
-  `NotImplementedError` — Phase 2 (implementation) fills them.
+- Architecture phase: data structures, registry, and `pretty_print` are
+  implemented; the remaining behavioral bodies (`Builder`, `verify`,
+  `serialize_module/deserialize_module`, shape-inference hooks in
+  `inference.py`) raise `NotImplementedError` — Phase 2 (implementation)
+  fills them.
 - Files < ~1000 lines; op_defs split by category (done).
 - Unknown op name in `opdef()` → `KeyError`; duplicate registration →
   `ValueError`; version/format mismatch on deserialize → `PersistenceError`;
@@ -202,7 +203,7 @@ terminators). CPU only.
 
 ## Status
 
-Architecture phase complete: SSA data model, op registry (75 ops), Builder/
-verify/serialize/pretty_print interfaces, and this contract. Behavioral bodies
-are `NotImplementedError` stubs — Phase 2 (implementation, delegated to a
-Manager) fills them.
+Architecture phase in progress: SSA data model, op registry (75 ops), and
+`pretty_print` are implemented. The remaining behavioral bodies (Builder,
+verify, serialize) and shape-inference hooks are `NotImplementedError` stubs —
+Phase 2 (implementation, delegated to a Manager) fills them.
