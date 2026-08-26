@@ -109,13 +109,11 @@ def _wrap_result(value: Any, location: Any) -> "core.SymbolicTensor":
     """
     value_type = value.type
     shape = value_type.shape
-    # TEMPORARY CORE-GAP WORKAROUND: core.SymbolicTensor.__post_init__
-    # rejects None shape entries with TypeError (while ir.ValueType and
-    # core.TensorSpec allow them). World-group collectives infer None dims
-    # (runtime-dynamic), so construct the facade with a sanitized shape
-    # (None -> 0) and immediately restore the true IR shape directly —
-    # keeping world-group tracing functional once the ir-side group_size
-    # attr issue (ATTR_INT rejects None) is fixed upstream.
+    # World-group collectives infer None dims (runtime-dynamic); None shape
+    # entries are accepted by core.SymbolicTensor / TensorSpec / ValueType.
+    # Construct the facade with a sanitized shape (None -> 0) and restore
+    # the true IR shape directly, so ``result.shape`` always matches the
+    # result's ValueType.
     sanitized = tuple(0 if dim is None else dim for dim in shape)
     result = core.SymbolicTensor(
         value=value,

@@ -18,8 +18,9 @@ CONTEXT.md where they disagree): op names have NO ``dist.`` prefix; all six
 communication collectives carry attrs ``group: str`` (required) and
 ``group_size: int | None`` (required — ``None`` for the world group) plus
 per-op params. ``broadcast`` builds the ``broadcast_collective`` op (the
-shape op ``broadcast`` owns its name), which declares NO ``src_rank`` attr
-(a known ir-side gap — dist validates ``src_rank`` and does not pass it).
+shape op ``broadcast`` owns its name); the registry declares a
+``src_rank`` attr (default 0) that the builder fills — dist validates
+``src_rank`` itself and does not pass it.
 """
 
 from __future__ import annotations
@@ -274,9 +275,10 @@ def broadcast(tensor: "core.SymbolicTensor", src_rank: int = 0, group: Optional[
         ValueError: ``src_rank`` negative or not in an explicit group.
 
     IR: one ``broadcast_collective`` op (the shape op ``broadcast`` owns its
-    name); effect kind ``collective``; attrs ``{group, group_size}`` only —
-    the registry declares NO ``src_rank`` attr (known ir-side gap; dist
-    validates ``src_rank`` above and does not pass it); 1 operand, 1 result.
+    name); effect kind ``collective``; attrs ``{group, group_size}`` plus
+    the registry-declared ``src_rank`` (default 0, filled by the builder —
+    dist validates ``src_rank`` above but does not record it); 1 operand,
+    1 result.
     """
     group = _resolve_group(group)
     if not _is_rank(src_rank) or src_rank < 0:

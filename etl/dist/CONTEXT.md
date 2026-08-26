@@ -85,10 +85,6 @@ Canonical op defs live in `etl/ir/op_defs/collective.py` — **the registry wins
 
 Result shapes come from the op defs' `shape_fn`s (`infer_identity`, `infer_all_gather`, `infer_reduce_scatter`, `infer_all_to_all`, `infer_scalar_int64` in `etl/ir/inference.py`) applied automatically by `Builder.create()` — dist reads result dtypes/shapes from the result value's type and never recomputes them. dist still performs its own explicit divisibility checks (reduce_scatter / all_to_all, static int dims, explicit groups) before building, for clear `ShapeError`s.
 
-**Known ir-side gaps (binding: do NOT patch ir from the dist node):**
-- `broadcast_collective` declares NO `src_rank` attr — dist validates `src_rank` (non-bool int ≥ 0; membership in explicit groups) and omits it from the attrs (extra attrs would fail verification).
-- The Builder's `ATTR_INT` check rejects `group_size=None` (the AttrSpecs lack `default=None`) even though the OpDef docstrings and `infer_*` support `None` — so world-group collectives currently fail with `VerificationError` at trace time. dist already passes `group="world"`, `group_size=None` (verified by spy-builder validation); the fix (AttrSpec `default=None` or relaxing the ATTR_INT check) belongs upstream in `etl/ir`. Until fixed, world-group tracing of the six collectives is blocked; `rank`/`world_size` are unaffected (no `group_size` attr).
-
 ## Collective executor hook contract
 
 ```
@@ -146,7 +142,7 @@ pytest under `../tests/dist/` (sibling — read-only from here; escalate test wr
 
 | Path | Area |
 |---|---|
-| `./_op_utils.py` | private shared helpers: operand normalization (`_require_symbolic_tensor`), location capture (`_get_location`), result wrapping (`_wrap_result` incl. the None-shape core-gap workaround), group/reduction/axis/pairs validation, `REDUCTIONS` |
+| `./_op_utils.py` | private shared helpers: operand normalization (`_require_symbolic_tensor`), location capture (`_get_location`), result wrapping (`_wrap_result`), group/reduction/axis/pairs validation, `REDUCTIONS` |
 | `./group.py` | `Group`, `group()`, `WORLD_GROUP` — static group values + validation |
 | `./collectives.py` | the six collectives + `REDUCTIONS` (re-exported from `_op_utils`) — graph-time op builders |
 | `./context.py` | `rank()`, `world_size()`, `RankContext`, executor hook (`CollectiveExecutor` protocol + `set/get_collective_executor`) |
@@ -156,4 +152,4 @@ Siblings (read-only — escalate writes to parent): `../core/` (SymbolicTensor, 
 
 ## Status
 
-Implementation complete: all six collectives build canonical IR ops (registry op names, `reduce_op`/`group`/`group_size` attrs, effect `collective`), `rank()`/`world_size()` build scalar int64 `read`-effect ops, and the executor hook slot (`CollectiveExecutor` protocol + `set/get_collective_executor`) is live. Validated via throwaway scripts (explicit-group shapes/attrs/serialization round-trip, world-group attrs + documented ir blocker, error paths, executor hook). Open item: world-group tracing of the six collectives is blocked upstream by the ir ATTR_INT/`group_size=None` issue (see "IR op attribute layout") — not fixable from this node.
+Implementation complete: all six collectives build canonical IR ops (registry op names, `reduce_op`/`group`/`group_size` attrs, effect `collective`), `rank()`/`world_size()` build scalar int64 `read`-effect ops, and the executor hook slot (`CollectiveExecutor` protocol + `set/get_collective_executor`) is live. Validated via throwaway scripts (explicit-group and world-group shapes/attrs, serialization round-trip, error paths, executor hook).
