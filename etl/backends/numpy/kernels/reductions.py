@@ -1,11 +1,12 @@
-"""Reduction kernels: reduce_* family, argmax/argmin, cumsum.
+"""Reduction kernels: reduce_* family, argmax/argmin.
 
 Covers the IR reduction ops (the sugar names ``sum``/``max``/``min``/
 ``mean``/``prod`` NEVER reach the IR — ``ops`` expands them onto the
 ``reduce_*`` ops at build time, and the ``ir`` registry defines no sugar op
 names): ``reduce_sum``, ``reduce_max``, ``reduce_min``, ``reduce_mean``,
-``reduce_prod``, ``argmax``, ``argmin``, ``cumsum`` — all ``pure``, one
-operand, one result.
+``reduce_prod``, ``argmax``, ``argmin`` — all ``pure``, one operand, one
+result. (``cumsum`` lives in ``indexing.py`` — it honors the ops
+dtype-preservation contract with ``dtype=operand.dtype``.)
 
 Semantics (each mirrors the IR inference hook that declared the result type,
 so the interpreter's post-kernel validation always agrees):
@@ -31,11 +32,6 @@ so the interpreter's post-kernel validation always agrees):
   axis -> ``np.expand_dims(result, axis)``; with ``axis=None`` numpy has no
   keepdims, so the scalar index is reshaped to the all-1 shape the IR
   declared (``(1,) * rank``).
-- ``cumsum``: attrs ``axis`` (int), ``reverse`` (bool|None). ``np.cumsum``
-  along the axis; ``reverse`` -> ``np.flip`` along the same axis (numpy
-  ``cumsum`` dtype rule; ``ops`` pre-casts bool -> int64, executed as-is).
-  Rank-0: the single element is its own cumulative sum — a copy, no axis
-  (numpy would flatten to ``(1,)`` and ``np.flip`` on a scalar raises).
 
 Design notes (binding, parent CONTEXT.md):
 - Axes and keepdims arrive as op attributes (graph constants); runtime shapes
@@ -162,28 +158,6 @@ def _arg_reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     return core.Tensor(np.asarray(result))
 
 
-def _cumsum(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
-    """``cumsum``: numpy cumulative sum along ``axis``, optionally reversed.
-
-    ``reverse`` -> ``np.flip`` along the same axis. Rank 0: the single
-    element is its own cumulative sum — return a copy (numpy would flatten a
-    scalar to ``(1,)`` and ``np.flip`` on a scalar raises ``AxisError``; the
-    IR declares the identity shape ``()``). Dtype follows ``np.cumsum``
-    (``ops`` pre-casts bool -> int64, executed as-is).
-    """
-    del ctx
-    array = operands[0].numpy()
-    _check_dtype(op.name, array)
-    axis = op.attributes["axis"]
-    reverse = bool(op.attributes.get("reverse", False))
-    if array.ndim == 0:
-        return core.Tensor(array.copy())
-    result = np.cumsum(array, axis=axis)
-    if reverse:
-        result = np.flip(result, axis=axis)
-    return core.Tensor(result)
-
-
 def register_kernels(table: dict) -> None:
     """Register this module's reduction kernels into the dispatch table.
 
@@ -194,4 +168,3 @@ def register_kernels(table: dict) -> None:
         table[name] = _reduce
     table["argmax"] = _arg_reduce
     table["argmin"] = _arg_reduce
-    table["cumsum"] = _cumsum

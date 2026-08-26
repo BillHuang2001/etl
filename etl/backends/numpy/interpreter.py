@@ -17,8 +17,10 @@ Execution model (binding, parent CONTEXT.md):
   the ``return`` terminator is special-cased in the loop, NOT dispatched.
 - **Output validation:** every kernel result is checked against the op's
   declared result types — dtype must match exactly (``BackendError`` naming
-  the op), shape must match the evaluated symbolic shape with ``None`` dims
-  unchecked (``ShapeError``). Kernels never silently coerce.
+  the op); shape is validated ELEMENTWISE (``ShapeError`` naming op/index/
+  dim): rank must match exactly, an expected ``None`` (runtime-dynamic) dim
+  is unchecked, and every other dim must evaluate to the concrete runtime
+  dim. Kernels never silently coerce.
 
 ``KernelContext`` (the ``ctx`` of the kernel contract in
 ``kernels/__init__.py``) carries per-execution state:
@@ -186,8 +188,12 @@ def _validate_result(
     """Validate one kernel result against its declared IR result type.
 
     dtype must match exactly (``BackendError`` naming the op — kernels never
-    silently coerce); the concrete shape must match the evaluated symbolic
-    shape with ``None`` dims unchecked (``ShapeError``).
+    silently coerce). Shape validation is elementwise (``ShapeError`` naming
+    the op, result index, and offending dim):
+    - rank must match exactly;
+    - an expected ``None`` (runtime-dynamic) dim is UNCHECKED — skipped;
+    - every other expected dim is evaluated against the symbolic-dim
+      bindings and must equal the concrete runtime dim.
     """
     value_type = value.type
     if tensor.dtype != value_type.dtype:
@@ -197,11 +203,21 @@ def _validate_result(
             "never silently coerce dtypes"
         )
     expected = _shape_with_unchecked_nones(value_type.shape, ctx.bindings)
-    if tuple(tensor.shape) != expected:
+    actual = tuple(tensor.shape)
+    if len(actual) != len(expected):
         raise core.ShapeError(
             f"kernel for op '{op.name}' produced result {index} with shape "
-            f"{tuple(tensor.shape)}, expected {expected}"
+            f"{actual}, expected {expected} — rank mismatch"
         )
+    for dim, (want, got) in enumerate(zip(expected, actual)):
+        if want is None:
+            continue  # runtime-dynamic dim: unchecked by design
+        if want != got:
+            raise core.ShapeError(
+                f"kernel for op '{op.name}' produced result {index} with "
+                f"shape {actual}, expected {expected} — dim {dim}: got "
+                f"{got}, expected {want}"
+            )
 
 
 class KernelContext:

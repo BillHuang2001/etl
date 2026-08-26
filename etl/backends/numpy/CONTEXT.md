@@ -81,12 +81,12 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./shapes.py` | `evaluate_dim_expr` / `evaluate_shape` — runtime `Dim`/`DimExpr` evaluation (shape-rule reuse) |
 | `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules |
 | `./kernels/elementwise.py` | add/subtract/multiply/divide/power/remainder/maximum/minimum/abs/negate/square/sqrt/exp/log/log1p/sin/cos/tan/tanh/sigmoid/relu/gelu/erf/sign/bitwise_*/logical_*/cast/equal/not_equal/less/less_equal/greater/greater_equal/select/broadcast/stop_gradient |
-| `./kernels/reductions.py` | reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod + sum/max/min/mean/prod + argmax/argmin |
-| `./kernels/indexing.py` | reshape/transpose/slice/gather/scatter/concatenate/pad |
-| `./kernels/linalg.py` | dot/conv |
-| `./kernels/control_flow.py` | cond/while_loop/scan region execution (recursive region runs) |
+| `./kernels/reductions.py` | reduce_* family (reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod), argmax/argmin (cumsum moved out to indexing.py) |
+| `./kernels/indexing.py` | reshape/transpose/slice/gather/scatter/concatenate/pad/tril/triu/cumsum |
+| `./kernels/linalg.py` | dot/conv/solve |
+| `./kernels/control_flow.py` | if/while/call — recursive region execution (the `return` terminator is special-cased by the interpreter loop, never dispatched) |
 | `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
-| `./kernels/custom.py` | `constant` (registered now); `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time) and `block_call` (registered numpy impl dispatch) are follow-up work |
+| `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
 
 Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry, StableHLO exporter.
 
@@ -103,8 +103,11 @@ Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from 
 
 ## Notes for agents
 
-- **Implemented**: staging flow (lower/compile/load), interpreter loop, KernelContext, kernel contract, constant kernel. The 6 kernel category modules register nothing yet (no-op `register_kernels`) — follow-up agents fill them one category at a time; the table assembles now and grows per category.
+- **Kernel dispatch coverage (complete)**: all 74 non-`return` IR op names are registered in `KERNEL_TABLE`; the `return` terminator is special-cased by the interpreter loop and is never dispatched. `register_all()` is idempotent; duplicate keys across category modules ⇒ `BackendError`.
 - `_register_block_impls()` is a documented no-op — block dispatch resolves via `etl.block.registry` at lower/load/run time (`get_impl(name, "numpy")` keeps the op; `get_portable(name)` is traced and spliced at lower; neither ⇒ `BackendError` naming the block). User blocks register via `BlockOp.impl("numpy")`/`.portable(...)`.
+- **Block-impl call convention (finalized with `etl.block`)**: a registered numpy impl is called as `impl(*numpy_arrays, **static_args) -> ndarray | tuple[ndarray, ...]` — operand tensors arrive as raw numpy arrays (`.numpy()`), the op's JSON-able `static_args` attribute arrives as kwargs, and the return is normalized and validated exactly like `runtime_call` (count/dtype/shape against the declared result specs).
+- **Known v1 collective-protocol limitations** (documented, never silently worked around): the `CollectiveExecutor` protocol's `reduce_scatter` has NO `reduce_op` parameter, so the op's `reduce_op` attr is not forwarded to the executor; `all_to_all` takes a single `axis`, so only `split_axis` is forwarded (`concat_axis` is not — v1 protocol limitation).
+- **Output validation with runtime-dynamic dims**: op result shapes with `None` (runtime-dynamic) dims are UNCHECKED per-dim by the interpreter (rank is still validated exactly); every non-`None` dim must evaluate to the concrete runtime dim (⇒ `ShapeError` otherwise).
 - `_module_function_names` is the single touch point for the `ir.Module` accessor API (now finalized).
 - `Capabilities.dtypes` includes all `numpy.sctypes` entries (+`bool_`) per the binding contract, including non-numeric "others" dtypes — per-op kernels validate concrete dtype support at run time (no silent coercion).
 - Kernel call convention (finalized, binding — see the docstring of `kernels/__init__.py`): `kernel(ctx, op, operands) -> Tensor | tuple[Tensor, ...]`; `ctx` is `KernelContext` (`.bindings`, `.rank_context`, `.module`, `.run_region`, `.compute_output_shapes`, `.resolve_callback`, `.evaluate_shape`). The interpreter validates outputs against `op.results` types (dtype exact; symbolic dims via `ctx.bindings`; None dims unchecked).
