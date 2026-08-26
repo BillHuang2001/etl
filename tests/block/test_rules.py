@@ -350,7 +350,7 @@ def test_jvp_derived_from_portable_vjp_fallback():
     dx = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     expected = _swish_deriv(x) * dx
 
-    tf = etl.jvp(rule_portgrad_loss, etl.TensorSpec((DIM,), etl.float32))
+    tf = etl.jvp(rule_portgrad, etl.TensorSpec((DIM,), etl.float32))
     # BUG(etl): transforms never derives jvp from the vjp rule (block/op.py
     # documents "when absent, transforms derives jvp from the vjp rule" but
     # autodiff.require_jvp_rule consults only jvp_rules) — jvp of a
