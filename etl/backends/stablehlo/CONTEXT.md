@@ -15,7 +15,6 @@ Binding contracts: `../../../CONTEXT.md` (staging pipeline, error strategy, non-
 - Returns StableHLO MLIR text (`str`) — compiler input for external tools.
 - Unsupported or deferred op ⇒ `core.BackendError` NAMING THE OP, message suggests decomposition or a future adapter. Never silently skips an op, never partial output.
 - Export-only: not registered as a Backend; performs no lower/compile/load/run.
-- **Architecture phase**: `export()` and all `Writer` methods are stubs raising `NotImplementedError`; only `ops.py` (mapping data + trivial helpers) is implemented. Behavior is implemented by `subagent_manager`.
 
 ## v1 mapping (data lives in `./ops.py`; binding table from `../../CONTEXT.md`)
 
@@ -81,11 +80,10 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 | Path | Area |
 |---|---|
 | `./ops.py` | v1 mapping tables (data) + lookup/status helpers — the auditable mapping source of truth |
-| `./writer.py` | `Writer` skeleton — StableHLO MLIR text emission (stubbed) |
-| `./__init__.py` | `export()` — the only public entry point (stubbed) |
+| `./writer.py` | StableHLO MLIR text emission (`Writer`, ~999 lines; consumes `ops.py` data only) |
+| `./__init__.py` | `export()` — the only public entry point |
 
 ## Notes for agents
 
-- **Architecture phase**: behavioral bodies raise `NotImplementedError`; only `ops.py` data + trivial helpers are implemented. Implementation is delegated to `subagent_manager` at this node by the parent orchestrator.
-- **`broadcast` name collision**: the etl op name `broadcast` appears in BOTH `SHAPE_MAP` (`stablehlo.broadcast_in_dim` — data movement) and `COLLECTIVE_MAP` (`stablehlo.collective_broadcast` — dist collective). `lookup_mapping("broadcast")` resolves to the SHAPE_MAP entry; the writer must disambiguate by the op's effect kind (collective effect ⇒ collective mnemonic). Confirm the IR op name used by `dist.broadcast` with the `dist` owner during implementation.
+- **`broadcast` name collision — resolved**: the IR op names do NOT collide — the dist collective's IR op name is `broadcast_collective` (COLLECTIVE_MAP → `stablehlo.collective_broadcast`, emitted in `writer.py`'s `_emit_collective`, ~line 821), while the shape op keeps the IR name `broadcast` (SHAPE_MAP → `stablehlo.broadcast_in_dim`, emitted in `_emit_broadcast`). Dispatch is purely by IR op name — no effect-kind disambiguation is needed at emission time. Golden-tested in `../../../tests/backends/test_stablehlo.py` (collective export asserts `stablehlo.collective_broadcast`).
 - `../../` = `etl/backends/`, `../../../` = repo root (the tests path above is correct from this node).
