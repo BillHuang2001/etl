@@ -93,7 +93,7 @@ Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i
 
 ## Test strategy
 
-`../tests/backends/` (sibling — read-only from here; test-related writes escalate to root):
+`../../tests/backends/` (sibling — read-only from here; test-related writes escalate to root):
 - `registry.py`: register/get/duplicate/unknown-name behavior.
 - numpy interpreter: per-op coverage per kernel category; symbolic-dim binding at run time; dynamic control flow; `runtime_call` sync execution; block impl dispatch (impl vs portable decomposition vs missing ⇒ BackendError); collectives — single-rank identity AND multi-rank in-process simulation via the `CollectiveExecutor` hook; persistence round-trips (artifact save/load, backend mismatch ⇒ PersistenceError).
 - stablehlo: golden-text exports for the v1 table (elementwise, reduce, dot, if/while, symbolic-dims rendering), deferred ops ⇒ BackendError naming the op.
