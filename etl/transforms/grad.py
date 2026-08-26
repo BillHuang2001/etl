@@ -142,6 +142,40 @@ def _first_structure_mismatch(
     return None
 
 
+def _single_entry_leaves(pytree, tree_spec, static_records):
+    """Single-tensor fallback for `_normalize_extra_pytree`.
+
+    When the graph has exactly one tensor leaf in `tree_spec` (one tensor
+    input for jvp, one tensor output for vjp), the user may spell the single
+    tangent/cotangent entry as a bare `core.TensorSpec`/`None` or as a
+    1-tuple `(spec_or_None,)` — regardless of which shape the graph's own
+    tree has (the vectorize/vmap precedent). Both spellings expand to the
+    full flat leaf list aligned with `tree_spec`: the entry lands at the
+    single tensor position and static positions default to `None` (they carry
+    no tangent/cotangent). Returns `None` when `pytree` is neither spelling,
+    so the caller raises its original structure-mismatch error.
+    """
+    if isinstance(pytree, core.TensorSpec) or pytree is None:
+        entry = pytree
+    elif isinstance(pytree, tuple) and len(pytree) == 1 and (
+        pytree[0] is None or isinstance(pytree[0], core.TensorSpec)
+    ):
+        entry = pytree[0]
+    else:
+        return None
+    static_positions = {record.index for record in static_records}
+    tensor_positions = [
+        index
+        for index in range(tree_spec.num_leaves)
+        if index not in static_positions
+    ]
+    if len(tensor_positions) != 1:  # defensive; the caller guarantees one
+        return None
+    leaves = [None] * tree_spec.num_leaves
+    leaves[tensor_positions[0]] = entry
+    return leaves
+
+
 def _normalize_extra_pytree(
     pytree: Any,
     tree_spec: "core.TreeSpec",
@@ -163,6 +197,10 @@ def _normalize_extra_pytree(
 
     * Structure must match the tree (ignoring leaf types) — else
       `core.TransformError` naming the first mismatching path.
+    * Single-tensor graphs (exactly one tensor leaf in `tree_spec`) also
+      accept the entry spelled as a bare `core.TensorSpec`/`None` or as a
+      1-tuple `(spec_or_None,)` — whichever shape the tree itself has;
+      static positions default to `None` (see `_single_entry_leaves`).
     * Static positions (recorded in `static_records`) carry no
       tangent/cotangent: the entry must be `None` or mirror the recorded
       static value; anything else → `core.TransformError`.
@@ -175,6 +213,10 @@ def _normalize_extra_pytree(
     """
     leaves, user_spec = core.flatten(pytree)
     mismatch = _first_structure_mismatch(user_spec, tree_spec)
+    if mismatch is not None and len(primal_specs) == 1:
+        leaves = _single_entry_leaves(pytree, tree_spec, static_records)
+        if leaves is not None:
+            mismatch = None
     if mismatch is not None:
         raise core.TransformError(
             f"{transform}: the {kind} structure does not match the graph's "
