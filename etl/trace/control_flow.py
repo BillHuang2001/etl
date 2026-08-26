@@ -528,7 +528,12 @@ def scan(f: Any, init: Any, xs: Any, length: Optional[int] = None) -> tuple:
        static leading dim (must be a static int — else `core.TraceError`).
        SYMBOLIC/dynamic length → `core.TraceError` in v1 (documented:
        dynamic-scan region ops are reserved; no silent fallback). Length 0
-       (empty scan) is unsupported in v1 → `core.TraceError`.
+       (empty scan) is unsupported in v1 → `core.TraceError`. An explicit
+       `length` SHORTER than xs's static leading dim is a PREFIX scan: the
+       scan runs only the first `length` steps and yields stacked outputs
+       of shape `(length, ...)` (the shorter loop simply never touches the
+       remaining elements). Only an explicit `length` LARGER than a
+       statically known leading dim raises `core.TraceError`.
     2. Desugars to `while_loop`. Because the `while` op is typed
        (loop-carried value types must stay constant across iterations —
        `while_loop` enforces this), the stack accumulators are carried at
@@ -599,12 +604,13 @@ def scan(f: Any, init: Any, xs: Any, length: Optional[int] = None) -> tuple:
                 f"etl.scan: length must be >= 1, got {length} — empty scans "
                 "are not supported in v1"
             )
-        # Trace-time sanity: an explicit length must agree with any
-        # statically known leading dim (symbolic/dynamic dims defer to
-        # runtime).
+        # Trace-time sanity: an explicit length must not EXCEED any
+        # statically known leading dim (a shorter length is a prefix scan —
+        # scan only the first `length` elements; symbolic/dynamic dims
+        # defer to runtime).
         for leaf in xs_leaves:
             dim0 = leaf.shape[0]
-            if isinstance(dim0, int) and not isinstance(dim0, bool) and dim0 != length:
+            if isinstance(dim0, int) and not isinstance(dim0, bool) and dim0 < length:
                 raise core.TraceError(
                     f"etl.scan: explicit length {length} does not match xs's "
                     f"static leading dim {dim0}"
