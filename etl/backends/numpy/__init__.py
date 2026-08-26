@@ -163,6 +163,9 @@ class NumpyBackend(Backend):
                 for value_type in main_fn.output_types
             ),
             static_values=tuple(record.value for record in graph.static_values),
+            output_static_values=tuple(
+                record.value for record in graph.output_static_values
+            ),
         )
         payload = ir.serialize_module(graph.module)
         return LoweredProgram(backend="numpy", signature=signature, payload=payload)

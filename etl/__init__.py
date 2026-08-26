@@ -189,4 +189,14 @@ from .persist import Cache, FileCache  # noqa: F401
 
 # --- Execution pipeline (etl.pipeline) -------------------------------------
 from . import pipeline  # noqa: F401
-from .pipeline import Executable, bind, build, compile, evaluate, load, lower, run  # noqa: F401
+from .pipeline import (  # noqa: F401
+    BoundExecutable,
+    Executable,
+    bind,
+    build,
+    compile,
+    evaluate,
+    load,
+    lower,
+    run,
+)

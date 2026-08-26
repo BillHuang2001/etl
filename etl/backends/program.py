@@ -37,13 +37,14 @@ _SIGNATURE_KEYS = (
     "input_specs",
     "output_specs",
     "static_values",
+    "output_static_values",
 )
 
 
 def _encode_signature(signature: "Signature | None"):
     """Encode ``signature`` as a JSON-safe dict for the persist container.
 
-    Mirrors ``trace.Graph.signature_info()`` exactly: the five keys are the
+    Mirrors ``trace.Graph.signature_info()`` exactly: the keys are the
     ``Signature`` field names, each value ``persist.encode_value``'d (TreeSpec,
     TensorSpec and static values all have codec entries), so the dict is
     JSON-safe as passed to ``persist.save_object``. ``None`` in, ``None`` out.
@@ -58,13 +59,14 @@ def _encode_signature(signature: "Signature | None"):
         "input_specs": persist.encode_value(signature.input_specs),
         "output_specs": persist.encode_value(signature.output_specs),
         "static_values": persist.encode_value(signature.static_values),
+        "output_static_values": persist.encode_value(signature.output_static_values),
     }
 
 
 def _decode_signature(signature_info) -> "Signature | None":
     """Rebuild a ``Signature`` from container ``signature_info``.
 
-    Decodes each of the five encoded keys via ``persist.decode_value``; a
+    Decodes each of the encoded keys via ``persist.decode_value``; a
     missing/empty ``signature_info`` yields ``None``. A present-but-malformed
     dict raises ``PersistenceError`` naming the missing field — artifacts are
     never loaded with a silently partial signature.
@@ -128,8 +130,12 @@ class Signature:
         output_tree: ``core.TreeSpec`` of the structured output.
         input_specs: per-leaf ``core.TensorSpec`` in flattened input order.
         output_specs: per-leaf ``core.TensorSpec`` in flattened output order.
-        static_values: Python values the trace specialized on; validated at run time
-            (changing them means a different graph — never a hidden recompile).
+        static_values: Python values the trace specialized on (input static
+            leaves, in pre-order leaf order); validated at run time (changing
+            them means a different graph — never a hidden recompile).
+        output_static_values: Python values recorded for static OUTPUT leaves
+            (in pre-order leaf order), re-inserted by ``etl.run`` when
+            reconstructing the structured outputs.
     """
 
     input_tree: Any = None
@@ -137,6 +143,7 @@ class Signature:
     input_specs: tuple[Any, ...] = ()
     output_specs: tuple[Any, ...] = ()
     static_values: tuple[Any, ...] = ()
+    output_static_values: tuple[Any, ...] = ()
 
 
 @dataclass

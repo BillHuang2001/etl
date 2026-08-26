@@ -577,7 +577,17 @@ def _treetype_name(typ):
 def _resolve_treetype(name):
     """Resolve a treetype name back to a type (short names first, then
     importlib + getattr chain over the qualified name)."""
-    short_names = {"tuple": tuple, "list": list, "dict": dict, "NoneType": None}
+    short_names = {
+        "tuple": tuple,
+        "list": list,
+        "dict": dict,
+        "NoneType": None,
+        # ``_treetype_name`` writes ``builtins.NoneType`` for TreeSpec leaves
+        # whose type field is ``type(None)`` (e.g. static None leaves —
+        # core.flatten records the leaf type as NoneType, which is not None);
+        # builtins has no NoneType attribute, so resolve it here.
+        "builtins.NoneType": type(None),
+    }
     if name in short_names:
         return short_names[name]
     if not isinstance(name, str) or "." not in name:

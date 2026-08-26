@@ -547,14 +547,15 @@ class Graph:
 
         The keys match the fields of `etl.backends.Signature`
         (`input_tree`, `output_tree`, `input_specs`, `output_specs`,
-        `static_values`) so backends can construct their signature from it.
-        Every value is encoded with `persist.encode_value` (lazy import), so
-        the whole dict is JSON-safe as passed to the persistence container.
-        `output_specs` is derived from the entry function's `return`
-        terminator — its operands ARE the output tree's SymbolicTensor
-        leaves in leaf order. The IR format version travels inside the
-        serialized module payload itself (`ir.serialize_module` records and
-        `ir.deserialize_module` validates it).
+        `static_values`, `output_static_values`) so backends can construct
+        their signature from it. Every value is encoded with
+        `persist.encode_value` (lazy import), so the whole dict is
+        JSON-safe as passed to the persistence container. `output_specs` is
+        derived from the entry function's `return` terminator — its operands
+        ARE the output tree's SymbolicTensor leaves in leaf order. The IR
+        format version travels inside the serialized module payload itself
+        (`ir.serialize_module` records and `ir.deserialize_module` validates
+        it).
         """
         from etl import persist
 
@@ -565,6 +566,9 @@ class Graph:
             "output_specs": persist.encode_value(self._output_specs()),
             "static_values": persist.encode_value(
                 tuple(record.value for record in self.static_values)
+            ),
+            "output_static_values": persist.encode_value(
+                tuple(record.value for record in self.output_static_values)
             ),
         }
 
