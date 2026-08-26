@@ -29,40 +29,66 @@ BOOL_SCALAR = ir.ValueType(np.dtype("bool"), ())
 
 
 # ---------------------------------------------------------------------------
-# Test-only opdef registrations.
-#
-# - ``_test_halt``: a registered NON-return terminator.  `verify` requires the
-#   last op of every block to be the ``return`` op specifically, so hitting
-#   the "terminator must be the 'return' op" branch needs a second terminator
-#   in the registry (v1 ships only ``return``).
-# - ``_test_no_rule``: a registered op with ``shape_fn=None`` and no
-#   op-specific result rule — `verify` rejects such ops explicitly.
+# Test-only opdef registrations — see the ``test_only_opdefs`` fixture below:
+# tests that need ``_test_halt`` / ``_test_no_rule`` must request it, because
+# the opdef registry is process-global (registering at import time would leak
+# into every other test module in the same pytest run).
 # ---------------------------------------------------------------------------
 
-if not ir.has_opdef("_test_halt"):
-    ir.register_opdef(
-        ir.OpDef(
-            name="_test_halt",
-            category="terminator",
-            description="test-only terminator for verify() violation tests",
-            arity=(0, None),
-            result_count=0,
-            effect=ir.EFFECT_PURE,
-            is_terminator=True,
-        )
-    )
 
-if not ir.has_opdef("_test_no_rule"):
-    ir.register_opdef(
-        ir.OpDef(
-            name="_test_no_rule",
-            category="control",
-            description="test-only op with no shape_fn and no result rule",
-            arity=0,
-            result_count=1,
-            effect=ir.EFFECT_PURE,
-        )
+def _make_test_only_opdefs() -> tuple[ir.OpDef, ir.OpDef]:
+    """Build the two test-only OpDefs used by the violation tests.
+
+    - ``_test_halt``: a registered NON-return terminator.  `verify` requires
+      the last op of every block to be the ``return`` op specifically, so
+      hitting the "terminator must be the 'return' op" branch needs a second
+      terminator in the registry (v1 ships only ``return``).
+    - ``_test_no_rule``: a registered op with ``shape_fn=None`` and no
+      op-specific result rule — `verify` rejects such ops explicitly.
+    """
+    halt = ir.OpDef(
+        name="_test_halt",
+        category="terminator",
+        description="test-only terminator for verify() violation tests",
+        arity=(0, None),
+        result_count=0,
+        effect=ir.EFFECT_PURE,
+        is_terminator=True,
     )
+    no_rule = ir.OpDef(
+        name="_test_no_rule",
+        category="control",
+        description="test-only op with no shape_fn and no result rule",
+        arity=0,
+        result_count=1,
+        effect=ir.EFFECT_PURE,
+    )
+    return halt, no_rule
+
+
+@pytest.fixture
+def test_only_opdefs():
+    """Register the test-only OpDefs; restore the registry to its prior state.
+
+    Restoring the registry exactly (including any OpDef that was already
+    registered under those names before this fixture ran) keeps the global
+    registry clean for sibling test modules such as ``test_registry.py``.
+    """
+    from etl.ir import op_defs as op_defs_mod
+
+    opdefs = _make_test_only_opdefs()
+    prior = {
+        opdef.name: op_defs_mod._REGISTRY.pop(opdef.name, None) for opdef in opdefs
+    }
+    try:
+        for opdef in opdefs:
+            op_defs_mod.register_opdef(opdef)
+        yield
+    finally:
+        for name, previous in prior.items():
+            op_defs_mod._REGISTRY.pop(name, None)
+            if previous is not None:
+                op_defs_mod._REGISTRY[name] = previous
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +460,7 @@ def test_module_level_violations(build, mutate, pattern):
         ),
     ],
 )
-def test_function_level_violations(build, mutate, pattern):
+def test_function_level_violations(build, mutate, pattern, test_only_opdefs):
     _assert_violation(build, mutate, pattern)
 
 
@@ -608,7 +634,7 @@ def test_shape_fn_agreement_violations(result_type, pattern):
         ),
     ],
 )
-def test_op_specific_result_rule_violations(build, mutate, pattern):
+def test_op_specific_result_rule_violations(build, mutate, pattern, test_only_opdefs):
     _assert_violation(build, mutate, pattern)
 
 
