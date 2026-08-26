@@ -165,9 +165,25 @@ class StaticValue:
         if self.kind == "dtype":
             return np.dtype(self.value)
         if self.kind == "enum":
-            module_name, _, member_path = self.value.rpartition(".")
-            obj: Any = importlib.import_module(module_name)
-            for part in member_path.split("."):
+            # Encoded as "<module>.<qualname>.<member>" — the module may be a
+            # dotted package path, so take the LONGEST importable prefix as
+            # the module and walk the remainder as the attribute path.
+            parts = self.value.split(".")
+            obj: Any = None
+            rest: List[str] = []
+            for i in range(len(parts), 0, -1):
+                try:
+                    obj = importlib.import_module(".".join(parts[:i]))
+                    rest = parts[i:]
+                    break
+                except ImportError:
+                    continue
+            if obj is None:
+                raise BlockError(
+                    f"corrupt StaticValue: cannot import the enum module "
+                    f"from {self.value!r}"
+                )
+            for part in rest:
                 obj = getattr(obj, part)
             return obj
         raise BlockError(f"corrupt StaticValue: unknown kind {self.kind!r}")

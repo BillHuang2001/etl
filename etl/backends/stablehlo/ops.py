@@ -5,9 +5,30 @@ defined in `../../CONTEXT.md` ("StableHLO exporter — v1 scope", binding).
 The MLIR text emission logic lives in `./writer.py` and consumes these
 tables; this module contains no emission logic.
 
-NOTE: the exact StableHLO mnemonics below must be verified against the
-StableHLO spec at implementation time (the writer implementer is
-responsible for this check; do not trust the mnemonics blindly).
+MNEMONIC VERIFICATION (done at implementation time against the StableHLO
+spec, https://openxla.org/stablehlo/spec, the interpreter status table
+https://openxla.org/stablehlo/interpreter_status, and
+stablehlo/dialect/StablehloOps.td):
+
+* Confirmed as specced StableHLO ops: add/subtract/multiply/divide/power/
+  remainder/maximum/minimum, abs/negate/sqrt/sign, exponential
+  (``exp``), log/log_plus_one, sine/cosine/tan/tanh, logistic (sigmoid),
+  and/or/xor/not, convert (cast), compare (+ ``comparison_direction``),
+  select, broadcast_in_dim, reshape, transpose, slice, concatenate, pad,
+  reduce (with a reducer region + init value), dot_general, convolution,
+  constant, if/while, all_gather/all_reduce/all_to_all/
+  collective_broadcast/collective_permute/reduce_scatter.
+* NOT in StableHLO (moved to DEFERRED_OPS here):
+  - ``erf`` — only ``chlo.erf`` exists (CHLO: "an intermediate value in
+    decompositions, never constructed directly"), and there is no trivial
+    StableHLO decomposition of the error function. Emitting
+    ``stablehlo.erf`` would produce invalid MLIR.
+  - ``gelu`` — the binding decomposition (0.5*x*(1+erf(x/sqrt(2)))) needs
+    erf, so it is deferred together with it (no silent approximation).
+  - ``argmax``/``argmin`` — no such ops in the StableHLO opset (see
+    openxla/xla issue #33449 requesting them); no trivial decomposition.
+* ``collective_broadcast`` IS a specced StableHLO op (present in the
+  spec's collective-op list and the status table).
 """
 
 from __future__ import annotations
@@ -42,7 +63,6 @@ ELEMENTWISE_MAP: dict[str, str] = {
     "tan": "stablehlo.tan",
     "tanh": "stablehlo.tanh",
     "sigmoid": "stablehlo.logistic",
-    "erf": "stablehlo.erf",
     "bitwise_and": "stablehlo.and",
     "bitwise_or": "stablehlo.or",
     "bitwise_xor": "stablehlo.xor",
@@ -58,7 +78,6 @@ ELEMENTWISE_MAP: dict[str, str] = {
 DECOMPOSITIONS: dict[str, str] = {
     "square": "multiply(x, x)",
     "relu": "maximum(x, 0)",
-    "gelu": "erf-based: 0.5*x*(1+erf(x/sqrt(2)))",
     "stop_gradient": "identity passthrough (emit operand directly)",
     "reduce_mean": "reduce-sum then divide by element count",
 }
@@ -89,8 +108,6 @@ SHAPE_MAP: dict[str, str] = {
     "reduce_max": "stablehlo.reduce",
     "reduce_min": "stablehlo.reduce",
     "reduce_prod": "stablehlo.reduce",
-    "argmax": "stablehlo.argmax",
-    "argmin": "stablehlo.argmin",
     "dot": "stablehlo.dot_general",
     "conv": "stablehlo.convolution",
 }
@@ -103,9 +120,12 @@ CONSTANT_MAP: dict[str, str] = {
     "constant": "stablehlo.constant",
 }
 
+# The real IR op names for the trace-level cond/while_loop constructs are
+# `if` and `while` (etl.trace lowers cond/while_loop to if/while ops); the
+# frontend names never appear in IR.
 CONTROL_FLOW_MAP: dict[str, str] = {
-    "cond": "stablehlo.if",
-    "while_loop": "stablehlo.while",
+    "if": "stablehlo.if",
+    "while": "stablehlo.while",
 }
 
 COLLECTIVE_MAP: dict[str, str] = {
@@ -113,7 +133,7 @@ COLLECTIVE_MAP: dict[str, str] = {
     "all_gather": "stablehlo.all_gather",
     "reduce_scatter": "stablehlo.reduce_scatter",
     "all_to_all": "stablehlo.all_to_all",
-    "broadcast": "stablehlo.collective_broadcast",
+    "broadcast_collective": "stablehlo.collective_broadcast",
     "collective_permute": "stablehlo.collective_permute",
 }
 
@@ -121,9 +141,22 @@ COLLECTIVE_MAP: dict[str, str] = {
 # message suggesting decomposition or a future adapter. `rank`/`world_size`
 # are the dist graph scalars; complex-number elementwise beyond cast is
 # additionally deferred (not an op name — enforced by dtype checks in the
-# writer).
+# writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
+# only); `argmax`/`argmin` because StableHLO has no such ops.
 DEFERRED_OPS: frozenset[str] = frozenset(
-    {"gather", "scatter", "scan", "runtime_call", "block_call", "rank", "world_size"}
+    {
+        "gather",
+        "scatter",
+        "scan",
+        "runtime_call",
+        "block_call",
+        "rank",
+        "world_size",
+        "argmax",
+        "argmin",
+        "erf",
+        "gelu",
+    }
 )
 
 # numpy dtype -> MLIR type string. Keys are numpy dtype objects; lookups
@@ -182,8 +215,8 @@ def lookup_mapping(op_name: str) -> str:
 
     Raises KeyError if `op_name` appears in no table.
 
-    Note: exact StableHLO mnemonics must be verified against the StableHLO
-    spec at implementation time.
+    Note: the mnemonics were verified against the StableHLO spec at
+    implementation time (see the module docstring).
     """
     for table in _SEARCH_ORDER:
         if op_name in table:
@@ -224,12 +257,9 @@ def mlir_dtype(dtype) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Known name collision (do not "fix" without updating ../../CONTEXT.md):
-# the etl op name `broadcast` appears in BOTH SHAPE_MAP
-# (`stablehlo.broadcast_in_dim` — the ops.broadcast data-movement op) and
-# COLLECTIVE_MAP (`stablehlo.collective_broadcast` — the dist.broadcast
-# collective). lookup_mapping resolves it to the SHAPE_MAP entry; the writer
-# must disambiguate by the op's effect kind (collective effect ⇒ collective
-# mnemonic) at emission time. Confirm the IR op name used by `dist.broadcast`
-# with the `dist` owner during implementation.
+# Naming note: the IR op names do NOT collide — the shape op is `broadcast`
+# (SHAPE_MAP → `stablehlo.broadcast_in_dim`) and the dist collective is
+# `broadcast_collective` (COLLECTIVE_MAP → `stablehlo.collective_broadcast`),
+# matching the collective op defs in `etl/ir/op_defs/collective.py`. No
+# effect-kind disambiguation is needed at emission time.
 # ---------------------------------------------------------------------------

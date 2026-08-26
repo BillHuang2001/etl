@@ -12,6 +12,8 @@ is binding) and `../../../CONTEXT.md` (root design principles).
 
 from __future__ import annotations
 
+from etl.ir import Module, verify  # allowed: top-level imports are core/ir only
+
 __all__ = ["export"]
 
 
@@ -27,8 +29,7 @@ def export(graph_or_module) -> str:
         The StableHLO MLIR text (a ``str``) — compiler input for external
         tools, e.g. ``iree-compile model.mlir -o model.vmfb``.
 
-    Behavior (binding — implemented by the Manager in the implementation
-    phase; this stub raises NotImplementedError):
+    Behavior (binding):
         1. Unwrap: if the argument has a ``.module`` attribute
            (`trace.Graph`), use it; accept `etl.ir.Module` directly;
            otherwise raise ``TypeError``.
@@ -46,14 +47,19 @@ def export(graph_or_module) -> str:
            lower/compile/load/run.
 
     Raises:
-        NotImplementedError: architecture-phase stub (current behavior).
         TypeError: if ``graph_or_module`` is neither Graph-like nor an
             `etl.ir.Module`.
         core.VerificationError: if the IR fails verification.
         core.BackendError: if any op is unsupported/deferred in v1 (names
             the op).
     """
-    raise NotImplementedError(
-        "etl.backends.stablehlo.export is an architecture-phase stub; "
-        "behavior is implemented by subagent_manager per the docstring above"
-    )
+    module = getattr(graph_or_module, "module", graph_or_module)
+    if not isinstance(module, Module):
+        raise TypeError(
+            "etl.backends.stablehlo.export: expected a trace.Graph or an "
+            f"etl.ir.Module, got {type(graph_or_module).__name__}"
+        )
+    verify(module)
+    from .writer import Writer
+
+    return Writer(module).write()
