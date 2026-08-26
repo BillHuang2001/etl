@@ -13,7 +13,7 @@ import pytest
 
 import etl
 import etl.numpy as enp
-from _ir_utils import normalize_ir
+from tests.numpy._ir_utils import normalize_ir
 
 SPEC_A = etl.TensorSpec((3, 3), etl.float32)
 SPEC_B = etl.TensorSpec((3, 2), etl.float32)

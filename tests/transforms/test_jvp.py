@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 import etl
-from _fd_utils import central_directional, run_graph, run_jvp, to_np
+from tests.transforms._fd_utils import central_directional, run_graph, run_jvp, to_np
 
 # Reference settings: float32 references are computed in float64 with a
 # coarser step (float32 rounding would dominate a 1e-6 step); float64 uses a

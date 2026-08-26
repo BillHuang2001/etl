@@ -24,7 +24,7 @@ import pytest
 
 import etl
 
-from conftest import ops_of, run_numpy
+from tests.ops.conftest import ops_of, run_numpy
 
 # NOTE: ``etl.ops.constant`` as an ATTRIBUTE is the re-exported function
 # (``etl.ops.__init__`` re-exports the op), so the module itself must be

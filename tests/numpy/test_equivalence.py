@@ -22,7 +22,7 @@ import pytest
 import etl
 import etl.numpy as enp
 from etl import ops
-from _ir_utils import normalize_ir
+from tests.numpy._ir_utils import normalize_ir
 
 F32 = etl.float32
 F64 = etl.float64

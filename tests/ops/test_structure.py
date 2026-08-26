@@ -14,7 +14,7 @@ import pytest
 import etl
 from etl import DTypeError, ShapeError
 
-from conftest import ops_of, run_numpy, trace_fn
+from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 #: Module-level symbolic dims for parametrize lists (Dims with equal names
 #: compare equal, so tests may build their own ``etl.dim("n")`` as well).

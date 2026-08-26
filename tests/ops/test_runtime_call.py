@@ -23,7 +23,7 @@ import pytest
 import etl
 from etl import ir
 
-from conftest import ops_of, run_numpy
+from tests.ops.conftest import ops_of, run_numpy
 
 # Module-level access to the callback registry (``etl.ops.constant`` as an
 # attribute is the re-exported function; see test_constant.py).

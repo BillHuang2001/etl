@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 
 import etl
-from conftest import ops_of, run_numpy, trace_fn
+from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 
 # ---------------------------------------------------------------------------

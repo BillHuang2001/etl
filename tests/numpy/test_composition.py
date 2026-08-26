@@ -16,7 +16,7 @@ import pytest
 import etl
 import etl.ir
 import etl.numpy as enp
-from _ir_utils import normalize_ir
+from tests.numpy._ir_utils import normalize_ir
 
 F32 = etl.float32
 

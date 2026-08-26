@@ -16,7 +16,7 @@ import pytest
 
 import etl
 
-from conftest import ops_of, run_numpy, trace_fn
+from tests.ops.conftest import ops_of, run_numpy, trace_fn
 
 # Rank-2 specs (matmul/dot needs rank >= 2; every other binary pair
 # broadcasts fine on these shapes).

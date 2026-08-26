@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import etl
-from _fd_utils import (
+from tests.transforms._fd_utils import (
     central_directional,
     central_grad,
     run_grad,

@@ -34,7 +34,7 @@ The suite therefore exits non-zero with exactly these 4 known failures (269 pass
 
 ## Notes for agents
 
-- `from _ir_utils import normalize_ir` relies on pytest's prepend import mode putting `tests/numpy` on sys.path — do not add an `__init__.py` or change the import style without checking `python3 -m pytest -q tests/numpy`.
+- `from tests.numpy._ir_utils import normalize_ir` — test dirs are packages (have `__init__.py`), so helper imports must be package-qualified.
 - `normalize_ir` strips per-op ` loc("file":line:col)` tokens: enp callsites live in `etl/numpy/*.py` while ops-composed defns live in the test file, so raw printed IR never matches without this normalization. The entry function is always named `main`.
 - `ops.dot` requires rank ≥ 2 (batched matmul) — 1-D `enp.dot`/`enp.matmul` raise ShapeError; that is the documented v1 deviation, not a bug.
 - Creation ops emit large-constant warnings by design (`ETL_LARGE_CONSTANT_BYTES`, default 1 MiB) — tests use small shapes and treat warnings as expected, not bugs.

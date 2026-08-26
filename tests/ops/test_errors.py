@@ -26,7 +26,7 @@ import pytest
 
 import etl
 
-from conftest import ops_of
+from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
 # Per-op table of MINIMAL VALID call arguments (all 67 public ops).
