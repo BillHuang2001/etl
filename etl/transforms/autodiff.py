@@ -100,15 +100,38 @@ def get_vjp_rule(op_name: str) -> Optional[VJPRule]:
 
 
 def require_jvp_rule(op_name: str) -> JVPRule:
-    """Like `get_jvp_rule`, but raises `TransformError` naming the op."""
+    """Like `get_jvp_rule`, but raises `TransformError` naming the op.
+
+    Note: the sweep does not require a registered JVP rule when a VJP rule
+    exists — it derives the JVP from the VJP rule via the adjoint
+    (double-vjp) trick (see `_jvp_from_vjp`), so `register_jvp_rule` is only
+    required when NEITHER rule is registered.
+    """
     rule = jvp_rules.get(op_name)
     if rule is None:
         raise TransformError(
-            f"jvp: no JVP rule for op '{op_name}'. Register one with "
-            f"register_jvp_rule('{op_name}', fn) (custom blocks: "
-            f"BlockOp.jvp_rule); there is no silent fallback."
+            f"jvp: no JVP rule for op '{op_name}' (and no VJP rule to derive "
+            f"one from). Register one with register_jvp_rule('{op_name}', fn) "
+            f"(custom blocks: BlockOp.jvp_rule); there is no silent fallback."
         )
     return rule
+
+
+def require_jvp_or_vjp_rule(op_name: str) -> Optional[JVPRule]:
+    """Like `require_jvp_rule`, but satisfied by a registered VJP rule too.
+
+    When only a VJP rule exists, the sweep derives the JVP from it via the
+    adjoint (double-vjp) trick (`_jvp_from_vjp`). Raises `TransformError`
+    naming the op only when NEITHER rule is registered.
+    """
+    if op_name in jvp_rules or op_name in vjp_rules:
+        return jvp_rules.get(op_name)
+    raise TransformError(
+        f"jvp: no JVP rule for op '{op_name}' (and no VJP rule to derive one "
+        f"from). Register one with register_jvp_rule('{op_name}', fn) or "
+        f"register_vjp_rule('{op_name}', fn) (custom blocks: "
+        f"BlockOp.jvp_rule/vjp_rule); there is no silent fallback."
+    )
 
 
 def require_vjp_rule(op_name: str) -> VJPRule:
@@ -188,6 +211,169 @@ def _accumulate(env: Dict[int, object], value: ir.Value, cotangent) -> None:
         env[id(value)] = cotangent
     else:
         env[id(value)] = ops.add(_sym(existing), _sym(cotangent)).value
+
+
+def _combine(entries) -> Optional[ir.Value]:
+    """Combine accumulated cotangent entries: `None` for no entries, the
+    single entry as-is, or the add-reduced `ir.Value` of multiple entries
+    (built with `etl.ops.add` — the canonical cotangent-accumulation op)."""
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return entries[0]
+    total = _sym(entries[0])
+    for other in entries[1:]:
+        total = ops.add(total, _sym(other))
+    return total.value
+
+
+def _repair_portable_vjp(proxy: ir.Op, emitted, seeds) -> Tuple[Optional[ir.Value], ...]:
+    """Recompute a buggy portable-fallback VJP with correct post-inline seeding.
+
+    `etl/block`'s pre-registered portable-decomposition vjp fallback inlines
+    the decomposition into the active builder but seeds its local reverse
+    sweep on the block_call's own result values (the PRE-inline values) —
+    the inlined decomposition produces NEW values, so the fallback's sweep
+    finds no seeds and returns all-`ZeroTangent` (repo bug: grad-via-portable
+    yields all zeros). This mirrors that fallback's local sweep but seeds the
+    accumulator on the decomposition's OUTPUTS (identified among `emitted`)
+    with `seeds` (aligned with `proxy.results`) — the post-inline values the
+    fallback SHOULD have seeded.
+
+    Returns the repaired input cotangents aligned with `proxy.operands`
+    (missing → `ZeroTangent()`). Nested `block_call` ops inside the
+    decomposition resolve via their own `block:<name>` rules.
+
+    Raises:
+        TransformError: The number of decomposition outputs does not match
+            `len(proxy.results)` — never guess an alignment.
+    """
+    emitted_ids = {op.id for op in emitted}
+    outputs = []
+    for op in emitted:
+        for result in op.results:
+            if all(use.owner.id not in emitted_ids for use in result.uses):
+                outputs.append(result)
+    if len(outputs) != len(proxy.results):
+        raise TransformError(
+            f"cannot repair the portable-decomposition vjp rule for op "
+            f"'{_rule_name(proxy)}': found {len(outputs)} decomposition "
+            f"outputs for {len(proxy.results)} block results — never guessing"
+        )
+
+    # Seed the accumulator on the decomposition outputs (skip zero seeds).
+    acc: Dict[int, list] = {}
+    for out_value, seed in zip(outputs, seeds):
+        if _is_real(seed):
+            acc.setdefault(out_value.id, []).append(seed)
+
+    # Local reverse sweep over ONLY the inlined ops.
+    for inlined in reversed(emitted):
+        if not any(acc.get(result.id) for result in inlined.results):
+            continue  # dead for backprop: no result carries a cotangent
+        per_result = tuple(
+            _combine(acc.get(result.id)) for result in inlined.results
+        )
+        vjp_fn = require_vjp_rule(_rule_name(inlined))
+        input_cotangents = vjp_fn(inlined, per_result, inlined.operands)
+        for operand_value, in_ct in zip(inlined.operands, input_cotangents):
+            if _is_real(in_ct):
+                acc.setdefault(operand_value.id, []).append(in_ct)
+
+    # Finalize: aligned with proxy.operands (missing -> ZeroTangent).
+    repaired = []
+    for primal in proxy.operands:
+        entries = acc.get(primal.id)
+        repaired.append(_combine(entries) if entries else ZeroTangent())
+    return tuple(repaired)
+
+
+def _jvp_from_vjp(proxy: ir.Op, tangents, builder: ir.Builder):
+    """Derive the JVP of `proxy` from its registered VJP rule (adjoint trick).
+
+    The VJP rule builds the linear map L: c ↦ Jᵀc. Instantiate it with
+    c = the op's (rebuilt) primal results — any well-typed c works, since the
+    adjoint of L is independent of the concrete c — then apply L's transpose
+    (J) to the tangents with a SECOND reverse sweep over the ops L emitted
+    (the rule's emissions plus, for the buggy portable fallback fingerprint,
+    the repair's emissions). Cotangents only propagate along paths that reach
+    a ct slot (a `proxy.results` value): paths to primals are second-order
+    terms and are dropped, which also keeps the graph free of dead
+    second-order ops (the decomposition's own vjp rules never run).
+
+    Returns a tuple aligned with `proxy.results` of
+    `ir.Value | None | ZeroTangent` — the output tangents J·v.
+    """
+    if all(t is None or isinstance(t, ZeroTangent) for t in tangents):
+        return (ZeroTangent(),) * len(proxy.results)
+
+    key = _rule_name(proxy)
+    vjp_rule = require_vjp_rule(key)
+    before = {op.id for op in builder.current_block.ops}
+    l_outputs = vjp_rule(proxy, tuple(proxy.results), proxy.operands)
+    emitted = [op for op in builder.current_block.ops if op.id not in before]
+    if not isinstance(l_outputs, (tuple, list)):
+        raise TransformError(
+            f"vjp rule for op '{key}' did not return a tuple of cotangents, "
+            f"got {type(l_outputs).__name__}"
+        )
+    if len(l_outputs) != len(proxy.operands):
+        raise TransformError(
+            f"vjp rule for op '{key}' returned {len(l_outputs)} cotangents, "
+            f"expected {len(proxy.operands)} (one per operand)"
+        )
+    for entry in l_outputs:
+        if entry is not None and not isinstance(entry, (ir.Value, ZeroTangent)):
+            raise TransformError(
+                f"vjp rule for op '{key}' returned an invalid cotangent entry "
+                f"{entry!r}: entries must be ir.Value | None | ZeroTangent"
+            )
+
+    if (
+        proxy.name == "block_call"
+        and emitted
+        and all(ct is None or isinstance(ct, ZeroTangent) for ct in l_outputs)
+    ):
+        # Buggy portable-fallback fingerprint: all-zero return WITH emissions.
+        # Repair with the correct post-inline seeding; the repaired extraction
+        # yields L's real outputs (entries that stay zero are structurally
+        # zero columns of Jᵀ — kept as such).
+        l_outputs = _repair_portable_vjp(proxy, emitted, tuple(proxy.results))
+        emitted = [op for op in builder.current_block.ops if op.id not in before]
+
+    # Second reverse sweep = the adjoint application J·v (transpose of L):
+    # seed the tangents on L's outputs, then sweep back. Keep cotangents only
+    # on the ct slots and on values downstream of them (the only paths that
+    # reach J·v); every other operand's cotangent is a second-order term.
+    ct_ids = {result.id for result in proxy.results}
+    on_ct_path = set(ct_ids)
+    for op in emitted:
+        if any(operand.id in on_ct_path for operand in op.operands):
+            on_ct_path.update(result.id for result in op.results)
+
+    acc2: Dict[int, list] = {}
+    for u, v in zip(l_outputs, tangents):
+        if _is_real(u) and _is_real(v):
+            acc2.setdefault(u.id, []).append(v)
+    for op in reversed(emitted):
+        if op.name == "constant":
+            continue  # zero operands — nothing to propagate backward
+        if not any(acc2.get(result.id) for result in op.results):
+            continue  # no seeded result — off the ct path (second-order)
+        per_result = tuple(_combine(acc2.get(result.id)) for result in op.results)
+        vjp_fn = require_vjp_rule(_rule_name(op))
+        in_cts = vjp_fn(op, per_result, op.operands)
+        for operand, in_ct in zip(op.operands, in_cts):
+            if _is_real(in_ct) and operand.id in on_ct_path:
+                acc2.setdefault(operand.id, []).append(in_ct)
+
+    # Output tangents: accumulated cotangents on the ct slots (the primal
+    # results); missing -> structurally zero.
+    out_tangents = []
+    for result in proxy.results:
+        entries = acc2.get(result.id)
+        out_tangents.append(_combine(entries) if entries else ZeroTangent())
+    return tuple(out_tangents)
 
 
 def _validate_extra_specs(graph: Graph, extra_specs, expected: int, kind: str):
@@ -285,7 +471,7 @@ def _sweep(graph: Graph, extra_specs, mode: str) -> Graph:
             is_constant = op.name == "constant"
             if not is_constant:
                 if mode == "jvp":
-                    require_jvp_rule(name)
+                    require_jvp_or_vjp_rule(name)
                 else:
                     require_vjp_rule(name)
             new_operands = tuple(value_env[id(operand)] for operand in op.operands)
@@ -316,7 +502,13 @@ def _sweep(graph: Graph, extra_specs, mode: str) -> Graph:
                         dual_env.get(id(operand), ZeroTangent())
                         for operand in new_operands
                     )
-                    out_tangents = jvp_rules[name](proxy, tangents)
+                    jvp_rule = jvp_rules.get(name)
+                    if jvp_rule is not None:
+                        out_tangents = jvp_rule(proxy, tangents)
+                    else:
+                        # No JVP rule: derive it from the VJP rule via the
+                        # adjoint (double-vjp) trick.
+                        out_tangents = _jvp_from_vjp(proxy, tangents, builder)
                     if not isinstance(out_tangents, (tuple, list)):
                         raise TransformError(
                             f"jvp rule for op '{name}' did not return a tuple of "
@@ -379,7 +571,29 @@ def _sweep(graph: Graph, extra_specs, mode: str) -> Graph:
                     dual_env.get(id(result), ZeroTangent())
                     for result in proxy.results
                 )
+                before = {op.id for op in builder.current_block.ops}
                 in_cotangents = vjp_rules[name](proxy, cotangents, proxy.operands)
+                emitted = [
+                    op for op in builder.current_block.ops if op.id not in before
+                ]
+                if (
+                    proxy.name == "block_call"
+                    and emitted
+                    and all(
+                        ct is None or isinstance(ct, ZeroTangent)
+                        for ct in in_cotangents
+                    )
+                    and any(_is_real(ct) for ct in cotangents)
+                ):
+                    # Buggy portable-fallback fingerprint (all-zero return
+                    # WITH inlined emissions AND a real incoming cotangent —
+                    # the fallback short-circuits without inlining when all
+                    # incoming cotangents are zero, and an all-zero result is
+                    # then correct): recompute with the correct post-inline
+                    # seeding (seeds on the decomposition's outputs).
+                    in_cotangents = _repair_portable_vjp(
+                        proxy, emitted, cotangents
+                    )
                 if not isinstance(in_cotangents, (tuple, list)):
                     raise TransformError(
                         f"vjp rule for op '{name}' did not return a tuple of "

@@ -33,17 +33,18 @@ def current_builder() -> "ir.Builder":
     Raises:
         core.TraceError: When no trace (or control-flow region) is active —
             i.e. an op function was called outside `etl.trace` / `etl.cond` /
-            `etl.while_loop` / `etl.scan` bodies. The message directs the
-            user to trace/evaluate.
+            `etl.while_loop` / `etl.scan` bodies. The message names all
+            three entry points (`@etl.defn`-traced definitions, `etl.trace`,
+            `etl.evaluate`).
     """
     stack = _builder_stack.get()
     if not stack:
         raise core.TraceError(
             "No active trace: tensor ops can only be called while tracing "
-            "(inside a function passed to `etl.trace`, or inside the "
-            "callables of `etl.cond` / `etl.while_loop` / `etl.scan`). Call "
-            "`etl.trace(fn, *specs)` or `etl.evaluate(fn, *args)` to run a "
-            "graph definition."
+            "a graph definition (inside an `@etl.defn` function traced via "
+            "`etl.trace`, or inside the callables of `etl.cond` / "
+            "`etl.while_loop` / `etl.scan`). Call `etl.trace(fn, *specs)` "
+            "or `etl.evaluate(fn, *args)` to run a graph definition."
         )
     return stack[-1]
 

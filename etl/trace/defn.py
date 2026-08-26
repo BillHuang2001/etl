@@ -84,4 +84,6 @@ def defn(fn: Optional[Callable[..., Any]] = None, **options: Any) -> Any:
             return Defn(f, options)
 
         return wrap
+    if isinstance(fn, Defn):
+        return fn
     return Defn(fn, options)

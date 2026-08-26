@@ -152,8 +152,10 @@ rules (`constant`: dtype/shape from the payload; `call`: callee output
 signature; `if`: operand types of both branches' `return` terminators, which
 must agree; `runtime_call`/`block_call`: `result_specs` entries — `ValueType`
 | core `TensorSpec` | `{"dtype", "shape"}` dict — converted to `ValueType`);
-anything else with `shape_fn=None` demands explicit types. `ShapeError` from a
-`shape_fn` propagates unchanged. NOTE: the `result_specs` conversion applies
+anything else with `shape_fn=None` demands explicit types. A `ShapeError`
+from a `shape_fn` propagates with the op's source location appended to its
+message (when a real location is known — never for `Location.unknown()`).
+NOTE: the `result_specs` conversion applies
 to result-TYPE RESOLUTION only — the stored attribute is NOT rewritten, and
 `verify` requires the stored `result_specs` to be a sequence of `ValueType`
 instances. Frontends must pass `ValueType`s (not `TensorSpec`/dict entries)

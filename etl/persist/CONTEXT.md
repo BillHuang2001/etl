@@ -86,8 +86,13 @@ agents).
 ## Cache (cache.py)
 
 - Key = sha256 hex of canonical JSON (`sort_keys`, compact separators) of
-  `[ETL_FORMAT_VERSION, [encoded components]]` — a format bump invalidates
-  all entries.
+  `[ETL_FORMAT_VERSION, container_tag, [encoded components]]`, where
+  `container_tag` type-tags the components container
+  ("str"/"tuple"/"list"/"dict"/qualified name) so a bare string and a
+  one-element sequence derive different keys, and encoded dict-envelope
+  item lists are sorted by canonical JSON so dict insertion order never
+  matters (a dict `key_components` also iterates its keys sorted); a
+  format bump still invalidates all entries.
 - Keying contract (binding): components MUST include every input affecting
   the value — graph bytes, frontend/IR version, static values, signatures,
   backend name+version, compiler version/options, target, custom ops,

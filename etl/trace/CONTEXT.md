@@ -140,8 +140,12 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
   `expand_dims`. Step 0 runs pre-loop via a static `slice` at index 0;
   `length == 0` raises `TraceError` (v1).
 
-`scan` v1 scope: STATIC length only (int, or derived from xs's static
-leading dim). Symbolic length → `TraceError` (dynamic-scan region ops
+`scan` v1 scope: STATIC length only (an explicit static `int`, or derived
+from xs's static leading dim). An explicit static `length` SMALLER than a
+statically-known leading dim is allowed and runs a PREFIX scan over the
+first `length` elements (stacked outputs have shape `(length, ...)`); only
+an explicit `length` LARGER than a statically-known leading dim raises
+`TraceError`. Symbolic length → `TraceError` (dynamic-scan region ops
 reserved; no silent fallback).
 
 ## Error cases (all public errors derive from `core.ETLError`)
@@ -207,6 +211,17 @@ Fully implemented (Phase 2 complete): `trace.py` (7-step tracer),
 (cond/while_loop/scan region building), plus `builder.py`/`defn.py`
 (pre-existing). All graphs produced by `etl.trace` pass `ir.verify`;
 Graph save/load round-trips through the persist container.
+
+## Design Decisions
+
+- **A fully-static dataclass config object passed as a trace argument is
+  legitimate static specialization, not an error.** Dataclass instances are
+  pytree containers: the tracer descends into them, and a config whose
+  fields are all static Python values specializes statically at trace time —
+  each static leaf is recorded in `static_values` and validated at run time
+  via `Graph.flatten_inputs`. (A dataclass containing non-static,
+  non-`TensorSpec` leaves still raises `TraceError` per the trace algorithm
+  above.)
 
 ## Notes for agents
 

@@ -89,6 +89,15 @@ def _reduce_leading(v: ir.Value, primal: ir.Value) -> ir.Value:
     diff = v.type.rank - primal.type.rank
     if diff <= 0: return v
     return ops.reduce_sum(_sym(v), axes=tuple(range(diff))).value
+def _reduce_to_operand(ct_value: ir.Value, operand_value: ir.Value) -> ir.Value:
+    """Sum-reduce implicit broadcast dims so a cotangent matches the operand's shape: leading rank-padding axes plus any expanded size-one dims (`dim == 1` is safe — symbolic `Dim`/`DimExpr` never compare equal to an int)."""
+    diff = ct_value.type.rank - operand_value.type.rank
+    axes = list(range(diff)) + [diff + i for i, dim in enumerate(operand_value.type.shape) if dim == 1]
+    if not axes: return ct_value
+    reduced = ops.reduce_sum(_sym(ct_value), axes=tuple(axes))
+    if tuple(reduced.shape) != tuple(operand_value.type.shape):
+        reduced = ops.reshape(reduced, tuple(operand_value.type.shape))
+    return reduced.value
 def _fold_product(shape) -> "int | core.DimExpr | None":
     """Fold a shape into one int/DimExpr (None when a dim is dynamic)."""
     out = None
@@ -528,16 +537,21 @@ def _pointwise_jvp(op, tangents):
 def _vjp_add(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
-    return (ct, ct)
+    a, b = primals
+    return (_reduce_to_operand(ct, a), _reduce_to_operand(ct, b))
 def _vjp_subtract(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
-    return (ct, ops.negate(_sym(ct)).value)
+    a, b = primals
+    neg = ops.negate(_sym(ct)).value
+    return (_reduce_to_operand(ct, a), _reduce_to_operand(neg, b))
 def _vjp_multiply(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
     a, b = primals
-    return (ops.multiply(_sym(ct), _sym(b)).value, ops.multiply(_sym(ct), _sym(a)).value)
+    g_a = ops.multiply(_sym(ct), _sym(b)).value
+    g_b = ops.multiply(_sym(ct), _sym(a)).value
+    return (_reduce_to_operand(g_a, a), _reduce_to_operand(g_b, b))
 def _vjp_divide(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
@@ -545,7 +559,7 @@ def _vjp_divide(op, ct, primals):
     y = op.results[0]
     g_a = ops.divide(_sym(ct), _sym(b)).value
     g_b = ops.negate(ops.divide(ops.multiply(_sym(ct), _sym(y)), _sym(b))).value
-    return (g_a, g_b)
+    return (_reduce_to_operand(g_a, a), _reduce_to_operand(g_b, b))
 def _vjp_power(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
@@ -553,7 +567,7 @@ def _vjp_power(op, ct, primals):
     y = op.results[0]
     g_a = ops.multiply(ops.multiply(_sym(ct), _sym(y)), ops.divide(_sym(b), _sym(a))).value
     g_b = ops.multiply(ops.multiply(_sym(ct), _sym(y)), ops.log(_sym(a))).value
-    return (g_a, g_b)
+    return (_reduce_to_operand(g_a, a), _reduce_to_operand(g_b, b))
 def _vjp_remainder(op, ct, primals):
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(), ZeroTangent())
@@ -586,15 +600,7 @@ def _vjp_broadcast(op, ct, primals):
     """Broadcast VJP: reduce the cotangent over the leading inserted axes and over any size-one expanded dims, then reshape back to the input shape."""
     ct = _ok(ct)
     if ct is None: return (ZeroTangent(),)
-    a = primals[0]
-    diff = ct.type.rank - a.type.rank
-    axes = list(range(diff)) + [diff + i for i, dim in enumerate(a.type.shape) if dim == 1]
-    if not axes: return (ct,)
-    reduced = ops.reduce_sum(_sym(ct), axes=tuple(axes))
-    target = tuple(a.type.shape)
-    if tuple(reduced.shape) != target:
-        reduced = ops.reshape(reduced, target)
-    return (reduced.value,)
+    return (_reduce_to_operand(ct, primals[0]),)
 
 #: Per-op VJP rules for the special-cased elementwise ops.
 _POINTWISE_VJP = {

@@ -11,6 +11,7 @@ rewriting, no implicit communication, and never shard inside the graph
 
 from __future__ import annotations
 
+import numbers
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -95,6 +96,14 @@ def devices(kind: Optional[str] = None) -> List[Device]:
     )
 
 
+def _invalid_axis_error(axis: Any) -> DeviceError:
+    """Canonical invalid-axis error: name the bad value and its type."""
+    return DeviceError(
+        f"split_tensor axis {axis!r} is not a valid axis: expected an integer, "
+        f"got {type(axis).__name__}"
+    )
+
+
 def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Tensor"]:
     """Split a local tensor along ``axis`` into one tensor per device.
 
@@ -106,26 +115,47 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
 
     Args:
         tensor: The local concrete tensor to split.
-        axis: Axis along which to split (normalized, may be negative).
+        axis: Axis along which to split (normalized, may be negative; must
+            be an integer — bools are rejected).
         devices: Target devices (one result tensor each).
 
     Returns:
         A list of :class:`Tensor`\s, one per device, each a contiguous chunk.
 
     Raises:
-        DeviceError: If ``devices`` is empty or ``axis`` is out of range.
+        DeviceError: If ``devices`` is empty, if ``tensor`` is not a
+            :class:`Tensor`, if ``axis`` is not an integer (bools included),
+            if ``axis`` is out of range, or if the split fails.
         ShapeError: If ``tensor.shape[axis]`` is not divisible by
             ``len(devices)``.
     """
     if not devices:
         raise DeviceError("split_tensor requires at least one device")
+    from .tensor import Tensor  # deferred: avoids a runtime import cycle
+
+    if not isinstance(tensor, Tensor):
+        raise DeviceError(f"split_tensor expects a Tensor, got {type(tensor).__name__}")
     ndim = tensor.data.ndim
-    normalized = axis + ndim if axis < 0 else axis
+    # bools are rejected up-front (they are ints, but never a valid axis).
+    if isinstance(axis, bool):
+        raise _invalid_axis_error(axis)
+    try:
+        # Non-numeric axes (str, None, complex, multi-element arrays) raise
+        # here; numpy arrays can also raise ValueError from ambiguous truth.
+        normalized = axis + ndim if axis < 0 else axis
+    except (TypeError, ValueError):
+        raise _invalid_axis_error(axis) from None
+    # Range check comes before the integrality check so a numeric out-of-range
+    # axis (e.g. 2.5 on a 2-D tensor) keeps the "out of range" diagnostic.
     if normalized < 0 or normalized >= ndim:
         raise DeviceError(
             f"split_tensor axis {axis} is out of range for a tensor with "
             f"{ndim} dimension(s)"
         )
+    # In-range non-integral axes (e.g. 0.5 on a 1-D tensor). numpy integer
+    # scalars (np.int32, ...) are numbers.Integral and pass.
+    if not isinstance(axis, numbers.Integral):
+        raise _invalid_axis_error(axis)
     dim_size = tensor.shape[normalized]
     if dim_size % len(devices) != 0:
         raise ShapeError(
@@ -134,7 +164,10 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
             f"divisible by {len(devices)}"
         )
     # np.split returns views of the input — no copies, just device tagging.
-    chunks = np.split(tensor.data, len(devices), axis=normalized)
+    try:
+        chunks = np.split(tensor.data, len(devices), axis=normalized)
+    except (TypeError, ValueError, IndexError) as exc:
+        raise DeviceError(f"split_tensor failed to split along axis {axis}: {exc}") from exc
     return [_tensor(chunk, device) for chunk, device in zip(chunks, devices)]
 
 
@@ -153,9 +186,16 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
         A list of :class:`Tensor`\s, one per device, all sharing the data.
 
     Raises:
-        DeviceError: If ``devices`` is empty.
+        DeviceError: If ``devices`` is empty or ``tensor`` is not a
+            :class:`Tensor`.
     """
     if not devices:
         raise DeviceError("replicate_tensor requires at least one device")
+    from .tensor import Tensor  # deferred: avoids a runtime import cycle
+
+    if not isinstance(tensor, Tensor):
+        raise DeviceError(
+            f"replicate_tensor expects a Tensor, got {type(tensor).__name__}"
+        )
     # The SAME ndarray object tagged with each device — no copies.
     return [_tensor(tensor.data, device) for device in devices]

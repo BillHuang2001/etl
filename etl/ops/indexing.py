@@ -630,6 +630,8 @@ def getitem(x, key) -> "core.SymbolicTensor":
                 raise core.TraceError(
                     f"getitem: slice step must be an int or None, got {step!r}"
                 )
+            if step == 0:
+                raise TypeError("getitem: slice step cannot be zero")
             if step in (None, 1):
                 start = 0 if entry.start is None else entry.start
                 stop = entry.stop
