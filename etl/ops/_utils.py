@@ -236,11 +236,19 @@ def weak_scalar_dtype(value: Scalar, array_dtype) -> np.dtype:
       ``array_dtype`` when the value is exactly representable in it, else
       ``float64`` (complex64 with an unrepresentable int → ``complex128``);
       integer/uint/bool tensors promote via ``np.result_type``.
-    - ``float``: weak toward complex64 ONLY — ``float + complex64 → complex64``;
-      otherwise ``np.result_type(float64, array_dtype)`` (so ``float + float32
-      → float64``, matching NEP 50).
-    - ``complex``: weak toward nothing — always ``np.result_type(complex128,
+    - ``float``: weak toward ALL float/complex array dtypes (NEP 50) — result
+      is ``array_dtype`` when its kind is ``f`` or ``c`` (``float + float16 →
+      float16``, ``float + float32 → float32``, ``float + float64 → float64``,
+      ``float + complex64 → complex64``, ``float + complex128 → complex128``);
+      integer/uint/bool tensors promote via ``np.result_type(float64,
       array_dtype)``.
+    - ``complex``: weak toward complex64/complex128 ONLY (never toward the
+      float dtypes) — against float/complex array dtypes the scalar is taken
+      as complex64 and promoted via plain ``np.result_type`` (``complex +
+      float16/32 → complex64``, ``complex + float64 → complex128``,
+      ``complex + complex64 → complex64``, ``complex + complex128 →
+      complex128``); integer/uint/bool tensors promote via
+      ``np.result_type(complex128, array_dtype)``.
 
     Args:
         value: The Python scalar.
@@ -277,10 +285,18 @@ def weak_scalar_dtype(value: Scalar, array_dtype) -> np.dtype:
         # scalar's natural dtype is int64).
         return np.result_type(np.dtype("int64"), array_dtype)
     if scalar_kind is float:
-        if array_dtype == core.complex64:
+        # NEP 50: a python float is weak toward EVERY float/complex array
+        # dtype (no value-based checks); integer/uint/bool arrays promote
+        # via plain result_type with the scalar's natural float64.
+        if array_dtype.kind in "fc":
             return array_dtype
         return np.result_type(np.dtype("float64"), array_dtype)
-    # complex: weak toward nothing — plain result_type with complex128.
+    # complex: weak toward complex64/complex128 ONLY — never toward the
+    # float dtypes (NEP 50). Against float/complex arrays, take the scalar
+    # as complex64 and promote plainly (float16/32 → complex64, float64 →
+    # complex128); integer/uint/bool arrays promote with complex128.
+    if array_dtype.kind in "fc":
+        return np.result_type(np.dtype("complex64"), array_dtype)
     return np.result_type(np.dtype("complex128"), array_dtype)
 
 
