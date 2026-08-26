@@ -357,6 +357,8 @@ def _cumsum(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     reverse = bool(op.attributes.get("reverse", False))
     if arr.ndim == 0:
         return core.Tensor(np.array(arr, copy=True))
+    if reverse:
+        arr = np.flip(arr, axis=axis)
     try:
         result = np.cumsum(arr, axis=axis, dtype=arr.dtype)
     except (ValueError, IndexError) as exc:
