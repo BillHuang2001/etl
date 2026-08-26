@@ -37,7 +37,14 @@ _VMAP_CALLABLE_DOC = """\
 calling it with a structure of TensorSpecs (mapped inputs include the leading
 batch dim) + static values returns the vectorized Graph, tracing `f` exactly
 once. Equivalent to: trace `f` with the leading mapped dim stripped from each
-mapped spec, then vectorize, then rearrange outputs per out_axes."""
+mapped spec, then vectorize, then rearrange outputs per out_axes.
+
+`vmap(tf)` applied to another TransformCallable (composition — nested vmap,
+`vmap(grad(f))`, ...) also returns a TransformCallable: calling it invokes
+the inner callable with the stripped specs (which traces its own wrapped
+function exactly once) and vectorizes the returned Graph with the outer
+axes, then rearranges outputs per out_axes — each level adds one leading
+mapped dim."""
 
 #: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
 #: (`Dim("batch")`, `Dim("batch_1")`, ... — see batching._batched_input_specs).
@@ -68,6 +75,12 @@ def vmap(fn_or_graph, in_axes=0, out_axes=0):
           returns the vectorized `Graph`; `f` is invoked exactly once, in
           graph-building mode. Passing concrete tensors raises `TraceError`
           (transforms never execute; build the returned graph explicitly).
+        * `TransformCallable` when given another `TransformCallable`
+          (composition — `vmap(vmap(f))`, `vmap(grad(f))`, ...): calling the
+          result invokes the inner callable with the stripped specs (it traces
+          its wrapped fn exactly once), then vectorizes the returned graph
+          with the outer `in_axes` and rearranges per `out_axes`. Nested
+          levels compose mechanically, each adding one leading mapped dim.
 
     Unsupported ops without a batching rule raise `core.TransformError`
     naming the op — never a silent fallback. Nested vmap is supported when the
@@ -88,12 +101,29 @@ def vmap(fn_or_graph, in_axes=0, out_axes=0):
 
 
 def _vmap_fn(fn, args, in_axes, out_axes) -> Graph:
-    """Trace `fn` exactly once with unvectorized specs derived from `args`
-    (strip the leading mapped dim from each mapped spec per `in_axes`), then
-    vectorize and rearrange outputs per `out_axes`."""
+    """Build the `TransformCallable` result for one `vmap(f)(*args)` call.
+
+    Plain callable/`Defn`: trace `fn` exactly once with unvectorized specs
+    derived from `args` (strip the leading mapped dim from each mapped spec
+    per `in_axes`), then vectorize and rearrange outputs per `out_axes`.
+
+    `TransformCallable` (`vmap` of another transform — e.g. `vmap(vmap(f))`,
+    `vmap(grad(f))`): composition. The inner callable already maps stripped
+    specs to a `Graph`, so it is INVOKED with the stripped argument structure
+    (tracing its own wrapped fn exactly once) instead of being traced here;
+    the outer `in_axes` is then applied to that graph via `vectorize` — the
+    inner graph's input tree has the same structure as the stripped args, so
+    `in_axes` re-normalizes cleanly — followed by the usual output
+    rearrangement. Depth-3+ nesting recurses through the same path (each
+    nested `vmap` layer is itself a `TransformCallable`).
+    """
     unvectorized = _derive_unvectorized_args(args, in_axes)
-    graph = trace(fn, *unvectorized)
-    graph = vectorize(graph, in_axes)
+    if isinstance(fn, TransformCallable):
+        inner_graph = fn(*unvectorized)
+        graph = vectorize(inner_graph, in_axes)
+    else:
+        graph = trace(fn, *unvectorized)
+        graph = vectorize(graph, in_axes)
     return _rearrange_outputs(graph, out_axes)
 
 
