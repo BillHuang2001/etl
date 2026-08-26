@@ -37,7 +37,7 @@ All names below are re-exported from `etl/core/__init__.py` (see also `../CONTEX
 | `spec.py` | `TensorSpec` (frozen dataclass + validation, implemented) |
 | `tensor.py` | `Tensor` data holder + DLPack passthrough (implemented); creators/`from_numpy`/`from_dlpack` implemented |
 | `symbolic.py` | `SymbolicTensor` + operator-handler registry + `constant` hook (implemented; op building lives in `../ops/`) |
-| `device.py` | `Device` (implemented); `devices`/`split_tensor`/`replicate_tensor` implemented |
+| `device.py` | `Device` (implemented); `devices`/`split_tensor`/`replicate_tensor` implemented — `split_tensor`/`replicate_tensor` validate inputs up-front and raise `DeviceError` for invalid axis/input kind (no raw numpy/AttributeError leaks) |
 | `tree.py` | `TreeSpec` + pytree registry (implemented); `flatten`/`unflatten` implemented |
 
 Cross-references: `../ops/` registers operator handlers + the constant builder into `core` at import time; `../ir/` provides the real `Value`/`Location` types that `SymbolicTensor.value`/`.location` duck-type; `../../tests/core/` is the test mirror (sibling — read-only from here, escalate writes to root).
@@ -52,6 +52,7 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 - **`TensorSpec` normalization**: shape tuple-ified and element-validated; dtype normalized via `dtype()`; rank always known. `SymbolicTensor.shape` additionally accepts `Dim` entries (callers resolve to `DimExpr`).
 - **TreeSpec invariants**: pre-order leaves; `unflatten(flatten(x))` ≡ `x`; dict keys sorted; namedtuple/dataclass metadata in `node_data`; custom types via registry `{type: (flatten_fn, unflatten_fn)}`.
 - **`device.py` ↔ `tensor.py`**: `device.py` imports `Tensor` only under `TYPE_CHECKING` to avoid a cycle (`tensor.py` imports `Device`).
+- **`split_tensor` axis-validation ordering**: bools are rejected up-front (they are `int`s but never a valid axis); non-numeric axes (str/None/complex/multi-element arrays) are rejected when normalization (`axis < 0` / `axis + ndim`) raises `TypeError`/`ValueError`; the range check stays *first* for numeric axes so an out-of-range non-int like `2.5` keeps "out of range" as the primary diagnostic (a test asserts this); in-range non-integral axes are rejected after the range check via `numbers.Integral` (which accepts numpy integer scalars such as `np.int32`). All invalid-axis cases share one `DeviceError` message naming the value and its type. Residual `np.split` errors are wrapped in `DeviceError` chained via `from exc` — never swallowed.
 
 ## Test strategy
 
