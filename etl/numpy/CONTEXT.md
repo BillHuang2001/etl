@@ -81,9 +81,8 @@ Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining m
 
 ## Known contract conflicts (escalated to root — see parent report)
 
-1. **`ops.solve`, `ops.tril`, `ops.triu`, `ops.cumsum` are missing from the `ops` bullet in `../CONTEXT.md`.** The enp objective requires them. Until ops implements and publishes them (contract + `etl/__init__.py`), the corresponding enp functions stay `NotImplementedError` (they are stubbed with conflict notes in docstrings).
-2. **Unspecified ops signatures** — implementation phase must confirm against the actual ops module: `ops.select` argument order (assumed `(cond, x, y)`), `ops.concatenate`/`ops.pad`/`ops.broadcast`/`ops.reduce_*` kwarg names (assumed `axis=`/`pad_width=`/`shape=`/`keepdims=`), and the **Constant-op construction path** creators should reuse (assumed: the same path `etl.constant` uses). enp mirrors whatever ops defines.
-3. **Large creation constants warn by design** (creation embeds full arrays; `ETL_LARGE_CONSTANT_BYTES` applies). The root contract is silent on creators specifically — noted so test authors don't treat the warning as a bug.
+1. **Unspecified ops signatures** — implementation phase must confirm against the actual ops module: `ops.select` argument order (assumed `(cond, x, y)`), `ops.reduce_*` kwarg names (assumed `axis=`/`keepdims=`), and the **Constant-op construction path** creators should reuse (assumed: the same path `etl.constant` uses). enp mirrors whatever ops defines. (shape.py's ops signatures are confirmed frozen: `ops.reshape(x, shape)`, `ops.transpose(x, axes=None)`, `ops.broadcast(x, shape)`, `ops.concatenate(tensors, axis=0)`, `ops.pad(x, config, value=0)`, `ops.slice(x, start, lengths, strides=1)`, `ops.tril/triu(x, k=0)`.)
+2. **Large creation constants warn by design** (creation embeds full arrays; `ETL_LARGE_CONSTANT_BYTES` applies). The root contract is silent on creators specifically — noted so test authors don't treat the warning as a bug.
 
 ## Test strategy
 
