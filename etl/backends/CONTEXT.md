@@ -113,4 +113,4 @@ Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i
 
 - **Architecture phase**: all behavioral bodies raise `NotImplementedError`; only trivial pure-type code (dataclasses, protocols, mapping data, registry) is implemented. Implementation is delegated to `subagent_manager` at this node by the parent orchestrator.
 - Contract conflicts found while architecting: the cross-module bullet says backends import `etl.ops` (not `etl.block`) for block-impl registration — the registration pathway must be finalized with the `ops`/`block` owners during implementation (`numpy/__init__.py::_register_block_impls` lazy-imports `etl.ops` inside the function body per the letter of the contract).
-- `../tests/` is a sibling: read-only, escalate writes to root.
+- `../../tests/` is a sibling: read-only, escalate writes to root.
