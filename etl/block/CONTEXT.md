@@ -120,6 +120,19 @@ transforms always finds an entry); else `unsupported`. A registered explicit
 rule always wins over the policy. An explicit policy suppresses the automatic
 decomposition fallback.
 
+**Safe-policy dispatch (implemented):** for `elementwise` and
+`map_over_batch`, decl pre-registers transforms' built-in pass-through rule
+(`transforms.batching.block_call_pass_through_rule()` — rebuilds the
+`block_call` over pointwise-aligned batched operands) under `block:<name>` at
+declaration time. That is what makes those policies "safe without a user
+rule". An explicit user rule registered afterwards overwrites the entry (dict
+assignment): `BlockOp.batching_rule(fn)` → `register_batching_rule` → last
+registration wins. Nothing is pre-registered for `opaque_batched`,
+`unsupported`, `broadcast_batch`, or an explicit `batching_rule` policy — for
+those, vectorize/vmap raise `TransformError` naming the block unless an
+explicit rule (or, for the default-resolved `batching_rule`, the
+decomposition fallback) exists.
+
 ## Resolution policy (lowering a block_call)
 
 Per backend capabilities, in order — first available wins, none → explicit
@@ -237,7 +250,7 @@ escalate test writes to root). Planned coverage:
 | `./decl.py` | `block()` factory (both forms), name/spec/schema/effects/policy validation, StaticValue encoding |
 | `./op.py` | `BlockOp` class, BLOCK_CALL_OPDEF (informational mirror), `_ensure_ir_opdef` (lazy ir verification), `_get_location` |
 | `./registry.py` | `get_block`, BlockOp/impl/portable registries |
-| `./rules.py` | bridges into transforms rule registries + decomposition fallback wrappers (batching/vjp) |
+| `./rules.py` | bridges into transforms rule registries (batching/vjp/jvp + safe-policy pass-through) + decomposition fallback wrappers (batching/vjp) |
 | `./errors.py` | `BlockError` |
 
 ## Notes for agents
@@ -254,9 +267,10 @@ escalate test writes to root). Planned coverage:
 - `BlockOp.__call__` positional statics bind in SCHEMA order; a positional
   whose next schema-ordered slot was already supplied by keyword raises
   `BlockError` (no double-fill).
-- Remaining coordination with siblings: ir should add op-level
-  `effects`/`batching_policy` attrs to `block_call` (currently fixed at
-  `read`); transforms must consume the fallback rules per the frozen
-  signatures; backends need the numpy impl signature for `block_call`
-  lowering; persist must encode `static_args` payloads through its envelope
-  codec (currently handled by ir's generic attribute encoding).
+- Remaining coordination with siblings: ir could optionally add a
+  `batching_policy` attr to the `block_call` opdef (transforms supports an
+  attribute channel; the rule channel already covers in-process dispatch) and
+  op-level `effects` (currently fixed at `read`); backends need the numpy
+  impl signature for `block_call` lowering; persist must encode `static_args`
+  payloads through its envelope codec (currently handled by ir's generic
+  attribute encoding).

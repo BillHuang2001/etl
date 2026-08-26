@@ -25,7 +25,10 @@ The fallback wrappers inline the portable decomposition: batching re-traces
 the portable over the (batched) operand values, which makes batching safe
 automatically on every backend; vjp re-traces the portable and runs a LOCAL
 reverse sweep over only the inlined ops (nested block_calls inside the
-decomposition resolve via their own `block:<name>` keys).
+decomposition resolve via their own `block:<name>` keys). For blocks declared
+with an `elementwise`/`map_over_batch` policy, decl additionally installs
+transforms' built-in pass-through rule (`batching.block_call_pass_through_rule`)
+under `block:<name>` — see `register_policy_pass_through`.
 """
 
 from __future__ import annotations
@@ -73,6 +76,30 @@ def register_jvp_rule(name: str, fn: Callable) -> None:
     from etl import transforms
 
     transforms.jvp_rules[f"block:{name}"] = fn
+
+
+def register_policy_pass_through(name: str) -> None:
+    """Install the built-in policy pass-through as the batching rule.
+
+    Called by decl at declaration time when a block is declared with an
+    `elementwise` or `map_over_batch` batching policy. Those policies make
+    batch dims pass through untouched, so vectorize/vmap is safe WITHOUT a
+    user rule. The rule installed is transforms' reusable built-in
+    `batching.block_call_pass_through_rule()` — it rebuilds the `block_call`
+    over pointwise-aligned batched operands with batch-dims-prepended result
+    types. Transforms never imports block; the rule arrives through this
+    namespaced `block:<name>` registry key.
+
+    An explicit user rule (`BlockOp.batching_rule(fn)`) registered after the
+    declaration overwrites this entry — a registered rule always wins over
+    the policy (binding: `./CONTEXT.md` batching-policy semantics).
+    """
+    if not isinstance(name, str) or not name:
+        raise BlockError(f"block name must be a non-empty string, got {name!r}")
+    from etl import transforms
+    from etl.transforms.batching import block_call_pass_through_rule
+
+    transforms.batching_rules[f"block:{name}"] = block_call_pass_through_rule()
 
 
 def register_portable_batching_fallback(name: str) -> None:

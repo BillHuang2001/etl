@@ -377,7 +377,11 @@ def _make_block(
     # (op.py and rules.py import decl at module level).
     from .op import BlockOp
     from .registry import register, register_portable, validate_portable
-    from .rules import register_portable_batching_fallback, register_portable_diff_fallback
+    from .rules import (
+        register_policy_pass_through,
+        register_portable_batching_fallback,
+        register_portable_diff_fallback,
+    )
 
     _validate_name(name)
     in_specs = _normalize_specs(inputs, "inputs", name)
@@ -410,6 +414,14 @@ def _make_block(
             # Resolved policy is BATCHING_RULE: pre-register the decomposition
             # as the namespaced batching rule so transforms always finds it.
             register_portable_batching_fallback(name)
+    if policy in (BatchingPolicy.ELEMENTWISE, BatchingPolicy.MAP_OVER_BATCH):
+        # Safe policy: batch dims pass through untouched, so vectorize/vmap is
+        # safe without a user rule. Pre-register transforms' built-in
+        # pass-through rule under block:<name> (the rule channel — the
+        # block_call op itself carries no batching_policy attribute; ir owns
+        # the opdef). An explicit user rule registered later overwrites this
+        # entry: a registered rule always wins over the policy.
+        register_policy_pass_through(name)
     return op
 
 
