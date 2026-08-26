@@ -5,9 +5,9 @@ Pure sugar over etl.ops: every function builds exactly the same IR as the
 mapped ops calls — no new op kinds, no hidden semantics, no eager fallback.
 Graph-building namespace: SymbolicTensors in, SymbolicTensors out; concrete
 Tensors raise TraceError (same as ops). See CONTEXT.md for the full mapping
-table, design decisions, deferrals, and known conflicts.
+table, design decisions, deferrals, and documented numpy deviations.
 
-Architecture phase: all bodies raise NotImplementedError.
+Implementation complete: all bodies build IR per the mapping table.
 """
 
 from __future__ import annotations
