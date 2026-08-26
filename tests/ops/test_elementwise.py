@@ -9,10 +9,6 @@ locations), error semantics, and numerical agreement with numpy references
 computed in the same promoted dtype.
 
 ``select`` is NOT covered here (it belongs to test_structure.py).
-
-Known failing tests are tagged with ``# BUG(etl): ...`` — they encode the
-documented contract where the etl implementation currently deviates. They are
-left plain (not xfail) so the failure stays visible for the parent agent.
 """
 from __future__ import annotations
 
@@ -235,12 +231,6 @@ def test_symbolic_runtime_binding_happy_path():
 
 
 def test_runtime_broadcast_conflict_raises_shape_error():
-    # BUG(etl): a runtime broadcast conflict between symbolic dims surfaces as
-    # a raw numpy ValueError, not core.ShapeError — contradicting the
-    # symbolic-broadcast contract (etl/ops/CONTEXT.md: "the numpy backend
-    # enforces the exact compatibility check at run time"; _utils.broadcast_shapes
-    # docstring: "surfaces a ShapeError there if the dims disagree"). Repro:
-    # trace add with specs (n,3)⊕(5,1), run with (7,3) and (5,1).
     n = etl.dim("n")
 
     def fn(x, y):
@@ -914,15 +904,6 @@ def test_sign_numerics():
 
 
 def test_abs_complex_numerics_give_real_magnitude():
-    # BUG(etl): evaluating abs of a complex tensor crashes at run time with
-    # BackendError. ops.abs composes abs→cast (the IR declares the abs result
-    # as complex64 and post-casts to the real magnitude dtype), but the numpy
-    # backend's abs kernel computes np.abs directly (already the real
-    # magnitude), so the interpreter's result validation rejects the kernel
-    # output ("kernel for op 'abs' produced result 0 with dtype float32,
-    # expected complex64"). Contradicts the abs docstring ("complex input
-    # yields the real magnitude per numpy"). Repro:
-    #   etl.evaluate(lambda x: etl.abs(x), np.array([3+4j], np.complex64))
     def traced(x):
         return etl.abs(x)
 

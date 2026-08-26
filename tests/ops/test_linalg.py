@@ -701,12 +701,6 @@ def test_cumsum_bool_promotes_to_int64():
 def test_cumsum_reverse_scans_from_the_end():
     """``reverse=True`` is documented as "scan from the end toward the start",
     i.e. out[i] = sum(x[i:]) — equivalently flip(cumsum(flip(x))).
-
-    # BUG(etl): the numpy kernel flips only AFTER cumsum (the pre-cumsum flip
-    # is missing), producing flip(cumsum(x)) — a mirrored forward scan, not a
-    # reversed scan. Repro: etl.evaluate(lambda x: etl.cumsum(x, axis=1,
-    # reverse=True), [[0, 1, 2], [3, 4, 5]]) → [[3, 1, 0], [12, 7, 3]];
-    # documented semantics give [[3, 3, 2], [12, 9, 5]].
     """
     def f(x):
         return etl.cumsum(x, axis=1, reverse=True)

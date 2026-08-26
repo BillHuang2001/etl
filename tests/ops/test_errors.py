@@ -209,11 +209,6 @@ def test_no_trace_message_mentions_defn():
     """Binding contract (etl/ops/CONTEXT.md, "Unified semantics" #2): the
     no-active-trace message must mention ``etl.trace`` / ``@etl.defn`` /
     ``etl.evaluate``.
-
-    # BUG(etl): the message raised by ``trace.current_builder()``
-    (etl/trace/builder.py) mentions only ``etl.trace`` and ``etl.evaluate`` —
-    ``@etl.defn`` is missing. This test fails until the message names all
-    three supported ways to obtain a trace.
     """
     with pytest.raises(etl.TraceError) as exc:
         etl.add(1.0, 1.0)
@@ -324,11 +319,6 @@ def test_shape_error_message_includes_call_site_location(wrapped):
     include the call-site location whenever a graph location exists. The
     location IS captured here (see the control test above) — for both a plain
     fn and an ``@etl.defn``-wrapped one.
-
-    # BUG(etl): the static broadcast ShapeError is raised by IR shape
-    inference (etl/ir/inference.py) without the op's captured Location, so
-    the message carries no file:line. This test fails until etl threads the
-    location into the message.
     """
     def fn(a, b):
         return etl.add(a, b)
