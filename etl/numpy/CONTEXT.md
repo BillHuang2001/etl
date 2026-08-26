@@ -43,13 +43,13 @@ Re-exported from `__init__.py` (exact names; `shape.py` implemented, remaining m
 | `tril/triu(a, k=0)` | `ops.tril/triu(a, k=k)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
 | `sum/mean/prod/max/min(a, axis=None, keepdims=False)` | `ops.sum/mean/prod/max/min` (→ `reduce_*` ops) | `axis=None` → all axes (rank known at trace time); `dtype≠None` composes `ops.cast` (sum/mean/prod/cumsum) |
 | `argmax/argmin(a, axis=None, keepdims=False)` | `ops.argmax/argmin` | |
-| `cumsum(a, axis=None, dtype=None)` | `ops.cumsum`; `axis=None` flattens first via `reshape` to 1-D, then `axis=0` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `cumsum(a, axis=None, dtype=None)` | `ops.cumsum`; `axis=None` flattens first via `reshape` to 1-D, then `axis=0` | |
 | `zeros/ones(shape, dtype=float32)` | Constant op (zeros/ones-filled array) | graph ops — same op kind as `etl.constant`; large-constant warning applies |
 | `full(shape, fill_value, dtype=None)` | Constant op | `dtype=None` → numpy dtype inference of static `fill_value` at trace time |
 | `empty(shape, dtype=float32)` | Constant op (uninitialized array) | values unspecified (numpy semantics); warns like any large constant |
 | `arange(start, stop=None, step=1, dtype=None)` | Constant op with `numpy.arange(...)` data | concrete bounds/step required at trace time; symbolic bounds deferred |
 | `matmul(a, b)` / `dot(a, b)` | `ops.dot(a, b)` | v1: `dot` is an alias of `matmul`; numpy's 1-D `dot` vector semantics not special-cased |
-| `linalg.solve(a, b)` | `ops.solve(a, b)` | ⚠ NOT yet in the `ops` contract (see conflicts) |
+| `linalg.solve(a, b)` | `ops.solve(a, b)` | |
 
 ## Constraints
 
