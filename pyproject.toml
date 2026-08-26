@@ -22,3 +22,6 @@ include = ["etl*"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
+# NOTE: do NOT include "dist" in norecursedirs — `tests/dist/` is a test
+# package (pytest's default list would silently skip it).
+norecursedirs = [".git", ".genesis", "__pycache__", "*.egg-info", "build", "node_modules", "venv"]
