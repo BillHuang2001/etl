@@ -5,7 +5,7 @@
 Turn verified frontend Graphs into executable programs. Four responsibilities:
 
 1. **Backend contract** — `Capabilities`, `Backend` ABC, backend `Executable` protocol, registry. This is the plug-in seam for compilers.
-2. **Shared pluggable-compiler framework** (`compiler.py`, `inline.py`, `adapters/`) — `CompilerBackend` / `CompilerExecutable` + the shared block-call inlining machinery, so compiler adapters (IREE/XLA/TVM — implemented as a SEPARATE parallel effort in `adapters/`) reuse the exact same lowering logic as the numpy backend.
+2. **Shared pluggable-compiler framework** (`compiler.py`, `inline.py`, `adapters/`) — `CompilerBackend` / `CompilerExecutable` + the shared block-call inlining machinery, so compiler adapters reuse the exact same lowering logic as the numpy backend. **Three adapters are IMPLEMENTED in `adapters/`: `"iree"`, `"xla"` (via PJRT, not the jax frontend), `"tvm"`** — each does lower (shared) → compile (native compiler on the StableHLO text) → load → run, satisfying the `Backend`/`Executable` contracts (see `adapters/CONTEXT.md` for validated designs, capabilities, and known issues).
 3. **Reference numpy CPU backend** (`numpy_backend`, default) — a pure-Python numpy interpreter proving the IR semantics; the only concrete-computation path besides `core`'s concrete creators.
 4. **StableHLO export utility** (`stablehlo`) — emits StableHLO MLIR text so external compilers (`iree-compile model.mlir -o model.vmfb`) can take over compilation. Export-only in v1, NOT a compilable backend.
 
