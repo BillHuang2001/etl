@@ -406,7 +406,7 @@ def ensure_compat() -> None:
                 "stablehlo.dynamic_broadcast_in_dim of bool data is not "
                 "supported by the tvm adapter"
             )
-        source = self._dynamic_broadcast_source(node.operands[1])
+        source = _dynamic_broadcast_source(self, node.operands[1])
         ones = self.block_builder.emit(
             relax.op.full_like(source, relax.const(1, dtype), dtype)
         )
