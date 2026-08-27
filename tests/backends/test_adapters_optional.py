@@ -155,9 +155,13 @@ def test_missing_dep_raises_backend_error_with_install_hint(
     proc = _run_subprocess(
         _MISSING_DEP_SCRIPT.format(blocked=blocked_module, name=adapter, hints=hints)
     )
-    # The subprocess prints the actual error message; a passing subprocess
-    # exit proves the message carried an install hint.
-    assert "unknown backend" in proc.stdout
+    # The subprocess prints the actual error message; its zero exit already
+    # proves it was an ``etl.BackendError`` carrying an install hint (the
+    # script asserts the hint itself). The exact wording is the adapter's —
+    # e.g. "the iree backend requires the IREE Python packages ... `pip
+    # install etl[iree]`" — and must NOT be pinned to the generic "unknown
+    # backend" phrasing (that is reserved for genuinely unknown names,
+    # pinned elsewhere).
 
 
 # ---------------------------------------------------------------------------
