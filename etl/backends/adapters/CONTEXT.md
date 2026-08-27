@@ -52,7 +52,7 @@ Each adapter module (`iree.py`, `xla.py`, `tvm.py`) exposes the same shape:
 - **No `jax`**: `import jax` / `from jax` is forbidden anywhere in `etl/` (grep-proof; the TVM shim satisfies the vendored translator's `jax._src` import). `jaxlib` may appear ONLY inside function bodies, ideally only via `_mlir_bindings.py`, and NEVER in the xla adapter (`_pjrt_c_api.py`/`xla_util.py`/`xla.py` are jaxlib-free).
 - Errors: capability violations and compiler/translator failures raise `core.BackendError` naming the op/feature — never silent fallback to numpy or partial semantics; load-time mismatches raise `core.PersistenceError`; dtype mismatches `core.DTypeError`, shape mismatches `core.ShapeError` (mirrors the numpy interpreter).
 - Staging never composes: `load` never re-traces/lowers/compiles; device handles are never serialized.
-- CPU only; non-CPU devices raise `core.BackendError`, non-`Device` objects `core.DeviceError`.
+- CPU only, EXCEPT the iree adapter which also accepts `core.Device("cuda", index)` (see the IREE section; the numpy/xla/tvm paths remain CPU-only); a device kind the adapter does not support raises `core.BackendError`, non-`Device` objects `core.DeviceError`.
 
 ## Known Issues
 
