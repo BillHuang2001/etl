@@ -84,7 +84,7 @@ All public errors derive from `ETLError` (in `core`): `TraceError`, `ShapeError`
 
 ## Dependencies, testing, and hardware policy
 
-- **Deps:** `numpy` is the only hard runtime dependency. Pure Python — no native C/Rust code in the library. Optional extras: torch (DLPack interop tests only), IREE/TVM (future adapters).
+- **Deps:** `numpy` is the only hard runtime dependency. Pure Python — no native C/Rust code in the library. Optional extras: torch (DLPack interop tests; `bench` — required only when running `etl.bench` comparisons against PyTorch), IREE/TVM (future adapters).
 - **Testing:** pytest, CPU only. Tests mirror package structure under `./tests/`. torch interop tests use `pytest.importorskip("torch")`. Spec-compliance tests live in `./tests/test_spec_compliance.py` (closure capture errors, SymbolicTensor has no `.numpy()`, staging explicitness, bind is sugar, vmap=vectorize sugar, etc.).
 - **GPU policy:** v1 never requires GPU — the reference backend is a CPU numpy interpreter. GPU is only considered later for optional adapters; if ever used, scan for an empty GPU first and do not occupy it for long.
 
