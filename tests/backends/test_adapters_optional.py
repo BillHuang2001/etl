@@ -107,7 +107,7 @@ def test_import_etl_does_not_import_adapter_deps():
 #: (adapter name, blocked module, install-hint fragments the message must
 #: contain at least one of)
 MISSING_DEP_CASES = [
-    ("iree", "iree", ("etl[iree]", "iree-compiler")),
+    ("iree", "iree", ("etl[iree]", "iree-base-compiler")),
     ("xla", "jaxlib", ("etl[xla]", "jaxlib")),
     ("tvm", "tvm", ("etl[tvm]", "apache-tvm")),
 ]
