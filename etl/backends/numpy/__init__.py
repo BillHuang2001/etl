@@ -33,7 +33,7 @@ function bodies; never import ``etl.pipeline`` at top level.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
@@ -48,7 +48,13 @@ from ..registry import register
 from . import kernels
 from .collectives import CollectiveExecutor, SingleRankCollectiveExecutor
 from .interpreter import Interpreter, entry_function
-from .inline import clone_ops_into, drop_op_uses
+from .inline import (
+    clone_ops_into,  # noqa: F401  (shared machinery re-export, ../inline.py)
+    drop_op_uses,  # noqa: F401  (shared machinery re-export, ../inline.py)
+    inline_portables,
+    iter_block_ops,  # noqa: F401  (shared machinery re-export, ../inline.py)
+    iter_ops,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from etl.core import Tensor
@@ -88,28 +94,13 @@ def _all_numpy_dtypes() -> frozenset:
     return frozenset(dtypes)
 
 
-def _iter_block_ops(block: Any) -> Iterator[Any]:
-    """Yield every op of a block, nested-region ops FIRST (bottom-up)."""
-    for op in block.ops:
-        for region in op.regions:
-            for nested in region.blocks:
-                yield from _iter_block_ops(nested)
-        yield op
-
-
-def _iter_ops(module: "Module") -> Iterator[Any]:
-    """Yield every op of every function of the module, regions-first.
-
-    Bottom-up (nested regions before the op owning them) so inlining can
-    walk and rewrite at any nesting depth.
-    """
-    for function in module.functions:
-        for block in function.region.blocks:
-            yield from _iter_block_ops(block)
-
-
 class NumpyBackend(Backend):
-    """Default reference CPU backend: a pure-Python numpy interpreter."""
+    """Default reference CPU backend: a pure-Python numpy interpreter.
+
+    ``lower()`` reuses the shared block-inlining machinery
+    (``../inline.py::inline_portables``, ``keep_backend_impls="numpy"``),
+    shared with compiler backends (``CompilerBackend``).
+    """
 
     name: ClassVar[str] = "numpy"
     capabilities: ClassVar[Capabilities] = Capabilities(
@@ -132,11 +123,12 @@ class NumpyBackend(Backend):
            kernel-table membership is re-checked AFTER inlining (the full
            drift net — portables replace ``block_call``s first).
         3. Inline ``block_call`` portable decompositions as a graph->graph
-           expansion at LOWER time (fixpoint — portables may themselves emit
-           block calls). A block with neither a portable decomposition nor a
-           registered numpy impl -> ``core.BackendError`` naming the block —
-           never a silent skip. ``graph.verify()`` again afterwards
-           (defensive, cheap).
+           expansion at LOWER time via the SHARED fixpoint helper
+           ``inline_portables`` (``../inline.py``, ``keep_backend_impls=
+           "numpy"`` — portables may themselves emit block calls). A block
+           with neither a portable decomposition nor a registered numpy
+           impl -> ``core.BackendError`` naming the block — never a silent
+           skip. ``graph.verify()`` again afterwards (defensive, cheap).
         4. Record the ``Signature`` from the Graph's LIVE attributes
            (input/output TreeSpec + per-leaf specs + static values) — passed
            down, never re-derived.
@@ -149,7 +141,7 @@ class NumpyBackend(Backend):
         graph.verify()  # surfaces core.VerificationError as-is
         kernels.register_all()  # idempotent
         self._check_capabilities(graph.module, check_kernels=False)
-        self._inline_portables(graph.module)
+        inline_portables(graph.module, keep_backend_impls="numpy")
         self._check_capabilities(graph.module, check_kernels=True)
         graph.verify()  # defensive post-inline verification
 
@@ -192,7 +184,7 @@ class NumpyBackend(Backend):
         module = ir.deserialize_module(lowered.payload)
         block_names = {
             op.attributes["block_name"]
-            for op in _iter_ops(module)
+            for op in iter_ops(module)
             if op.name == "block_call"
         }
         required_custom_ops = tuple(sorted(block_names))
@@ -276,7 +268,7 @@ class NumpyBackend(Backend):
           flags make future capability changes fail explicitly).
         """
         capabilities = self.capabilities
-        for op in _iter_ops(module):
+        for op in iter_ops(module):
             if op.is_terminator:
                 continue  # 'return' is special-cased in the interpreter loop
             if check_kernels and op.name not in kernels.KERNEL_TABLE:
@@ -299,111 +291,6 @@ class NumpyBackend(Backend):
                     f"capability drift: the numpy backend cannot execute "
                     f"collective op '{op.name}'"
                 )
-
-    def _inline_portables(self, module: "Module") -> None:
-        """Fixpoint: inline every ``block_call`` with a portable decomposition.
-
-        A portable trace may itself emit block calls, so inlining repeats
-        until no expandable ``block_call`` remains. Blocks with a registered
-        numpy impl are KEPT (dispatched by the block_call kernel at run
-        time) — their op ids are remembered so the fixpoint does not
-        re-consider them.
-        """
-        kept: set[int] = set()
-        expansions = 0
-        while True:
-            target = next(
-                (
-                    op
-                    for op in _iter_ops(module)
-                    if op.name == "block_call" and op.id not in kept
-                ),
-                None,
-            )
-            if target is None:
-                return
-            expansions += 1
-            if expansions > 1000:
-                raise core.BackendError(
-                    "block_call portable decomposition did not converge "
-                    "after 1000 expansions (recursive portable?)"
-                )
-            if not self._expand_block_call(target, module):
-                kept.add(target.id)  # has a numpy impl — keep, don't revisit
-
-    def _expand_block_call(self, op: Any, module: "Module") -> bool:
-        """Inline ONE block_call op via its portable decomposition.
-
-        Returns True if the op was inlined; False if it was KEPT (a numpy
-        impl is registered — the block_call kernel dispatches it at run
-        time).
-
-        Resolution order (``etl.block.registry``): a registered numpy impl
-        keeps the op; else the portable (``etl.defn``) implementation is
-        traced with the operand types as specs (the op's non-empty dict
-        ``static_args`` attr re-specializes the trace as keyword arguments)
-        and its entry block is spliced in place of the op (``inline.py``).
-        Neither impl nor portable => ``core.BackendError`` naming the block.
-        """
-        from etl.block import registry as block_registry
-        from etl.block.errors import BlockError
-        from etl.trace import trace
-
-        block_name = op.attributes.get("block_name")
-        try:
-            block_registry.get_block(block_name)
-        except BlockError as exc:
-            raise core.BackendError(
-                f"cannot lower block_call: unknown block {block_name!r} — "
-                "declare it first with etl.block(...)"
-            ) from exc
-        impl = block_registry.get_impl(block_name, "numpy")
-        if impl is not None:
-            return False  # keep the op — the block_call kernel dispatches it at run time
-        portable = block_registry.get_portable(block_name)
-        if portable is None:
-            raise core.BackendError(
-                f"block {block_name!r} has neither a portable decomposition "
-                "nor a registered numpy impl — register one via "
-                "BlockOp.portable(...) or BlockOp.impl('numpy')"
-            )
-        specs = tuple(
-            core.TensorSpec(shape=value.type.shape, dtype=value.type.dtype)
-            for value in op.operands
-        )
-        static_args = op.attributes.get("static_args", ())
-        if isinstance(static_args, dict) and static_args:
-            # trace() binds positional specs only; re-specialize the portable
-            # with the op's static kwargs through a thin wrapper (static
-            # values specialize the traced graph — identical to passing them
-            # at the block_call site).
-            underlying = getattr(portable, "fn", portable)
-
-            def bound(*args: Any) -> Any:
-                return underlying(*args, **static_args)
-
-            traced = trace(bound, *specs)
-        elif static_args in ((), None, {}):
-            traced = trace(portable, *specs)
-        else:
-            raise core.BackendError(
-                f"block_call static_args must be a dict (or empty), got "
-                f"{type(static_args).__name__}"
-            )
-        source_block = traced.module.main.entry_block
-        target_block = op.parent
-        clone_ops_into(
-            target_block=target_block,
-            index=target_block.ops.index(op),
-            source_entry_block=source_block,
-            operand_values=tuple(op.operands),
-            result_values=tuple(op.results),
-            module=module,
-        )
-        drop_op_uses(op)
-        target_block.erase(op)
-        return True
-
 
 def _module_function_names(module: Any) -> tuple[str, ...]:
     """Function names exposed by an ``ir.Module`` (the single access point)."""
