@@ -3,33 +3,53 @@
 Pluggable compiler backend that consumes the shared StableHLO payload
 (``CompilerBackend.lower``, see ``../compiler.py``) and compiles it with the
 external IREE compiler, producing an IREE VM flatbuffer executed through the
-IREE runtime on the ``local-task`` CPU driver.
+IREE runtime on the ``local-task`` CPU driver or the ``cuda`` HAL driver —
+both drivers are compiled into the runtime wheel (validated on IREE 3.11.0,
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316).
 
 Exact IREE Python APIs used (all inside function bodies — the heavy-import
 rule: ``iree`` / ``iree.compiler`` / ``iree.runtime`` / ``numpy`` are NEVER
 imported at module top level, so ``import etl`` stays light):
 
-- ``iree.compiler.compile_str(text, target_backends=["llvm-cpu"],
-  input_type="stablehlo", extra_args=[...])`` — compiles the StableHLO MLIR
-  payload in-process (spawns ``iree-compile``) and returns the VM flatbuffer
-  as ``bytes``. ``extra_args`` are fixed:
+- ``iree.compiler.compile_str(text, target_backends=..., input_type=
+  "stablehlo", extra_args=[...])`` — compiles the StableHLO MLIR payload
+  in-process (spawns ``iree-compile``) and returns the VM flatbuffer as
+  ``bytes``. The compile ``target_backends`` option selects the targets
+  (default ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda"}`` —
+  anything else is rejected with ``core.BackendError`` naming it, never a
+  silent fallback). ``"cuda"`` emits default sm_60 PTX, JIT'd by the CUDA
+  driver to newer archs at load (validated on 3.11.0 to sm_86 / RTX A6000 —
+  no arch flag needed). ``extra_args`` are fixed:
   ``--iree-input-demote-f64-to-f32=false`` (IREE demotes f64 to f32 by
   default for StableHLO input — silent dtype coercion, which etl's error
-  strategy forbids; disabling it keeps f64 semantics exact) and
+  strategy forbids; disabling it keeps f64 semantics exact) and, ONLY when
+  ``llvm-cpu`` is among the requested targets,
   ``--iree-llvmcpu-target-cpu=generic`` (portable generic-CPU codegen; also
-  silences IREE's generic-CPU warning).
-- ``iree.runtime.get_driver("local-task")`` →
-  ``driver.create_default_device()`` — the RELIABLE device-acquisition path.
-  The historical ``rt.system_setup(config=rt.Config("local-task"))`` recipe
-  fails with ``TypeError: 'module' object is not callable`` because
+  silences IREE's generic-CPU warning — llvm-cpu-specific and meaningless for
+  cuda, so not passed there).
+- ``iree.runtime.get_driver("local-task")`` / ``get_driver("cuda")`` →
+  ``driver.create_default_device()`` (GPU 0 for cuda) — the RELIABLE
+  device-acquisition path. The historical
+  ``rt.system_setup(config=rt.Config("local-task"))`` recipe fails with
+  ``TypeError: 'module' object is not callable`` because
   ``iree.runtime.system_setup`` is a MODULE in IREE 20241104.1068
   (distributed at the time as ``iree-runtime``; the current PyPI
   distribution is ``iree-base-runtime``); its function was replaced by
   ``system_api.Config``. This path was validated repeatedly (fresh
   processes and in-process loops).
+- ``driver.create_device(device_id=N)`` — IREE CUDA device ids are 1-BASED:
+  N maps to physical GPU index N-1 (verified empirically on 3.11.0:
+  device_id=4 -> GPU 3; device_id=1 -> GPU 0); device_id=0 raises ValueError
+  "Device id 0 not found" — never pass 0. etl maps ``Device("cuda", index)``
+  to ``device_id=index+1`` (default index 0 -> device_id 1).
 - ``iree.runtime.load_vm_flatbuffer(flatbuffer_bytes, driver="local-task")``
-  — loads the VM flatbuffer into a ``BoundModule``; entry functions are
-  resolved as attributes (``module.main``).
+  — loads the VM flatbuffer into a ``BoundModule`` (CPU path); entry
+  functions are resolved as attributes (``module.main``). This driver-name
+  form ALWAYS creates the DEFAULT device, so it cannot select a CUDA index —
+  the CUDA path instead loads via ``rt.Config(device=device)`` +
+  ``rt.VmModule.copy_buffer(config.vm_instance, vmfb)`` +
+  ``rt.load_vm_module(vm_module, config)``, which binds the module to a
+  SPECIFIC acquired device.
 - ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
   array into a HAL device buffer for function input.
 - ``np.asarray(result)`` — converts a returned ``DeviceArray`` back to a
@@ -41,9 +61,10 @@ re-lowers/re-compiles. Compiler failures surface as
 ``core.BackendError`` carrying the ``iree.compiler.CompilerToolError``
 diagnostics — never silently swallowed or papered over.
 
-Capability notes (all validated end-to-end on the 20241104.1068 release —
-distributed at the time as ``iree-compiler``/``iree-runtime``, now
-``iree-base-compiler``/``iree-base-runtime`` — llvm-cpu, CPU only):
+Capability notes (all validated end-to-end on IREE 3.11.0 —
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316 — llvm-cpu CPU
+and cuda GPU; the notes below apply to BOTH targets — fp64/fp16 etc. all work
+on cuda, and the v1 wgp list includes fp64):
 
 - ``dtypes``: float16/float32/float64/int8/int16/int32/int64/bool_. NOT
   declared: uint8/uint16 (iree-compile cannot legalize unsigned-int
@@ -58,20 +79,17 @@ distributed at the time as ``iree-compiler``/``iree-runtime``, now
   LEGALIZED by iree-compile 20241104 ("failed to legalize operation
   'stablehlo.collective_broadcast' that was explicitly marked illegal" —
   upstream limitation); the other five compile but the local-task/local-sync
-  HAL drivers of the 20241104.1068 IREE runtime (distributed at the time as
-  ``iree-runtime``; now ``iree-base-runtime``) raise "UNIMPLEMENTED;
-  collectives not implemented" at ``hal.channel.create`` (the Python wheels
-  ship no communicating channel provider). With this flag False, the SHARED
-  ``lower()`` rejects every collective-effect op explicitly with
-  ``core.BackendError`` naming it — never a silent fallback.
+  CPU and cuda HAL drivers of the IREE runtime wheels (3.11.0 validated)
+  raise "UNIMPLEMENTED; collectives not implemented" at ``hal.channel.create``
+  (the Python wheels ship no communicating channel provider). With this flag
+  False, the SHARED ``lower()`` rejects every collective-effect op explicitly
+  with ``core.BackendError`` naming it — never a silent fallback.
 - ``dynamic_shapes=True``: a symbolic-dim graph compiles and runs correctly
   with different concrete sizes. Scalar-constant broadcasts over dynamic
   shapes (e.g. ``relu`` on a dynamic tensor) are emitted as
   ``stablehlo.dynamic_broadcast_in_dim`` with a
   ``get_dimension_size``-built runtime ``output_dimensions`` chain —
-  validated end-to-end with the 20241104.1068 release (then
-  ``iree-compiler``/``iree-runtime``, now ``iree-base-compiler``/
-  ``iree-base-runtime``) at multiple concrete sizes.
+  validated end-to-end on 3.11.0 at multiple concrete sizes.
 
 Import acyclicity (binding, ``../CONTEXT.md``): top-level imports restricted
 to stdlib + ``etl.core`` + the sibling modules ``compiler`` / ``registry`` /
@@ -149,9 +167,13 @@ class IreeBackend(CompilerBackend):
     - ``check_available`` — probes the IREE packages; missing deps raise
       ``core.BackendError`` with the install hint ``pip install etl[iree]``.
     - ``compile`` — invokes ``iree.compiler.compile_str`` on the MLIR payload
-      and records the VM flatbuffer (base64, JSON-safe) in the artifact.
-    - ``load`` — decodes the flatbuffer, acquires the ``local-task`` runtime
-      device, and builds an ``IreeExecutable``.
+      (targets from the ``target_backends`` compile option, default
+      ``["llvm-cpu"]``; ``"cuda"`` supported) and records the VM flatbuffer
+      (base64, JSON-safe) in the artifact.
+    - ``load`` — decodes the flatbuffer, validates artifact/device target
+      compatibility, acquires the runtime device (``cpu`` via the
+      ``local-task`` driver; ``cuda`` via the ``cuda`` driver with the
+      1-based device-id mapping), and builds an ``IreeExecutable``.
 
     Staging never composes: ``compile`` never loads; ``load`` never
     re-lowers/re-compiles.
@@ -201,18 +223,27 @@ class IreeBackend(CompilerBackend):
            ``format == "stablehlo"`` and a ``mlir_text`` string; a malformed
            payload raises ``core.BackendError`` "corrupt").
         3. ``check_available``.
-        4. ``iree.compiler.compile_str`` with
-           ``target_backends=["llvm-cpu"]``, ``input_type="stablehlo"`` and
-           ``extra_args=["--iree-input-demote-f64-to-f32=false",
-           "--iree-llvmcpu-target-cpu=generic"]`` (f64 semantics preserved;
-           portable generic-CPU codegen). ``iree.compiler.CompilerToolError``
-           is re-raised as ``core.BackendError`` CARRYING the compiler
-           diagnostics — honest, never silent.
+        4. Resolve the compile ``target_backends`` option (default
+           ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda"}`` — a
+           non-list/tuple, an empty list, or an unknown target raises
+           ``core.BackendError`` naming the offending value, never a silent
+           fallback). ``iree.compiler.compile_str`` with those targets,
+           ``input_type="stablehlo"`` and ``extra_args`` fixed as
+           ``["--iree-input-demote-f64-to-f32=false"]`` plus
+           ``"--iree-llvmcpu-target-cpu=generic"`` only when ``llvm-cpu`` is
+           requested (f64 semantics preserved; portable generic-CPU codegen).
+           ``iree.compiler.CompilerToolError`` is re-raised as
+           ``core.BackendError`` CARRYING the compiler diagnostics — honest,
+           never silent.
         5. Record a self-describing ``CompiledArtifact``: JSON-safe payload
            (``format == "iree-vmfb"``, the MLIR text, the base64 VM
-           flatbuffer, the entry-function names), ``required_custom_ops=()``
-           (the shared ``lower`` already inlined every portable block), and
-           ``runtime_dependencies`` (numpy + IREE package versions).
+           flatbuffer, the entry-function names, and the ``target_backends``
+           tuple — ``load`` validates artifact/device compatibility against
+           it), ``required_custom_ops=()`` (the shared ``lower`` already
+           inlined every portable block), and ``runtime_dependencies`` (numpy
+           + IREE package versions). ``CompiledArtifact.target`` is ``"cpu"``
+           for ``["llvm-cpu"]``, ``"cuda"`` for ``["cuda"]``, and the
+           ``"+"``-joined targets for mixed lists.
 
         ``compile`` NEVER loads (no runtime is touched here).
         """
@@ -248,33 +279,66 @@ class IreeBackend(CompilerBackend):
                 "entry functions"
             )
         mlir_text = payload["mlir_text"]
+        # Compile targets come from the ``target_backends`` compile option
+        # (default ["llvm-cpu"] — unchanged CPU behavior). v1 supported set:
+        # {"llvm-cpu", "cuda"}.
+        raw_targets = (options or {}).get("target_backends", ["llvm-cpu"])
+        if (
+            not isinstance(raw_targets, (list, tuple))
+            or not raw_targets
+            or not all(isinstance(target, str) for target in raw_targets)
+        ):
+            raise core.BackendError(
+                f"the {self.name} 'target_backends' compile option must be a "
+                f"non-empty list/tuple of strings, got {raw_targets!r}"
+            )
+        supported_targets = {"llvm-cpu", "cuda"}
+        for target in raw_targets:
+            if target not in supported_targets:
+                raise core.BackendError(
+                    f"the {self.name} backend does not support compile "
+                    f"target {target!r} — supported targets: "
+                    f"{', '.join(sorted(supported_targets))}"
+                )
+        target_backends = tuple(raw_targets)
+        extra_args = ["--iree-input-demote-f64-to-f32=false"]
+        if "llvm-cpu" in target_backends:
+            # llvm-cpu-specific (portable generic-CPU codegen; silences IREE's
+            # generic-CPU warning) — meaningless for cuda, so only passed when
+            # llvm-cpu is among the requested targets.
+            extra_args.append("--iree-llvmcpu-target-cpu=generic")
         try:
             vmfb = iree_compiler.compile_str(
                 mlir_text,
-                target_backends=["llvm-cpu"],
+                target_backends=list(target_backends),
                 input_type="stablehlo",
-                extra_args=[
-                    "--iree-input-demote-f64-to-f32=false",
-                    "--iree-llvmcpu-target-cpu=generic",
-                ],
+                extra_args=extra_args,
             )
         except iree_compiler.CompilerToolError as exc:
             raise core.BackendError(
                 f"iree-compile failed to compile the StableHLO program for "
-                f"the {self.name} backend:\n{exc}"
+                f"the {self.name} backend (targets: "
+                f"{', '.join(target_backends)}):\n{exc}"
             ) from exc
 
+        if set(target_backends) == {"llvm-cpu"}:
+            artifact_target = "cpu"
+        elif set(target_backends) == {"cuda"}:
+            artifact_target = "cuda"
+        else:
+            artifact_target = "+".join(target_backends)
         artifact_payload = {
             "format": "iree-vmfb",
             "format_version": 1,
             "mlir_text": mlir_text,
             "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
             "entry_functions": entry_functions,
+            "target_backends": target_backends,
         }
         return CompiledArtifact(
             backend=self.name,
             signature=lowered.signature,
-            target="cpu",
+            target=artifact_target,
             payload=artifact_payload,
             required_custom_ops=(),
             runtime_dependencies={
@@ -299,15 +363,31 @@ class IreeBackend(CompilerBackend):
         2. Validate the payload (``format == "iree-vmfb"``, base64 vmfb,
            entry functions; malformed => ``core.BackendError`` "corrupt").
         3. ``check_available``.
-        4. Validate the device: ``None`` or a CPU ``core.Device`` — a
-           non-``Device`` object raises ``core.DeviceError``; another kind
-           raises ``core.BackendError`` naming it (v1 CPU only).
-        5. Base64-decode the VM flatbuffer; acquire the runtime device via
+        4. Validate the device: ``None`` (CPU default) or a ``core.Device``
+           of kind ``"cpu"`` or ``"cuda"`` — a non-``Device`` object raises
+           ``core.DeviceError``; another kind raises ``core.BackendError``
+           naming it.
+        5. Artifact/device target compatibility — never silent: the artifact
+           payload's ``target_backends`` must include the driver matching the
+           requested device kind (``"llvm-cpu"`` for cpu, ``"cuda"`` for
+           cuda); absent ``target_backends`` (artifacts saved before CUDA
+           support) is treated as ``["llvm-cpu"]``. A mismatch raises
+           ``core.BackendError`` naming both the artifact's compile targets
+           and the requested device.
+        6. Base64-decode the VM flatbuffer; acquire the runtime device. CPU:
            the reliable path (``rt.get_driver("local-task")`` +
-           ``create_default_device()``); ``load_vm_flatbuffer``; resolve the
-           v1 entry function (``"main"``, else the single recorded entry).
-           A ``ValueError`` from ``load_vm_flatbuffer`` (the runtime VM
-           verifier rejecting the module's required features — see
+           ``create_default_device()``) then ``load_vm_flatbuffer``. CUDA:
+           ``rt.get_driver("cuda")`` + ``driver.create_device(device_id=
+           index+1)`` (IREE cuda ids are 1-BASED: etl index N -> device_id
+           N+1; the driver's ``ValueError`` for an out-of-range index is
+           surfaced as ``core.BackendError`` naming the index) then the
+           ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
+           vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module, config)``
+           path (the ``load_vm_flatbuffer`` driver-name form always creates
+           the DEFAULT device and cannot select a CUDA index). Then resolve
+           the v1 entry function (``"main"``, else the single recorded
+           entry). A ``ValueError`` from the CPU ``load_vm_flatbuffer`` (the
+           runtime VM verifier rejecting the module's required features — see
            ``adapters/CONTEXT.md`` Known Issue #7, the mixed-install trap) is
            surfaced as an actionable ``core.BackendError`` naming the cause
            and remedy, with the original exception as ``__cause__``.
@@ -339,35 +419,83 @@ class IreeBackend(CompilerBackend):
                 "functions"
             )
         self.check_available()
+        device_kind = "cpu"  # device=None = default CPU device
         if device is not None:
             if not isinstance(device, Device):
                 raise core.DeviceError(
                     f"device must be a core.Device, got "
                     f"{type(device).__name__}"
                 )
-            if device.kind != "cpu":
+            if device.kind not in ("cpu", "cuda"):
                 raise core.BackendError(
-                    f"the {self.name} backend v1 supports CPU devices only, "
-                    f"got device kind {device.kind!r}"
+                    f"the {self.name} backend supports cpu and cuda devices "
+                    f"only, got device kind {device.kind!r}"
                 )
+            device_kind = device.kind
+
+        # Artifact/device target compatibility — never silent: the artifact's
+        # compile targets must include the driver matching the requested
+        # device kind. Absent target_backends (artifacts saved before CUDA
+        # support) is treated as ["llvm-cpu"].
+        raw_targets = payload.get("target_backends")
+        if raw_targets is None:
+            target_backends = ("llvm-cpu",)
+        elif isinstance(raw_targets, str):
+            target_backends = (raw_targets,)
+        else:
+            target_backends = tuple(raw_targets)
+        expected_target = "llvm-cpu" if device_kind == "cpu" else "cuda"
+        if expected_target not in target_backends:
+            raise core.BackendError(
+                f"the {self.name} artifact was compiled for target(s) "
+                f"{', '.join(target_backends) or '(none)'} and cannot run on "
+                f"the requested device {device!r} (device kind "
+                f"{device_kind!r} requires compile target {expected_target!r})"
+                f" — never silently recompile"
+            )
 
         import iree.runtime as rt
 
         vmfb = base64.b64decode(payload["vmfb_base64"].encode("ascii"))
-        driver = rt.get_driver("local-task")
-        runtime_device = driver.create_default_device()
-        try:
-            module = rt.load_vm_flatbuffer(vmfb, driver="local-task")
-        except ValueError as exc:
-            # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md): the
-            # legacy iree-compiler/iree-runtime distributions and the current
-            # iree-base-* distributions share the SAME 'iree' Python
-            # namespace and must NOT coexist; a mixed/residual install makes
-            # the runtime VM verifier reject the module ("required module
-            # features [Ch] are not available in this runtime configuration")
-            # with a raw ValueError deep inside the runtime. Surface it as an
-            # actionable BackendError instead of the cryptic raw error.
-            raise core.BackendError(
+        if device_kind == "cuda":
+            # IREE cuda device ids are 1-BASED: etl Device("cuda", index)
+            # maps to device_id = index + 1 (verified empirically on 3.11.0:
+            # device_id=4 -> physical GPU 3; device_id=0 raises ValueError
+            # "Device id 0 not found" — never pass 0).
+            driver = rt.get_driver("cuda")
+            device_id = device.index + 1
+            try:
+                runtime_device = driver.create_device(device_id=device_id)
+            except ValueError as exc:
+                raise core.BackendError(
+                    f"IREE could not acquire CUDA device id {device_id} "
+                    f"(1-based; physical GPU index {device.index}): {exc}. "
+                    f"IREE cuda device ids are 1-based and device_id=0 does "
+                    f"not exist; the requested index must be less than the "
+                    f"number of available GPUs (check nvidia-smi)"
+                ) from exc
+            # load_vm_flatbuffer's driver-name form always creates the DEFAULT
+            # device, so it cannot select a CUDA index — bind the module to
+            # the specific acquired device via Config(device=...).
+            config = rt.Config(device=runtime_device)
+            vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
+            module = rt.load_vm_module(vm_module, config)
+        else:
+            driver = rt.get_driver("local-task")
+            runtime_device = driver.create_default_device()
+            try:
+                module = rt.load_vm_flatbuffer(vmfb, driver="local-task")
+            except ValueError as exc:
+                # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md):
+                # the legacy iree-compiler/iree-runtime distributions and the
+                # current iree-base-* distributions share the SAME 'iree'
+                # Python namespace and must NOT coexist; a mixed/residual
+                # install makes the runtime VM verifier reject the module
+                # ("required module features [Ch] are not available in this
+                # runtime configuration") with a raw ValueError deep inside
+                # the runtime. Surface it as an actionable BackendError
+                # instead of the cryptic raw error.
+                raise core.BackendError(
                 f"IREE could not load the compiled VM module: the runtime "
                 f"rejected the module's required features at load ({exc}). "
                 f"This is almost certainly a MIXED IREE INSTALL: the legacy "
@@ -395,7 +523,8 @@ class IreeBackend(CompilerBackend):
 class IreeExecutable(CompilerExecutable):
     """IREE runtime executable (satisfies the backend ``Executable`` protocol).
 
-    Runs the compiled VM module on the ``local-task`` CPU driver:
+    Runs the compiled VM module on the acquired IREE HAL device (``local-task``
+    CPU or ``cuda`` GPU):
 
     1. Validate flat inputs against the recorded ``Signature``: count
        (``core.BackendError``), per-input dtype (``core.BackendError``),
