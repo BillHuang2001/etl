@@ -306,6 +306,11 @@ class IreeBackend(CompilerBackend):
            the reliable path (``rt.get_driver("local-task")`` +
            ``create_default_device()``); ``load_vm_flatbuffer``; resolve the
            v1 entry function (``"main"``, else the single recorded entry).
+           A ``ValueError`` from ``load_vm_flatbuffer`` (the runtime VM
+           verifier rejecting the module's required features — see
+           ``adapters/CONTEXT.md`` Known Issue #7, the mixed-install trap) is
+           surfaced as an actionable ``core.BackendError`` naming the cause
+           and remedy, with the original exception as ``__cause__``.
 
         NEVER re-traces / re-lowers / re-compiles — load-time mismatches fail
         clearly (root error strategy).
@@ -351,7 +356,32 @@ class IreeBackend(CompilerBackend):
         vmfb = base64.b64decode(payload["vmfb_base64"].encode("ascii"))
         driver = rt.get_driver("local-task")
         runtime_device = driver.create_default_device()
-        module = rt.load_vm_flatbuffer(vmfb, driver="local-task")
+        try:
+            module = rt.load_vm_flatbuffer(vmfb, driver="local-task")
+        except ValueError as exc:
+            # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md): the
+            # legacy iree-compiler/iree-runtime distributions and the current
+            # iree-base-* distributions share the SAME 'iree' Python
+            # namespace and must NOT coexist; a mixed/residual install makes
+            # the runtime VM verifier reject the module ("required module
+            # features [Ch] are not available in this runtime configuration")
+            # with a raw ValueError deep inside the runtime. Surface it as an
+            # actionable BackendError instead of the cryptic raw error.
+            raise core.BackendError(
+                f"IREE could not load the compiled VM module: the runtime "
+                f"rejected the module's required features at load ({exc}). "
+                f"This is almost certainly a MIXED IREE INSTALL: the legacy "
+                f"'iree-compiler'/'iree-runtime' distributions and the "
+                f"current 'iree-base-compiler'/'iree-base-runtime' "
+                f"distributions share the SAME 'iree' Python namespace and "
+                f"must NOT coexist — a mixed or residual install (e.g. pip "
+                f"uninstall leaving dist-info/egg-info residue) makes the "
+                f"runtime verifier claim the module's features are "
+                f"unavailable. Remedy: purge ALL 'iree*' distributions from "
+                f"site-packages (including stale dist-info/egg-info residue) "
+                f"and reinstall ONLY 'iree-base-compiler' and "
+                f"'iree-base-runtime'."
+            ) from exc
         return IreeExecutable(
             artifact=artifact,
             signature=artifact.signature,
