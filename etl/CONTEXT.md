@@ -83,8 +83,17 @@ Formats versioned via constants (`ETL_FORMAT_VERSION`). Artifacts are self-descr
 | `./dist/` | Groups + explicit collectives |
 | `./pipeline.py` | Orchestration: `lower/compile/load/run/bind/build/evaluate` + user-facing `Executable`/`BoundExecutable` wrappers |
 | `./persist/` | Save/load container format, explicit cache |
+| `./bench/` | Conformance & benchmark harness for example etl programs (numpy + optional lazy torch references) |
 
 Sibling: `../tests/` → test suite (read-only from here; escalate test-related writes to root).
+
+## etl.bench — conformance & benchmark harness (user-facing tool)
+
+`etl.bench` is a standalone harness subpackage (NOT part of the core API — deliberately NOT re-exported on the top-level `etl` namespace; use `import etl.bench`). It runs curated example `@etl.defn` graphs through the explicit pipeline (`etl.build`+`etl.run`, default numpy backend) and compares results against pure-numpy references — and, optionally, PyTorch references.
+
+Public API (see `./bench/CONTEXT.md`): `etl.bench.conformance(examples=None, *, use_torch=None, tolerance=None, rtol=1e-5, atol=1e-5, seed=0) -> ConformanceReport`, `etl.bench.benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2, seed=0) -> BenchmarkReport`, `etl.bench.list_examples()`, `etl.bench.get_example(name)`, report types (`ExampleResult`, `ConformanceReport`, `BenchmarkReport`, `print_report`), CLI `python -m etl.bench`. Example programs live in `./bench/examples.py` (matmul, conv2d ×3, elementwise fusion, softmax, layernorm, MLP, cumsum, attention — each with numpy reference and lazily-built torch reference).
+
+**torch-optionality (binding):** `import etl` / `import etl.bench` MUST always succeed without torch — torch never appears at module scope anywhere in this subpackage (same discipline as `./backends/adapters/`). torch is probed/imported lazily inside function bodies (`./bench/_torch.py`); when absent, torch comparisons are skipped with `torch_pass=None`/`torch_available=False` (auto mode), and `use_torch=True` raises a clear `ImportError` mentioning `pip install etl[bench]` — never a raw `ModuleNotFoundError`.
 
 ## Test strategy
 
