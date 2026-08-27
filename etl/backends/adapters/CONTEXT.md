@@ -1,99 +1,55 @@
-# etl/backends/adapters — optional compiler adapters (IREE implemented; XLA/TVM future)
+# etl/backends/adapters — optional compiler backends (pluggable adapters)
 
 ## Intent
 
-The pluggable-compiler seam: optional backends that consume the SHARED StableHLO lowering
-(`../compiler.py` — `CompilerBackend.lower` does verify → capability pre-check → portable
-inlining → StableHLO export → `Signature` recording → MLIR-text payload, for every adapter)
-and add only the compiler-specific half (`check_available` / `compile` / `load` /
-`CompilerExecutable` subclass). Adapters are NEVER imported at `etl`/`etl.backends` import
-time: `registry.get("iree"|"xla"|"tvm")` imports + registers them on first use
-(`registry.OPTIONAL_ADAPTERS`) — `import etl` stays light (validated: no iree/jax/tvm in
-`sys.modules`).
+Optional compiler adapters plugging external compilers into the shared `etl.backends.compiler` framework (`CompilerBackend` with shared `lower()`; `CompilerExecutable` base). Each adapter is ONE module (heavy dependency imports confined to function bodies) activated lazily by `etl.backends.registry.get(name)` on first use — `import etl` never imports an adapter or its compiler dependency. The shared framework is the parent `../compiler.py`; sibling constraints (import acyclicity, error strategy, no hidden staging) live in `../CONTEXT.md` — binding.
+
+**Status:** the XLA-via-PJRT adapter (`xla.py` + `xla_util.py`) is IMPLEMENTED and validated. `iree.py` and `tvm.py` are future parallel efforts (not present; their names are reserved in `registry.OPTIONAL_ADAPTERS`).
 
 ## API Surface
 
 | Name | Where | Notes |
 |---|---|---|
-| `iree_backend` | `iree.py` | `IreeBackend` singleton, registered via module-level `register()` |
-| `IreeBackend` | `iree.py` | `CompilerBackend` subclass: `name = "iree"`; `capabilities` (see below); `check_available()` probes iree.compiler+iree.runtime (raises `core.BackendError` with hint `pip install etl[iree]` when missing); `compile()` → iree-compile on the MLIR payload; `load()` → `IreeExecutable` |
-| `IreeExecutable` | `iree.py` | `CompilerExecutable` subclass (`backend_name = "iree"`): runs the VM flatbuffer on the `local-task` CPU driver; `save`/`load` inherited (artifact round-trip, explicit reconstruction) |
-| `register()` | `iree.py` | module-level: availability probe → `registry.register(iree_backend)` (idempotent, same instance) |
-| `xla.py`, `tvm.py` | — | FUTURE adapter modules (contract in `__init__.py`); not implemented — `registry.get` raises `BackendError` for them |
+| `XlaBackend` | `xla.py` | `CompilerBackend` subclass; `name="xla"`, `capabilities`, `check_available()`, `compile(lowered, options)`, `load(artifact, device)`. Inherits the shared `lower()` (verify → capability pre-check → portable inlining → StableHLO export → Signature) |
+| `XlaExecutable` | `xla.py` | `CompilerExecutable` subclass (`backend_name="xla"`); `run(flat_input_tensors)`; shared `save`/`.load` (artifact round-trip, explicit reconstruction) |
+| `xla_backend` | `xla.py` | module-level singleton |
+| `register()` | `xla.py` | probes jaxlib + registers idempotently; raises `core.BackendError` with `pip install etl[xla]` hint |
+| jaxlib plumbing | `xla_util.py` | private helpers (`_import_xla_runtime`, `_verify_xla_api_surface`, `_acquire_cpu_client`, `_make_mlir_context`, `_parse_stablehlo_module`, `_make_buffer_putter`, `_resolve_static_shape`, `_Aval`). NOT a public surface |
 
-**IreeBackend capabilities** (all validated end-to-end against iree-compiler==20241104.1068 /
-iree-runtime==20241104.1068, llvm-cpu, CPU only; see `iree.py` docstring for the full data):
+## XLA adapter design (validated against jax 0.10.2 / jaxlib 0.10.2 / numpy 2.4.6, CPU)
 
-- `dtypes`: float16/float32/float64/int8/int16/int32/int64/bool_. NOT declared: uint8/uint16
-  (iree-compile cannot legalize unsigned `reduce` — deterministic failure), uint32/uint64
-  (iree-compile 20241104 legalizes the same module NON-DETERMINISTICALLY — upstream race,
-  so not a reliable capability), complex64/128 (stablehlo exporter v1 defers complex
-  computation beyond cast).
-- `collectives=False` — see Known Issues (all six `etl.dist` collectives unreachable on the
-  local drivers; shared `lower()` rejects them explicitly, never silently).
-- `dynamic_shapes=True` — symbolic-dim graphs compile and run with different concrete sizes
-  (validated); see Known Issues for the scalar-broadcast exporter limitation.
-- `runtime_calls=False`, `custom_blocks=False` (portables inlined by the shared lower),
-  `async_collectives=False`.
+**Acquisition path (record every step when upgrading jaxlib):**
 
-## Constraints (binding)
+1. **PJRT client discovery.** NO standalone `pjrt_c_api_cpu_plugin.so` exists anywhere in jaxlib 0.10.2 site-packages (searched exhaustively). The CPU PJRT client is EMBEDDED in jaxlib's native `_xla.so`; acquire with `xc.make_cpu_client()` (prints 3 INFO lines from `pjrt_client.cc` to stderr — C++ logging, absl-py not even installed; cosmetic, no Python knob).
+2. **StableHLO parsing.** jaxlib MLIR bindings: `_jax_mlir_ext.register_dialects(registry)` + `ctx.append_dialect_registry` + `ctx.load_all_available_dialects()` loads core dialects (func/cf/arith/…); `stablehlo`/`chlo` (.so-separate dialects) need their own `register_dialect(ctx)`. `Context(load_on_create_dialects=[...])` alone does NOT work. No jax frontend needed.
+3. **Compilation.** `client.compile_and_load(mlir_module, executable_devices=xc.DeviceList(tuple(client.devices())), compile_options=xc.CompileOptions())` — the same entry point jax's own `_src/compiler.py` uses. The bytecode/`jaxlib._jax.mlir.mlir_module_to_xla_computation` route is NOT needed; plain `client.compile(module)` fails with a missing-compiler-factory error on CPU.
+4. **Buffer staging.** `client.buffer_from_pyval` DOES NOT EXIST in 0.10.2. Use `xc.batched_device_put(aval, sharding, [arr], [dev], True, enable_x64=True)` with a duck-typed aval (`shape`/`dtype`/`weak_type`/`named_shape`) and a `xc.SingleDeviceSharding(dev)` instance patched with `_to_xla_hlo_sharding = lambda _: xc.HloSharding.replicate()` (pybind CALLS that method). `enable_x64=True` is MANDATORY — the default x64-off state silently truncates float64/int64 to 32-bit. Returns the `ArrayImpl` directly for a single array.
+5. **Serialization.** `exe.serialize() -> bytes` and `client.deserialize_executable(bytes, device_list)` both EXIST and round-trip correctly (verified). Artifact payload is JSON-safe: `{"format": "xla-serialized-executable", "mlir_text", "executable_base64", "entry_functions", "static_input_shapes", "static_output_shapes"}`.
 
-- **Heavy-import rule**: `iree`/`iree.compiler`/`iree.runtime`/`numpy` imports live ONLY
-  inside function bodies; top level is stdlib + `etl.core` + sibling modules
-  (`..compiler`, `..registry`, `..program`, `..backend`). Never import `etl.pipeline`.
-- **Honest staging**: `compile` never loads; `load` never re-lowers/re-compiles;
-  `iree.compiler.CompilerToolError` → `core.BackendError` carrying the diagnostics.
-- **Reliable device acquisition** (validated 12 in-process cycles + 5 fresh processes):
-  `rt.get_driver("local-task")` + `driver.create_default_device()` — do NOT use the
-  historical `rt.system_setup(config=...)` recipe (`iree.runtime.system_setup` is a MODULE
-  in iree-runtime 20241104 → `TypeError: 'module' object is not callable`).
+**Capabilities (honestly validated):**
+- `dtypes`: ALL etl dtypes (float16/32/64, int8/16/32/64, uint8/16/32/64, bool, complex64/128) validated end-to-end through the full path (elementwise add; dot for float16/32/64/int32/int64; bool in+out; complex64 multiply).
+- `dynamic_shapes=False`: `compile()` applies a **static-shape gate** over `signature.input_specs` AND `output_specs` — `None` entries, unknown-size `Dim`, or `DimExpr` with free runtime dims raise `core.BackendError` naming the spec ("the xla adapter requires fully static shapes; got …"). Known-size dims and closed `DimExpr` pass. Gate results are recorded into the artifact for exact run-time validation.
+- `collectives=False`: 5/6 etl collectives (all_reduce, all_gather, reduce_scatter, all_to_all, collective_permute) compile AND run single-replica, but `dist.broadcast` (stablehlo `collective-broadcast`) fails AT RUN TIME on XLA:CPU (`UNIMPLEMENTED: HLO opcode collective-broadcast is not supported by XLA:CPU ThunkEmitter`). Per the capability contract (any failure → flag off), collectives are conservatively False so the shared `lower()` rejects collective graphs explicitly.
+- `runtime_calls=False`, `custom_blocks=False` (block_calls are portable-inlined before export), `async_collectives=False`.
 
-## Routing table
+**Errors:** backend/device/ABI mismatches → `PersistenceError`; unsupported device kind → `BackendError`; compile/conversion failures → `BackendError` with the original message; run-time input dtype/shape mismatches → `DTypeError`/`ShapeError`; capability violations → `BackendError` from the shared `lower()` pre-check. No silent fallbacks, never re-traces/re-compiles.
+
+## Routing Table
 
 | Path | Area |
 |---|---|
-| `./__init__.py` | docstring-only package marker + adapter-module contract (no heavy imports) |
-| `./iree.py` | IREE adapter: `IreeBackend`, `IreeExecutable`, `iree_backend`, `register()` |
-| `./xla.py` | FUTURE XLA-via-PJRT adapter (not implemented) |
-| `./tvm.py` | FUTURE TVM adapter (not implemented) |
+| `./xla.py` | `XlaBackend`, `XlaExecutable`, `xla_backend`, `register()` (module docstring = acquisition summary) |
+| `./xla_util.py` | jaxlib plumbing helpers (private) + the detailed verified acquisition-path doc |
+| `./iree.py` / `./tvm.py` | future parallel efforts (not present) |
 
-## Test strategy
+## Test Strategy
 
-Validated via throwaway scripts (NOT committed) in `$TMPDIR`: light-import check; registry
-auto-activation; end-to-end parity vs the numpy backend (matmul+relu+reduce_sum;
-reshape/broadcast/transpose; symbolic dims at two concrete sizes; `cond`/`while_loop`;
-structured multi-output; full dtype matrix); explicit rejection of all six collectives and
-`runtime_call` at `lower()`; run-time validation errors (`BackendError` for count/dtype,
-`ShapeError` for rank/static-shape, symbolic dims pass through); save/load round-trips
-(`CompiledArtifact.save/.load`, `IreeExecutable.save/.load`); `LoweredProgram.text()`
-rendering MLIR; compile determinism (10/10 on declared-capability graphs); device
-acquisition reliability. Full repo suite: 4106 passed, 7 torch skips, 0 failures.
+Sibling `../../tests/` is read-only from here (escalate test writes to root). Adapter validation runs as throwaway probe scripts in `$TMPDIR` (never committed): (1) fresh-process `import etl` leaves `sys.modules` free of jax/jaxlib/iree/tvm; (2) `etl.backends.get("xla")` auto-activates via the registry map; (3) parity vs the numpy backend (matmul+relu+reduce_sum, reshape/broadcast/transpose, cond, while_loop, multi-output/0-d, full dtype matrix); (4) NEGATIVE: symbolic/None dims → explicit static-shape `BackendError` at `compile()`; (5) `CompiledArtifact.save/.load` + `XlaExecutable.save/.load` round-trips run identically; (6) `LoweredProgram.text()` renders MLIR; (7) full suite `python3 -m pytest` stays green (4106 passed, 7 torch skips as of the last run).
 
-## Known issues
+## Known Issues / Notes for Agents
 
-- **`collective_broadcast` cannot be legalized** by iree-compile 20241104 llvm-cpu
-  ("failed to legalize operation 'stablehlo.collective_broadcast' that was explicitly
-  marked illegal" — upstream). The other five collectives compile but cannot RUN:
-  local-task/local-sync HAL raises "UNIMPLEMENTED; collectives not implemented" at
-  `hal.channel.create` (the Python wheels ship no communicating channel provider).
-  Consequence: `collectives=False`; the shared `lower()` rejects every collective-effect
-  op with `BackendError` naming it. Revisit when an MPI-backed channel provider or newer
-  IREE lands.
-- **StableHLO exporter (Phase A, `../stablehlo/`) emits illegal StableHLO for scalar
-  broadcasts to dynamic shapes** (e.g. `relu` on a symbolic-dim tensor):
-  `broadcast_in_dim` results MUST be statically shaped per the StableHLO spec; the spec'd
-  dynamic form is `dynamic_broadcast_in_dim` (+ `get_dimension_size` shape operand), which
-  iree-compile DOES support (validated). Such graphs fail at `compile()` with the
-  compiler's diagnostics — explicit, never silent. Fix belongs in the exporter, not here.
-- **iree-compile 20241104 nondeterminism on unsigned-int `reduce`** (uint32/uint64):
-  identical input+flags flip between success and "failed to legalize unresolved
-  materialization" — an upstream race; those dtypes are excluded from capabilities.
-- **IREE demotes f64→f32 by default** for StableHLO input; the adapter always passes
-  `--iree-input-demote-f64-to-f32=false` (silent dtype coercion would violate etl's
-  dtype contract). `--iree-llvmcpu-target-cpu=generic` keeps artifacts portable and
-  silences the generic-CPU warning.
-- **`stablehlo.add` on i1 is XOR** per the StableHLO spec, while numpy's bool `+` is
-  logical-or — an exporter semantic gap for bool arithmetic graphs (bool is validated and
-  supported through logical/compare ops, which map unambiguously).
-- Compile is a real iree-compile subprocess invocation (~1s per call) — `compile()` is
-  not intended for per-call hot loops; cache artifacts explicitly (`etl.Cache`).
+- **Version pin:** `jaxlib>=0.4.23` (from pyproject extras) is TOO LOOSE — the APIs used (`compile_and_load` with an MLIR module, `batched_device_put`, `deserialize_executable`) were validated against **jaxlib 0.10.2**; `check_available()` probes the exact API surface and raises with a version hint on drift. Bump `VALIDATED_JAXLIB_VERSION` only after re-running the full probe script.
+- `client.buffer_from_pyval` does not exist in 0.10.2 — do not "restore" it; the `batched_device_put` staging is the verified path.
+- The CPU client prints 3 stderr INFO lines at creation (cosmetic, no absl knob).
+- `collectives=False` is conservative: 5/6 collectives actually run single-replica; only `collective-broadcast` is unimplemented in XLA:CPU's ThunkEmitter (run-time failure). Re-probe after jaxlib upgrades before flipping the flag.
+- Parent `../CONTEXT.md` (etl/backends) still describes the adapters as "not present yet" — update it when the parent node next touches it.
