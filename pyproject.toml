@@ -31,6 +31,10 @@ compilers = [
     "jax>=0.10,<0.11",
     "apache-tvm>=0.26",
 ]
+# Only needed when running the etl.bench conformance/benchmark harness, which
+# compares against PyTorch. The etl library itself never imports torch, and
+# `import etl` must work without it.
+bench = ["torch>=2.0"]
 
 [tool.setuptools.packages.find]
 include = ["etl*"]
