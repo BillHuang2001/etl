@@ -64,7 +64,7 @@ Must-expose names (re-exported from `etl/backends/__init__.py` and from `etl`):
 
 ## StableHLO exporter — v1 scope
 
-Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableHLO MLIR text. Output is compiler input for external tools (`iree-compile model.mlir -o model.vmfb`); the IREE/XLA/TVM adapter MODULES are a separate parallel effort in `./adapters/` (framework only — `CompilerBackend`/`CompilerExecutable` here; the adapters themselves are not present yet).
+Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableHLO MLIR text. Output is compiler input for external tools (`iree-compile model.mlir -o model.vmfb`); the IREE/XLA/TVM adapters in `./adapters/` are IMPLEMENTED and consume this export as their lowering payload.
 
 **v1 mapping table** (`stablehlo/ops.py`; exact stablehlo op names verified against the StableHLO spec at implementation time):
 
@@ -96,6 +96,25 @@ Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i
 
 `LoweredProgram.save`/`CompiledArtifact.save` delegate to the `etl.persist` container format (lazy import): magic header + format version + JSON metadata + payload + SHA-256 integrity. Metadata is self-describing: backend name/version, target, signature (TreeSpecs + specs + static values), required custom ops, IR format version. `load()` validates the recorded backend against the registry (numpy reconstruction handled by `NumpyBackend`) — mismatch or missing custom op ⇒ `PersistenceError`. Never silently re-traces/re-compiles.
 
+## Compiler adapter framework (design)
+
+`compiler.py` is the pluggability seam: a new StableHLO-consuming compiler backend is a `CompilerBackend` subclass declaring `name`/`capabilities`, implementing `check_available()` (dependency probe with a `pip install etl[...]` hint), `compile()` (invoke the native compiler on the payload's `mlir_text`; JSON-safe artifact payload), and `load()` (rebuild the executable — never recompiling), plus a `CompilerExecutable` subclass implementing `run()`. The shared `lower()` does everything else (verify → capability pre-check → portable block inlining → StableHLO export → Signature → MLIR payload). The "How to add a new adapter" recipe lives in `compiler.py`'s docstring.
+
+**Implemented adapters** (all validated end-to-end with numpy-backend parity on real graphs; details + per-adapter known issues in `adapters/CONTEXT.md`):
+- **`"iree"`** — `iree.compiler.compile_str` → VM flatbuffer → `iree.runtime` (local-task driver). `dynamic_shapes=True`; dtypes f16/f32/f64/i8/i16/i32/i64/bool; collectives off.
+- **`"xla"`** (XLA via PJRT, never the jax frontend) — jaxlib's EMBEDDED CPU PJRT client (`xla_client.make_cpu_client()`; no standalone plugin .so exists in jaxlib 0.10.2); StableHLO text parsed with jaxlib's MLIR bindings → `client.compile_and_load`; x64 explicitly enabled. `dynamic_shapes=False` (static-shape gate at compile — explicit BackendError for symbolic dims); all 14 etl dtypes; collectives off.
+- **`"tvm"`** — `tvm.relax.frontend.stablehlo.from_stablehlo` → `tvm.relax.vm_build.build` (llvm) → `tvm.runtime.vm.VirtualMachine`; true serialize via `export_library` (no load-time rebuild). `dynamic_shapes=True` (constant-free graphs); 12 dtypes (no complex); collectives off; compile-time op whitelist gate (no control flow/conv/gather/scatter).
+
+All three: `runtime_calls=False` (runtime_call rejected at lower), `custom_blocks=False` (portable-only inlining at lower), `async_collectives=False`; never silently fall back to the numpy backend.
+
+## Known Issues
+
+- **StableHLO writer limits surfaced by adapters** (in this package's `stablehlo/`): (a) symbolic-dim graphs mixing scalar-constant broadcasts (e.g. `relu` on dynamic shapes) emit `broadcast_in_dim` to a dynamic result — the StableHLO verifier forbids it; the spec'd `dynamic_broadcast_in_dim` path is NOT emitted yet (iree-compile supports it) — honest compile-time BackendError today; (b) mixed-dtype binary ops with Python scalar constants can produce dtype-mismatch parse errors (workaround: explicit `etl.cast`); (c) `stablehlo.add` on i1 is XOR (XLA semantics) vs numpy bool+ = OR.
+- **IREE**: `collective_broadcast` cannot be legalized by iree-compile 20241104 llvm-cpu (upstream) — hence `collectives=False`; u32/u64 excluded (nondeterministic upstream legalization of unsigned reduce). `iree.runtime.system_setup(config=...)` intermittently fails (`TypeError: 'module' object is not callable`, submodule shadowing) — use `get_driver("local-task")` + `create_default_device()`.
+- **XLA**: `client.buffer_from_pyval` does not exist in jaxlib 0.10.2 (inputs stage via `batched_device_put` with a patched SingleDeviceSharding); x64 must stay ENABLED (default off silently truncates f64/i64); cosmetic C++ INFO lines at client creation; collectives off because `collective-broadcast` fails at XLA:CPU run time (5/6 work single-replica — re-probe before flipping).
+- **TVM**: requires jax/jaxlib present at adapter runtime (the vendored StableHLO translator imports jax's mlir bindings) AND a compatibility shim (`tvm_util.ensure_compat()`) patching the 0.26.0 vendored translator against the new jax mlir python bindings; control flow / conv / gather / scatter / remainder / multi-function / multi-output modules rejected by the compile-time gate.
+- **pyproject extras** (repo root — escalated): `iree` extra OK (`>=20240410`); `xla` extra `jaxlib>=0.4.23` too loose — recommend `jax>=0.10,<0.11`; `tvm` extra `apache-tvm>=0.14` too loose — `from_stablehlo` exists only in 0.26 — recommend `apache-tvm>=0.26` + `jax>=0.10,<0.11`.
+
 ## Test strategy
 
 `../../tests/backends/` (sibling — read-only from here; test-related writes escalate to root):
@@ -113,13 +132,13 @@ Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i
 | `./inline.py` | SHARED block-inlining machinery: `iter_block_ops`/`iter_ops` (regions-first bottom-up walk), `clone_ops_into`/`drop_op_uses` (portable splicing + use bookkeeping), `inline_portables` (fixpoint driver) |
 | `./program.py` | `Signature`, `LoweredProgram`, `CompiledArtifact` (owned by backends; `text()` renders str / stablehlo-dict (`mlir_text`) / serialized-module payloads) |
 | `./registry.py` | `register`/`get` + `OPTIONAL_ADAPTERS` (first-use auto-activation of optional adapters) |
-| `./adapters/` | optional compiler adapter modules (`iree.py`/`xla.py`/`tvm.py` — a SEPARATE parallel effort, not present yet); `__init__.py` is docstring-only, no heavy imports |
+| `./adapters/` | optional compiler adapter modules — ALL IMPLEMENTED: `iree.py` (iree-compiler/runtime, VM flatbuffer), `xla.py` + `xla_util.py` (XLA via jaxlib PJRT — embedded CPU client, StableHLO parse → `compile_and_load`), `tvm.py` + `tvm_util.py` (Relax `from_stablehlo` + VM build/run + vendored-translator compat shim); `__init__.py` is docstring-only, no heavy imports |
 | `./numpy/` | Reference numpy CPU interpreter: `NumpyBackend`, `NumpyExecutable`, `interpreter.py` (execution loop + KernelContext), `exec_context.py` (per-run RankContext), `inline.py` (thin re-export of `../inline.py`), `kernels/` (per-category kernels), `shapes.py` (DimExpr evaluation), `collectives.py` (default executor; canonical hook lives in `etl.dist.context`) |
 | `./stablehlo/` | StableHLO MLIR export utility: `export`, `ops.py` (mapping table data), `writer.py` (MLIR text emission) |
 
 ## Notes for agents
 
-- **Implementation status: complete.** All behavioral bodies in `backend.py`, `program.py`, `compiler.py`, `inline.py`, `registry.py`, `numpy/`, and `stablehlo/` are implemented; no `NotImplementedError` stubs remain in this node (the abstract methods of `CompilerBackend`/`CompilerExecutable` are adapter contracts, by design). The `adapters/` subpackage holds the framework docs only — the `iree.py`/`xla.py`/`tvm.py` adapter modules are a SEPARATE parallel effort. `etl.pipeline` (orchestration above this package) and sibling test suites are handled elsewhere.
+- **Implementation status: complete.** All behavioral bodies in `backend.py`, `program.py`, `compiler.py`, `inline.py`, `registry.py`, `numpy/`, `stablehlo/`, and `adapters/` (iree/xla/tvm) are implemented; no `NotImplementedError` stubs remain in this node (the abstract methods of `CompilerBackend`/`CompilerExecutable` are adapter contracts, by design). `etl.pipeline` (orchestration above this package) and sibling test suites are handled elsewhere.
 - Optional adapters are NEVER imported at `etl`/`etl.backends` import time — `registry.get("iree"|"xla"|"tvm")` imports + registers them on first use (verified with a fresh interpreter: `import etl` leaves `sys.modules` free of iree/jax/tvm). `program.py._require_registered_backend` routes through `get()`, so persisted adapter artifacts auto-activate on load.
 - The IR op names for control flow are `if`/`while` (trace lowers `cond`/`while_loop`/`scan` into them) and the dist broadcast collective is `broadcast_collective` — frontend names differ from IR names; kernels and the stablehlo writer dispatch on IR names.
 - `runtime_call` carries its callback as a STRING registry id (resolved via `etl.ops.constant._get_callback` at run time) — artifacts with `runtime_call` require the same callback registrations at load time; callbacks are never serialized.
