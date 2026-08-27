@@ -1,55 +1,51 @@
-# etl/backends/adapters — optional compiler backends (pluggable adapters)
+# etl/backends/adapters — optional compiler adapters (TVM implemented; IREE/XLA pending)
 
 ## Intent
 
-Optional compiler adapters plugging external compilers into the shared `etl.backends.compiler` framework (`CompilerBackend` with shared `lower()`; `CompilerExecutable` base). Each adapter is ONE module (heavy dependency imports confined to function bodies) activated lazily by `etl.backends.registry.get(name)` on first use — `import etl` never imports an adapter or its compiler dependency. The shared framework is the parent `../compiler.py`; sibling constraints (import acyclicity, error strategy, no hidden staging) live in `../CONTEXT.md` — binding.
+Pluggable compiler backends for etl: each adapter consumes the SHARED StableHLO lowering produced by `CompilerBackend.lower` (`../compiler.py` — capability pre-check, block-portable inlining, StableHLO export, Signature recording) and implements only the compiler-specific half: dependency probe (`check_available`), `compile` (invoke the external compiler), `load` (rebuild the executable — never recompiling). Activation is register-on-first-use: `etl.backends.registry.get("tvm")` imports the module and calls its `register()`; `import etl` never imports an adapter or its compiler dependency.
 
-**Status:** the XLA-via-PJRT adapter (`xla.py` + `xla_util.py`) is IMPLEMENTED and validated. `iree.py` and `tvm.py` are future parallel efforts (not present; their names are reserved in `registry.OPTIONAL_ADAPTERS`).
+Status: **`tvm.py` implemented and validated** (TVM 0.26.0). `iree.py` / `xla.py` are documented framework slots, not implemented.
 
 ## API Surface
 
-| Name | Where | Notes |
-|---|---|---|
-| `XlaBackend` | `xla.py` | `CompilerBackend` subclass; `name="xla"`, `capabilities`, `check_available()`, `compile(lowered, options)`, `load(artifact, device)`. Inherits the shared `lower()` (verify → capability pre-check → portable inlining → StableHLO export → Signature) |
-| `XlaExecutable` | `xla.py` | `CompilerExecutable` subclass (`backend_name="xla"`); `run(flat_input_tensors)`; shared `save`/`.load` (artifact round-trip, explicit reconstruction) |
-| `xla_backend` | `xla.py` | module-level singleton |
-| `register()` | `xla.py` | probes jaxlib + registers idempotently; raises `core.BackendError` with `pip install etl[xla]` hint |
-| jaxlib plumbing | `xla_util.py` | private helpers (`_import_xla_runtime`, `_verify_xla_api_surface`, `_acquire_cpu_client`, `_make_mlir_context`, `_parse_stablehlo_module`, `_make_buffer_putter`, `_resolve_static_shape`, `_Aval`). NOT a public surface |
+- `tvm.py`: `TvmBackend` (name `"tvm"`, a `CompilerBackend`), `TvmExecutable` (a `CompilerExecutable`), singleton `tvm_backend`, module-level `register()` (probes the dependency — `core.BackendError` with the pip hint when missing — then registers idempotently).
+- `tvm_util.py`: the vendored-translator compatibility shim (`ensure_compat()`), the validated-op whitelist (`SUPPORTED_STABLEHLO_OPS`), compile-time gate (`parse_stablehlo`, `precheck_module`), and the translate/build/run/persist helpers (`translate`, `build_vm_executable`, `export_library_base64`, `load_virtual_machine`, `invoke`, `as_tvm_tensor`).
+- `__init__.py`: documentation only, no imports.
 
-## XLA adapter design (validated against jax 0.10.2 / jaxlib 0.10.2 / numpy 2.4.6, CPU)
+## TVM adapter — validated design (all end-to-end, numpy-backend parity)
 
-**Acquisition path (record every step when upgrading jaxlib):**
+**Pipeline (TVM 0.26.0, tvm_ffi 0.1.13.post3, jax/jaxlib 0.10.2):**
+- translate: `tvm.relax.frontend.stablehlo.from_stablehlo(mlir_text)` — parses with `jax._src.interpreters.mlir.make_ir_context()`; NOTE `tvm.relax.vm.build` does NOT exist in 0.26 (`vm` resolves to `tvm.runtime.vm`; build lives in `relax.vm_build`, re-exported as `tvm.relax.build`).
+- build: `tvm.relax.vm_build.build(mod, target=tvm.target.Target("llvm"))` → `VMExecutable`; artifact `target="cpu - llvm"`.
+- run: `tvm.runtime.vm.VirtualMachine(ex, tvm.runtime.cpu())["main"](...)`; inputs `tvm.runtime.tensor(np_array, tvm.runtime.cpu())` (the `tvm.nd` namespace no longer exists); outputs `tvm.runtime.Tensor.numpy()` → `core.Tensor(np.asarray(...))` (the numpy interpreter's canonical construction).
+- persist: `VMExecutable.export_library(path)` writes a host .so; bytes are base64'd into the artifact payload (`format="tvm-vm-library"`, keeps `mlir_text` + `entry_functions`); `load` decodes to a temp file and `tvm.runtime.load_module(path)` — **no recompile at load** (validated: reloaded module runs identically). `Module.save_to_file` does not exist in 0.26. `runtime_dependencies={"numpy": ..., "tvm": ...}`; load enforces the recorded tvm version (mismatch ⇒ `core.PersistenceError`).
 
-1. **PJRT client discovery.** NO standalone `pjrt_c_api_cpu_plugin.so` exists anywhere in jaxlib 0.10.2 site-packages (searched exhaustively). The CPU PJRT client is EMBEDDED in jaxlib's native `_xla.so`; acquire with `xc.make_cpu_client()` (prints 3 INFO lines from `pjrt_client.cc` to stderr — C++ logging, absl-py not even installed; cosmetic, no Python knob).
-2. **StableHLO parsing.** jaxlib MLIR bindings: `_jax_mlir_ext.register_dialects(registry)` + `ctx.append_dialect_registry` + `ctx.load_all_available_dialects()` loads core dialects (func/cf/arith/…); `stablehlo`/`chlo` (.so-separate dialects) need their own `register_dialect(ctx)`. `Context(load_on_create_dialects=[...])` alone does NOT work. No jax frontend needed.
-3. **Compilation.** `client.compile_and_load(mlir_module, executable_devices=xc.DeviceList(tuple(client.devices())), compile_options=xc.CompileOptions())` — the same entry point jax's own `_src/compiler.py` uses. The bytecode/`jaxlib._jax.mlir.mlir_module_to_xla_computation` route is NOT needed; plain `client.compile(module)` fails with a missing-compiler-factory error on CPU.
-4. **Buffer staging.** `client.buffer_from_pyval` DOES NOT EXIST in 0.10.2. Use `xc.batched_device_put(aval, sharding, [arr], [dev], True, enable_x64=True)` with a duck-typed aval (`shape`/`dtype`/`weak_type`/`named_shape`) and a `xc.SingleDeviceSharding(dev)` instance patched with `_to_xla_hlo_sharding = lambda _: xc.HloSharding.replicate()` (pybind CALLS that method). `enable_x64=True` is MANDATORY — the default x64-off state silently truncates float64/int64 to 32-bit. Returns the `ArrayImpl` directly for a single array.
-5. **Serialization.** `exe.serialize() -> bytes` and `client.deserialize_executable(bytes, device_list)` both EXIST and round-trip correctly (verified). Artifact payload is JSON-safe: `{"format": "xla-serialized-executable", "mlir_text", "executable_base64", "entry_functions", "static_input_shapes", "static_output_shapes"}`.
+**Capabilities (validated):** `dynamic_shapes=True` (symbolic `tensor<?x8xf32>` runs at multiple concrete sizes — with the writer caveat below); `collectives=False` (the vendored translator has no collective handlers — the shared `lower()` rejects collective ops explicitly); `runtime_calls=False`, `custom_blocks=False`, `async_collectives=False`. `dtypes` = float16/float32/float64/int8/int16/int32/int64/uint8/uint16/uint32/uint64/bool (each run end-to-end; complex64/128 excluded — the vendored `_convert_data_type` raises `NotImplementedError`).
 
-**Capabilities (honestly validated):**
-- `dtypes`: ALL etl dtypes (float16/32/64, int8/16/32/64, uint8/16/32/64, bool, complex64/128) validated end-to-end through the full path (elementwise add; dot for float16/32/64/int32/int64; bool in+out; complex64 multiply).
-- `dynamic_shapes=False`: `compile()` applies a **static-shape gate** over `signature.input_specs` AND `output_specs` — `None` entries, unknown-size `Dim`, or `DimExpr` with free runtime dims raise `core.BackendError` naming the spec ("the xla adapter requires fully static shapes; got …"). Known-size dims and closed `DimExpr` pass. Gate results are recorded into the artifact for exact run-time validation.
-- `collectives=False`: 5/6 etl collectives (all_reduce, all_gather, reduce_scatter, all_to_all, collective_permute) compile AND run single-replica, but `dist.broadcast` (stablehlo `collective-broadcast`) fails AT RUN TIME on XLA:CPU (`UNIMPLEMENTED: HLO opcode collective-broadcast is not supported by XLA:CPU ThunkEmitter`). Per the capability contract (any failure → flag off), collectives are conservatively False so the shared `lower()` rejects collective graphs explicitly.
-- `runtime_calls=False`, `custom_blocks=False` (block_calls are portable-inlined before export), `async_collectives=False`.
+**Op coverage** (compile-time whitelist gate, `SUPPORTED_STABLEHLO_OPS`): arithmetic (add/subtract/multiply/divide/power/maximum/minimum), unary math (abs/negate/sign/sqrt/rsqrt/exp/log/log_plus_one/sine/cosine/tanh/logistic), compare (EQ/NE/LT/LE/GT/GE), select, bitwise/logical and/or/xor/not, convert, broadcast_in_dim, reshape, transpose, concatenate, slice (unit strides), pad (zero interior), reduce (add/maximum/minimum/multiply reducers), dot_general (matmul), constant. Rejected at compile with `core.BackendError` naming the op: control flow (`stablehlo.if`/`while`), gather/scatter, remainder, convolution and reduce_window (vendored handlers hardcode NHWC/HWIO — silently wrong for etl's NCHW conv), multi-function modules, multi-tensor-output functions (vendored importer keeps only the first output).
 
-**Errors:** backend/device/ABI mismatches → `PersistenceError`; unsupported device kind → `BackendError`; compile/conversion failures → `BackendError` with the original message; run-time input dtype/shape mismatches → `DTypeError`/`ShapeError`; capability violations → `BackendError` from the shared `lower()` pre-check. No silent fallbacks, never re-traces/re-compiles.
+## Known Issues
 
-## Routing Table
+1. **Vendor-compat shim (required):** the TVM 0.26.0 vendored StableHLO translator targets the OLD mlir python bindings (`ShapedType.isinstance` classmethods, `OpView` as an `Operation` subclass) and old FFI conventions; with jaxlib ≥0.9 (new bindings) it crashes on basic programs. `tvm_util.ensure_compat()` patches the five gaps (type-check classmethods, OpView/Operation key normalization, `broadcast_to` ShapeExpr, `DenseI64ArrayAttr` decoding, np.asarray constant decoding for float16) and extends the op map with validated handlers. Each patch restores exactly the semantics the vendored code assumed — no computation changes.
+2. **etl StableHLO writer limitation (sibling node — NOT fixed here):** (a) symbolic-dim graphs that mix scalar-constant broadcasts (e.g. `relu`) export `broadcast_in_dim` to a dynamic-shape result, which the StableHLO verifier forbids — the adapter surfaces the parse error as `core.BackendError` at compile; (b) mixed-dtype binary ops with Python scalar constants (e.g. int32 tensor + int literal) export operands of mismatched types (no implicit `convert`) — same honest compile-time parse error. Workaround: cast operands explicitly / avoid scalar constants in those graphs.
+3. **Version floor:** the adapter probes the exact APIs it calls at `check_available`; validated against `apache-tvm 0.26.0` + `jax/jaxlib 0.10.2`. pyproject's `apache-tvm>=0.14` extra is TOO LOOSE — 0.26 (from_stablehlo + tvm_ffi API) and a jaxlib matching the translator's mlir bindings are required (the extra must also include jaxlib — the translator imports `jax._src.interpreters.mlir`). Recommend `apache-tvm>=0.26` + `jaxlib` in the `tvm` extra.
+4. `iree.py` / `xla.py` are not implemented (documented framework slots).
+
+## Constraints (binding)
+
+- Heavy-import rule: `tvm`/`jaxlib` imports only inside function bodies (`tvm_util` + `tvm.py` both); top-level imports limited to stdlib, `numpy`, `etl.core`, and the `..compiler`/`..program`/`..registry` siblings. Verified: `import etl` leaves `sys.modules` free of tvm/jax/iree.
+- Errors: capability violations and translator/build failures raise `core.BackendError` naming the op/feature — never silent fallback; load-time mismatches raise `core.PersistenceError`; input dtype mismatches `core.DTypeError`, shape mismatches `core.ShapeError` (mirrors the numpy interpreter).
+- Staging never composes: `load` never re-traces/lowers/compiles.
+- CPU only (`llvm` target); non-CPU devices raise `core.BackendError`.
+
+## Routing table
 
 | Path | Area |
 |---|---|
-| `./xla.py` | `XlaBackend`, `XlaExecutable`, `xla_backend`, `register()` (module docstring = acquisition summary) |
-| `./xla_util.py` | jaxlib plumbing helpers (private) + the detailed verified acquisition-path doc |
-| `./iree.py` / `./tvm.py` | future parallel efforts (not present) |
+| `./__init__.py` | package marker + adapter-module contract (documentation only) |
+| `./tvm.py` | `TvmBackend` (compile/load/check_available), `TvmExecutable` (run), `tvm_backend`, `register()` |
+| `./tvm_util.py` | vendored-translator compat shim, op whitelist, compile-time gate, translate/build/run/persist helpers |
 
-## Test Strategy
+## Test strategy
 
-Sibling `../../tests/` is read-only from here (escalate test writes to root). Adapter validation runs as throwaway probe scripts in `$TMPDIR` (never committed): (1) fresh-process `import etl` leaves `sys.modules` free of jax/jaxlib/iree/tvm; (2) `etl.backends.get("xla")` auto-activates via the registry map; (3) parity vs the numpy backend (matmul+relu+reduce_sum, reshape/broadcast/transpose, cond, while_loop, multi-output/0-d, full dtype matrix); (4) NEGATIVE: symbolic/None dims → explicit static-shape `BackendError` at `compile()`; (5) `CompiledArtifact.save/.load` + `XlaExecutable.save/.load` round-trips run identically; (6) `LoweredProgram.text()` renders MLIR; (7) full suite `python3 -m pytest` stays green (4106 passed, 7 torch skips as of the last run).
-
-## Known Issues / Notes for Agents
-
-- **Version pin:** `jaxlib>=0.4.23` (from pyproject extras) is TOO LOOSE — the APIs used (`compile_and_load` with an MLIR module, `batched_device_put`, `deserialize_executable`) were validated against **jaxlib 0.10.2**; `check_available()` probes the exact API surface and raises with a version hint on drift. Bump `VALIDATED_JAXLIB_VERSION` only after re-running the full probe script.
-- `client.buffer_from_pyval` does not exist in 0.10.2 — do not "restore" it; the `batched_device_put` staging is the verified path.
-- The CPU client prints 3 stderr INFO lines at creation (cosmetic, no absl knob).
-- `collectives=False` is conservative: 5/6 collectives actually run single-replica; only `collective-broadcast` is unimplemented in XLA:CPU's ThunkEmitter (run-time failure). Re-probe after jaxlib upgrades before flipping the flag.
-- Parent `../CONTEXT.md` (etl/backends) still describes the adapters as "not present yet" — update it when the parent node next touches it.
+Validated with throwaway scripts in `$TMPDIR` (not committed — per the framework's adapter validation pattern): registry auto-activation, numpy-backend parity (matmul+relu+reduce_sum; reshape/broadcast/transpose; symbolic-dim dot at two sizes), artifact/executable/wrapped-executable save-load round-trips, error paths (unsupported ops, dtype/shape/device mismatches, cross-backend artifact, collectives at lower). Committed tests for this adapter would live in `../../../tests/backends/` — a SIBLING directory; test-related writes escalate to the repo root. The full suite (`python3 -m pytest -q`) stays green (4113 collected, exit 0).
