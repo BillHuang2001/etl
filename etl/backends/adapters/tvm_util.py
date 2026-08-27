@@ -528,7 +528,7 @@ def ensure_compat() -> None:
     _orig_retrieve = StableHLOImporter._retrieve_operands
 
     def _retrieve_operands(self, node):
-        if isinstance(node, mlir.ir.OpView):
+        if isinstance(node, ir.OpView):
             node = node.operation
         return _orig_retrieve(self, node)
 
