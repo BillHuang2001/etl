@@ -19,13 +19,17 @@ dev = ["pytest>=7"]
 # always exportable). Install an extra to enable the matching backend:
 #   pip install etl[iree] / etl[xla] / etl[tvm] / etl[compilers]
 iree = ["iree-compiler>=20240410", "iree-runtime>=20240410"]
-xla = ["jaxlib>=0.4.23"]  # PJRT C API plugin (CPU) — used via ctypes, NOT via jax
-tvm = ["apache-tvm>=0.14"]
+# The CPU PJRT client is embedded in jaxlib; the adapter drives the PJRT C
+# API via ctypes and never imports the jax frontend. jax pulls a matching jaxlib.
+xla = ["jax>=0.10,<0.11"]
+# from_stablehlo exists only in apache-tvm >= 0.26; its vendored translator
+# imports jax's MLIR python bindings, so jax/jaxlib is a runtime requirement.
+tvm = ["apache-tvm>=0.26", "jax>=0.10,<0.11"]
 compilers = [
     "iree-compiler>=20240410",
     "iree-runtime>=20240410",
-    "jaxlib>=0.4.23",
-    "apache-tvm>=0.14",
+    "jax>=0.10,<0.11",
+    "apache-tvm>=0.26",
 ]
 
 [tool.setuptools.packages.find]

@@ -38,18 +38,27 @@ Features:
 - Graph transforms: `etl.vectorize` / `etl.vmap`, `etl.grad` / `etl.jvp` / `etl.vjp`
 - Explicit collectives: `etl.dist.all_reduce(...)`
 - Custom ops via `etl.block` (portable impls, per-backend kernels, batching/derivative rules)
-- Reference CPU backend (numpy interpreter) + StableHLO MLIR export for external compilers
+- Reference CPU backend (numpy interpreter, default) + StableHLO MLIR export
+- Pluggable compiler adapters — IREE, XLA (via PJRT), TVM — optional extras, lazily
+  activated (`etl.lower(graph, backend="iree")`); the library runs with none installed
 - Serializable, cacheable pipeline objects (`Graph`, `LoweredProgram`, `CompiledArtifact`)
 - DLPack interoperability with PyTorch / CuPy / other runtimes
+
+```python
+# Same graph, real compilers (needs: pip install etl[iree] / etl[xla] / etl[tvm]):
+exe = etl.build(f, etl.TensorSpec((4, 8), etl.float32), etl.TensorSpec((8, 4), etl.float32),
+                backend="iree", device="cpu")
+```
 
 See `CONTEXT.md` for the architecture and `etl/CONTEXT.md` for the public API contract.
 
 ## Install
 
 ```bash
-pip install -e .          # numpy only
+pip install -e .          # numpy only — runs fully with the default numpy backend
 pip install -e ".[dev]"   # + pytest
 pip install -e ".[interop]"  # + torch (DLPack interop tests)
+pip install -e ".[compilers]"  # + IREE, XLA (PJRT), TVM adapters
 ```
 
 ## Test
