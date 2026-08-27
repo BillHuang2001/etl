@@ -89,6 +89,24 @@ class Tensor:
             # (numpy < 2.0 rejects it — hence the plain call above first).
             return self.data.__dlpack__(stream=stream, max_version=(1, 0))
 
+    def __dlpack_device__(self) -> Tuple[int, int]:
+        """Report the DLPack device where this tensor's memory lives.
+
+        The DLPack Python protocol requires ``__dlpack_device__`` alongside
+        ``__dlpack__``; consumers (e.g. ``torch.utils.dlpack.from_dlpack``)
+        call it to learn the exporter's device before consuming the capsule.
+
+        v1 tensors always wrap numpy host memory, so the memory physically
+        lives on the CPU — we report the device the memory ACTUALLY lives
+        on, even if a ``device`` label (core.Device) is attached. Per
+        dlpack.h: kDLCPU = 1, kDLCUDA = 2, ...; device id 0 is the sole CPU.
+
+        Returns:
+            A ``(device_type, device_id)`` tuple: ``(1, 0)`` for CPU host
+            memory.
+        """
+        return (1, 0)
+
     def __eq__(self, other: Any) -> bool:
         """Structural equality: identity of metadata + value.
 
