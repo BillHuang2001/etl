@@ -33,7 +33,14 @@ internals. It is split out of ``tvm.py`` for two reasons:
 
    ``ensure_compat()`` also EXTENDS the translator's op map
    (``convert_map``) with handlers for ops the vendored translator lacks
-   but which map 1:1 onto Relax ops. Every added handler is validated
+   but which map 1:1 onto Relax ops — including the writer's
+   dynamic-broadcast plumbing (``get_dimension_size`` /
+   ``dynamic_broadcast_in_dim``: the Relax VM of 0.26 cannot codegen
+   ``broadcast_to`` with a symbolic shape, so the dynamic handler recovers
+   the runtime shape source from the writer's deterministic
+   ``output_dimensions`` chain and emits ``multiply(data,
+   full_like(source, 1))`` — validated end-to-end at multiple concrete
+   sizes). Every added handler is validated
    end-to-end (translate → ``relax.vm_build.build`` → run → numpy parity);
    the validated set is ``SUPPORTED_STABLEHLO_OPS`` below, which the
    compile-time pre-check enforces — anything outside it raises
@@ -126,6 +133,11 @@ SUPPORTED_STABLEHLO_OPS: frozenset[str] = frozenset(
         "stablehlo.concatenate",
         "stablehlo.slice",
         "stablehlo.pad",
+        # dynamic-shape broadcast plumbing (writer-emitted for broadcasts
+        # whose result has dynamic dims; handlers in the compat shim —
+        # validated end-to-end at multiple concrete sizes)
+        "stablehlo.get_dimension_size",
+        "stablehlo.dynamic_broadcast_in_dim",
         # reductions / linear algebra / constants / comparisons
         "stablehlo.reduce",
         "stablehlo.dot_general",
@@ -310,6 +322,96 @@ def ensure_compat() -> None:
             )
         return self.block_builder.emit(fn(data[0], axis=dimensions))
 
+    def _get_dimension_size(self, node):
+        """``stablehlo.get_dimension_size`` -> scalar i32 placeholder.
+
+        The writer emits this op ONLY inside the ``output_dimensions``
+        chain of a ``stablehlo.dynamic_broadcast_in_dim``, whose tvm
+        handler derives the target shape from the result type and never
+        consumes this value — so a type-consistent scalar placeholder
+        keeps the importer walk coherent (the value is dead by
+        construction).
+        """
+        self.retrieve_operands(node)
+        return self.block_builder.emit(relax.const(0, "int32"))
+
+    def _dynamic_broadcast_source(self, dims_value):
+        """Recover the shape-source mlir Value from the writer's
+        deterministic ``output_dimensions`` chain.
+
+        The writer emits: ``concatenate(reshape(get_dimension_size(src,
+        i)), constant(tensor<1xi32>)...)`` — every dynamic dim of the
+        target shape queries the SAME source tensor. Returns the Relax
+        value of that source; an unrecognized chain raises
+        ``core.BackendError`` (never a silent guess).
+        """
+        pieces = []
+
+        def walk(value):
+            op = value.owner if hasattr(value, "owner") else value
+            op = getattr(op, "operation", op)
+            name = getattr(op, "OPERATION_NAME", None) or getattr(op, "name", None)
+            if name == "stablehlo.concatenate":
+                for operand in op.operands:
+                    walk(operand)
+                return
+            if name == "stablehlo.reshape":
+                walk(op.operands[0])
+                return
+            if name == "stablehlo.constant":
+                return  # static target dim — no runtime source needed
+            if name == "stablehlo.get_dimension_size":
+                pieces.append(op.operands[0])
+                return
+            raise core.BackendError(
+                "stablehlo.dynamic_broadcast_in_dim output_dimensions chain "
+                f"op {name!r} is not supported by the tvm adapter"
+            )
+
+        walk(dims_value)
+        sources = {str(piece) for piece in pieces}
+        if len(sources) != 1:
+            raise core.BackendError(
+                "stablehlo.dynamic_broadcast_in_dim with output dimensions "
+                "derived from multiple tensors is not supported by the tvm "
+                "adapter"
+            )
+        return self._retrieve_operands(pieces[0])
+
+    def _dynamic_broadcast_in_dim(self, node):
+        """``stablehlo.dynamic_broadcast_in_dim`` -> Relax broadcast.
+
+        Static target shapes emit ``relax.op.broadcast_to`` (VM-codegenable).
+        Dynamic target shapes cannot use ``broadcast_to`` (the Relax VM of
+        0.26 cannot codegen it with a symbolic shape); instead the handler
+        recovers the runtime shape source from the writer's
+        ``output_dimensions`` chain and emits ``multiply(data,
+        full_like(source, 1))`` — elementwise broadcasting computes the
+        target shape at run time (validated end-to-end at multiple
+        concrete sizes). Bool data is rejected explicitly (no multiply
+        trick on i1).
+        """
+        operands = self.retrieve_operands(node)
+        data = operands[0]
+        target_shape = self.get_shape(node.result.type)
+        if all(isinstance(d, int) for d in target_shape):
+            if len(target_shape) == 0:
+                return data
+            return self.block_builder.emit(
+                relax.op.broadcast_to(data, relax.ShapeExpr(target_shape))
+            )
+        dtype = self._convert_data_type(node.result.type)
+        if dtype == "bool":
+            raise core.BackendError(
+                "stablehlo.dynamic_broadcast_in_dim of bool data is not "
+                "supported by the tvm adapter"
+            )
+        source = _dynamic_broadcast_source(self, node.operands[1])
+        ones = self.block_builder.emit(
+            relax.op.full_like(source, relax.const(1, dtype), dtype)
+        )
+        return self.block_builder.emit(relax.op.multiply(data, ones))
+
     _extra_handlers = {
         "stablehlo.transpose": _transpose,
         "stablehlo.compare": _compare,
@@ -331,6 +433,8 @@ def ensure_compat() -> None:
         "stablehlo.slice": _slice,
         "stablehlo.pad": _pad,
         "stablehlo.reduce": _reduce,
+        "stablehlo.get_dimension_size": _get_dimension_size,
+        "stablehlo.dynamic_broadcast_in_dim": _dynamic_broadcast_in_dim,
     }
 
     # -- (3) importer __init__: normalize _nodes, extend the convert map ----

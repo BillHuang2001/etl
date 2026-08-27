@@ -2,7 +2,7 @@
 
 ## Intent
 
-Pluggable compiler backends for etl. Each adapter consumes the SHARED StableHLO lowering produced by `CompilerBackend.lower` (`../compiler.py` — verify, capability pre-check, block-portable inlining, StableHLO export, Signature recording) and implements only the compiler-specific half: dependency probe (`check_available`), `compile` (invoke the external compiler on the MLIR text), `load` (rebuild the executable from the artifact — never re-compiling). Activation is register-on-first-use: `etl.backends.registry.get(name)` imports the adapter module via `registry.OPTIONAL_ADAPTERS` and calls its `register()`; `import etl` never imports an adapter or its compiler dependency.
+Pluggable compiler backends for etl. Each adapter consumes the SHARED StableHLO lowering produced by `CompilerBackend.lower` (`../compiler.py` — verify, capability pre-check, block-portable inlining, StableHLO export, Signature recording) and implements only the compiler-specific half: optional dependency probe (`check_available` override — the shared base is a concrete no-op), `compile` (invoke the external compiler on the MLIR text), `load` (rebuild the executable from the artifact — never re-compiling). Activation is register-on-first-use: `etl.backends.registry.get(name)` imports the adapter module via `registry.OPTIONAL_ADAPTERS` and calls its `register()`; `import etl` never imports an adapter or its compiler dependency.
 
 Status: **all three adapters implemented and validated** against the installed compiler versions (iree 20241104.1068, jax/jaxlib 0.10.2, apache-tvm 0.26.0 + jaxlib).
 
@@ -62,10 +62,11 @@ Each adapter module (`iree.py`, `xla.py`, `tvm.py`) exposes the same shape:
 | `./xla.py` | `XlaBackend`, `XlaExecutable` (static-shape gate), `xla_backend`, `register()` |
 | `./xla_util.py` | jaxlib plumbing: dialect registration, StableHLO parse, compile/execute, buffer staging, serialization |
 | `./tvm.py` | `TvmBackend`, `TvmExecutable`, `tvm_backend`, `register()` |
-| `./tvm_util.py` | vendored-translator compat shim, op whitelist gate, translate/build/run/persist helpers |
+| `./tvm_util.py` | vendored-translator compat shim (incl. `get_dimension_size`/`dynamic_broadcast_in_dim` handlers), op whitelist gate, translate/build/run/persist helpers |
 
 Sibling: `../compiler.py` → shared `CompilerBackend`/`CompilerExecutable` framework; `../registry.py` → `OPTIONAL_ADAPTERS` auto-activation.
 
 ## Test strategy
 
 Validated with throwaway scripts in `$TMPDIR` (not committed): registry auto-activation, numpy-backend parity (matmul+relu+reduce_sum; reshape/broadcast/transpose; symbolic-dim graphs at multiple sizes where supported), artifact/executable save-load round-trips, error paths (unsupported ops, dtype/shape/device mismatches, cross-backend artifacts, collectives at lower, static-shape gate for xla). Committed tests for these adapters would live in `../../../tests/backends/` — a SIBLING directory; test-related writes escalate to the repo root. The full suite (`python3 -m pytest -q`) stays green.
+ collectives at lower, static-shape gate for xla). Committed tests for these adapters would live in `../../../tests/backends/` — a SIBLING directory; test-related writes escalate to the repo root. The full suite (`python3 -m pytest -q`) stays green.

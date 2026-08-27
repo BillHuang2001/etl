@@ -47,8 +47,8 @@ Capability declaration (validated end-to-end, single CPU replica):
   rejects collective graphs explicitly instead of crashing mid-``run``.
 - ``runtime_calls=False`` / ``custom_blocks=False`` /
   ``async_collectives=False`` (the shared ``lower`` pre-check rejects
-  ``runtime_call``/collective ops explicitly; ``block_call`` is inlined
-  via its portable decomposition before export).
+  ``runtime_call`` / ``block_call`` / collective ops explicitly, naming
+  the feature).
 
 Import discipline (binding): NO heavy imports at module top level —
 stdlib + ``etl.core`` + sibling framework modules only. numpy, jaxlib and
