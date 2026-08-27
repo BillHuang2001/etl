@@ -4,15 +4,17 @@ This package is the home of the OPTIONAL compiler adapters. Each adapter is
 a separate module subclassing the shared ``etl.backends.compiler``
 ``CompilerBackend`` / ``CompilerExecutable`` base classes:
 
+- ``iree.py`` — IREE adapter (IMPLEMENTED): compiles the StableHLO payload
+  with ``iree.compiler.compile_str`` and executes the VM flatbuffer through
+  ``iree.runtime`` (local-task driver). Singleton ``iree_backend``.
 - ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): direct jaxlib/xla_client
   bindings (the jax frontend is never imported). Singleton ``xla_backend``;
   jaxlib plumbing helpers in ``xla_util.py``. See the module docstrings for
   the verified acquisition path (embedded CPU PJRT client, StableHLO
   parse/compile entry points, buffer staging, serialization).
-- ``iree.py`` — IREE adapter (module-level singleton ``iree_backend``) —
-  a SEPARATE parallel effort, not present yet.
-- ``tvm.py`` — TVM adapter (module-level singleton ``tvm_backend``) — a
-  SEPARATE parallel effort, not present yet.
+- ``tvm.py`` — TVM adapter (IMPLEMENTED): ``tvm.relax.frontend.stablehlo``
+  importer + Relax VM execution (llvm target); vendored-translator
+  compatibility shim in ``tvm_util.py``. Singleton ``tvm_backend``.
 
 Adapter-module contract (binding for adapter authors):
 
