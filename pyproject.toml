@@ -17,24 +17,28 @@ dev = ["pytest>=7"]
 # Compiler adapters — pluggable, optional. etl runs without any of these
 # (the numpy interpreter backend is the default; StableHLO MLIR text is
 # always exportable). Install an extra to enable the matching backend:
-#   pip install etl[iree] / etl[xla] / etl[tvm] / etl[compilers]
+#   pip install etl[iree] / etl[tvm] / etl[compilers]
+# The xla adapter has NO pip extra: it drives a USER-PROVIDED PJRT C API
+# plugin (.so exporting GetPjRtApi) via ctypes — configure it with the
+# ETL_PJRT_PLUGIN environment variable or the backend's plugin_path compile
+# option. Nothing pip-installable provides the plugin; build one from
+# OpenXLA, e.g. `bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`.
 # NOTE: IREE renamed its PyPI distributions — `iree-compiler`/`iree-runtime`
 # are deprecated and STALE (last release 20241104.1068, Nov 2024); the
 # current names are `iree-base-compiler`/`iree-base-runtime` (Python
 # namespaces unchanged: iree.compiler / iree.runtime). 2.9.0 is the first
 # release under the new names.
 iree = ["iree-base-compiler>=2.9.0", "iree-base-runtime>=2.9.0"]
-# The CPU PJRT client is embedded in jaxlib; the adapter drives the PJRT C
-# API via ctypes and never imports the jax frontend. jax pulls a matching jaxlib.
-xla = ["jax>=0.10,<0.11"]
-# from_stablehlo exists only in apache-tvm >= 0.26; its vendored translator
-# imports jax's MLIR python bindings, so jax/jaxlib is a runtime requirement.
-tvm = ["apache-tvm>=0.26", "jax>=0.10,<0.11"]
+# tvm needs apache-tvm (StableHLO frontend + Relax VM) and jaxlib — jaxlib
+# ONLY for its bundled LLVM MLIR python bindings (the vendored
+# `jaxlib.mlir` namespace used by apache-tvm's translator). The `jax`
+# package is never imported anywhere.
+tvm = ["apache-tvm>=0.26", "jaxlib>=0.10,<0.11"]
 compilers = [
     "iree-base-compiler>=2.9.0",
     "iree-base-runtime>=2.9.0",
-    "jax>=0.10,<0.11",
     "apache-tvm>=0.26",
+    "jaxlib>=0.10,<0.11",
 ]
 # Only needed when running the etl.bench conformance/benchmark harness, which
 # compares against PyTorch. The etl library itself never imports torch, and

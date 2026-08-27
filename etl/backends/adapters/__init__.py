@@ -7,14 +7,19 @@ a separate module subclassing the shared ``etl.backends.compiler``
 - ``iree.py`` — IREE adapter (IMPLEMENTED): compiles the StableHLO payload
   with ``iree.compiler.compile_str`` and executes the VM flatbuffer through
   ``iree.runtime`` (local-task driver). Singleton ``iree_backend``.
-- ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): direct jaxlib/xla_client
-  bindings (the jax frontend is never imported). Singleton ``xla_backend``;
-  jaxlib plumbing helpers in ``xla_util.py``. See the module docstrings for
-  the verified acquisition path (embedded CPU PJRT client, StableHLO
-  parse/compile entry points, buffer staging, serialization).
+- ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): drives a USER-PROVIDED
+  PJRT C API plugin (a ``.so`` exporting ``GetPjRtApi``) through
+  pure-stdlib ctypes — the vendored ABI translation lives in
+  ``_pjrt_c_api.py`` (provenance + version gate documented there) and the
+  driver in ``xla_util.py``. The plugin is configured via
+  ``options["plugin_path"]`` or the ``ETL_PJRT_PLUGIN`` environment
+  variable; build one from OpenXLA (``bazel build
+  //xla/pjrt/c:pjrt_c_api_cpu_plugin``) — never pip-installed. The ``jax``
+  package is never imported. Singleton ``xla_backend``.
 - ``tvm.py`` — TVM adapter (IMPLEMENTED): ``tvm.relax.frontend.stablehlo``
   importer + Relax VM execution (llvm target); vendored-translator
-  compatibility shim in ``tvm_util.py``. Singleton ``tvm_backend``.
+  compatibility shim in ``tvm_util.py`` (jaxlib is used ONLY for its
+  bundled MLIR python bindings). Singleton ``tvm_backend``.
 
 Adapter-module contract (binding for adapter authors):
 
@@ -26,10 +31,11 @@ Adapter-module contract (binding for adapter authors):
   ``core.BackendError`` with a pip-install hint (e.g. ``pip install
   etl[iree]``) when missing — and (b) calls
   ``etl.backends.registry.register(instance)`` (idempotent).
-- Heavy-import rule (binding): imports of the compiler dependency
-  (iree/jax/tvm/…) live ONLY inside function bodies, NEVER at module top
+- Heavy-import rule (binding): imports of the compiler dependencies
+  (iree/jaxlib/tvm/…) live ONLY inside function bodies, NEVER at module top
   level — ``import etl`` and ``import etl.backends`` must never import an
-  adapter or its compiler dependency.
+  adapter or its compiler dependency. The ``jax`` package is never imported
+  anywhere (jaxlib is used only for its bundled MLIR bindings, tvm adapter).
 - Activation is register-on-first-use: ``etl.backends.registry.get(name)``
   (via ``registry.OPTIONAL_ADAPTERS``) imports the adapter module and calls
   its ``register()`` on the first registry miss — the same path that

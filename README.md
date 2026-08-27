@@ -45,7 +45,8 @@ Features:
 - DLPack interoperability with PyTorch / CuPy / other runtimes
 
 ```python
-# Same graph, real compilers (needs: pip install etl[iree] / etl[xla] / etl[tvm]):
+# Same graph, real compilers (needs: pip install etl[iree] / etl[tvm];
+# the xla backend needs a user-provided PJRT plugin .so — ETL_PJRT_PLUGIN):
 exe = etl.build(f, etl.TensorSpec((4, 8), etl.float32), etl.TensorSpec((8, 4), etl.float32),
                 backend="iree", device="cpu")
 ```
@@ -58,7 +59,7 @@ See `CONTEXT.md` for the architecture and `etl/CONTEXT.md` for the public API co
 pip install -e .          # numpy only — runs fully with the default numpy backend
 pip install -e ".[dev]"   # + pytest
 pip install -e ".[interop]"  # + torch (DLPack interop tests)
-pip install -e ".[compilers]"  # + IREE, XLA (PJRT), TVM adapters
+pip install -e ".[compilers]"  # + IREE, TVM adapters (xla: user-provided PJRT plugin .so, no pip dep)
 ```
 
 ## Test
