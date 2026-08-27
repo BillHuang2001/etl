@@ -1,13 +1,18 @@
 """etl.backends.adapters — optional compiler backends (pluggable adapters).
 
 This package is the home of the OPTIONAL compiler adapters. Each adapter is
-a separate module implemented by the adapter authors (NOT this package's
-framework — see ``etl.backends.compiler`` for the shared
-``CompilerBackend`` / ``CompilerExecutable`` base classes they subclass):
+a separate module subclassing the shared ``etl.backends.compiler``
+``CompilerBackend`` / ``CompilerExecutable`` base classes:
 
-- ``iree.py`` — IREE adapter (module-level singleton ``iree_backend``).
-- ``xla.py`` — XLA-via-PJRT adapter (module-level singleton ``xla_backend``).
-- ``tvm.py`` — TVM adapter (module-level singleton ``tvm_backend``).
+- ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): direct jaxlib/xla_client
+  bindings (the jax frontend is never imported). Singleton ``xla_backend``;
+  jaxlib plumbing helpers in ``xla_util.py``. See the module docstrings for
+  the verified acquisition path (embedded CPU PJRT client, StableHLO
+  parse/compile entry points, buffer staging, serialization).
+- ``iree.py`` — IREE adapter (module-level singleton ``iree_backend``) —
+  a SEPARATE parallel effort, not present yet.
+- ``tvm.py`` — TVM adapter (module-level singleton ``tvm_backend``) — a
+  SEPARATE parallel effort, not present yet.
 
 Adapter-module contract (binding for adapter authors):
 
