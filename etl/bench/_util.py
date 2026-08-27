@@ -6,7 +6,7 @@ import time
 
 import numpy as np
 
-from etl import core
+from etl import backends, core
 from ._torch import require_torch, torch_available
 from .examples import get_example, list_examples
 
@@ -15,7 +15,125 @@ __all__ = [
     "resolve_torch_mode",
     "best_time_ms",
     "flatten_outputs",
+    "resolve_device",
+    "format_device",
+    "resolve_backend",
+    "resolve_backend_options",
+    "resolve_torch_device",
 ]
+
+
+def resolve_device(device=None) -> core.Device:
+    """Normalize a device argument to a :class:`~etl.core.Device`.
+
+    ``None`` → ``core.Device("cpu", 0)``. A ``core.Device`` is validated
+    (kind must be ``"cpu"`` or ``"cuda"``) and returned as-is. A string
+    parses as ``"KIND[:INDEX]"`` (e.g. ``"cpu"``, ``"cuda"``, ``"cuda:3"``);
+    the kind must be ``"cpu"`` or ``"cuda"`` and the index a non-negative
+    integer. Anything else raises ``TypeError``; a bad kind or index raises
+    ``ValueError`` with a clear message.
+    """
+    if device is None:
+        return core.Device("cpu", 0)
+    if isinstance(device, core.Device):
+        if device.kind not in ("cpu", "cuda"):
+            raise ValueError(
+                f"unsupported device kind {device.kind!r}: supported kinds "
+                "are 'cpu' and 'cuda'"
+            )
+        return device
+    if not isinstance(device, str):
+        raise TypeError(
+            f"device must be None, a core.Device, or a 'KIND[:INDEX]' string "
+            f"(e.g. 'cpu', 'cuda:3'), got {type(device).__name__}"
+        )
+    kind, separator, index_part = device.partition(":")
+    if separator:
+        if ":" in index_part or not index_part:
+            raise ValueError(
+                f"invalid device {device!r}: expected 'KIND[:INDEX]' "
+                "(e.g. 'cpu', 'cuda', 'cuda:3')"
+            )
+        try:
+            index = int(index_part)
+        except ValueError:
+            raise ValueError(
+                f"invalid device {device!r}: index {index_part!r} is not an "
+                "integer"
+            ) from None
+        if index < 0:
+            raise ValueError(
+                f"invalid device {device!r}: index must be a non-negative "
+                "integer"
+            )
+    else:
+        index = 0
+    if kind not in ("cpu", "cuda"):
+        raise ValueError(
+            f"unsupported device kind {kind!r} in {device!r}: supported "
+            "kinds are 'cpu' and 'cuda'"
+        )
+    return core.Device(kind, index)
+
+
+def format_device(device) -> str:
+    """Format a device as a string: ``"cpu"`` for ``Device("cpu", 0)``,
+    otherwise ``"KIND:INDEX"`` (e.g. ``"cuda:3"``)."""
+    if device.kind == "cpu" and device.index == 0:
+        return "cpu"
+    return f"{device.kind}:{device.index}"
+
+
+def resolve_backend(backend) -> str:
+    """Validate a backend name against the etl backend registry.
+
+    Must be a non-empty string (else ``TypeError``).
+    ``etl.backends.get`` validates registration and auto-activates optional
+    compiler adapters; its ``core.BackendError`` for unknown names or
+    missing adapter dependencies propagates unchanged. Returns the backend
+    name.
+    """
+    if not isinstance(backend, str) or not backend:
+        raise TypeError(f"backend must be a non-empty string, got {backend!r}")
+    backends.get(backend)  # validates; raises core.BackendError
+    return backend
+
+
+def resolve_backend_options(backend, device, backend_options) -> dict:
+    """Resolve backend compile options for a chosen backend/device.
+
+    Returns a NEW dict ``{**backend_options}``. For every non-numpy backend
+    (numpy is the only interpreter backend; all others are compiler
+    backends) without an explicit ``target_backends`` option, the
+    device-derived default is injected: ``["cuda"]`` for a cuda device,
+    ``["llvm-cpu"]`` otherwise. An explicit option always wins — never
+    overridden.
+    """
+    options = dict(backend_options or {})
+    if backend != "numpy" and "target_backends" not in options:
+        options["target_backends"] = (
+            ["cuda"] if device.kind == "cuda" else ["llvm-cpu"]
+        )
+    return options
+
+
+def resolve_torch_device(device, torch_mod):
+    """Resolve the torch device for an etl device, or ``None``.
+
+    Returns ``None`` when the device is not cuda, torch has no CUDA support
+    (``cuda.is_available()`` False), or the device index is beyond
+    ``torch.cuda.device_count()`` — torch references then run on CPU
+    (``device=None``), exactly today's behavior. Receives the already
+    imported torch module — never imports torch itself (torch optionality
+    is binding).
+    """
+    if device.kind != "cuda":
+        return None
+    if not torch_mod.cuda.is_available():
+        return None
+    if device.index >= torch_mod.cuda.device_count():
+        return None
+    return torch_mod.device(f"cuda:{device.index}")
 
 
 def resolve_examples(examples):

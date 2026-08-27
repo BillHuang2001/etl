@@ -52,7 +52,9 @@ class ConformanceReport:
     ``use_torch`` is the resolved mode: ``"auto"`` | ``"enabled"`` |
     ``"disabled"``. ``overall_pass`` is True iff every example ran without
     error and passed every executed comparison (numpy always; torch only when
-    it ran).
+    it ran). ``backend`` is the etl backend the graphs ran on (default
+    ``"numpy"``); ``device`` is the formatted device string (``"cpu"`` or
+    e.g. ``"cuda:3"``).
     """
 
     results: List[ExampleResult]
@@ -62,6 +64,8 @@ class ConformanceReport:
     atol: float = 1e-5
     tolerance: Optional[float] = None
     seed: int = 0
+    backend: str = "numpy"
+    device: str = "cpu"
 
     @property
     def overall_pass(self) -> bool:
@@ -92,7 +96,9 @@ class BenchmarkReport:
 
     Run times are best-of-``repeats`` milliseconds after ``warmup`` untimed
     runs (best-of-N; see :func:`etl.bench.benchmark`). ``use_torch`` is the
-    resolved mode (``"auto"`` | ``"enabled"`` | ``"disabled"``).
+    resolved mode (``"auto"`` | ``"enabled"`` | ``"disabled"``). ``backend``
+    is the etl backend the graphs ran on (default ``"numpy"``); ``device``
+    is the formatted device string (``"cpu"`` or e.g. ``"cuda:3"``).
     """
 
     results: List[ExampleResult]
@@ -101,6 +107,8 @@ class BenchmarkReport:
     use_torch: str = "auto"
     torch_available: bool = False
     seed: int = 0
+    backend: str = "numpy"
+    device: str = "cpu"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -163,6 +171,14 @@ def _short_error(message: Optional[str]) -> str:
     return message if len(message) <= 80 else message[:77] + "..."
 
 
+def _backend_device_prefix(report) -> str:
+    """Header prefix naming a non-default backend/device (default output is
+    byte-identical to the numpy/cpu-only format: empty prefix)."""
+    if report.backend == "numpy" and report.device == "cpu":
+        return ""
+    return f"backend={report.backend} device={report.device}, "
+
+
 def _format_conformance(report: ConformanceReport) -> str:
     header = [
         "example",
@@ -191,6 +207,7 @@ def _format_conformance(report: ConformanceReport) -> str:
     )
     lines = [
         "etl.bench conformance — "
+        f"{_backend_device_prefix(report)}"
         f"torch={_torch_label(report.use_torch, report.torch_available)}, "
         f"rtol={report.rtol:g} atol={report.atol:g}{tolerance}, seed={report.seed}",
         _table(header, rows),
@@ -234,6 +251,7 @@ def _format_benchmark(report: BenchmarkReport) -> str:
         )
     lines = [
         "etl.bench benchmark — "
+        f"{_backend_device_prefix(report)}"
         f"best-of-{report.repeats} ms after {report.warmup} warmup run(s), "
         f"torch={_torch_label(report.use_torch, report.torch_available)}, "
         f"seed={report.seed}",
