@@ -18,11 +18,12 @@ _HINT = (
 
 _probed = False
 _available = False
+_torch_mod = None  # cached imported torch module (set once probe succeeds)
 
 
 def torch_available() -> bool:
     """Return True iff torch can be imported (probed once, then cached)."""
-    global _probed, _available
+    global _probed, _available, _torch_mod
     if not _probed:
         _probed = True
         try:
@@ -31,13 +32,15 @@ def torch_available() -> bool:
             _available = False
         else:
             _available = True
+            _torch_mod = torch
     return _available
 
 
 def require_torch():
-    """Import and return torch, or raise a clear ``ImportError`` with the
-    ``pip install etl[bench]`` hint when torch is unavailable."""
-    global _probed, _available
+    """Import and return torch (cached after the first successful probe), or
+    raise a clear ``ImportError`` with the ``pip install etl[bench]`` hint when
+    torch is unavailable."""
+    global _probed, _available, _torch_mod
     if not _probed:
         _probed = True
         try:
@@ -50,9 +53,10 @@ def require_torch():
             ) from exc
         else:
             _available = True
+            _torch_mod = torch
     elif not _available:
         raise ImportError(
             "torch is required for this etl.bench operation but is not "
             f"installed. {_HINT}"
         )
-    return torch
+    return _torch_mod
