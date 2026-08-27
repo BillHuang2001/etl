@@ -39,7 +39,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 | `./trace/` | defn/trace/control-flow tests |
 | `./block/` | custom op tests |
 | `./transforms/` | vmap/grad/jvp/vjp tests |
-| `./backends/` | backend interface + stablehlo export tests |
+| `./backends/` | backend interface + stablehlo export tests + compiler-framework & IREE/XLA/TVM adapter tests |
 | `./dist/` | collective semantics tests |
 | `./persist/` | cache + container tests |
 
