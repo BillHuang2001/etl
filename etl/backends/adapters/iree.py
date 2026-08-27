@@ -236,8 +236,6 @@ class IreeBackend(CompilerBackend):
             )
         self.check_available()
 
-        import importlib.metadata as metadata
-
         import iree.compiler as iree_compiler
         import numpy as np
 
