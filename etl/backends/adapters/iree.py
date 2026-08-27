@@ -22,9 +22,11 @@ imported at module top level, so ``import etl`` stays light):
   ``driver.create_default_device()`` — the RELIABLE device-acquisition path.
   The historical ``rt.system_setup(config=rt.Config("local-task"))`` recipe
   fails with ``TypeError: 'module' object is not callable`` because
-  ``iree.runtime.system_setup`` is a MODULE in iree-runtime 20241104 (its
-  function was replaced by ``system_api.Config``). This path was validated
-  repeatedly (fresh processes and in-process loops).
+  ``iree.runtime.system_setup`` is a MODULE in IREE 20241104.1068
+  (distributed at the time as ``iree-runtime``; the current PyPI
+  distribution is ``iree-base-runtime``); its function was replaced by
+  ``system_api.Config``. This path was validated repeatedly (fresh
+  processes and in-process loops).
 - ``iree.runtime.load_vm_flatbuffer(flatbuffer_bytes, driver="local-task")``
   — loads the VM flatbuffer into a ``BoundModule``; entry functions are
   resolved as attributes (``module.main``).
@@ -39,8 +41,9 @@ re-lowers/re-compiles. Compiler failures surface as
 ``core.BackendError`` carrying the ``iree.compiler.CompilerToolError``
 diagnostics — never silently swallowed or papered over.
 
-Capability notes (all validated end-to-end on iree-compiler==20241104.1068 /
-iree-runtime==20241104.1068, llvm-cpu, CPU only):
+Capability notes (all validated end-to-end on the 20241104.1068 release —
+distributed at the time as ``iree-compiler``/``iree-runtime``, now
+``iree-base-compiler``/``iree-base-runtime`` — llvm-cpu, CPU only):
 
 - ``dtypes``: float16/float32/float64/int8/int16/int32/int64/bool_. NOT
   declared: uint8/uint16 (iree-compile cannot legalize unsigned-int
@@ -55,9 +58,10 @@ iree-runtime==20241104.1068, llvm-cpu, CPU only):
   LEGALIZED by iree-compile 20241104 ("failed to legalize operation
   'stablehlo.collective_broadcast' that was explicitly marked illegal" —
   upstream limitation); the other five compile but the local-task/local-sync
-  HAL drivers of iree-runtime 20241104 raise "UNIMPLEMENTED; collectives not
-  implemented" at ``hal.channel.create`` (the Python wheels ship no
-  communicating channel provider). With this flag False, the SHARED
+  HAL drivers of the 20241104.1068 IREE runtime (distributed at the time as
+  ``iree-runtime``; now ``iree-base-runtime``) raise "UNIMPLEMENTED;
+  collectives not implemented" at ``hal.channel.create`` (the Python wheels
+  ship no communicating channel provider). With this flag False, the SHARED
   ``lower()`` rejects every collective-effect op explicitly with
   ``core.BackendError`` naming it — never a silent fallback.
 - ``dynamic_shapes=True``: a symbolic-dim graph compiles and runs correctly
@@ -65,8 +69,9 @@ iree-runtime==20241104.1068, llvm-cpu, CPU only):
   shapes (e.g. ``relu`` on a dynamic tensor) are emitted as
   ``stablehlo.dynamic_broadcast_in_dim`` with a
   ``get_dimension_size``-built runtime ``output_dimensions`` chain —
-  validated end-to-end with iree-compile/runtime 20241104.1068 at
-  multiple concrete sizes.
+  validated end-to-end with the 20241104.1068 release (then
+  ``iree-compiler``/``iree-runtime``, now ``iree-base-compiler``/
+  ``iree-base-runtime``) at multiple concrete sizes.
 
 Import acyclicity (binding, ``../CONTEXT.md``): top-level imports restricted
 to stdlib + ``etl.core`` + the sibling modules ``compiler`` / ``registry`` /
@@ -109,6 +114,29 @@ def _dtype_capabilities() -> frozenset:
             core.bool_,
         }
     )
+
+
+def _iree_distribution_version(*distribution_names: str) -> str:
+    """Version of the first installed IREE distribution (diagnostics only).
+
+    IREE renamed its PyPI distributions: ``iree-compiler`` →
+    ``iree-base-compiler`` and ``iree-runtime`` → ``iree-base-runtime`` (the
+    old names are deprecated and stale on PyPI — last released
+    20241104.1068; the Python namespaces ``iree.compiler`` /
+    ``iree.runtime`` are unchanged by the rename). Either distribution set
+    may be installed, so probe the current names first and fall back to the
+    old names for environments still on the stale packages. Returns
+    ``"unknown"`` when none are found (``compile`` only reaches here after
+    ``check_available`` succeeded on the Python namespaces).
+    """
+    import importlib.metadata as metadata
+
+    for name in distribution_names:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            continue
+    return "unknown"
 
 
 class IreeBackend(CompilerBackend):
@@ -156,8 +184,9 @@ class IreeBackend(CompilerBackend):
         except ImportError as exc:
             raise core.BackendError(
                 f"the {cls.name} backend requires the IREE Python packages "
-                f"(iree-compiler + iree-runtime), which are unavailable: "
-                f"{exc}. Install them with `pip install etl[iree]`"
+                f"(iree-base-compiler + iree-base-runtime), which are "
+                f"unavailable: {exc}. Install them with "
+                f"`pip install etl[iree]`"
             ) from exc
 
     def compile(
@@ -252,8 +281,12 @@ class IreeBackend(CompilerBackend):
             required_custom_ops=(),
             runtime_dependencies={
                 "numpy": np.__version__,
-                "iree-compiler": metadata.version("iree-compiler"),
-                "iree-runtime": metadata.version("iree-runtime"),
+                "iree-compiler": _iree_distribution_version(
+                    "iree-base-compiler", "iree-compiler"
+                ),
+                "iree-runtime": _iree_distribution_version(
+                    "iree-base-runtime", "iree-runtime"
+                ),
             },
         )
 
