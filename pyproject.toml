@@ -14,6 +14,19 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 interop = ["torch>=2.0"]  # DLPack interop tests only
 dev = ["pytest>=7"]
+# Compiler adapters — pluggable, optional. etl runs without any of these
+# (the numpy interpreter backend is the default; StableHLO MLIR text is
+# always exportable). Install an extra to enable the matching backend:
+#   pip install etl[iree] / etl[xla] / etl[tvm] / etl[compilers]
+iree = ["iree-compiler>=20240410", "iree-runtime>=20240410"]
+xla = ["jaxlib>=0.4.23"]  # PJRT C API plugin (CPU) — used via ctypes, NOT via jax
+tvm = ["apache-tvm>=0.14"]
+compilers = [
+    "iree-compiler>=20240410",
+    "iree-runtime>=20240410",
+    "jaxlib>=0.4.23",
+    "apache-tvm>=0.14",
+]
 
 [tool.setuptools.packages.find]
 include = ["etl*"]
