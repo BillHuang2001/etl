@@ -1,10 +1,11 @@
 """etl.bench — conformance & benchmark harness for example etl programs.
 
 Runs curated example graphs through the explicit etl pipeline
-(``etl.build`` + ``etl.run`` on the default numpy backend) and compares the
-results against pure-numpy references — and, when torch is installed and
-requested, against PyTorch references. Reports precision (conformance) and
-speed (benchmark) per example.
+(``etl.build`` + ``etl.run`` on the default numpy backend — or any chosen
+backend/device: ``conformance(..., backend="iree", device="cuda:3")``) and
+compares the results against pure-numpy references — and, when torch is
+installed and requested, against PyTorch references. Reports precision
+(conformance) and speed (benchmark) per example.
 
 torch-optionality contract (binding): ``import etl`` and ``import etl.bench``
 MUST always succeed without torch installed. torch is imported lazily inside
@@ -20,6 +21,11 @@ Quick start::
     print(report.overall_pass)
     report = benchmark(use_torch=False)            # numpy-only timing
     report.to_json()                               # machine-readable
+
+    # Chosen backend/device with compile-option passthrough:
+    report = conformance(["matmul"], backend="iree", device="cpu",
+                         target_backends=["llvm-cpu"])
+    # device accepts None | core.Device | "KIND[:INDEX]" (e.g. "cuda:3").
 
 CLI: ``python -m etl.bench --help`` (exit code 1 when any conformance check
 fails).

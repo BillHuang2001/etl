@@ -1,14 +1,16 @@
 """Conformance checking: etl graphs vs numpy (and optional torch) references.
 
 Each selected example is staged through the explicit pipeline
-(``etl.build`` + ``etl.run`` on the default numpy backend) with inputs
+(``etl.build`` + ``etl.run`` on the default numpy backend — or a chosen
+``backend``/``device`` with ``backend_options`` passthrough) with inputs
 generated from a seeded RNG, then compared elementwise against the example's
 pure-numpy reference — and, when torch is available/requested, against its
 torch reference.
 
 Per-example execution failures are recorded in the report (``error`` field,
 ``overall_pass`` False) rather than aborting the whole run — nothing is
-silently swallowed, every failure is visible in the report.
+silently swallowed, every failure is visible in the report. Argument errors
+(unknown backend, bad device) raise up front instead.
 """
 from __future__ import annotations
 
@@ -19,7 +21,17 @@ from typing import List, Optional
 import numpy as np
 
 import etl
-from ._util import flatten_outputs, resolve_examples, resolve_torch_mode
+from ._torch import require_torch
+from ._util import (
+    flatten_outputs,
+    format_device,
+    resolve_backend,
+    resolve_backend_options,
+    resolve_device,
+    resolve_examples,
+    resolve_torch_device,
+    resolve_torch_mode,
+)
 from .examples import get_example
 from .report import ConformanceReport, ExampleResult
 
@@ -91,7 +103,8 @@ def _compare(actual, expected, rtol: float, atol: float,
 
 
 def conformance(examples=None, *, use_torch=None, tolerance=None,
-                rtol=1e-5, atol=1e-5, seed=0) -> ConformanceReport:
+                rtol=1e-5, atol=1e-5, seed=0, backend="numpy", device=None,
+                **backend_options) -> ConformanceReport:
     """Run conformance checks for the selected examples.
 
     Args:
@@ -107,6 +120,20 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         rtol: relative tolerance for the default rule.
         atol: absolute tolerance for the default rule.
         seed: RNG seed for generated inputs (``numpy.random.default_rng``).
+        backend: etl backend name to stage the graphs on (default
+            ``"numpy"``; e.g. ``"iree"`` — validated up front through
+            ``etl.backends.get``; unknown names / missing adapter deps raise
+            ``core.BackendError``).
+        device: device to run on — ``None`` (``Device("cpu", 0)``), a
+            ``core.Device``, or a ``"KIND[:INDEX]"`` string (e.g. ``"cpu"``,
+            ``"cuda"``, ``"cuda:3"``). The report records the formatted
+            device.
+        **backend_options: extra options passed through to ``etl.build``
+            (compile options for compiler backends). For any non-numpy
+            backend without an explicit ``target_backends`` option, the
+            device-derived default is injected: ``["cuda"]`` on a cuda
+            device, ``["llvm-cpu"]`` otherwise (an explicit option always
+            wins).
 
     Returns:
         :class:`ConformanceReport` with one :class:`ExampleResult` per
@@ -114,6 +141,10 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         pass flags, etl run time in ms, or an ``error`` string).
 
     Raises:
+        TypeError: invalid ``backend``/``device`` argument types.
+        ValueError: unsupported device kind or malformed device string.
+        BackendError: unknown backend name or missing adapter dependency
+            (raised up front, before any example runs).
         ImportError: ``use_torch=True`` without torch (clear hint, never a
             raw ``ModuleNotFoundError``).
         UnknownExampleError: unknown example name (lists available names).
@@ -122,14 +153,23 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         raise TypeError(
             f"tolerance must be a number or None, got {type(tolerance).__name__}"
         )
+    dev = resolve_device(device)
+    backend = resolve_backend(backend)
+    opts = resolve_backend_options(backend, dev, backend_options)
     names = resolve_examples(examples)
     mode, enabled, available = resolve_torch_mode(use_torch)
+    torch_device = None
+    if enabled:
+        torch_device = resolve_torch_device(dev, require_torch())
     results: List[ExampleResult] = []
     for name in names:
         example = get_example(name)
         try:
             inputs = example.generate_inputs(seed)
-            executable = etl.build(example.graph, *example.specs)
+            executable = etl.build(
+                example.graph, *example.specs,
+                backend=backend, device=dev, **opts
+            )
             start = time.perf_counter()
             actual = flatten_outputs(etl.run(executable, *inputs))
             etl_ms = (time.perf_counter() - start) * 1000.0
@@ -141,7 +181,9 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
                     raise ValueError(
                         f"example {name!r} has no torch reference"
                     )
-                torch_expected = flatten_outputs(example.torch_ref(inputs))
+                torch_expected = flatten_outputs(
+                    example.torch_ref(inputs, device=torch_device)
+                )
                 torch_comparison = _compare(
                     actual, torch_expected, rtol, atol, tolerance
                 )
@@ -171,4 +213,6 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         atol=atol,
         tolerance=tolerance,
         seed=seed,
+        backend=backend,
+        device=format_device(dev),
     )

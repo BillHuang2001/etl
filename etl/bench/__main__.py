@@ -1,13 +1,18 @@
 """CLI for etl.bench: ``python -m etl.bench [options]``.
 
 Exit codes: 0 = success; 1 = at least one conformance check failed; 2 =
-usage/argument errors (unknown example name, torch requested but missing).
+usage/argument errors (unknown example name, torch requested but missing,
+unknown backend, malformed ``--device``/``--backend-option``).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
+from etl.core import BackendError
+
+from ._util import resolve_device
 from .benchmark import benchmark
 from .conformance import conformance
 from .examples import UnknownExampleError, list_examples
@@ -18,7 +23,10 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m etl.bench",
         description=(
             "Conformance & benchmark harness for example etl programs "
-            "(numpy references always; torch references optional)."
+            "(numpy references always; torch references optional). Runs the "
+            "etl graphs on a chosen backend/device (--backend/--device, "
+            "default numpy/cpu) with backend compile options "
+            "(--backend-option, repeatable)."
         ),
     )
     parser.add_argument(
@@ -82,7 +90,67 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="RNG seed for generated inputs (default: 0)",
     )
+    parser.add_argument(
+        "--backend",
+        default="numpy",
+        metavar="NAME",
+        help="etl backend to run the graphs on (default: numpy; e.g. iree, "
+        "xla, tvm — registered backends only, validated up front)",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        metavar="KIND[:INDEX]",
+        help="device to run on: 'cpu' or 'cuda[:INDEX]' (default: cpu; e.g. "
+        "'cuda:3')",
+    )
+    parser.add_argument(
+        "--backend-option",
+        dest="backend_options",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="backend compile option, repeatable; VALUE is parsed as JSON "
+        "with a raw-string fallback, e.g. "
+        "--backend-option 'target_backends=[\"cuda\"]'",
+    )
     return parser
+
+
+def _parse_backend_option_value(value: str):
+    """Parse one ``--backend-option`` value: JSON first, raw string fallback.
+
+    ``"[\"cuda\"]"`` → ``["cuda"]``, ``"true"`` → ``True``, ``"bar"`` →
+    ``"bar"``.
+    """
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _parse_backend_options(pairs) -> dict:
+    """Parse repeated ``KEY=VALUE`` backend-option strings into a dict.
+
+    A missing ``=`` raises ``ValueError`` (usage error). Values parse JSON
+    first with a raw-string fallback (see
+    :func:`_parse_backend_option_value`). Later duplicates override earlier
+    ones.
+    """
+    options = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator:
+            raise ValueError(
+                f"invalid --backend-option {pair!r}: expected KEY=VALUE"
+            )
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"invalid --backend-option {pair!r}: empty key"
+            )
+        options[key] = _parse_backend_option_value(value)
+    return options
 
 
 def main(argv=None) -> int:
@@ -96,11 +164,20 @@ def main(argv=None) -> int:
     names = None
     if args.examples is not None:
         names = [part.strip() for part in args.examples.split(",") if part.strip()]
+    try:
+        device = resolve_device(args.device)
+        backend_options = _parse_backend_options(args.backend_options)
+    except ValueError as exc:
+        print(f"etl.bench: error: {exc}", file=sys.stderr)
+        return 2
     return_code = 0
     if args.run_conformance is not False:
         try:
-            report = conformance(names, use_torch=args.use_torch, seed=args.seed)
-        except (UnknownExampleError, ImportError) as exc:
+            report = conformance(
+                names, use_torch=args.use_torch, seed=args.seed,
+                backend=args.backend, device=device, **backend_options,
+            )
+        except (UnknownExampleError, ImportError, BackendError) as exc:
             print(f"etl.bench: error: {exc}", file=sys.stderr)
             return 2
         print(report)
@@ -110,9 +187,10 @@ def main(argv=None) -> int:
         try:
             report = benchmark(
                 names, use_torch=args.use_torch, repeats=args.repeats,
-                seed=args.seed,
+                seed=args.seed, backend=args.backend, device=device,
+                **backend_options,
             )
-        except (UnknownExampleError, ImportError) as exc:
+        except (UnknownExampleError, ImportError, BackendError) as exc:
             print(f"etl.bench: error: {exc}", file=sys.stderr)
             return 2
         print(report)
