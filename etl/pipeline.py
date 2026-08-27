@@ -784,13 +784,18 @@ def build(fn, *specs, backend=None, device=None, **options):
     """``build(f, *specs) -> Executable``.
 
     Documented shorthand for ``load(compile(lower(trace(fn, *specs),
-    backend), ...), backend, device)`` — no other behavior (docstring must
-    stay in sync with the expansion)::
+    backend), **options), backend, device)`` — no other behavior (docstring
+    must stay in sync with the expansion)::
 
         graph = etl.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
-        artifact = compile(lowered)
+        artifact = compile(lowered, **options)
         return load(artifact, backend=backend, device=device)
+
+    ``options`` are forwarded to BOTH ``lower`` and ``compile`` (stage-
+    appropriate: each stage uses the keys it understands and ignores the
+    rest, exactly as in the explicit pipeline — e.g. the iree adapter's
+    compile reads ``target_backends`` while its lower ignores it).
     """
     from etl.trace import trace as trace_fn
 
@@ -802,7 +807,7 @@ def build(fn, *specs, backend=None, device=None, **options):
         )
     graph = trace_fn(fn, *specs)
     lowered = lower(graph, backend=backend, **options)
-    artifact = compile(lowered)
+    artifact = compile(lowered, **options)
     return load(artifact, backend=backend, device=device)
 
 
