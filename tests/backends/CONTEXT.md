@@ -38,6 +38,5 @@ pytest suites validating `etl.backends` (sibling: `../../etl/backends` — read 
 
 ## Known Issues
 
-- The three `test_adapter_*.py` files are the forward spec for the IN-FLIGHT `etl/backends/compiler.py` + `etl/backends/adapters/{iree,xla,tvm}.py` implementation (parallel development). Until it lands, each file fails at COLLECTION with `ModuleNotFoundError: No module named 'etl.backends.adapters'` — EXPECTED and correct (NOT a BUG(etl) case; do not add skip guards around the etl-internal imports and do not weaken the tests).
-
+- Forward-spec files for the IN-FLIGHT `etl/backends/compiler.py` + `etl/backends/adapters/{iree,xla,tvm}.py` implementation (parallel development). Until it lands, `test_compiler_framework.py` and the three `test_adapter_*.py` files fail at COLLECTION with `ModuleNotFoundError: No module named 'etl.backends.compiler'` / `'etl.backends.adapters'`, and `test_adapters_optional.py` has 4 expected failures (3 missing-dep install-hint tests + the lazy-import test — at HEAD `backends.get('iree')` yields only `unknown backend 'iree'; registered backends: numpy`, with no install hint). All of this is EXPECTED and correct — these are NOT BUG(etl) cases; do not add skip guards around the etl-internal imports and do not weaken the tests. Once the implementation lands, DELETE this entry.
 - v1 collective-protocol limitations (asserted as-is): `reduce_scatter`'s `reduce_op` is not forwarded to the executor; `all_to_all` forwards only `split_axis`; `dist.broadcast` records the default `src_rank=0` in IR even when the user passes another value.
