@@ -61,14 +61,12 @@ iree-runtime==20241104.1068, llvm-cpu, CPU only):
   ``lower()`` rejects every collective-effect op explicitly with
   ``core.BackendError`` naming it — never a silent fallback.
 - ``dynamic_shapes=True``: a symbolic-dim graph compiles and runs correctly
-  with different concrete sizes. Known exporter-side limitation: the
-  StableHLO exporter emits ``stablehlo.broadcast_in_dim`` with a dynamic
-  result shape for scalar broadcasts (e.g. ``relu`` on a dynamic tensor) —
-  illegal StableHLO (``broadcast_in_dim`` results must be statically shaped;
-  the spec'd dynamic form is ``stablehlo.dynamic_broadcast_in_dim``, which
-  iree-compile DOES support). Such graphs fail at ``compile()`` with the
-  compiler's diagnostics — an explicit failure, never a silent fallback.
-  (See also ``./CONTEXT.md`` Known Issues.)
+  with different concrete sizes. Scalar-constant broadcasts over dynamic
+  shapes (e.g. ``relu`` on a dynamic tensor) are emitted as
+  ``stablehlo.dynamic_broadcast_in_dim`` with a
+  ``get_dimension_size``-built runtime ``output_dimensions`` chain —
+  validated end-to-end with iree-compile/runtime 20241104.1068 at
+  multiple concrete sizes.
 
 Import acyclicity (binding, ``../CONTEXT.md``): top-level imports restricted
 to stdlib + ``etl.core`` + the sibling modules ``compiler`` / ``registry`` /

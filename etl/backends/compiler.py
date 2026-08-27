@@ -7,7 +7,9 @@ the frontend half of the staging pipeline across all compilers:
 - the SAME block-call portable inlining every backend uses
   (``inline.py::inline_portables``);
 - the SAME capability pre-check pattern as the numpy reference backend
-  (``runtime_call`` / ``collective`` effects vs ``Capabilities``);
+  (``runtime_call`` / ``collective`` effects / ``block_call`` / dtypes /
+  dynamic shapes vs ``Capabilities`` — every rejection names the
+  feature);
 - the SAME ``Signature`` recording as ``NumpyBackend.lower``;
 - a StableHLO-MLIR ``LoweredProgram`` payload — the honest capability gate:
   the exporter raises ``core.BackendError`` naming any op it cannot emit,
@@ -15,11 +17,12 @@ the frontend half of the staging pipeline across all compilers:
   principle consume the program.
 
 Adapters only implement the compiler-specific half: ``check_available``
-(dependency probe), ``compile`` (invoke the external compiler on the MLIR
-payload) and ``load`` (build the executable from the artifact). The staging
-methods NEVER compose: ``lower`` never compiles, ``compile`` never loads,
-``load`` never re-lowers/re-compiles; backend/device/ABI mismatches fail
-clearly (``core.BackendError`` / ``core.PersistenceError``).
+(optional dependency probe — the base class provides a no-op default),
+``compile`` (invoke the external compiler on the MLIR payload) and ``load``
+(build the executable from the artifact). The staging methods NEVER
+compose: ``lower`` never compiles, ``compile`` never loads, ``load`` never
+re-lowers/re-compiles; backend/device/ABI mismatches fail clearly
+(``core.BackendError`` / ``core.PersistenceError``).
 
 Import acyclicity (binding, see ``../CONTEXT.md``): top-level imports
 restricted to ``etl.core`` plus the sibling modules ``backend.py``,
@@ -51,22 +54,28 @@ class CompilerBackend(Backend):
     """Shared base for compiler backends that consume StableHLO MLIR.
 
     Subclasses declare ``name`` and ``capabilities`` and implement
-    ``check_available`` / ``compile`` / ``load``. ``lower`` is shared:
-    verify -> capability pre-check -> portable inlining -> verify ->
-    StableHLO export -> ``Signature`` recording -> MLIR-text payload.
+    ``compile`` / ``load`` (and optionally override ``check_available`` —
+    concrete, no-op by default). ``lower`` is shared: verify ->
+    capability pre-check -> portable inlining -> verify -> StableHLO
+    export -> ``Signature`` recording -> MLIR-text payload.
 
     The lower-time contract (binding):
 
     - ``graph.verify()`` surfaces ``core.VerificationError`` as-is
       (before AND after inlining — defensive).
-    - Capability pre-check on the LIVE op walk (``inline.iter_ops``):
+    - Capability pre-check on the LIVE op walk (``inline.iter_ops``),
+      every rejection naming the missing feature:
       ``runtime_call`` requires ``capabilities.runtime_calls``;
-      ``collective``-effect ops require ``capabilities.collectives`` —
-      violations raise ``core.BackendError`` naming the op. ``block_call``
-      needs NO ``custom_blocks`` flag: a compiler adapter has no per-backend
-      block impls, so EVERY ``block_call`` must have a portable
-      decomposition and is inlined by ``inline_portables(module,
-      keep_backend_impls=None)`` — a block without one raises
+      ``collective``-effect ops require ``capabilities.collectives``;
+      ``block_call`` requires ``capabilities.custom_blocks``; every value
+      dtype must be declared in ``capabilities.dtypes``; when
+      ``capabilities.dynamic_shapes`` is False, symbolic /
+      runtime-dynamic (``None``) dimensions are rejected — all raise
+      ``core.BackendError`` naming the feature.
+    - Portable inlining: with ``custom_blocks=True`` every remaining
+      ``block_call`` is inlined by ``inline_portables(module,
+      keep_backend_impls=None)`` (a compiler adapter has no per-backend
+      block impls) — a block without a portable decomposition raises
       ``core.BackendError`` naming it.
     - The StableHLO export is the capability gate for ops: deferred ops
       raise ``core.BackendError`` naming them (see ``stablehlo/`` v1 scope).
@@ -75,24 +84,28 @@ class CompilerBackend(Backend):
       down, never re-derived.
     - The payload is JSON-safe (persist-container round-trip):
       ``{"format": "stablehlo", "format_version": 1, "mlir_text": ...,
-      "entry_functions": ...}``.
+      "entry_functions": [...]}`` (``entry_functions`` is a LIST).
 
     How to add a new adapter (the documented pluggability seam):
 
     1. Subclass ``CompilerBackend``; declare ``name`` (e.g. ``"iree"``)
        and ``capabilities`` (a ``Capabilities``).
-    2. Implement ``check_available`` — raise ``core.BackendError`` with a
-       pip-install hint (e.g. ``pip install etl[iree]``) when the adapter's
-       compiler dependency is unavailable; do nothing when available.
-    3. Implement ``compile`` — validate ``lowered.backend == self.name``
+    2. Implement ``compile`` — validate ``lowered.backend == self.name``
        (``core.BackendError`` otherwise), invoke the external compiler on
        the MLIR payload, and produce a self-describing ``CompiledArtifact``.
        ``compile`` NEVER loads.
-    4. Implement ``load`` — validate ``artifact.backend`` / device, build
+    3. Implement ``load`` — validate ``artifact.backend`` / device, build
        your ``CompilerExecutable`` subclass from the artifact. ``load``
        NEVER re-lowers or re-compiles; mismatches raise
        ``core.PersistenceError`` (or ``core.BackendError`` for unsupported
        devices).
+    4. OPTIONAL: override the ``check_available`` classmethod when the
+       adapter has an external compiler dependency — raise
+       ``core.BackendError`` with a pip-install hint (e.g.
+       ``pip install etl[iree]``) when the dependency is unavailable; do
+       nothing when available. The base implementation is a concrete
+       no-op (returns ``None``), so subclasses with no dependency to
+       probe need not implement it.
     5. At the module bottom declare the singleton (e.g.
        ``iree_backend = IreeBackend()``) and a module-level ``register()``
        function that calls ``registry.register(iree_backend)``
@@ -108,19 +121,55 @@ class CompilerBackend(Backend):
     capabilities: ClassVar[Capabilities] = Capabilities()
 
     @classmethod
-    @abstractmethod
     def check_available(cls) -> None:
-        """Probe the compiler dependency; raise if unavailable.
+        """Probe the compiler dependency; raise if unavailable (default: no-op).
 
-        Raises ``core.BackendError`` with a pip-install hint (e.g.
-        ``pip install etl[iree]``) when the adapter's compiler dependency
-        is missing in this environment; does nothing when available.
-        Adapters call this from ``compile``/``load`` (or their
-        ``register()``) so a missing dependency fails with an actionable
-        message instead of an obscure ``ImportError`` deep inside the
-        vendor API.
+        Adapters with an external compiler dependency override this to
+        probe it and raise ``core.BackendError`` with a pip-install hint
+        (e.g. ``pip install etl[iree]``) when the dependency is missing in
+        this environment; do nothing when available. Adapters call this
+        from ``compile``/``load`` (or their ``register()``) so a missing
+        dependency fails with an actionable message instead of an obscure
+        ``ImportError`` deep inside the vendor API.
+
+        The DEFAULT implementation is a concrete no-op (returns ``None``):
+        subclasses without a dependency to probe (e.g. lightweight or test
+        subclasses) need only implement ``compile`` / ``load``.
         """
-        ...
+        return None
+
+    @staticmethod
+    def _is_static_dim(dim: Any) -> bool:
+        """True for concrete int dims (bool excluded — it is not a size)."""
+        return isinstance(dim, int) and not isinstance(dim, bool)
+
+    @classmethod
+    def _shape_is_static(cls, shape: Any) -> bool:
+        return all(cls._is_static_dim(d) for d in shape)
+
+    def _check_value_dtype(self, dtype: Any, where: str) -> None:
+        """Raise ``core.BackendError`` when ``dtype`` is not declared."""
+        capabilities = self.capabilities
+        if dtype in capabilities.dtypes:
+            return
+        import numpy as np
+
+        raise core.BackendError(
+            f"capability drift: the {self.name} backend cannot execute "
+            f"dtype {np.dtype(dtype).name} ({where}) — its declared dtypes "
+            f"are {sorted(d.name for d in capabilities.dtypes)}"
+        )
+
+    def _check_static_shape(self, shape: Any, where: str) -> None:
+        """Raise ``core.BackendError`` when the shape has dynamic dims but
+        ``capabilities.dynamic_shapes`` is False."""
+        if self.capabilities.dynamic_shapes or self._shape_is_static(shape):
+            return
+        raise core.BackendError(
+            f"capability drift: the {self.name} backend cannot execute "
+            f"dynamic shapes ({where} has symbolic/runtime-dynamic "
+            "dimensions)"
+        )
 
     def lower(self, graph: "Graph", options: dict | None = None) -> LoweredProgram:
         """Shared lowering for compiler adapters: Graph -> StableHLO payload.
@@ -128,10 +177,10 @@ class CompilerBackend(Backend):
         1. ``graph.verify()`` — surfaces ``core.VerificationError`` as-is.
         2. Capability pre-check on the CURRENT module state (live walk via
            ``inline.iter_ops`` — the module is mutated by inlining in
-           step 3): ``runtime_call`` and ``collective``-effect ops are
-           checked against ``Capabilities`` here (mirrors the numpy
-           backend's flag pattern). ``block_call`` requires NO flag — every
-           block_call gets inlined in step 3.
+           step 3): ``runtime_call`` / ``collective``-effect ops /
+           ``block_call`` / dtypes / dynamic shapes are checked against
+           ``Capabilities`` here (mirrors the numpy backend's flag
+           pattern). Every rejection names the missing feature.
         3. ``inline_portables(graph.module, keep_backend_impls=None)`` — a
            compiler adapter has NO per-backend block impls; every
            ``block_call`` MUST have a portable decomposition, else
@@ -151,6 +200,10 @@ class CompilerBackend(Backend):
         graph.verify()  # surfaces core.VerificationError as-is
 
         capabilities = self.capabilities
+        for function in graph.module.functions:
+            for value_type in (*function.input_types, *function.output_types):
+                self._check_value_dtype(value_type.dtype, "function signature")
+                self._check_static_shape(value_type.shape, "function signature")
         for op in iter_ops(graph.module):
             if op.is_terminator:
                 continue  # 'return' carries no capability risk
@@ -164,10 +217,14 @@ class CompilerBackend(Backend):
                     f"capability drift: the {self.name} backend cannot "
                     f"execute collective op '{op.name}'"
                 )
-            # block_call: NO custom_blocks flag requirement — a compiler
-            # adapter has no per-backend block impls, so step 3 inlines
-            # every block_call via its portable decomposition (and raises
-            # for any block without one).
+            if op.name == "block_call" and not capabilities.custom_blocks:
+                raise core.BackendError(
+                    f"capability drift: the {self.name} backend cannot "
+                    "execute custom block ops (block_call)"
+                )
+            for result in op.results:
+                self._check_value_dtype(result.type.dtype, f"op '{op.name}'")
+                self._check_static_shape(result.type.shape, f"op '{op.name}'")
 
         inline_portables(graph.module, keep_backend_impls=None)
         graph.verify()  # defensive post-inline verification
@@ -196,7 +253,7 @@ class CompilerBackend(Backend):
             "format": "stablehlo",
             "format_version": 1,
             "mlir_text": mlir_text,
-            "entry_functions": tuple(fn.name for fn in graph.module.functions),
+            "entry_functions": list(fn.name for fn in graph.module.functions),
         }
         return LoweredProgram(backend=self.name, signature=signature, payload=payload)
 

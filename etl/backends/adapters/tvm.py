@@ -29,17 +29,20 @@ numpy-backend parity on real etl graphs):
 
 - ``dynamic_shapes=True``: symbolic dims (``tensor<?x8xf32>``) translate
   into Relax ``T.Var``-shaped tensors and run at multiple concrete sizes
-  (validated with two sizes). KNOWN LIMITATION: symbolic-dim graphs that
-  mix scalar-constant broadcasts (e.g. ``relu``) hit an etl StableHLO
-  WRITER limitation (it emits ``broadcast_in_dim`` to a dynamic-shape
-  result, which the StableHLO verifier forbids) — the adapter surfaces
-  the parse error as ``core.BackendError`` at compile time, honestly.
+  (validated with two sizes). Scalar-constant broadcasts over dynamic
+  shapes (e.g. ``x * 2.0``) are handled: the writer emits
+  ``stablehlo.dynamic_broadcast_in_dim`` with a
+  ``get_dimension_size``-built ``output_dimensions`` chain, and the
+  compat shim lowers it via ``multiply(data, full_like(source, 1))``
+  (the Relax VM of 0.26 cannot codegen ``broadcast_to`` with a symbolic
+  shape) — validated end-to-end at two concrete sizes.
 - ``collectives=False``: the vendored translator has NO collective
   handlers — the shared ``lower()`` rejects collective-effect ops up
   front (``core.BackendError`` naming the op).
 - ``runtime_calls=False`` / ``custom_blocks=False`` /
-  ``async_collectives=False`` (block calls are portable-inlined at
-  lower time by the shared framework).
+  ``async_collectives=False`` (the shared ``lower()`` pre-check rejects
+  ``runtime_call`` / ``block_call`` / collective ops explicitly, naming
+  the feature).
 - ``dtypes``: every dtype below was run through a full etl graph with
   numpy parity. Complex64/128 are excluded (the vendored translator's
   ``_convert_data_type`` raises ``NotImplementedError`` for complex).
@@ -156,8 +159,8 @@ class TvmBackend(CompilerBackend):
         5. Persist the built executable: ``VMExecutable.export_library``
            to a temp file, base64 into the payload. ``load`` reloads the
            library — compile never loads, load never compiles.
-        6. ``target="cpu - llvm"``; ``required_custom_ops=()`` (all block
-           calls were portable-inlined at lower time);
+        6. ``target="cpu - llvm"``; ``required_custom_ops=()`` (``block_call``
+           graphs are rejected at lower time — ``custom_blocks=False``);
            ``runtime_dependencies`` records numpy + tvm versions
            (self-describing per the serialization contract).
         """

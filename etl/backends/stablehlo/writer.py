@@ -35,8 +35,17 @@ https://openxla.org/stablehlo/spec and stablehlo/dialect/StablehloOps.td):
   (add/maximum/compare/select/...) require ALL operands and the result to
   share one shape, so scalar operands (Python scalars auto-promoted to
   scalar constants at trace time, decomposed literals) are broadcast to
-  the result shape via ``stablehlo.broadcast_in_dim`` before use; a
-  scalar-only computation keeps the plain scalar constant.
+  the result shape before use; a scalar-only computation keeps the plain
+  scalar constant. Broadcasts whose RESULT shape is fully static use
+  ``stablehlo.broadcast_in_dim``. Broadcasts whose result has dynamic
+  dims use ``stablehlo.dynamic_broadcast_in_dim`` with the runtime
+  ``output_dimensions`` built from the shape source via
+  ``stablehlo.get_dimension_size`` (+ ``reshape`` / ``concatenate``) —
+  ``stablehlo.broadcast_in_dim`` to a dynamic result is forbidden by the
+  StableHLO verifier, and this opset generation has no
+  ``stablehlo.shape_of``. A dynamic-target broadcast with NO operand
+  carrying the full result shape raises ``BackendError`` naming
+  "dynamic broadcast" (the runtime output dimensions have no source).
 - **convert/reshape** emit the functional-type custom form
   ``: (tensor<...>) -> tensor<...>`` (their operand and result types
   differ; the single-type form is rejected by the compiler).
@@ -122,6 +131,16 @@ def _re_split_exp(text: str):
         if ch in "eE":
             return text[:i], text[i + 1 :]
     return text, ""
+
+
+def _is_static_dim(dim) -> bool:
+    """True for concrete int dims (bool excluded — it is not a size)."""
+    return isinstance(dim, int) and not isinstance(dim, bool)
+
+
+def _shape_is_static(shape) -> bool:
+    """True when every dim of ``shape`` is a concrete int."""
+    return all(_is_static_dim(d) for d in shape)
 
 
 class Writer:
@@ -307,10 +326,11 @@ class Writer:
         mnemonic = mapping.lookup_mapping(op.name)
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
+        shape_source = self._shape_source(op.operands, result_shape)
         lines: list[str] = []
         names = []
         for operand in op.operands:
-            name, extra = self._equalize_operand(operand, result_shape)
+            name, extra = self._equalize_operand(operand, result_shape, shape_source)
             lines.extend(extra)
             names.append(name)
         if op.name == "cast":
@@ -326,7 +346,84 @@ class Writer:
             )
         return "\n".join(lines)
 
-    def _equalize_operand(self, value: Value, result_shape: tuple) -> tuple[str, list]:
+    def _shape_source(self, operands, result_shape):
+        """An operand whose type shape equals ``result_shape`` — the runtime
+        source for dynamic-broadcast output dimensions; ``None`` when the
+        result shape is static or no operand carries the full shape."""
+        if _shape_is_static(result_shape):
+            return None
+        for operand in operands:
+            if tuple(operand.type.shape) == result_shape:
+                return operand
+        return None
+
+    def _emit_dynamic_broadcast(
+        self,
+        value_name: str,
+        dtype,
+        operand_shape,
+        result_shape,
+        dims,
+        src_name: str,
+        src_dtype,
+        src_shape,
+    ) -> tuple[str, list]:
+        """Emit ``stablehlo.dynamic_broadcast_in_dim`` for a broadcast whose
+        RESULT has dynamic dims.
+
+        The runtime ``output_dimensions`` (a ``tensor<Rxi32>``) are built
+        from the shape source ``src``: static dims via constants, dynamic
+        dims via ``stablehlo.get_dimension_size`` (+ ``reshape`` to
+        ``tensor<1xi32>``), joined by ``stablehlo.concatenate``. Returns
+        ``(broadcast_name, lines)``. Requires a shape source whose shape
+        equals ``result_shape`` (callers enforce this) — this opset
+        generation has no ``stablehlo.shape_of``.
+        """
+        lines: list[str] = []
+        pieces: list[str] = []
+        src_type = self._type_str(src_dtype, src_shape)
+        for i, dim in enumerate(result_shape):
+            if _is_static_dim(dim):
+                piece = self._new_name()
+                lines.append(
+                    f"{piece} = stablehlo.constant "
+                    f"{self._constant_text(np.asarray([int(dim)], dtype=np.int32))}"
+                    f" : tensor<1xi32>"
+                )
+            else:
+                size_name = self._new_name()
+                lines.append(
+                    f'{size_name} = "stablehlo.get_dimension_size"({src_name}) '
+                    f"{{dimension = {i} : i64}} : ({src_type}) -> tensor<i32>"
+                )
+                piece = self._new_name()
+                lines.append(
+                    f"{piece} = stablehlo.reshape {size_name} : "
+                    f"(tensor<i32>) -> tensor<1xi32>"
+                )
+            pieces.append(piece)
+        if len(pieces) == 1:
+            dims_name = pieces[0]
+        else:
+            dims_name = self._new_name()
+            piece_types = ", ".join("tensor<1xi32>" for _ in pieces)
+            lines.append(
+                f"{dims_name} = stablehlo.concatenate {', '.join(pieces)}, "
+                f"dim = 0 : ({piece_types}) -> tensor<{len(pieces)}xi32>"
+            )
+        bcast_name = self._new_name()
+        lines.append(
+            f'{bcast_name} = "stablehlo.dynamic_broadcast_in_dim"'
+            f"({value_name}, {dims_name}) "
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(dtype, operand_shape)}, "
+            f"tensor<{len(pieces)}xi32>) -> {self._type_str(dtype, result_shape)}"
+        )
+        return bcast_name, lines
+
+    def _equalize_operand(
+        self, value: Value, result_shape: tuple, shape_source=None
+    ) -> tuple[str, list]:
         """SSA name of ``value`` valid inside an elementwise op whose result
         has ``result_shape``, plus any broadcast lines to prepend.
 
@@ -337,6 +434,13 @@ class Writer:
         (numpy-style broadcasting — the etl shape-inference contract);
         anything else raises ``BackendError`` naming the operand (never
         silently emits an op the compiler would reject).
+
+        Static result shapes emit ``stablehlo.broadcast_in_dim``. Dynamic
+        result shapes emit ``stablehlo.dynamic_broadcast_in_dim`` with the
+        runtime output dimensions sourced from ``shape_source`` (an operand
+        whose type shape equals the result shape); without one the
+        broadcast cannot be computed — ``BackendError`` naming
+        "dynamic broadcast".
         """
         name = self._name(value)
         shape = tuple(value.type.shape)
@@ -346,23 +450,51 @@ class Writer:
         dims = [rank_diff + i for i in range(len(shape))]
         for i, dim in enumerate(shape):
             target = result_shape[rank_diff + i]
-            if dim != 1 and dim != target:
+            if _is_static_dim(dim):
+                if dim != 1 and dim != target:
+                    raise BackendError(
+                        f"stablehlo export: cannot broadcast operand of "
+                        f"shape {shape!r} to the elementwise result shape "
+                        f"{result_shape!r} — StableHLO elementwise ops "
+                        "require equal operand shapes"
+                    )
+            elif dim != target:
                 raise BackendError(
                     f"stablehlo export: cannot broadcast operand of shape "
                     f"{shape!r} to the elementwise result shape "
-                    f"{result_shape!r} — StableHLO elementwise ops require "
-                    "equal operand shapes"
+                    f"{result_shape!r} — symbolic operand dimension {dim!r} "
+                    "does not match the result dimension"
                 )
-        bcast_name = self._new_name()
-        line = (
-            f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
-            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
-            f"({self._vt(value.type)}) -> "
-            f"{self._type_str(value.type.dtype, result_shape)}"
+        if _shape_is_static(result_shape):
+            bcast_name = self._new_name()
+            line = (
+                f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
+                f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+                f"({self._vt(value.type)}) -> "
+                f"{self._type_str(value.type.dtype, result_shape)}"
+            )
+            return bcast_name, [line]
+        if shape_source is None:
+            raise BackendError(
+                f"stablehlo export: cannot broadcast operand of shape "
+                f"{shape!r} to the dynamic result shape {result_shape!r} — "
+                "no operand carries the full result shape to source the "
+                "runtime output dimensions (dynamic broadcast)"
+            )
+        return self._emit_dynamic_broadcast(
+            name,
+            value.type.dtype,
+            shape,
+            result_shape,
+            dims,
+            self._name(shape_source),
+            shape_source.type.dtype,
+            tuple(shape_source.type.shape),
         )
-        return bcast_name, [line]
 
-    def _scalar_constant_for(self, dtype, value, target_shape) -> tuple[str, list]:
+    def _scalar_constant_for(
+        self, dtype, value, target_shape, shape_source=None
+    ) -> tuple[str, list]:
         """Emit a scalar constant and — when ``target_shape`` is non-scalar —
         its broadcast to that shape; returns ``(name, lines)``.
 
@@ -370,7 +502,12 @@ class Writer:
         literals (``relu``'s zero, ``reduce_mean``'s divisor) interacting
         with a non-scalar tensor must be broadcast first. When the target
         IS a scalar the constant is used directly (broadcast_in_dim with
-        empty dims is invalid on scalars).
+        empty dims is invalid on scalars). Static targets emit
+        ``stablehlo.broadcast_in_dim``; dynamic targets emit
+        ``stablehlo.dynamic_broadcast_in_dim`` with ``shape_source`` (an
+        SSA ``(name, dtype, shape)`` tuple whose shape equals the target —
+        the runtime output-dimension source); without one,
+        ``BackendError`` naming "dynamic broadcast".
         """
         name = self._new_name()
         lines = [
@@ -379,13 +516,26 @@ class Writer:
             f" : {self._elem_type(dtype)}"
         ]
         if target_shape:
-            bcast_name = self._new_name()
-            lines.append(
-                f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
-                f"{{broadcast_dimensions = array<i64>}} : "
-                f"({self._elem_type(dtype)}) -> "
-                f"{self._type_str(dtype, target_shape)}"
+            if _shape_is_static(target_shape):
+                bcast_name = self._new_name()
+                lines.append(
+                    f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
+                    f"{{broadcast_dimensions = array<i64>}} : "
+                    f"({self._elem_type(dtype)}) -> "
+                    f"{self._type_str(dtype, target_shape)}"
+                )
+                return bcast_name, lines
+            if shape_source is None:
+                raise BackendError(
+                    f"stablehlo export: cannot broadcast a scalar constant "
+                    f"to the dynamic target shape {target_shape!r} — no "
+                    "shape source for the runtime output dimensions "
+                    "(dynamic broadcast)"
+                )
+            bcast_name, extra = self._emit_dynamic_broadcast(
+                name, dtype, (), target_shape, (), *shape_source
             )
+            lines.extend(extra)
             return bcast_name, lines
         return name, lines
 
@@ -394,10 +544,11 @@ class Writer:
         the result shape (StableHLO requires equal non-scalar shapes)."""
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
+        shape_source = self._shape_source(op.operands, result_shape)
         lines: list[str] = []
         names = []
         for operand in op.operands:
-            name, extra = self._equalize_operand(operand, result_shape)
+            name, extra = self._equalize_operand(operand, result_shape, shape_source)
             lines.extend(extra)
             names.append(name)
         op_types = ", ".join(
@@ -413,10 +564,11 @@ class Writer:
         direction = mapping.lookup_mapping(op.name)
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
+        shape_source = self._shape_source(op.operands, result_shape)
         lines: list[str] = []
         names = []
         for operand in op.operands:
-            name, extra = self._equalize_operand(operand, result_shape)
+            name, extra = self._equalize_operand(operand, result_shape, shape_source)
             lines.extend(extra)
             names.append(name)
         op_types = ", ".join(
@@ -459,10 +611,36 @@ class Writer:
         # i + rank_diff; leading result dims are implicit broadcast dims.
         dims = list(range(rank_diff, rank_diff + in_rank))
         result_name = self._bind_results(op)[0]
-        return (
-            f'{result_name} = "stablehlo.broadcast_in_dim"({self._name(x)}) '
-            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
-            f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
+        result_shape = tuple(op.result.type.shape)
+        if _shape_is_static(result_shape):
+            return (
+                f'{result_name} = "stablehlo.broadcast_in_dim"({self._name(x)}) '
+                f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+                f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
+            )
+        # Dynamic result: only the identity broadcast (the operand already
+        # carries the full result shape) can source its runtime output
+        # dimensions — broadcast_in_dim to a dynamic result is forbidden by
+        # the StableHLO verifier, and there is no other shape source.
+        if tuple(x.type.shape) == result_shape:
+            bcast_name, lines = self._emit_dynamic_broadcast(
+                self._name(x),
+                x.type.dtype,
+                tuple(x.type.shape),
+                result_shape,
+                dims,
+                self._name(x),
+                x.type.dtype,
+                tuple(x.type.shape),
+            )
+            self._names[id(op.result)] = bcast_name
+            return "\n".join(lines)
+        raise BackendError(
+            f"stablehlo export: op 'broadcast'{self._loc(op)} to the dynamic "
+            f"result shape {result_shape!r} cannot be computed — the operand "
+            f"of shape {tuple(x.type.shape)!r} does not carry the full "
+            "result shape, so the runtime output dimensions have no source "
+            "(dynamic broadcast)"
         )
 
     def _emit_reshape(self, op: Op) -> str:
@@ -614,8 +792,13 @@ class Writer:
         )
         # The divisor constant is scalar; StableHLO elementwise ops require
         # equal shapes, so broadcast it when the reduced tensor is not.
+        # A dynamic reduced shape (non-reduced symbolic dims) sources the
+        # runtime output dimensions from the converted sum itself.
         count_name, count_lines = self._scalar_constant_for(
-            out_dtype, count, reduced_shape
+            out_dtype,
+            count,
+            reduced_shape,
+            shape_source=(converted, out_dtype, reduced_shape),
         )
         lines.extend(count_lines)
         divided = self._new_name()
@@ -1052,9 +1235,14 @@ class Writer:
             # The literal zero is a scalar constant; StableHLO elementwise
             # ops require equal shapes, so broadcast it when x is
             # non-scalar (a scalar x uses the constant directly —
-            # broadcast_in_dim with empty dims is invalid on scalars).
+            # broadcast_in_dim with empty dims is invalid on scalars). A
+            # dynamic x shape sources the runtime output dimensions.
+            x_shape = tuple(x.type.shape)
             zero_name, zero_lines = self._scalar_constant_for(
-                dtype, 0, tuple(x.type.shape)
+                dtype,
+                0,
+                x_shape,
+                shape_source=(self._name(x), x.type.dtype, x_shape),
             )
             return "\n".join(
                 [
