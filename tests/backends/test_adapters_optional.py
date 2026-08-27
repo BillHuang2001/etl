@@ -1,13 +1,18 @@
 """Optional external-compiler adapters (IREE / XLA / TVM) — spec tests.
 
 The three adapter modules under ``etl/backends/adapters/`` are OPTIONAL: their
-third-party dependencies (``iree-compiler``, ``jaxlib``, ``apache-tvm``) are
-never hard requirements of etl, and importing ``etl`` must never import them.
-This file runs ALWAYS — no adapter dependency is required to collect or run
-it — and every test is ORDER-INDEPENDENT: it passes regardless of pytest file
-ordering and regardless of whether other files in the same session already
-imported or registered adapters. That is achieved by a strict
-in-process / subprocess split:
+third-party dependencies are never hard requirements of etl, and importing
+``etl`` must never import them. Dependency shape per adapter: iree needs the
+``iree-base-compiler`` / ``iree-base-runtime`` pip packages; xla needs a
+USER-PROVIDED PJRT C API plugin ``.so`` (exporting ``GetPjRtApi`` — built
+from OpenXLA, e.g. ``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin``; NOT
+pip-installable; configured via ``ETL_PJRT_PLUGIN`` or the ``plugin_path``
+compile option); tvm needs ``apache-tvm`` + ``jaxlib`` (jaxlib only for its
+bundled MLIR python bindings). This file runs ALWAYS — no adapter dependency
+is required to collect or run it — and every test is ORDER-INDEPENDENT: it
+passes regardless of pytest file ordering and regardless of whether other
+files in the same session already imported or registered adapters. That is
+achieved by a strict in-process / subprocess split:
 
 * Environment-sensitive assertions (``sys.modules`` hygiene, lazy adapter
   import, install hints) run in a FRESH SUBPROCESS (``_run_subprocess``)
@@ -20,9 +25,10 @@ in-process / subprocess split:
 
 Expected adapter behaviors pinned here (once ``etl/backends/adapters/``
 lands): a missing third-party dependency makes ``get(<adapter>)`` raise
-``etl.BackendError`` carrying an install hint naming the ``etl[...]`` extra;
-a present dependency makes ``get`` lazily import the adapter module and
-register its backend.
+``etl.BackendError`` carrying an actionable install/config hint (the
+``etl[...]`` extra name for pip-installable deps, the plugin discovery /
+build guidance for xla); a present dependency makes ``get`` lazily import
+the adapter module and register its backend.
 """
 
 import os
@@ -108,12 +114,16 @@ def test_import_etl_does_not_import_adapter_deps():
 #: contain at least one of)
 MISSING_DEP_CASES = [
     ("iree", "iree", ("etl[iree]", "iree-base-compiler")),
-    ("xla", "jaxlib", ("etl[xla]", "jaxlib")),
+    # xla has NO pip dependency: blocking "jaxlib" is harmless (the adapter
+    # never imports it) and pins the case to the plugin-missing path, whose
+    # actionable message must carry the plugin configuration/build guidance.
+    ("xla", "jaxlib", ("ETL_PJRT_PLUGIN", "plugin_path", "bazel build")),
     ("tvm", "tvm", ("etl[tvm]", "apache-tvm")),
 ]
 
 _MISSING_DEP_SCRIPT = """\
 import importlib.util
+import os
 import sys
 
 _BLOCKED = {blocked!r}
@@ -131,6 +141,13 @@ importlib.util.find_spec = _blocked_find_spec
 
 import etl
 from etl import backends
+
+# Determinism for the xla case: plugin discovery must not accidentally
+# succeed from the ambient environment (ETL_PJRT_PLUGIN) or from the
+# well-known search paths — the case under test is "no plugin anywhere".
+os.environ.pop("ETL_PJRT_PLUGIN", None)
+from etl.backends.adapters import xla_util as _xla_util
+_xla_util._DEFAULT_PLUGIN_PATHS = ()
 
 try:
     backends.get({name!r})

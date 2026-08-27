@@ -2,11 +2,21 @@
 
 Contract under test: the shared ``CompilerBackend`` framework
 (``etl/backends/compiler.py``) plus the XLA adapter's REAL
-lower/compile/load/run through ``jaxlib`` (CPU PJRT plugin, bound via
+lower/compile/load/run through a USER-PROVIDED PJRT C API plugin (a ``.so``
+exporting ``GetPjRtApi``, configured via the ``ETL_PJRT_PLUGIN`` environment
+variable or the ``plugin_path`` compile option; the adapter drives it via
 ctypes — NOT the ``jax`` package). One contract, three dependencies: this
 file, ``test_adapter_iree.py`` and ``test_adapter_tvm.py`` are structurally
 identical and share the graph builders, tolerances and parity helper in
 ``tests/backends/_adapter_utils``.
+
+The plugin is a real external artifact (build one from OpenXLA with ``bazel
+build //xla/pjrt/c:pjrt_c_api_cpu_plugin``; there is no pip-installable
+plugin). When none is configured the module SKIPS at import time with an
+actionable message — the same contract is exercised without a real XLA
+build by ``test_pjrt_ctypes_plugin.py`` against a fake plugin built from C
+at test time. Set ``ETL_PJRT_PLUGIN`` (or pass ``plugin_path=...``) to run
+these tests for real.
 
 Pinned here:
 
@@ -36,14 +46,29 @@ module-scoped artifact fixture plus one compile per distinct graph.
 import numpy as np
 import pytest
 
-pytest.importorskip("jaxlib")
-
 import etl
 from etl.backends.adapters import xla
 
 from tests.backends import _adapter_utils as u
 
 NAME = "xla"
+
+# Real-plugin presence gate (module level): the adapter requires a
+# user-provided PJRT C API plugin (.so exporting GetPjRtApi) — there is no
+# pip-installable dependency. ``register()`` runs the adapter's own probe
+# (bindings integrity + plugin discovery + ABI version gate + a live client
+# create/destroy round-trip) and raises ``etl.BackendError`` when no plugin
+# is available; skip the whole module in that case with an actionable hint.
+try:
+    xla.register()
+except etl.BackendError as exc:
+    pytest.skip(
+        "the xla adapter requires a user-provided PJRT C API plugin (.so "
+        "exporting GetPjRtApi); set ETL_PJRT_PLUGIN=/path/to/"
+        "pjrt_c_api_cpu_plugin.so or pass plugin_path=... to the compile "
+        f"options. Details: {exc}",
+        allow_module_level=True,
+    )
 
 
 # ---------------------------------------------------------------------------

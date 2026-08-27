@@ -36,6 +36,10 @@ import numpy as np
 import pytest
 
 pytest.importorskip("tvm")
+# The tvm adapter also needs jaxlib (ONLY for its bundled LLVM MLIR python
+# bindings used by apache-tvm's StableHLO translator — the jax frontend is
+# never imported). Skip cleanly when tvm is present but jaxlib is not.
+pytest.importorskip("jaxlib")
 
 import etl
 from etl.backends.adapters import tvm
