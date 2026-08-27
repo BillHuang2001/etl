@@ -11,7 +11,11 @@ inlining, StableHLO export, ``Signature`` recording — lives in
 ``etl.run(executable, *tensors)``    -> results (TVM VM execution)
 
 The concrete APIs (validated on TVM 0.26.0 / tvm_ffi 0.1.13.post3 /
-jax-jaxlib 0.10.2 — see ``tvm_util.py`` for the full inventory):
+jaxlib 0.10.2 — see ``tvm_util.py`` for the full inventory). jaxlib is
+used ONLY for its bundled LLVM MLIR python bindings, accessed exclusively
+through the ``_mlir_bindings`` seam; the ``jax`` package is NOT used at
+all (the vendored translator's ``jax._src`` import is satisfied by a
+``sys.modules`` shim — ``tvm_util._install_jax_shim``):
 
 - translate: ``tvm.relax.frontend.stablehlo.from_stablehlo(mlir_text)``
   (via the compatibility shim ``tvm_util.ensure_compat()``)
@@ -131,10 +135,12 @@ class TvmBackend(CompilerBackend):
 
     @classmethod
     def check_available(cls) -> None:
-        """Probe TVM + its StableHLO frontend + jaxlib (see ``tvm_util``).
+        """Probe TVM + its StableHLO frontend + the jaxlib MLIR bindings.
 
-        Raises ``core.BackendError`` with ``pip install etl[tvm]`` when
-        the compiler dependency is missing or lacks the probed APIs.
+        See ``tvm_util`` — the ``jax`` package is never used (the vendored
+        translator's ``jax._src`` import is satisfied by a shim). Raises
+        ``core.BackendError`` with ``pip install etl[tvm]`` when the
+        compiler dependency is missing or lacks the probed APIs.
         """
         tvm_util.check_available()
 
@@ -149,10 +155,11 @@ class TvmBackend(CompilerBackend):
            otherwise — never cross-backend compilation) and the shared
            StableHLO payload format.
         2. ``check_available`` + apply the compat shim.
-        3. Parse the MLIR (``jax._src.interpreters.mlir.make_ir_context``)
-           and run the compile-time op gate (``tvm_util.precheck_module``)
-           — unsupported ops / multi-output programs / invalid MLIR raise
-           ``core.BackendError`` BEFORE the translator runs.
+        3. Parse the MLIR via the ``_mlir_bindings`` seam
+           (``_mlir_bindings.make_ir_context``) and run the compile-time op
+           gate (``tvm_util.precheck_module``) — unsupported ops /
+           multi-output programs / invalid MLIR raise ``core.BackendError``
+           BEFORE the translator runs.
         4. ``from_stablehlo(mlir_text)`` -> Relax module;
            ``tvm.relax.vm_build.build(mod, target=Target("llvm"))``.
            Translator/build errors re-raised as ``core.BackendError``.

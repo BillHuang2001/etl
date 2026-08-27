@@ -1,11 +1,15 @@
 """TVM adapter support: vendored-translator compatibility layer + VM helpers.
 
-This module is the ONLY place in the adapter that touches TVM / jaxlib
-internals. It is split out of ``tvm.py`` for two reasons:
+This module is the ONLY place in the adapter that touches TVM internals and
+the vendored-translator compatibility surface (all MLIR-binding access
+routes through the ``_mlir_bindings`` seam). It is split out of ``tvm.py``
+for two reasons:
 
 1. **Heavy-import rule (binding, ``../CONTEXT.md``).** ``import tvm`` and
    ``import jaxlib`` are lazy — every import lives inside a function body,
-   so ``import etl`` and ``import etl.backends`` never import TVM or jax.
+   so ``import etl`` and ``import etl.backends`` never import TVM or
+   jaxlib. The ``jax`` package is never imported at all (see
+   ``_install_jax_shim``).
 2. **Honest accounting of a vendored-code compatibility shim.** The
    StableHLO→Relax translator vendored in TVM 0.26.0
    (``tvm.relax.frontend.stablehlo``) targets the *old* ``mlir`` python
@@ -48,10 +52,13 @@ internals. It is split out of ``tvm.py`` for two reasons:
    (the vendored translator fails with bare ``assert``\s for unknown ops).
 
 Validated translator/build/run/persistence APIs (TVM 0.26.0,
-``tvm_ffi`` 0.1.13.post3, jax/jaxlib 0.10.2):
+``tvm_ffi`` 0.1.13.post3, jaxlib 0.10.2 — jaxlib ONLY for its bundled MLIR
+python bindings; the ``jax`` package is never used, see ``_install_jax_shim``):
 
 - import: ``tvm.relax.frontend.stablehlo.from_stablehlo(mlir_text)``
-  (parses the MLIR with ``jax._src.interpreters.mlir.make_ir_context()``)
+  (parses the MLIR with ``_mlir_bindings.make_ir_context()`` — the same
+  context recipe the vendored translator's ``jax_mlir.make_ir_context``
+  shim delegates to)
 - build: ``tvm.relax.vm_build.build(mod, target=tvm.target.Target("llvm"))``
   (note: ``tvm.relax.vm.build`` does NOT exist in 0.26 — ``vm`` resolves to
   ``tvm.runtime.vm``; the build function lives in ``relax.vm_build`` /
@@ -63,15 +70,29 @@ Validated translator/build/run/persistence APIs (TVM 0.26.0,
 - persistence: ``VMExecutable.export_library(path)`` writes a host .so;
   ``tvm.runtime.load_module(path)`` reloads it WITHOUT recompiling
   (``Module.save_to_file`` does not exist in 0.26)
+
+**jax-package independence.** The TVM 0.26.0 vendored StableHLO translator
+executes ``from jax._src.interpreters import mlir as jax_mlir`` (inside
+``from_stablehlo``) and uses exactly two things from it:
+``jax_mlir.make_ir_context()`` and ``jax_mlir.ir`` (the latter a literal
+re-export of ``jaxlib.mlir.ir``). ``_install_jax_shim()`` satisfies that
+import with ``sys.modules`` shims — ``make_ir_context`` delegates to
+``_mlir_bindings``, ``ir`` is the ``jaxlib.mlir.ir`` re-export — so the
+``jax`` package is never imported and the adapter keeps working even with
+``sys.modules["jax"]`` blocked (set to ``None``).
 """
 from __future__ import annotations
 
 import base64
 import os
+import sys
 import tempfile
+import types
 from typing import Any
 
 from etl import core
+
+from . import _mlir_bindings
 
 __all__ = [
     "SUPPORTED_STABLEHLO_OPS",
@@ -166,6 +187,62 @@ REDUCER_OPS: frozenset[str] = frozenset(
 _shims_applied = False
 
 
+def _install_jax_shim() -> None:
+    """Inject ``sys.modules`` shims for the ``jax`` package — never import it.
+
+    The TVM 0.26.0 vendored StableHLO translator executes
+    ``from jax._src.interpreters import mlir as jax_mlir`` (inside
+    ``from_stablehlo``) and uses exactly ``jax_mlir.make_ir_context()`` and
+    ``jax_mlir.ir`` (the latter a literal re-export of ``jaxlib.mlir.ir``).
+    The shims satisfy that import without the jax package: ``jax`` /
+    ``jax._src`` / ``jax._src.interpreters`` are minimal ``types.ModuleType``
+    namespace shells, and ``jax._src.interpreters.mlir`` exposes
+    ``make_ir_context()`` (delegating to ``_mlir_bindings.make_ir_context``)
+    and ``ir`` (``_mlir_bindings.ir`` — the same module object jax
+    re-exports).
+
+    Idempotent (a ``_etl_jax_shim`` marker on the ``jax`` shim
+    short-circuits) and cheap. CRITICAL ORDERING: it must run BEFORE any
+    ``tvm.relax.frontend.stablehlo`` import/use — hence it is called at the
+    top of both ``check_available()`` and ``ensure_compat()``.
+
+    Edge cases:
+    * ``sys.modules["jax"] = None`` (a jax-blocked process): the entry is
+      overwritten — the shim takes over.
+    * A real jax already imported in this process: left in place (it
+      satisfies the translator's import and works); the shim only occupies
+      the namespace when no real jax is present.
+    """
+    existing = sys.modules.get("jax")
+    if isinstance(existing, types.ModuleType):
+        if getattr(existing, "_etl_jax_shim", False):
+            return  # our shim is already installed
+        return  # a real jax is already imported — leave it alone
+    # sys.modules["jax"] is absent or a blocker (None) — install the shims.
+
+    jax_mod = types.ModuleType("jax")
+    jax_mod._etl_jax_shim = True
+    src_mod = types.ModuleType("jax._src")
+    interpreters_mod = types.ModuleType("jax._src.interpreters")
+
+    mlir_shim = types.ModuleType("jax._src.interpreters.mlir")
+
+    def _make_ir_context(*args, **kwargs):
+        # jax's signature is (platforms=None, thread_pool_size=...) — both
+        # tune jax lowering callbacks the vendored translator never uses;
+        # the binding-provider factory takes none.
+        return _mlir_bindings.make_ir_context()
+
+    mlir_shim.make_ir_context = _make_ir_context
+    mlir_shim.ir = _mlir_bindings.ir  # jax_mlir.ir IS jaxlib.mlir.ir
+
+    sys.modules["jax"] = jax_mod
+    sys.modules["jax._src"] = src_mod
+    sys.modules["jax._src.interpreters"] = interpreters_mod
+    interpreters_mod.mlir = mlir_shim
+    sys.modules["jax._src.interpreters.mlir"] = mlir_shim
+
+
 def _op_name(op: Any) -> str:
     """The operation name of a parsed mlir op (OpView or plain Operation)."""
     return getattr(op, "OPERATION_NAME", None) or op.name
@@ -177,10 +254,8 @@ def _op_key(obj: Any) -> Any:
     New mlir bindings: ``OpView.operation`` is the Operation; old bindings:
     OpView IS an Operation. Either way this returns the stable identity.
     """
-    from jaxlib import mlir
-
     op = getattr(obj, "operation", None)
-    if isinstance(op, mlir.ir.Operation):
+    if isinstance(op, _mlir_bindings.ir.Operation):
         return op
     return obj
 
@@ -195,20 +270,20 @@ def ensure_compat() -> None:
     global _shims_applied
     if _shims_applied:
         return
+    _install_jax_shim()
     check_available()
-    import types
 
-    from jaxlib import mlir
+    ir = _mlir_bindings.ir  # jaxlib.mlir.ir via the binding-provider seam
     from tvm import relax
     from tvm.relax.frontend.stablehlo.stablehlo_translator import StableHLOImporter
 
     # -- (1) restore the removed ``X.isinstance(v)`` classmethods ----------
     for cls in (
-        mlir.ir.ShapedType,
-        mlir.ir.IntegerAttr,
-        mlir.ir.FloatAttr,
-        mlir.ir.DenseIntElementsAttr,
-        mlir.ir.DenseFPElementsAttr,
+        ir.ShapedType,
+        ir.IntegerAttr,
+        ir.FloatAttr,
+        ir.DenseIntElementsAttr,
+        ir.DenseFPElementsAttr,
     ):
         if not hasattr(cls, "isinstance"):
             cls.isinstance = classmethod(lambda c, other: isinstance(other, c))
@@ -479,9 +554,9 @@ def ensure_compat() -> None:
         name = type(node).__name__
         if name.startswith("Dense") and name.endswith("ArrayAttr"):
             return list(node)
-        if mlir.ir.DenseIntElementsAttr.isinstance(
+        if ir.DenseIntElementsAttr.isinstance(node) or ir.DenseFPElementsAttr.isinstance(
             node
-        ) or mlir.ir.DenseFPElementsAttr.isinstance(node):
+        ):
             import numpy as np
 
             shape = self.get_shape(node.type)
@@ -495,19 +570,25 @@ def ensure_compat() -> None:
 
 
 def check_available() -> None:
-    """Probe the TVM compiler dependency + the StableHLO frontend.
+    """Probe the TVM compiler dependency + the StableHLO frontend + jaxlib.
 
     Raises ``core.BackendError`` with the pip-install hint when TVM or the
-    jaxlib mlir bindings the vendored translator needs are unavailable or
-    too old (the APIs probed here are the exact ones the adapter calls:
-    ``from_stablehlo``, ``relax.vm_build.build``, ``VirtualMachine``,
-    ``tvm.runtime.tensor``, ``tvm.runtime.load_module``).
+    jaxlib MLIR python bindings the vendored translator needs are
+    unavailable or too old (the APIs probed here are the exact ones the
+    adapter calls: ``from_stablehlo``, ``relax.vm_build.build``,
+    ``VirtualMachine``, ``tvm.runtime.tensor``, ``tvm.runtime.load_module``).
+    The ``jax`` package is NOT probed — the translator's ``jax._src``
+    import is satisfied by the shim installed first (``_install_jax_shim``).
     """
-    hint = "pip install etl[tvm] (apache-tvm>=0.26 with the StableHLO frontend and jaxlib)"
+    _install_jax_shim()
+    hint = (
+        "pip install etl[tvm] (apache-tvm>=0.26 with the StableHLO frontend "
+        "and jaxlib for its MLIR python bindings)"
+    )
     try:
-        import jax  # noqa: F401  (the importer uses jax._src.interpreters.mlir)
         import tvm  # noqa: F401
         from jaxlib import mlir  # noqa: F401
+        from jaxlib.mlir import ir  # noqa: F401
         from tvm import relax  # noqa: F401
         from tvm.relax.frontend.stablehlo import from_stablehlo  # noqa: F401
         from tvm.relax.vm_build import build  # noqa: F401
@@ -516,7 +597,7 @@ def check_available() -> None:
     except ImportError as exc:
         raise core.BackendError(
             f"the tvm backend requires the TVM compiler with its StableHLO "
-            f"frontend and the jaxlib mlir bindings: {exc} — {hint}"
+            f"frontend and jaxlib's MLIR python bindings: {exc} — {hint}"
         ) from exc
 
 
@@ -530,19 +611,16 @@ def tvm_version() -> str:
 def parse_stablehlo(mlir_text: str) -> Any:
     """Parse StableHLO MLIR text into a jaxlib mlir module.
 
-    Uses the exact context factory the vendored ``from_stablehlo`` uses
-    (``jax._src.interpreters.mlir.make_ir_context()`` — registers all
-    dialects). Parse failures raise ``core.BackendError`` carrying the
-    MLIR error message (this is how an invalid etl export — e.g. the
-    dynamic-shape scalar-broadcast limitation documented in Known Issues —
-    surfaces: honestly, at compile time, never silently).
+    Uses the binding-provider seam ``_mlir_bindings`` — the same context
+    factory the vendored ``from_stablehlo`` uses (registers all dialects,
+    including stablehlo/chlo). Parse failures raise ``core.BackendError``
+    carrying the MLIR error message (this is how an invalid etl export —
+    e.g. the dynamic-shape scalar-broadcast limitation documented in Known
+    Issues — surfaces: honestly, at compile time, never silently).
     """
     ensure_compat()
-    from jax._src.interpreters import mlir as jax_mlir
-
     try:
-        context = jax_mlir.make_ir_context()
-        return jax_mlir.ir.Module.parse(mlir_text, context)
+        return _mlir_bindings.parse_module(mlir_text)
     except Exception as exc:
         raise core.BackendError(
             f"the TVM backend could not parse the StableHLO export: {exc}"
