@@ -279,10 +279,10 @@ class IreeBackend(CompilerBackend):
             required_custom_ops=(),
             runtime_dependencies={
                 "numpy": np.__version__,
-                "iree-compiler": _iree_distribution_version(
+                "iree-base-compiler": _iree_distribution_version(
                     "iree-base-compiler", "iree-compiler"
                 ),
-                "iree-runtime": _iree_distribution_version(
+                "iree-base-runtime": _iree_distribution_version(
                     "iree-base-runtime", "iree-runtime"
                 ),
             },
