@@ -1,40 +1,45 @@
-"""XLA adapter via PJRT — direct jaxlib/xla_client, NOT the jax frontend.
+"""XLA adapter via PJRT — drives a user-provided PJRT C API plugin.
 
 This module implements the ``"xla"`` optional compiler backend for the
 shared pluggable-compiler framework (``etl.backends.compiler``). It
 consumes the StableHLO MLIR text produced by the shared
-``CompilerBackend.lower`` and compiles it with the PJRT CPU client that
-ships EMBEDDED in jaxlib. The jax frontend (tracing, ``jax.jit``,
-``jax.core``, ``jax._src.*``) is never imported — everything goes through
-the ``jaxlib.xla_client`` / ``jaxlib.mlir`` / ``jaxlib._jax`` native
-bindings. The full acquisition path (plugin discovery, dialect loading,
-compile entry point, buffer creation, serialization APIs — each verified
-against jax 0.10.2 / jaxlib 0.10.2, CPU, numpy 2.4.6) is documented in
-``xla_util.py``; a summary:
+``CompilerBackend.lower`` and compiles it by driving a **user-provided PJRT
+C API plugin** (``.so`` exporting ``GetPjRtApi``) through pure-stdlib
+``ctypes``. No Python frontend and no native binding package is imported
+anywhere in this adapter — the plugin ABI translation lives in
+``_pjrt_c_api.py`` (vendored from the canonical OpenXLA header; see its
+docstring for provenance) and the driver in ``xla_util.py``. The full flow:
 
-- **PJRT client**: NO standalone ``pjrt_c_api_cpu_plugin.so`` exists in
-  jaxlib 0.10.2 — the CPU client is EMBEDDED in ``_xla.so`` and acquired
-  via ``xc.make_cpu_client()``.
-- **Compilation**: parse the MLIR text with jaxlib's MLIR bindings and
-  call ``client.compile_and_load(module, executable_devices=...,
-  compile_options=...)`` (the same entry point jax's own compiler uses;
-  no bytecode/``mlir_module_to_xla_computation`` conversion needed).
-- **Buffers**: ``client.buffer_from_pyval`` DOES NOT EXIST in 0.10.2 —
-  inputs stage via ``xc.batched_device_put(aval, sharding, [arr],
-  [dev], True, enable_x64=True)`` with a duck-typed aval and a patched
-  single-device sharding. ``enable_x64=True`` is mandatory (the default
-  x64-off state silently truncates float64/int64 to 32-bit).
-- **Serialization**: ``exe.serialize() -> bytes`` and
-  ``client.deserialize_executable(bytes, device_list)`` both exist and
-  round-trip correctly.
+- **Plugin discovery**: (a) ``options["plugin_path"]`` (the backend
+  compile-options dict, e.g. ``etl.compile(lowered, backend="xla",
+  plugin_path="/path/to/pjrt_c_api_cpu_plugin.so")``), (b) the
+  ``ETL_PJRT_PLUGIN`` environment variable, (c) well-known paths
+  (``/usr/local/lib``, ``/usr/lib``, ``$HOME/.local/lib``, ``./``).
+  Missing plugin -> ``core.BackendError`` with build instructions
+  (``bazel build //xla/pjrt/c:pjrt_c_api_cpu_plugin`` from OpenXLA) — the
+  plugin binary is provided BY THE USER, never pip-installed.
+- **Compilation**: ``PJRT_Client_Create`` (empty options) ->
+  ``PJRT_Client_Compile`` with ``PJRT_Program{code=mlir_text,
+  format="mlir"}`` — the plugin accepts StableHLO MLIR text directly (the
+  header documents ``"mlir"`` as "MLIR module bytecode (or string)"); no
+  MLIR parsing happens in this process.
+- **Buffers**: ``PJRT_Client_BufferFromHostBuffer`` (dense row-major numpy
+  arrays, all 14 etl dtypes incl. complex64/128) -> execute ->
+  ``PJRT_Buffer_ToHostBuffer`` -> ``core.Tensor`` exactly like the numpy
+  interpreter.
+- **Persistence**: ``PJRT_Executable_Serialize`` /
+  ``PJRT_Executable_DeserializeAndLoad`` (true serialize; no load-time
+  recompile).
+- **Errors**: ``PJRT_Error*`` is checked on EVERY call (NULL = success);
+  failures raise ``core.BackendError`` with the plugin's message text
+  (``PJRT_Error_Message``) and the error is destroyed. No silent
+  fallbacks.
 
-Capability declaration (validated end-to-end, single CPU replica):
+Capability declaration (see ``xla_util.py`` for the driver contract):
 
 - ``dtypes``: float16/32/64, int8/16/32/64, uint8/16/32/64, bool,
-  complex64/128 — ALL etl dtypes validated through the full
-  parse->compile->execute path (elementwise add; dot additionally for
-  float16/32/64/int32/int64; bool as input AND output; complex64
-  multiply).
+  complex64/128 — ALL etl dtypes map 1:1 to ``PJRT_Buffer_Type`` and are
+  staged as dense host buffers (numpy's complex layout matches C).
 - ``dynamic_shapes=False``: XLA dynamic shapes are limited; ``compile``
   enforces a static-shape gate naming the offending spec.
 - ``collectives=False``: 5/6 etl collectives (all_reduce, all_gather,
@@ -50,12 +55,11 @@ Capability declaration (validated end-to-end, single CPU replica):
   ``runtime_call`` / ``block_call`` / collective ops explicitly, naming
   the feature).
 
-Import discipline (binding): NO heavy imports at module top level —
-stdlib + ``etl.core`` + sibling framework modules only. numpy, jaxlib and
-the MLIR bindings are imported INSIDE function bodies (``xla_util.py``
-holds the jaxlib plumbing under the same rule). ``import etl`` /
-``import etl.backends`` never import this module or jaxlib (the registry
-auto-activates on first ``get("xla")``).
+Import discipline (binding): top-level imports limited to stdlib +
+``etl.core`` + sibling framework modules + this package's ``_pjrt_c_api``
+and ``xla_util`` (both stdlib-only). numpy is imported inside function
+bodies. ``import etl`` / ``import etl.backends`` never import this module
+(the registry auto-activates on first ``get("xla")``).
 """
 
 from __future__ import annotations
@@ -69,14 +73,11 @@ from ..backend import Capabilities
 from ..compiler import CompilerBackend, CompilerExecutable
 from ..program import CompiledArtifact, LoweredProgram
 from ..registry import register as _registry_register
+from . import _pjrt_c_api as _pjrt
 from .xla_util import (
     _StaticShapeError,
-    _acquire_cpu_client,
-    _import_xla_runtime,
-    _make_buffer_putter,
-    _parse_stablehlo_module,
+    _load_plugin,
     _resolve_static_shape,
-    _verify_xla_api_surface,
 )
 
 __all__ = ["XlaBackend", "XlaExecutable", "xla_backend", "register"]
@@ -91,11 +92,11 @@ class XlaBackend(CompilerBackend):
     Shares the frontend half of the pipeline with every compiler adapter
     (``CompilerBackend.lower``: verify -> capability pre-check -> portable
     inlining -> StableHLO export -> Signature recording). This class adds
-    the compiler-specific half: ``check_available`` (jaxlib probe),
-    ``compile`` (parse -> PJRT compile -> serialized-executable artifact),
-    ``load`` (deserialize -> ``XlaExecutable``). The acquisition path and
-    every probed API are documented in ``xla_util.py`` — keep it updated
-    when bumping jaxlib.
+    the compiler-specific half: ``check_available`` (plugin probe),
+    ``compile`` (plugin compile -> serialized-executable artifact),
+    ``load`` (deserialize -> ``XlaExecutable``). The plugin driver and the
+    ABI translation are documented in ``xla_util.py`` / ``_pjrt_c_api.py``
+    — keep them in sync with the plugin's PJRT C API version.
     """
 
     name: ClassVar[str] = "xla"
@@ -131,18 +132,25 @@ class XlaBackend(CompilerBackend):
 
     @classmethod
     def check_available(cls) -> None:
-        """Probe the jaxlib dependency; raise ``core.BackendError`` if absent.
+        """Probe the PJRT plugin dependency; raise ``core.BackendError`` if absent.
 
-        Checks (1) jaxlib imports, (2) the exact native API surface this
-        adapter uses (``make_cpu_client``, ``batched_device_put``,
-        ``compile_and_load``, ``deserialize_executable``, the MLIR dialect
-        hooks), and (3) that an actual CPU PJRT client can be created.
-        Raises ``core.BackendError`` with the ``pip install etl[xla]``
-        hint — never a bare ImportError.
+        Checks (1) the vendored ctypes bindings module integrity, (2)
+        plugin discovery + ``GetPjRtApi`` + the ABI version gate, and (3)
+        a live ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip.
+        Raises ``core.BackendError`` naming the missing piece and how to
+        provide/build a plugin (``ETL_PJRT_PLUGIN`` /
+        ``options["plugin_path"]``, ``bazel build
+        //xla/pjrt/c:pjrt_c_api_cpu_plugin``) — never a bare ImportError.
         """
-        xc, _ = _import_xla_runtime()
-        _verify_xla_api_surface(xc)
-        _acquire_cpu_client(xc)  # definitive: a live CPU PJRT client exists
+        _pjrt.verify_api  # bindings module integrity (import-time layout)
+        if _pjrt.sizeof(_pjrt.PJRT_Api) <= 0:
+            raise core.BackendError(
+                "the vendored PJRT C API bindings are broken: PJRT_Api has "
+                "no layout"
+            )
+        plugin = _load_plugin()  # discovery + GetPjRtApi + version gate
+        client = plugin.create_client()  # live create/destroy round-trip
+        client.close()
 
     # ---------------------------------------------------------------- compile
 
@@ -161,17 +169,18 @@ class XlaBackend(CompilerBackend):
            raises ``core.BackendError`` naming the spec — XLA dynamic
            shapes are limited; the adapter never silently miscompiles
            them.
-        3. Parse the MLIR text with jaxlib's MLIR bindings, then
-           ``client.compile_and_load(module, executable_devices=...,
-           compile_options=...)`` on the embedded CPU PJRT client.
-        4. Serialize the loaded executable (``exe.serialize() -> bytes``)
+        3. Load the PJRT plugin (discovery order in the module docstring;
+           ``options["plugin_path"]`` takes precedence) and compile the
+           MLIR text directly via ``PJRT_Client_Compile`` (the plugin
+           accepts StableHLO MLIR text — no MLIR parsing in-process).
+        4. Serialize the loaded executable (``PJRT_Executable_Serialize``)
            into a JSON-safe payload:
            ``{"format": "xla-serialized-executable", "mlir_text": ...,
            "executable_base64": ..., "entry_functions": ...,
            "static_input_shapes": ..., "static_output_shapes": ...}``.
 
-        Conversion/compile errors are re-raised as ``core.BackendError``
-        carrying the original message — never silent. ``compile`` NEVER
+        Plugin/compile errors are re-raised as ``core.BackendError``
+        carrying the plugin's message — never silent. ``compile`` NEVER
         loads (no executable is retained beyond the serialized bytes).
         """
         if lowered.backend != self.name:
@@ -207,29 +216,18 @@ class XlaBackend(CompilerBackend):
             signature.output_specs, "output"
         )
 
-        # Dependency probe: compile itself creates a live CPU client below
-        # (the definitive check — its failure raises BackendError), so only
-        # the API-surface verification is needed here (no duplicate client).
-        xc, jaxlib = _import_xla_runtime()
-        _verify_xla_api_surface(xc)
-        client = _acquire_cpu_client(xc)
+        # Compile through the plugin (step 3) — errors raise BackendError.
+        plugin = _load_plugin(options)
+        client = plugin.create_client()
         try:
-            module = _parse_stablehlo_module(payload["mlir_text"])
-            device_list = xc.DeviceList(tuple(client.devices()))
-            compile_options = xc.CompileOptions()
-            executable = client.compile_and_load(
-                module,
-                executable_devices=device_list,
-                compile_options=compile_options,
-            )
-            serialized = executable.serialize()
-        except core.BackendError:
-            raise
-        except Exception as exc:
-            raise core.BackendError(
-                f"the xla backend failed to compile the StableHLO program: "
-                f"{exc}"
-            ) from exc
+            loaded = client.compile(payload["mlir_text"])
+            try:
+                serialized = loaded.serialize()
+            finally:
+                loaded.close()
+            platform_name, platform_version = client.platform_info()
+        finally:
+            client.close()
 
         import numpy as np
 
@@ -251,7 +249,11 @@ class XlaBackend(CompilerBackend):
             required_custom_ops=(),
             runtime_dependencies={
                 "numpy": np.__version__,
-                "jaxlib": jaxlib.__version__,
+                # The PJRT C API header revision the bindings were
+                # translated from (see _pjrt_c_api.py), plus the plugin's
+                # self-reported platform identity.
+                "pjrt_c_api": _pjrt.HEADER_COMMIT,
+                "plugin": f"{platform_name} {platform_version}",
             },
         )
 
@@ -283,12 +285,12 @@ class XlaBackend(CompilerBackend):
         """Reconstruct an ``XlaExecutable`` from a serialized artifact.
 
         Validates the recorded backend (``core.PersistenceError`` naming
-        both on mismatch), the dependency, the device (None or a CPU
-        ``core.Device``; non-``Device`` -> ``core.DeviceError``; non-cpu
-        kind -> ``core.BackendError``), and the payload format. The
-        base64 executable is deserialized with
-        ``client.deserialize_executable(bytes, device_list)`` on a fresh
-        embedded CPU PJRT client. NEVER re-traces, re-lowers, or
+        both on mismatch), the plugin (``check_available``), the device
+        (None or a CPU ``core.Device``; non-``Device`` ->
+        ``core.DeviceError``; non-cpu kind -> ``core.BackendError``), and
+        the payload format. The base64 executable is deserialized with
+        ``PJRT_Executable_DeserializeAndLoad`` on a fresh client from the
+        (re-discovered) plugin. NEVER re-traces, re-lowers, or
         re-compiles; a deserialization failure (environment/ABI mismatch)
         raises ``core.PersistenceError`` — no silent recompilation.
         """
@@ -325,35 +327,40 @@ class XlaBackend(CompilerBackend):
                 "executable_base64 field"
             )
 
-        xc, _ = _import_xla_runtime()
-        client = _acquire_cpu_client(xc)
-        device_list = xc.DeviceList(tuple(client.devices()))
+        plugin = _load_plugin()
+        client = plugin.create_client()
         try:
             serialized = base64.b64decode(payload["executable_base64"])
-            executable = client.deserialize_executable(serialized, device_list)
-        except Exception as exc:
-            raise core.PersistenceError(
-                "failed to deserialize the XLA executable — the artifact "
-                f"is incompatible with this environment/ABI: {exc} — never "
-                "silently recompiling"
-            ) from exc
+            try:
+                loaded = client.deserialize(serialized)
+            except core.BackendError as exc:
+                raise core.PersistenceError(
+                    "failed to deserialize the XLA executable — the artifact "
+                    "is incompatible with this environment/ABI/plugin: "
+                    f"{exc} — never silently recompiling"
+                ) from exc
+        except Exception:
+            client.close()  # only on failure — success hands the client over
+            raise
         return XlaExecutable(
             artifact=artifact,
             device=effective_device,
-            native_module=executable,
+            native_module=loaded,
             entry_functions=tuple(payload.get("entry_functions", ())),
             client=client,
+            plugin=plugin,
         )
 
 
 class XlaExecutable(CompilerExecutable):
     """Run-time object for the xla backend (satisfies ``Executable``).
 
-    ``native_module`` is the jaxlib ``LoadedExecutable``;
-    ``run(flat_input_tensors)`` stages numpy host buffers through
-    ``batched_device_put``, executes, and wraps the results as
-    ``core.Tensor`` exactly like the numpy interpreter (``core.Tensor(
-    np.asarray(result))``). ``save``/``load`` are the SHARED
+    ``native_module`` is the driver's ``_LoadedExecutable`` (a live
+    ``PJRT_LoadedExecutable``); ``run(flat_input_tensors)`` stages numpy
+    host buffers through ``PJRT_Client_BufferFromHostBuffer``, executes,
+    copies the output buffers back via ``PJRT_Buffer_ToHostBuffer``, and
+    wraps the results as ``core.Tensor`` exactly like the numpy interpreter
+    (``core.Tensor(np.asarray(...))``). ``save``/``load`` are the SHARED
     ``CompilerExecutable`` implementations (artifact round-trip; the
     executable is reconstructed explicitly at ``load`` — device handles
     are never serialized).
@@ -369,6 +376,7 @@ class XlaExecutable(CompilerExecutable):
         native_module: Any = None,
         entry_functions: tuple[str, ...] = (),
         client: Any = None,
+        plugin: Any = None,
     ) -> None:
         super().__init__(
             artifact=artifact,
@@ -378,7 +386,20 @@ class XlaExecutable(CompilerExecutable):
             entry_functions=entry_functions,
         )
         self._client = client
-        self._put = None
+        self._plugin = plugin  # keeps the loaded plugin library alive
+
+    def close(self) -> None:
+        """Release the plugin handles (executable first, then client).
+
+        Not part of the ``Executable`` protocol; call it when done with the
+        executable (the process also reclaims everything at exit).
+        """
+        if self.native_module is not None:
+            self.native_module.close()
+            self.native_module = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     # -------------------------------------------------------------------- run
 
@@ -389,10 +410,10 @@ class XlaExecutable(CompilerExecutable):
         count (``BackendError``), type, dtype (``DTypeError``) and the
         static shape recorded at compile time (``ShapeError`` — the xla
         adapter's shapes are static). Inputs are staged via
-        ``batched_device_put`` (``enable_x64=True``), executed, and the
-        output buffers are wrapped as ``core.Tensor`` exactly like the
-        numpy interpreter. Output count/dtype/shape are validated against
-        ``signature.output_specs``. A runtime failure raises
+        ``PJRT_Client_BufferFromHostBuffer``, executed, and the output
+        buffers are copied back and wrapped as ``core.Tensor`` exactly like
+        the numpy interpreter. Output count/dtype/shape are validated
+        against ``signature.output_specs``. A runtime failure raises
         ``core.BackendError`` naming the cause — never a silent fallback.
         """
         if self.native_module is None or self._client is None:
@@ -439,17 +460,16 @@ class XlaExecutable(CompilerExecutable):
                 )
             arrays.append(tensor.numpy())
 
-        if self._put is None:
-            self._put = _make_buffer_putter(self._client)
-        buffers = [self._put(array) for array in arrays]
+        buffers = [self._client.buffer_from_host(array) for array in arrays]
+        output_buffers: list[Any] = []
         try:
-            outputs = self.native_module.execute(buffers)
-        except Exception as exc:
-            raise core.BackendError(f"XLA execution failed: {exc}") from exc
-
-        import numpy as np
-
-        tensors = [core.Tensor(np.asarray(buffer)) for buffer in outputs]
+            output_buffers = self.native_module.execute(buffers)
+            tensors = [core.Tensor(buffer.to_host()) for buffer in output_buffers]
+        finally:
+            for buffer in buffers:
+                buffer.close()
+            for buffer in output_buffers:
+                buffer.close()
 
         output_specs = tuple(self.signature.output_specs)
         if len(tensors) != len(output_specs):
@@ -508,12 +528,15 @@ xla_backend = XlaBackend()
 
 
 def register() -> None:
-    """Probe the dependency and register the backend (idempotent).
+    """Probe the plugin and register the backend (idempotent).
 
     Called by ``etl.backends.registry.get("xla")`` on first use (and by
-    persisted-artifact loads). Raises ``core.BackendError`` with the
-    ``pip install etl[xla]`` hint when jaxlib is missing/incompatible;
-    does nothing observable when already registered.
+    persisted-artifact loads). Raises ``core.BackendError`` with an
+    actionable message (plugin discovery order + how to build a plugin
+    from OpenXLA) when no usable PJRT plugin is available — there is no
+    pip-installable dependency; the user provides the plugin binary via
+    ``options["plugin_path"]`` or the ``ETL_PJRT_PLUGIN`` environment
+    variable. Does nothing observable when already registered.
     """
     XlaBackend.check_available()
     _registry_register(xla_backend)
