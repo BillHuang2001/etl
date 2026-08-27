@@ -51,8 +51,9 @@ class Example:
         specs: tuple of ``etl.TensorSpec`` (static integer shapes).
         graph: ``@etl.defn`` graph taking one symbolic tensor per spec.
         numpy_ref: ``(inputs) -> ndarray | tuple[ndarray]``; pure numpy.
-        torch_ref: optional ``(inputs) -> ndarray | tuple[ndarray]`` factory
-            that imports torch inside its body (never at module scope).
+        torch_ref: optional ``(inputs, device=None) -> ndarray | tuple[ndarray]``
+            factory that imports torch inside its body (never at module scope);
+            ``device`` is an optional ``torch.device`` (``None`` = CPU).
     """
 
     name: str
@@ -121,10 +122,10 @@ def _matmul_numpy(inputs):
     return x @ w
 
 
-def _matmul_torch(inputs):
+def _matmul_torch(inputs, device=None):
     torch = require_torch()
-    x, w = (torch.from_numpy(a) for a in inputs)
-    return (x @ w).numpy()
+    x, w = (torch.as_tensor(a, device=device) for a in inputs)
+    return (x @ w).cpu().numpy()
 
 
 # --- conv2d (VALID, stride 1) -----------------------------------------------
@@ -140,10 +141,10 @@ def _conv2d_numpy_ref(inputs):
     return _conv2d_numpy(x, w, strides=(1, 1), padding="VALID")
 
 
-def _conv2d_torch(inputs):
+def _conv2d_torch(inputs, device=None):
     torch = require_torch()
-    x, w = (torch.from_numpy(a) for a in inputs)
-    return torch.nn.functional.conv2d(x, w, stride=1, padding=0).numpy()
+    x, w = (torch.as_tensor(a, device=device) for a in inputs)
+    return torch.nn.functional.conv2d(x, w, stride=1, padding=0).cpu().numpy()
 
 
 # --- conv2d (SAME padding, stride 1) ----------------------------------------
@@ -159,10 +160,10 @@ def _conv2d_same_numpy(inputs):
     return _conv2d_numpy(x, w, strides=(1, 1), padding="SAME")
 
 
-def _conv2d_same_torch(inputs):
+def _conv2d_same_torch(inputs, device=None):
     torch = require_torch()
-    x, w = (torch.from_numpy(a) for a in inputs)
-    return torch.nn.functional.conv2d(x, w, stride=1, padding=1).numpy()
+    x, w = (torch.as_tensor(a, device=device) for a in inputs)
+    return torch.nn.functional.conv2d(x, w, stride=1, padding=1).cpu().numpy()
 
 
 # --- conv2d (VALID, stride 2) -----------------------------------------------
@@ -178,10 +179,10 @@ def _conv2d_stride2_numpy(inputs):
     return _conv2d_numpy(x, w, strides=(2, 2), padding="VALID")
 
 
-def _conv2d_stride2_torch(inputs):
+def _conv2d_stride2_torch(inputs, device=None):
     torch = require_torch()
-    x, w = (torch.from_numpy(a) for a in inputs)
-    return torch.nn.functional.conv2d(x, w, stride=2, padding=0).numpy()
+    x, w = (torch.as_tensor(a, device=device) for a in inputs)
+    return torch.nn.functional.conv2d(x, w, stride=2, padding=0).cpu().numpy()
 
 
 # --- elementwise fusion -----------------------------------------------------
@@ -197,10 +198,10 @@ def _elementwise_fusion_numpy(inputs):
     return np.maximum((x + y) * z, 0.0)
 
 
-def _elementwise_fusion_torch(inputs):
+def _elementwise_fusion_torch(inputs, device=None):
     torch = require_torch()
-    x, y, z = (torch.from_numpy(a) for a in inputs)
-    return torch.relu((x + y) * z).numpy()
+    x, y, z = (torch.as_tensor(a, device=device) for a in inputs)
+    return torch.relu((x + y) * z).cpu().numpy()
 
 
 # --- softmax (from exp/sum/max primitives) ----------------------------------
@@ -220,10 +221,10 @@ def _softmax_numpy(inputs):
     return e / e.sum(axis=-1, keepdims=True)
 
 
-def _softmax_torch(inputs):
+def _softmax_torch(inputs, device=None):
     torch = require_torch()
     (x,) = inputs
-    return torch.softmax(torch.from_numpy(x), dim=-1).numpy()
+    return torch.softmax(torch.as_tensor(x, device=device), dim=-1).cpu().numpy()
 
 
 # --- layernorm (mean/var from sum primitives) -------------------------------
@@ -245,12 +246,12 @@ def _layernorm_numpy(inputs):
     return diff / np.sqrt(var + 1e-5)
 
 
-def _layernorm_torch(inputs):
+def _layernorm_torch(inputs, device=None):
     torch = require_torch()
     (x,) = inputs
     return torch.nn.functional.layer_norm(
-        torch.from_numpy(x), (x.shape[-1],), eps=1e-5
-    ).numpy()
+        torch.as_tensor(x, device=device), (x.shape[-1],), eps=1e-5
+    ).cpu().numpy()
 
 
 # --- mlp (2 linear layers + relu) -------------------------------------------
@@ -268,11 +269,11 @@ def _mlp_numpy(inputs):
     return h @ w2 + b2
 
 
-def _mlp_torch(inputs):
+def _mlp_torch(inputs, device=None):
     torch = require_torch()
-    x, w1, b1, w2, b2 = (torch.from_numpy(a) for a in inputs)
+    x, w1, b1, w2, b2 = (torch.as_tensor(a, device=device) for a in inputs)
     h = torch.relu(x @ w1 + b1)
-    return (h @ w2 + b2).numpy()
+    return (h @ w2 + b2).cpu().numpy()
 
 
 # --- cumsum -----------------------------------------------------------------
@@ -288,10 +289,10 @@ def _cumsum_numpy(inputs):
     return np.cumsum(x, axis=1)
 
 
-def _cumsum_torch(inputs):
+def _cumsum_torch(inputs, device=None):
     torch = require_torch()
     (x,) = inputs
-    return torch.cumsum(torch.from_numpy(x), dim=1).numpy()
+    return torch.cumsum(torch.as_tensor(x, device=device), dim=1).cpu().numpy()
 
 
 # --- attention (QK^T softmax V) ---------------------------------------------
@@ -317,13 +318,13 @@ def _attention_numpy(inputs):
     return probs @ v
 
 
-def _attention_torch(inputs):
+def _attention_torch(inputs, device=None):
     torch = require_torch()
-    q, k, v = (torch.from_numpy(a) for a in inputs)
+    q, k, v = (torch.as_tensor(a, device=device) for a in inputs)
     scale = 1.0 / math.sqrt(q.shape[-1])
     scores = (q @ k.transpose(-1, -2)) * scale
     probs = torch.softmax(scores, dim=-1)
-    return (probs @ v).numpy()
+    return (probs @ v).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
