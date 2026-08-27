@@ -3,8 +3,9 @@
 Produces StableHLO MLIR text from verified EvoXIR so external compilers can
 take over compilation, e.g. `iree-compile model.mlir -o model.vmfb`. This
 module is NOT a `Backend`: it is not registered with the backend registry
-and it never lowers, compiles, or runs anything. IREE/XLA/TVM adapters are
-documented future integration points — not implemented here.
+and it never lowers, compiles, or runs anything. The compiler adapters that
+CONSUME this export (`"iree"`, `"xla"`, `"tvm"`) are implemented in
+`../adapters/`.
 
 See `../../CONTEXT.md` (backends contract; "StableHLO exporter — v1 scope"
 is binding) and `../../../CONTEXT.md` (root design principles).

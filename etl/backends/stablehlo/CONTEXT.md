@@ -2,7 +2,7 @@
 
 ## Intent
 
-Turn verified EvoXIR (`etl.ir`) programs into **StableHLO MLIR text** so external compilers can take over compilation: `iree-compile model.mlir -o model.vmfb`. This module is an **export utility ONLY** in v1 — it is NOT a compilable `Backend`, it is NOT registered in the backend registry, and it never lowers/compiles/loads/runs anything. IREE/XLA/TVM adapters are documented future integration points, not implemented here.
+Turn verified EvoXIR (`etl.ir`) programs into **StableHLO MLIR text** so external compilers can take over compilation: `iree-compile model.mlir -o model.vmfb`. This module is an **export utility ONLY** in v1 — it is NOT a compilable `Backend`, it is NOT registered in the backend registry, and it never lowers/compiles/loads/runs anything. The compiler adapters that consume this export — `"iree"`, `"xla"` (via PJRT), `"tvm"` — are IMPLEMENTED in `../adapters/` (see `../adapters/CONTEXT.md`).
 
 Binding contracts: `../../../CONTEXT.md` (staging pipeline, error strategy, non-goals) and `../../CONTEXT.md` (backends package; the "StableHLO exporter — v1 scope" section defines the mapping, deferred list, and type map).
 

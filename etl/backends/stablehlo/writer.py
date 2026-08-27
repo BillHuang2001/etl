@@ -20,9 +20,26 @@ https://openxla.org/stablehlo/spec and stablehlo/dialect/StablehloOps.td):
   function (args/results via `mlir_type`, body ops in program order —
   program order IS effect order — ending in ``func.return``).
 - **SSA names**: op results ``%0``, ``%1``, ... sequentially (module-wide
-  counter); function args ``%argN``; while-region args continue past the
-  entry args (so enclosing values referenced inside regions are never
-  shadowed). Decompositions introduce intermediates from the same counter.
+  counter); function args ``%argN``; region block args (reduce/while) use
+  FRESH counter names — never ``%argN`` (MLIR SSA names are
+  function-scoped and would collide with the enclosing entry args).
+  Decompositions introduce intermediates from the same counter.
+- **Index-list attributes** render in the modern DenseI64ArrayAttr syntax
+  ``array<i64: 1, 2>`` (empty: ``array<i64>``) — the legacy
+  ``dense<[...]> : tensor<Nxi64>`` spelling is REJECTED by the installed
+  compiler generation ("failed to satisfy constraint: i64 dense array
+  attribute"). Dense TENSOR attributes (conv ``padding``,
+  ``replica_groups``, ``source_target_pairs``) keep the ``dense<...>``
+  form.
+- **Elementwise shape equalization**: StableHLO elementwise ops
+  (add/maximum/compare/select/...) require ALL operands and the result to
+  share one shape, so scalar operands (Python scalars auto-promoted to
+  scalar constants at trace time, decomposed literals) are broadcast to
+  the result shape via ``stablehlo.broadcast_in_dim`` before use; a
+  scalar-only computation keeps the plain scalar constant.
+- **convert/reshape** emit the functional-type custom form
+  ``: (tensor<...>) -> tensor<...>`` (their operand and result types
+  differ; the single-type form is rejected by the compiler).
 - **Dispatch** on the op name via `mapping.status`: "v1" emits the mapped
   mnemonic; "decompose" emits `mapping.DECOMPOSITIONS` sub-ops; "deferred"
   or unknown raises `core.BackendError` NAMING THE OP (never silently
@@ -34,12 +51,20 @@ https://openxla.org/stablehlo/spec and stablehlo/dialect/StablehloOps.td):
   cond/while_loop to them). `if` branches emit with no block args (etl
   entry args bind to the op operands — StableHLO branches capture
   enclosing values implicitly); `while` cond/body regions emit fresh
-  ``%argN`` block args bound to the loop-carried operands.
+  counter-named block args bound to the loop-carried operands.
 - **Collectives**: `replica_groups` built from the op's `group_size` attr
   (None — the world group — defaults to a single rank, matching v1
   single-process simulation). `broadcast_collective` maps to
   ``stablehlo.collective_broadcast`` — no effect-kind disambiguation
-  needed (the shape op keeps the name `broadcast`).
+  needed (the shape op keeps the name `broadcast`). `all_gather` /
+  `reduce_scatter` result axis dims are rendered CONCRETE (operand dim ×/
+  // emitted group size) so the emitted program is internally consistent
+  — a symbolic `?` there is rejected by the compiler. KNOWN COMPILER-SIDE
+  LIMITATION: iree-compile (20241104) parses and verifies
+  ``stablehlo.collective_broadcast`` but cannot LEGALIZE it for llvm-cpu
+  ("failed to legalize operation ... explicitly marked illegal") in any
+  attribute form — an emission change cannot fix that; newer compilers
+  with collective_broadcast lowering accept the emitted text as-is.
 """
 
 from __future__ import annotations
@@ -121,6 +146,10 @@ class Writer:
         self.module = module
         self._counter = count()
         self._names: dict[int, str] = {}
+        #: Per-value type-text overrides (value id -> rendered MLIR type),
+        #: used where the emitted program's types legitimately differ from
+        #: the IR's symbolic types (all_gather/reduce_scatter axis dims).
+        self._type_overrides: dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -142,22 +171,24 @@ class Writer:
         entry = fn.entry_block
         for i, arg in enumerate(entry.arguments):
             self._names[id(arg)] = f"%arg{i}"
-        # While-region block args are named %argN continuing past the
-        # entry args so they never shadow function parameters referenced
-        # from inside the regions (e.g. a cond capturing `n`).
-        self._arg_base = len(entry.arguments)
+        # Emit the body FIRST: op emission populates per-value type
+        # overrides (collective axis dims) that the function signature
+        # rendering below must already see.
+        body = self._block_body_lines(entry, terminator="func.return")
         args = ", ".join(
             f"%arg{i}: {self._vt(arg.type)}"
             for i, arg in enumerate(entry.arguments)
         )
-        outputs = fn.output_types
+        # Function outputs come off the return terminator's operands (the
+        # same values `fn.output_types` reads types from) so per-value type
+        # overrides (collective axis dims) stay consistent with the body.
+        outputs = entry.terminator.operands if entry.terminator else ()
         if not outputs:
             results = ""
         elif len(outputs) == 1:
-            results = f" -> {self._vt(outputs[0])}"
+            results = f" -> {self._vt_value(outputs[0])}"
         else:
-            results = " -> (" + ", ".join(self._vt(t) for t in outputs) + ")"
-        body = self._block_body_lines(entry, terminator="func.return")
+            results = " -> (" + ", ".join(self._vt_value(t) for t in outputs) + ")"
         text = "\n".join(body)
         indented = self._indent(text, 1) if text else ""
         return f"func.func @{fn.name}({args}){results} {{\n{indented}\n}}"
@@ -264,33 +295,139 @@ class Writer:
         raise self._unsupported(op)
 
     def _emit_elementwise(self, op: Op) -> str:
-        """Unary/binary elementwise ops (incl. cast) in custom print form."""
+        """Unary/binary elementwise ops (incl. cast).
+
+        StableHLO elementwise ops require ALL operands and the result to
+        share one shape (the verifier rejects mixed scalar/non-scalar
+        operands), so scalar operands — Python scalars auto-promoted to
+        scalar constants at trace time — are broadcast to the result shape
+        first. ``cast`` emits ``stablehlo.convert`` in the functional-type
+        custom form (operand and result types differ by definition).
+        """
         mnemonic = mapping.lookup_mapping(op.name)
+        result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
-        operands = ", ".join(self._name(v) for v in op.operands)
-        return (
-            f"{result_name} = {mnemonic} {operands} : {self._vt(op.result.type)}"
+        lines: list[str] = []
+        names = []
+        for operand in op.operands:
+            name, extra = self._equalize_operand(operand, result_shape)
+            lines.extend(extra)
+            names.append(name)
+        if op.name == "cast":
+            operand_type = self._vt(op.operands[0].type)
+            lines.append(
+                f"{result_name} = stablehlo.convert {names[0]} : "
+                f"({operand_type}) -> {self._vt(op.result.type)}"
+            )
+        else:
+            lines.append(
+                f"{result_name} = {mnemonic} {', '.join(names)} : "
+                f"{self._vt(op.result.type)}"
+            )
+        return "\n".join(lines)
+
+    def _equalize_operand(self, value: Value, result_shape: tuple) -> tuple[str, list]:
+        """SSA name of ``value`` valid inside an elementwise op whose result
+        has ``result_shape``, plus any broadcast lines to prepend.
+
+        Operands whose shape already equals the result shape are used
+        directly. A rank-0 operand is broadcast with an empty
+        ``broadcast_dimensions`` (``array<i64>``). A non-scalar operand with
+        a differing shape is broadcast when every mismatched dim is size 1
+        (numpy-style broadcasting — the etl shape-inference contract);
+        anything else raises ``BackendError`` naming the operand (never
+        silently emits an op the compiler would reject).
+        """
+        name = self._name(value)
+        shape = tuple(value.type.shape)
+        if shape == result_shape:
+            return name, []
+        rank_diff = len(result_shape) - len(shape)
+        dims = [rank_diff + i for i in range(len(shape))]
+        for i, dim in enumerate(shape):
+            target = result_shape[rank_diff + i]
+            if dim != 1 and dim != target:
+                raise BackendError(
+                    f"stablehlo export: cannot broadcast operand of shape "
+                    f"{shape!r} to the elementwise result shape "
+                    f"{result_shape!r} — StableHLO elementwise ops require "
+                    "equal operand shapes"
+                )
+        bcast_name = self._new_name()
+        line = (
+            f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._vt(value.type)}) -> "
+            f"{self._type_str(value.type.dtype, result_shape)}"
         )
+        return bcast_name, [line]
+
+    def _scalar_constant_for(self, dtype, value, target_shape) -> tuple[str, list]:
+        """Emit a scalar constant and — when ``target_shape`` is non-scalar —
+        its broadcast to that shape; returns ``(name, lines)``.
+
+        StableHLO elementwise ops require equal shapes, so decomposed
+        literals (``relu``'s zero, ``reduce_mean``'s divisor) interacting
+        with a non-scalar tensor must be broadcast first. When the target
+        IS a scalar the constant is used directly (broadcast_in_dim with
+        empty dims is invalid on scalars).
+        """
+        name = self._new_name()
+        lines = [
+            f"{name} = stablehlo.constant "
+            f"{self._constant_text(np.asarray(value, dtype=dtype))}"
+            f" : {self._elem_type(dtype)}"
+        ]
+        if target_shape:
+            bcast_name = self._new_name()
+            lines.append(
+                f'{bcast_name} = "stablehlo.broadcast_in_dim"({name}) '
+                f"{{broadcast_dimensions = array<i64>}} : "
+                f"({self._elem_type(dtype)}) -> "
+                f"{self._type_str(dtype, target_shape)}"
+            )
+            return bcast_name, lines
+        return name, lines
 
     def _emit_select(self, op: Op) -> str:
+        """`stablehlo.select` — all operands (pred included) equalized to
+        the result shape (StableHLO requires equal non-scalar shapes)."""
+        result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
-        operands = ", ".join(self._name(v) for v in op.operands)
-        op_types = ", ".join(self._vt(v.type) for v in op.operands)
-        return (
-            f"{result_name} = stablehlo.select {operands} : "
+        lines: list[str] = []
+        names = []
+        for operand in op.operands:
+            name, extra = self._equalize_operand(operand, result_shape)
+            lines.extend(extra)
+            names.append(name)
+        op_types = ", ".join(
+            self._type_str(v.type.dtype, result_shape) for v in op.operands
+        )
+        lines.append(
+            f"{result_name} = stablehlo.select {', '.join(names)} : "
             f"({op_types}) -> {self._vt(op.result.type)}"
         )
+        return "\n".join(lines)
 
     def _emit_compare(self, op: Op) -> str:
         direction = mapping.lookup_mapping(op.name)
+        result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
-        operands = ", ".join(self._name(v) for v in op.operands)
-        op_types = ", ".join(self._vt(v.type) for v in op.operands)
-        return (
-            f'{result_name} = "stablehlo.compare"({operands}) '
+        lines: list[str] = []
+        names = []
+        for operand in op.operands:
+            name, extra = self._equalize_operand(operand, result_shape)
+            lines.extend(extra)
+            names.append(name)
+        op_types = ", ".join(
+            self._type_str(v.type.dtype, result_shape) for v in op.operands
+        )
+        lines.append(
+            f'{result_name} = "stablehlo.compare"({", ".join(names)}) '
             f"{{comparison_direction = #stablehlo<comparison_direction "
             f"{direction}>}} : ({op_types}) -> {self._vt(op.result.type)}"
         )
+        return "\n".join(lines)
 
     def _emit_shape(self, op: Op) -> str:
         name = op.name
@@ -324,15 +461,18 @@ class Writer:
         result_name = self._bind_results(op)[0]
         return (
             f'{result_name} = "stablehlo.broadcast_in_dim"({self._name(x)}) '
-            f"{{broadcast_dimensions = {self._dense_1d(dims)}}} : "
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
             f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
         )
 
     def _emit_reshape(self, op: Op) -> str:
+        """`stablehlo.reshape` uses the functional-type custom form
+        (operand and result types differ — the single-type form is
+        rejected by the compiler as "invalid kind of type specified")."""
         result_name = self._bind_results(op)[0]
         return (
             f"{result_name} = stablehlo.reshape {self._name(op.operands[0])}"
-            f" : {self._vt(op.result.type)}"
+            f" : ({self._vt(op.operands[0].type)}) -> {self._vt(op.result.type)}"
         )
 
     def _emit_transpose(self, op: Op) -> str:
@@ -344,7 +484,7 @@ class Writer:
         result_name = self._bind_results(op)[0]
         return (
             f'{result_name} = "stablehlo.transpose"({self._name(x)}) '
-            f"{{permutation = {self._dense_1d(permutation)}}} : "
+            f"{{permutation = {self._i64_array(permutation)}}} : "
             f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
         )
 
@@ -356,9 +496,9 @@ class Writer:
         result_name = self._bind_results(op)[0]
         return (
             f'{result_name} = "stablehlo.slice"({self._name(x)}) '
-            f"{{start_indices = {self._dense_1d(starts)}, "
-            f"limit_indices = {self._dense_1d(limits)}, "
-            f"strides = {self._dense_1d(strides)}}} : "
+            f"{{start_indices = {self._i64_array(starts)}, "
+            f"limit_indices = {self._i64_array(limits)}, "
+            f"strides = {self._i64_array(strides)}}} : "
             f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
         )
 
@@ -396,9 +536,9 @@ class Writer:
             f"{pad_value} = stablehlo.constant {self._constant_text(fill)}"
             f" : {self._elem_type(dtype)}"
         )
-        low = self._dense_1d([p[0] for p in pairs])
-        high = self._dense_1d([p[1] for p in pairs])
-        interior = self._dense_1d([0] * rank)
+        low = self._i64_array([p[0] for p in pairs])
+        high = self._i64_array([p[1] for p in pairs])
+        interior = self._i64_array([0] * rank)
         result_name = self._bind_results(op)[0]
         lines.append(
             f'{result_name} = "stablehlo.pad"({self._name(x)}, {pad_value}) '
@@ -432,6 +572,7 @@ class Writer:
             converted = self._new_name()
             lines.append(
                 f"{converted} = stablehlo.convert {cur} : "
+                f"({self._type_str(elem_dtype, reduced_shape)}) -> "
                 f"{self._type_str(op.result.type.dtype, reduced_shape)}"
             )
             cur = converted
@@ -439,6 +580,7 @@ class Writer:
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
+                f"({self._type_str(op.result.type.dtype, reduced_shape)}) -> "
                 f"{self._vt(op.result.type)}"
             )
             cur = reshaped
@@ -467,14 +609,15 @@ class Writer:
         converted = self._new_name()
         lines.append(
             f"{converted} = stablehlo.convert {sum_name} : "
+            f"({self._type_str(x.type.dtype, reduced_shape)}) -> "
             f"{self._type_str(out_dtype, reduced_shape)}"
         )
-        count_name = self._new_name()
-        lines.append(
-            f"{count_name} = stablehlo.constant "
-            f"{self._constant_text(np.asarray(count, dtype=out_dtype))}"
-            f" : {self._elem_type(out_dtype)}"
+        # The divisor constant is scalar; StableHLO elementwise ops require
+        # equal shapes, so broadcast it when the reduced tensor is not.
+        count_name, count_lines = self._scalar_constant_for(
+            out_dtype, count, reduced_shape
         )
+        lines.extend(count_lines)
         divided = self._new_name()
         lines.append(
             f"{divided} = stablehlo.divide {converted}, {count_name} : "
@@ -485,6 +628,7 @@ class Writer:
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
+                f"({self._type_str(out_dtype, reduced_shape)}) -> "
                 f"{self._vt(op.result.type)}"
             )
             cur = reshaped
@@ -507,10 +651,15 @@ class Writer:
             f" : {elem_type}"
         )
         body_name = self._new_name()
+        # Region block args use FRESH counter names (%N), never %argN:
+        # MLIR SSA names are function-scoped, so reusing %arg0 inside the
+        # region collides with the enclosing function's entry arguments.
+        arg_a = self._new_name()
+        arg_b = self._new_name()
         region = (
             "({\n"
-            f"  ^bb0(%arg0: {elem_type}, %arg1: {elem_type}):\n"
-            f"    {body_name} = stablehlo.{body_mnemonic} %arg0, %arg1"
+            f"  ^bb0({arg_a}: {elem_type}, {arg_b}: {elem_type}):\n"
+            f"    {body_name} = stablehlo.{body_mnemonic} {arg_a}, {arg_b}"
             f" : {elem_type}\n"
             f"    stablehlo.return {body_name} : {elem_type}\n"
             "  })"
@@ -522,7 +671,7 @@ class Writer:
         result_name = self._new_name()
         lines.append(
             f'{result_name} = "stablehlo.reduce"({self._name(x)}, '
-            f"{init_name}) {region} {{dimensions = {self._dense_1d(dims)}}}"
+            f"{init_name}) {region} {{dimensions = {self._i64_array(dims)}}}"
             f" : ({self._vt(x.type)}, {elem_type}) -> {reduced_type}"
         )
         return lines, result_name, reduced_shape
@@ -535,10 +684,14 @@ class Writer:
         body_mnemonic = _REDUCE_BODY_MNEMONIC[kind]
         elem_type = self._elem_type(elem_dtype)
         body_name = self._new_name()
+        # Fresh counter names — see _emit_reduce_core (never %argN, which
+        # collides with the enclosing function's entry arguments).
+        arg_a = self._new_name()
+        arg_b = self._new_name()
         region = (
             "({\n"
-            f"  ^bb0(%arg0: {elem_type}, %arg1: {elem_type}):\n"
-            f"    {body_name} = stablehlo.{body_mnemonic} %arg0, %arg1"
+            f"  ^bb0({arg_a}: {elem_type}, {arg_b}: {elem_type}):\n"
+            f"    {body_name} = stablehlo.{body_mnemonic} {arg_a}, {arg_b}"
             f" : {elem_type}\n"
             f"    stablehlo.return {body_name} : {elem_type}\n"
             "  })"
@@ -606,7 +759,7 @@ class Writer:
             converted = self._new_name()
             lines.append(
                 f"{converted} = stablehlo.convert {cur} : "
-                f"{self._vt(op.result.type)}"
+                f"({dot_type}) -> {self._vt(op.result.type)}"
             )
             cur = converted
         self._names[id(op.result)] = cur
@@ -626,9 +779,15 @@ class Writer:
 
         spatial = self._int_list(range(n_spatial))
         # etl conv is NCHW (N, C_in, *spatial) / (C_out, C_in/g, *spatial).
+        # The StableHLO conv dnums custom syntax is positional with role
+        # letters: `[b, f, S...]x[o, i, S...]->[b, f, S...]` — the digit
+        # slots are the REMAINING (spatial) tensor positions, not dimension
+        # indices. `[b, 0, f]` would mean NHWC (feature LAST) and produces
+        # verifier failures ("input feature dimension / feature_group_count
+        # = kernel input feature dimension") — never emit that.
         dnums = (
             "#stablehlo.conv<"
-            f"[b, {spatial}, f]x[{spatial}, i, o]->[b, {spatial}, f]>"
+            f"[b, f, {spatial}]x[o, i, {spatial}]->[b, f, {spatial}]>"
         )
         attr_parts = [f"dimension_numbers = {dnums}"]
         if isinstance(padding, str):
@@ -647,16 +806,15 @@ class Writer:
         else:
             pairs = [tuple(p) for p in padding]
             attr_parts.append(f"padding = {self._dense_2d(pairs)}")
-        if any(s != 1 for s in strides):
-            attr_parts.append(f"window_strides = {self._dense_1d(strides)}")
-        if any(d != 1 for d in in_dilation):
-            attr_parts.append(f"lhs_dilation = {self._dense_1d(in_dilation)}")
-        if any(d != 1 for d in k_dilation):
-            attr_parts.append(f"rhs_dilation = {self._dense_1d(k_dilation)}")
-        if feature_groups != 1:
-            attr_parts.append(f"feature_group_count = {int(feature_groups)} : i64")
-        if batch_groups != 1:
-            attr_parts.append(f"batch_group_count = {int(batch_groups)} : i64")
+        # window_strides / lhs_dilation / rhs_dilation / feature_group_count
+        # / batch_group_count are REQUIRED attributes in the modern spec —
+        # the verifier rejects conv ops that omit them (defaults are no
+        # longer applied), so they are always emitted.
+        attr_parts.append(f"window_strides = {self._i64_array(strides)}")
+        attr_parts.append(f"lhs_dilation = {self._i64_array(in_dilation)}")
+        attr_parts.append(f"rhs_dilation = {self._i64_array(k_dilation)}")
+        attr_parts.append(f"feature_group_count = {int(feature_groups)} : i64")
+        attr_parts.append(f"batch_group_count = {int(batch_groups)} : i64")
 
         elem_dtype = np.dtype(x.type.dtype)
         conv_type = self._type_str(elem_dtype, op.result.type.shape)
@@ -671,7 +829,7 @@ class Writer:
             converted = self._new_name()
             lines.append(
                 f"{converted} = stablehlo.convert {cur} : "
-                f"{self._vt(op.result.type)}"
+                f"({conv_type}) -> {self._vt(op.result.type)}"
             )
             cur = converted
         self._names[id(op.result)] = cur
@@ -745,15 +903,15 @@ class Writer:
         return "\n".join(lines)
 
     def _emit_while_region(self, region) -> str:
-        """One `while` region (cond/body): fresh `%argN` block args bound
-        positionally to the loop-carried operands, named past the
-        enclosing function's entry args (see `_arg_base`) so captured
-        values keep their names."""
+        """One `while` region (cond/body): block args bound positionally to
+        the loop-carried operands. Args use FRESH counter names (never
+        `%argN` — MLIR SSA names are function-scoped and would collide
+        with the enclosing function's entry arguments / nested regions)."""
         out = []
         for i, block in enumerate(region.blocks):
             args = []
-            for j, arg in enumerate(block.arguments):
-                name = f"%arg{self._arg_base + j}"
+            for arg in block.arguments:
+                name = self._new_name()
                 self._names[id(arg)] = name
                 args.append(f"{name}: {self._vt(arg.type)}")
             out.append(f"  ^bb{i}({', '.join(args)}):")
@@ -770,8 +928,16 @@ class Writer:
         group_size = attrs.get("group_size")
         replica_groups = self._replica_groups(group_size)
         result_name = self._bind_results(op)[0]
+        result_type = self._vt(op.result.type)
+        if name in ("all_gather", "reduce_scatter"):
+            # etl scales the axis dim by world_size (symbolic => `?`), but
+            # the emitted replica_groups describe a CONCRETE group of `n`
+            # ranks, so the result type must be consistent with the emitted
+            # program (iree-compile rejects `tensor<?x...>` result types:
+            # "tensor.empty op incorrect number of dynamic sizes").
+            result_type = self._collective_result_type(op, x, name, group_size)
         signature = (
-            f"({self._vt(x.type)}) -> {self._vt(op.result.type)}"
+            f"({self._vt(x.type)}) -> {result_type}"
         )
         if name in ("all_reduce", "reduce_scatter"):
             kind = attrs["reduce_op"]
@@ -837,6 +1003,37 @@ class Writer:
             )
         raise self._unsupported(op)
 
+    def _collective_result_type(self, op: Op, x: Value, name: str, group_size) -> str:
+        """Result tensor type of all_gather/reduce_scatter, consistent with
+        the emitted ``replica_groups`` (an n-rank group — n = 1 for the
+        unknown world group, matching the v1 single-rank simulation).
+
+        The IR result dim at the axis is ``operand_dim * world_size`` /
+        ``// world_size`` — symbolic in general. When the operand axis dim
+        is concrete, substitute the emitted program's concrete count
+        (operand_dim * n / operand_dim // n); otherwise keep the symbolic
+        dim (the compiler rejects dynamic shapes at input time — surfaced
+        there, never silently re-specialized here).
+        """
+        axis = int(op.attributes.get("axis", 0))
+        n = 1
+        if (
+            isinstance(group_size, int)
+            and not isinstance(group_size, bool)
+            and group_size > 0
+        ):
+            n = group_size
+        shape = list(op.result.type.shape)
+        operand_dim = x.type.shape[axis]
+        if isinstance(operand_dim, int) and not isinstance(operand_dim, bool):
+            result_dim = operand_dim * n if name == "all_gather" else operand_dim // n
+            shape[axis] = result_dim
+        rendered = self._type_str(op.result.type.dtype, shape)
+        # Record the override so the enclosing func signature / return
+        # terminator render the SAME concrete type as this op.
+        self._type_overrides[id(op.result)] = rendered
+        return rendered
+
     # --- Decompositions ---
 
     def _emit_decomposed(self, op: Op) -> str:
@@ -851,14 +1048,20 @@ class Writer:
         if name == "relu":
             x = op.operands[0]
             dtype = np.dtype(x.type.dtype)
-            zero_name = self._new_name()
             result_name = self._bind_results(op)[0]
-            return (
-                f"{zero_name} = stablehlo.constant "
-                f"{self._constant_text(np.zeros((), dtype=dtype))}"
-                f" : {self._elem_type(dtype)}\n"
-                f"{result_name} = stablehlo.maximum {self._name(x)}, "
-                f"{zero_name} : {self._vt(op.result.type)}"
+            # The literal zero is a scalar constant; StableHLO elementwise
+            # ops require equal shapes, so broadcast it when x is
+            # non-scalar (a scalar x uses the constant directly —
+            # broadcast_in_dim with empty dims is invalid on scalars).
+            zero_name, zero_lines = self._scalar_constant_for(
+                dtype, 0, tuple(x.type.shape)
+            )
+            return "\n".join(
+                [
+                    *zero_lines,
+                    f"{result_name} = stablehlo.maximum {self._name(x)}, "
+                    f"{zero_name} : {self._vt(op.result.type)}",
+                ]
             )
         if name == "stop_gradient":
             self._names[id(op.result)] = self._name(op.operands[0])
@@ -876,7 +1079,7 @@ class Writer:
             if op.name == "return":
                 if op.operands:
                     values = ", ".join(self._name(v) for v in op.operands)
-                    types = ", ".join(self._vt(v.type) for v in op.operands)
+                    types = ", ".join(self._vt_value(v) for v in op.operands)
                     lines.append(f"{terminator} {values} : {types}")
                 else:
                     lines.append(terminator)
@@ -907,6 +1110,11 @@ class Writer:
     def _vt(self, vt) -> str:
         return self.mlir_type(vt.dtype, vt.shape)
 
+    def _vt_value(self, value: Value) -> str:
+        """Rendered tensor type of `value`, honoring per-value overrides
+        (see `_type_overrides`)."""
+        return self._type_overrides.get(id(value), self._vt(value.type))
+
     def _type_str(self, dtype, shape) -> str:
         return self.mlir_type(dtype, shape)
 
@@ -930,12 +1138,19 @@ class Writer:
         return ", ".join(str(int(v)) for v in values)
 
     @staticmethod
-    def _dense_1d(values) -> str:
+    def _i64_array(values) -> str:
+        """Render an index list as an i64 dense-array attribute.
+
+        Modern StableHLO (20241104-era spec) declares index-list attributes
+        as DenseI64ArrayAttr and REJECTS the legacy ``dense<[...]> :
+        tensor<Nxi64>`` spelling ("'dimensions' failed to satisfy
+        constraint: i64 dense array attribute"). The valid syntax is
+        ``array<i64: 1, 2>``; the empty array prints as ``array<i64>``
+        (``array<i64: >`` does NOT parse)."""
         inner = ", ".join(str(int(v)) for v in values)
-        n = len(values)
-        if n == 0:
-            return "dense<> : tensor<0xi64>"
-        return f"dense<[{inner}]> : tensor<{n}xi64>"
+        if not inner:
+            return "array<i64>"
+        return f"array<i64: {inner}>"
 
     @staticmethod
     def _dense_2d(pairs) -> str:

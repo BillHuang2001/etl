@@ -28,7 +28,7 @@ Exports (re-exported via `etl/backends/__init__.py` and surfaced at `etl.backend
 | `set_rank_context` / `get_rank_context` | `exec_context.py` | thread-local `RankContext` hook (default `RankContext(rank=0, world_size=1)`; per-run override on `NumpyExecutable.run(..., rank_context=...)`) |
 | `dispatch(op_name)` / `register_all()` / `KERNEL_TABLE` | `kernels/__init__.py` | op-name → kernel dispatch table; `register_all()` idempotent, duplicate keys across category modules ⇒ `BackendError` |
 
-Not public: `_register_block_impls` (documented no-op — block dispatch resolves via `etl.block.registry` at lower/load/run time), `_module_function_names` (single touch point for the `ir.Module` accessor), `_iter_ops` (bottom-up op walk incl. nested regions), `clone_ops_into` / `drop_op_uses` (`inline.py` — block_call portable splicing).
+Not public: `_register_block_impls` (documented no-op — block dispatch resolves via `etl.block.registry` at lower/load/run time), `_module_function_names` (single touch point for the `ir.Module` accessor). The bottom-up op walk (`iter_ops`/`iter_block_ops`), the portable-splicing helpers (`clone_ops_into` / `drop_op_uses`), and the fixpoint driver (`inline_portables`) MOVED to the shared `../inline.py` (also used by compiler backends); `./inline.py` is a thin re-export.
 
 ## Implemented execution engine
 
@@ -73,10 +73,10 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 
 | Path | Area |
 |---|---|
-| `./__init__.py` | `NumpyBackend` (lower/compile/load — incl. lower-time block_call portable inlining via `etl.block.registry`: `get_impl("numpy")` → keep, `get_portable` → splice, neither → `BackendError`), `NumpyExecutable`, `numpy_backend` + registration, `_register_block_impls` (documented no-op), re-exports, import-time `dist.context.set_collective_executor(SingleRankCollectiveExecutor())` |
+| `./__init__.py` | `NumpyBackend` (lower/compile/load — incl. lower-time block_call portable inlining via the shared `../inline.py::inline_portables(keep_backend_impls="numpy")`: `get_impl("numpy")` → keep, `get_portable` → splice, neither → `BackendError`), `NumpyExecutable`, `numpy_backend` + registration, `_register_block_impls` (documented no-op), re-exports, import-time `dist.context.set_collective_executor(SingleRankCollectiveExecutor())` |
 | `./interpreter.py` | `KernelContext` (bindings, rank_context, module, run_region, compute_output_shapes, resolve_callback, evaluate_shape), `Interpreter` (run + `_run_block` op loop + entry-function resolution + `_env_stack` outer-value resolution for nested regions), `entry_function` |
 | `./exec_context.py` | thread-local `set_rank_context`/`get_rank_context` hook over `dist.context.RankContext` (default rank=0, world_size=1) |
-| `./inline.py` | `clone_ops_into` (portable block_call splicing with fresh ids + Use bookkeeping + output-type guards), `drop_op_uses` (required before `Block.erase` under strict `ir.verify`) |
+| `./inline.py` | thin re-export of the shared `../inline.py` (`clone_ops_into` — portable block_call splicing with fresh ids + Use bookkeeping + output-type guards; `drop_op_uses` — required before `Block.erase` under strict `ir.verify`; plus `inline_portables`/`iter_ops`/`iter_block_ops`) |
 | `./collectives.py` | `CollectiveExecutor` alias of `dist.context.CollectiveExecutor` (CANONICAL home), `SingleRankCollectiveExecutor` (identity default) |
 | `./shapes.py` | `evaluate_dim_expr` / `evaluate_shape` — runtime `Dim`/`DimExpr` evaluation (shape-rule reuse) |
 | `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules |
@@ -88,7 +88,7 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
 | `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
 
-Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry, StableHLO exporter.
+Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry (optional-adapter auto-activation), StableHLO exporter, shared `inline.py` block-inlining machinery, `compiler.py` (`CompilerBackend`/`CompilerExecutable`), `adapters/` (separate parallel effort).
 
 ## Test strategy
 
@@ -116,4 +116,4 @@ Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from 
 - `runtime_call` callback resolution goes through `etl.ops.constant._get_callback` (via `ctx.resolve_callback`) — artifacts containing `runtime_call` require the same callback registrations at load time.
 - Collectives dispatch through `dist.context.get_collective_executor()`; the identity `SingleRankCollectiveExecutor` is installed at `numpy/__init__` import time. rank/world_size resolve from the per-execution `RankContext` (`exec_context.py`; override via `NumpyExecutable.run(..., rank_context=...)`).
 - `etl.dist` never imports backends, so `exec_context.py` and `__init__.py` may import `dist.context` at top level (acyclic). `etl.ops`, `etl.block`, `etl.trace`, `etl.persist` stay function-body-lazy.
-- `ir.verify` enforces strict use-bookkeeping: erase a spliced `block_call` only after `drop_op_uses` removes its `Use` records (`inline.py`).
+- `ir.verify` enforces strict use-bookkeeping: erase a spliced `block_call` only after `drop_op_uses` removes its `Use` records (shared `../inline.py`).
