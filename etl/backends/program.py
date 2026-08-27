@@ -176,6 +176,9 @@ class LoweredProgram:
         """Human-readable rendering of the payload (backend-specific).
 
         * MLIR-style payloads (``str``) are returned verbatim.
+        * Compiler-backend payloads (dict with ``"format": "stablehlo"``
+          and an ``"mlir_text"`` field — see ``compiler.CompilerBackend``)
+          render their MLIR text.
         * Serialized ``ir.Module`` payloads (dict carrying ``version`` +
           ``module`` keys) are deserialized and pretty-printed.
         * Anything else raises ``core.BackendError`` naming the backend.
@@ -183,6 +186,8 @@ class LoweredProgram:
         payload = self.payload
         if isinstance(payload, str):
             return payload
+        if isinstance(payload, dict) and "mlir_text" in payload:
+            return payload["mlir_text"]
         if isinstance(payload, dict) and "version" in payload and "module" in payload:
             from etl import ir
 
