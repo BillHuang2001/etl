@@ -181,10 +181,12 @@ class CompilerBackend(Backend):
            ``block_call`` / dtypes / dynamic shapes are checked against
            ``Capabilities`` here (mirrors the numpy backend's flag
            pattern). Every rejection names the missing feature.
-        3. ``inline_portables(graph.module, keep_backend_impls=None)`` — a
-           compiler adapter has NO per-backend block impls; every
+        3. ``inline_portables(graph.module, keep_backend_impls=None)`` — for
+           adapters declaring ``custom_blocks=True`` every remaining
            ``block_call`` MUST have a portable decomposition, else
-           ``core.BackendError`` naming the block.
+           ``core.BackendError`` naming the block (adapters with
+           ``custom_blocks=False`` have already rejected ``block_call``
+           at step 2).
         4. ``graph.verify()`` again (defensive, cheap).
         5. ``stablehlo.export(graph)`` — the capability gate for ops:
            deferred ops raise ``core.BackendError`` naming them.

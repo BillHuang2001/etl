@@ -80,7 +80,7 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 | Path | Area |
 |---|---|
 | `./ops.py` | v1 mapping tables (data) + lookup/status helpers — the auditable mapping source of truth |
-| `./writer.py` | StableHLO MLIR text emission (`Writer`, ~999 lines; consumes `ops.py` data only) |
+| `./writer.py` | StableHLO MLIR text emission (`Writer`, ~1400 lines incl. the dynamic-broadcast emission path; consumes `ops.py` data only) |
 | `./__init__.py` | `export()` — the only public entry point |
 
 ## Notes for agents
