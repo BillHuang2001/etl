@@ -491,3 +491,8 @@ def test_register_pytree_node_object_raises():
         match=r"register_pytree_node: cannot register 'object' as a pytree node — it would hijack the MRO lookup for all types",
     ):
         register_pytree_node(object, _tagged_flatten, _tagged_unflatten)
+    # Defensive cleanup: while the rejection guard is missing (parallel
+    # implementation not yet merged), the registration succeeds and would
+    # hijack the MRO dispatch for every type for the rest of the session —
+    # undo it so pre-existing tests stay green. No-op once the guard lands.
+    _PYTREE_NODE_REGISTRY.pop(object, None)
