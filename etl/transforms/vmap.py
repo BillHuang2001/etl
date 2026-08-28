@@ -47,8 +47,10 @@ axes, then rearranges outputs per out_axes — each level adds one leading
 mapped dim."""
 
 #: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
-#: (`Dim("batch")`, `Dim("batch_1")`, ... — see batching._batched_input_specs).
-#: These are the ONLY dims mapped-output detection keys on (by identity).
+#: (ONE shared `Dim("batch")` per pass — see batching._batched_input_specs).
+#: These are the ONLY dims mapped-output detection keys on (by identity); the
+#: `_\d+` suffix stays accepted for dims named `batch_1` in pre-existing or
+#: user-built graphs.
 _BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
 
 
@@ -210,14 +212,14 @@ def _derive_unvectorized_args(args, in_axes):
 def _collect_batch_dims(graph: Graph):
     """The fresh batch `Dim` objects this vectorization introduced.
 
-    `vectorize_graph` prepends a fresh symbolic `Dim("batch")`,
-    `Dim("batch_1")`, ... to every mapped input spec (unmapped specs are
-    reused unchanged), so the batch dims of THIS vectorization are exactly the
-    leading entries of the input specs whose names follow that reserved
-    pattern. Collected as objects — nested vmap levels create their OWN fresh
-    Dims with the same names, and only the current level's objects must count
-    (output detection compares by identity, `is`). An empty list (no mapped
-    inputs) makes every output unmapped.
+    `vectorize_graph` prepends ONE fresh symbolic `Dim("batch")` shared by all
+    mapped input specs of the pass (unmapped specs are reused unchanged), so
+    the batch dims of THIS vectorization are exactly the leading entries of
+    the input specs whose names follow that reserved pattern. Collected as
+    objects — nested vmap levels create their OWN fresh Dims with the same
+    names, and only the current level's objects must count (output detection
+    compares by identity, `is`). An empty list (no mapped inputs) makes every
+    output unmapped.
     """
     batch_dims = []
     for spec in graph.tensor_specs:
@@ -231,9 +233,11 @@ def _collect_batch_dims(graph: Graph):
 
 def _is_batch_entry(entry, batch_dims) -> bool:
     """True when one shape entry IS a batch dim (identity) or a `DimExpr`
-    built purely from batch dims and ints — e.g. the `max(batch, batch_1)` a
-    symbolic broadcast of two mapped operands produces. Such an entry still
-    IS the mapped leading axis."""
+    built purely from batch dims and ints — e.g. the `max(batch, batch)` a
+    symbolic broadcast of mapped operands from DIFFERENT vmap levels produces
+    (distinct Dim objects never compare equal, so their broadcast stays a max
+    DimExpr; within one pass the shared dim compares equal and no max arises).
+    Such an entry still IS the mapped leading axis."""
     if isinstance(entry, core.Dim):
         return any(entry is dim for dim in batch_dims)
     if isinstance(entry, core.DimExpr):

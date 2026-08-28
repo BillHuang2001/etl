@@ -214,10 +214,11 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
     via its batching rule, seeds input metadata from the normalized `axes`
     structure, and builds a NEW `Graph` (new module/function — the input graph
     is never mutated) whose mapped inputs/outputs carry an extra leading
-    dimension. Mapped input specs gain a fresh symbolic `Dim` (named `batch`,
-    `batch_1`, ...) as the leading dim; `output_tree` and `static_values` are
-    preserved. Region-bearing control-flow ops (`cond`/`while_loop`/`scan`)
-    are not vectorizable in v1 and raise `TransformError`.
+    dimension. All mapped input specs share ONE fresh symbolic `Dim` (named
+    `batch`) as the leading dim — a single pass introduces exactly one batch
+    axis; `output_tree` and `static_values` are preserved. Region-bearing
+    control-flow ops (`cond`/`while_loop`/`scan`) are not vectorizable in v1
+    and raise `TransformError`.
 
     Args:
         graph: the traced graph to rewrite.
@@ -243,8 +244,8 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
             f"{len(graph.tensor_specs)} tensor input specs"
         )
 
-    # 2. New input specs: mapped inputs gain a fresh leading symbolic dim
-    #    (`batch`, `batch_1`, ...); unmapped specs are reused unchanged.
+    # 2. New input specs: all mapped inputs share ONE fresh leading symbolic
+    #    dim (`batch`); unmapped specs are reused unchanged.
     new_specs, mapped_input_axes = _batched_input_specs(graph, tensor_axes)
 
     # 3. Build the NEW module/function (the input graph is never mutated).
@@ -343,11 +344,15 @@ def _batched_input_specs(
 ) -> Tuple[Tuple, Tuple[MappedAxes, ...]]:
     """New flat tensor specs + per-input `MappedAxes`.
 
-    Mapped inputs get a fresh symbolic `core.Dim` as the leading dim — `batch`
-    for the first mapped input, `batch_1`, `batch_2`, ... for the following
-    ones — preserving dtype/device/name. Unmapped specs are reused unchanged.
+    Mapped inputs all share ONE fresh symbolic `core.Dim` (named `batch`) as
+    their leading dim: a single vectorize pass introduces exactly one batch
+    axis, so every mapped input carries the same Dim object — object identity
+    IS the logical axis. Same-level dims therefore compare equal in shape
+    inference (no `max(batch, batch_1)` DimExprs in batched result types),
+    and the runtime's name-keyed dim binding rejects mismatched batch extents
+    with a clear ShapeError. Unmapped specs are reused unchanged.
     """
-    counter = 0
+    batch_dim = core.Dim("batch")
     new_specs = []
     mapped_axes = []
     for spec, entry in zip(graph.tensor_specs, tensor_axes):
@@ -355,8 +360,6 @@ def _batched_input_specs(
             new_specs.append(spec)
             mapped_axes.append(UNMAPPED)
             continue
-        batch_dim = core.Dim("batch") if counter == 0 else core.Dim(f"batch_{counter}")
-        counter += 1
         new_specs.append(
             core.TensorSpec(
                 shape=(batch_dim, *spec.shape),
