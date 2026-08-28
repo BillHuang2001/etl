@@ -38,7 +38,8 @@ import numpy as np
 
 from etl import core
 from etl import ir
-from etl.core import first_mismatch_path, format_path
+from etl.core import describe_node, first_mismatch_path, format_path
+from etl.core.tree import _subtree_spec_at  # shared mismatch-path subtree lookup
 
 __all__ = ["Graph", "StaticValue"]
 
@@ -165,88 +166,6 @@ def _same_structure(spec: "core.TreeSpec", other: "core.TreeSpec") -> bool:
     count is checked by the caller against the recorded specs.
     """
     return first_mismatch_path(spec, other) is None
-
-
-def _spec_keys(spec: "core.TreeSpec"):
-    """The recorded key list of a dict-subclass spec, or ``None`` when the
-    spec carries no ``node_data`` (hand-built specs).
-
-    Mirrors `core.tree._dict_keys` — the key resolution used by
-    `core.first_mismatch_path` (namedtuple specs record their field names in
-    ``node_data`` too, so those also resolve to string keys). ``defaultdict``
-    specs record ``(default_factory, keys)`` — the keys live at index 1.
-    """
-    if spec.node_data is None:
-        return None
-    if (
-        isinstance(spec.type, type)
-        and issubclass(spec.type, dict)
-        and isinstance(spec.node_data, tuple)
-        and len(spec.node_data) == 2
-    ):
-        # defaultdict-style ``(default_factory, keys)`` node_data.
-        return spec.node_data[1]
-    return spec.node_data
-
-
-def _subspec(spec: "core.TreeSpec", path: Tuple[Any, ...]) -> "core.TreeSpec":
-    """The subtree TreeSpec of ``spec`` at ``path``.
-
-    ``path`` is a mismatch path as produced by `core.first_mismatch_path`
-    (tuple of int positional indices / dict keys / namedtuple field names);
-    dict/namedtuple keys are resolved via the recorded ``node_data``.
-    """
-    current = spec
-    for key in path:
-        keys = _spec_keys(current)
-        index = keys.index(key) if keys is not None else key
-        current = current.children[index]
-    return current
-
-
-def _container_desc(spec: "core.TreeSpec") -> str:
-    """One-line description of the container node ``spec`` describes.
-
-    Kind + arity/keys, e.g. ``dict with keys ['a', 'b']``, ``tuple of length
-    2``, ``namedtuple of length 2``, ``dataclass with fields ['f1', 'f2']``.
-    Childless (empty) containers yield the same wording with an empty list
-    (``dict with keys []``). Kind detection mirrors `core.flatten`'s node
-    precedence (namedtuple before tuple; dataclass before plain containers).
-    """
-    spec_type = spec.type
-    if (
-        isinstance(spec_type, type)
-        and issubclass(spec_type, tuple)
-        and hasattr(spec_type, "_fields")
-    ):
-        return f"namedtuple of length {len(spec.children)}"
-    if isinstance(spec_type, type) and is_dataclass(spec_type):
-        return f"dataclass with fields {spec.node_data!r}"
-    if isinstance(spec_type, type) and issubclass(spec_type, tuple):
-        return f"tuple of length {len(spec.children)}"
-    if isinstance(spec_type, type) and issubclass(spec_type, list):
-        return f"list of length {len(spec.children)}"
-    if isinstance(spec_type, type) and issubclass(spec_type, dict):
-        return f"dict with keys {_spec_keys(spec)!r}"
-    # Registered custom container types (no pinned wording).
-    name = spec_type.__name__ if isinstance(spec_type, type) else str(spec_type)
-    return f"{name} of length {len(spec.children)}"
-
-
-def _node_desc(spec: "core.TreeSpec") -> str:
-    """One-line human description of the node ``spec`` describes, for
-    structure-mismatch messages.
-
-    Container nodes → `_container_desc`; childless leaf → its type name
-    (``Tensor``, ``int``, ``NoneType``, ...); childless empty container →
-    the container desc with an empty list.
-    """
-    if not spec.children:
-        if spec.num_leaves == 0:
-            return _container_desc(spec)
-        spec_type = spec.type
-        return spec_type.__name__ if isinstance(spec_type, type) else str(spec_type)
-    return _container_desc(spec)
 
 
 def _leaf_paths(spec: "core.TreeSpec", leaves, counter, prefix=()):
@@ -523,13 +442,13 @@ class Graph:
         leaves, spec = core.flatten(tuple(args))
         if not _same_structure(spec, self.input_specs):
             mismatch_path = first_mismatch_path(self.input_specs, spec)
-            expected_spec = _subspec(self.input_specs, mismatch_path)
-            got_spec = _subspec(spec, mismatch_path)
+            expected_spec = _subtree_spec_at(self.input_specs, mismatch_path)
+            got_spec = _subtree_spec_at(spec, mismatch_path)
             raise core.TraceError(
                 f"run-time input structure does not match the traced "
                 f"signature — first mismatch at pytree path "
                 f"{format_path(mismatch_path)}: expected "
-                f"{_node_desc(expected_spec)}, got {_node_desc(got_spec)} "
+                f"{describe_node(expected_spec)}, got {describe_node(got_spec)} "
                 f"(expected {expected_spec!r}, got {got_spec!r})"
             )
         total = len(self.tensor_specs) + len(self.static_values)
