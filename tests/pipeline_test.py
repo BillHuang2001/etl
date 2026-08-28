@@ -82,6 +82,27 @@ def _linear_nested_dict(t):
 
 
 @etl.defn
+def _linear_pair(x, params):
+    """Linear layer over ``(x, {"w": w, "b": b})`` — a mixed tuple+dict input.
+
+    Used by the run/bind structure-mismatch tests: the dict sits at pytree
+    path ``[1]`` and its leaves at ``[1]['w']`` / ``[1]['b']``.
+    """
+    return etl.relu(etl.add(etl.dot(x, params["w"]), params["b"]))
+
+
+def _pair_specs():
+    """Specs for `_linear_pair`: ``(x, {"w": w, "b": b})`` with named leaves."""
+    return (
+        etl.TensorSpec((2, 3), etl.float32, name="x"),
+        {
+            "w": etl.TensorSpec((3, 4), etl.float32, name="w"),
+            "b": etl.TensorSpec((4,), etl.float32, name="b"),
+        },
+    )
+
+
+@etl.defn
 def _scaled(x, scale, mode, nothing):
     """Specializes on three static Python values: float, str, None.
 
@@ -466,6 +487,63 @@ def test_bind_validation():
     )
     with pytest.raises(etl.TraceError, match="no named inputs"):
         etl.bind(unnamed_exe, x=etl.zeros((3,), dtype=etl.float32))
+
+
+# ---------------------------------------------------------------------------
+# Run-time structure mismatches name the first diverging pytree path
+# ---------------------------------------------------------------------------
+
+
+def _pair_inputs():
+    """Concrete inputs for `_linear_pair`: ``(x, {"w": w, "b": b})``."""
+    x = etl.ones((2, 3), dtype=etl.float32)
+    w = etl.ones((3, 4), dtype=etl.float32)
+    b = etl.ones((4,), dtype=etl.float32)
+    return x, w, b
+
+
+def test_run_structure_mismatch_reports_pytree_path():
+    """A wrong dict key at run time keeps the traced-signature lead-in AND
+    appends the first-mismatch pytree path (the missing key's position)."""
+    executable = etl.build(_linear_pair, *_pair_specs())
+    x, w, b = _pair_inputs()
+
+    with pytest.raises(etl.TraceError) as excinfo:
+        etl.run(executable, x, {"w2": w, "b": b})  # 'w' replaced by 'w2'
+    message = str(excinfo.value)
+    assert "run-time input structure does not match the traced signature" in message
+    assert "first mismatch at pytree path [1]['w']" in message
+
+
+def test_run_structure_mismatch_tuple_arity_reports_pytree_path():
+    """A wrong tuple arity at run time keeps the traced-signature lead-in AND
+    appends the first-mismatch pytree path (the diverging tuple position)."""
+    xs = etl.TensorSpec((2, 3), etl.float32)
+    ws = etl.TensorSpec((3, 4), etl.float32)
+    bs = etl.TensorSpec((4,), etl.float32)
+    executable = etl.build(_linear_tuple, *_tuple_specs(xs, ws, bs))
+
+    x = etl.ones((2, 3), dtype=etl.float32)
+    w = etl.ones((3, 4), dtype=etl.float32)
+    with pytest.raises(etl.TraceError) as excinfo:
+        etl.run(executable, (x, w))  # inner tuple arity 2, traced arity 3
+    message = str(excinfo.value)
+    assert "run-time input structure does not match the traced signature" in message
+    assert "first mismatch at pytree path [0]" in message
+
+
+def test_bind_structure_mismatch_reports_pytree_path():
+    """A BoundExecutable's remaining-argument structure mismatch (wrong dict
+    key for the unbound portion) also names the first-mismatch pytree path."""
+    executable = etl.build(_linear_pair, *_pair_specs())
+    bound = etl.bind(executable, w=etl.ones((3, 4), dtype=etl.float32))
+    x, _, b = _pair_inputs()
+
+    with pytest.raises(etl.TraceError) as excinfo:
+        etl.run(bound, x, {"bogus": b})  # expected key 'b' at [1], got 'bogus'
+    message = str(excinfo.value)
+    assert "run-time input structure does not match the traced signature" in message
+    assert "first mismatch at pytree path [1]" in message
 
 
 # ---------------------------------------------------------------------------
