@@ -24,6 +24,7 @@ from etl.ir.builder import InsertionPoint
 from etl.trace import Graph, trace
 from etl.trace.graph import _normalize_leaf_types
 from etl.transforms._wrappers import TransformCallable
+from etl.transforms.batching import with_batch_depth
 from etl.transforms.vectorize import (
     _first_structure_mismatch,
     _format_path,
@@ -47,10 +48,11 @@ axes, then rearranges outputs per out_axes — each level adds one leading
 mapped dim."""
 
 #: Reserved name pattern of the fresh batch dims `vectorize_graph` introduces
-#: (ONE shared `Dim("batch")` per pass — see batching._batched_input_specs).
-#: These are the ONLY dims mapped-output detection keys on (by identity); the
-#: `_\d+` suffix stays accepted for dims named `batch_1` in pre-existing or
-#: user-built graphs.
+#: (ONE shared `Dim` per pass, named from the active pass depth — `"batch"`
+#: at depth 0, `"batch_1"` at depth 1, ... — see
+#: `batching._batched_input_specs`). These are the ONLY dims mapped-output
+#: detection keys on (by identity); the `_\d+` suffix stays accepted for dims
+#: named `batch_1` in pre-existing or user-built graphs.
 _BATCH_DIM_NAME = re.compile(r"^batch(_\d+)?$")
 
 
@@ -121,7 +123,14 @@ def _vmap_fn(fn, args, in_axes, out_axes) -> Graph:
     """
     unvectorized = _derive_unvectorized_args(args, in_axes)
     if isinstance(fn, TransformCallable):
-        inner_graph = fn(*unvectorized)
+        # Composition (nested vmap): the inner callable runs one level deeper
+        # so its vectorize pass names its batch dim `batch_1`, `batch_2`, ...
+        # while the outer pass below runs at the parent depth and keeps the
+        # current level's name — the numpy interpreter binds symbolic dims BY
+        # NAME, so same-named dims from different nesting levels would
+        # collide at run time (unequal extents raise a misleading ShapeError).
+        with with_batch_depth():
+            inner_graph = fn(*unvectorized)
         graph = vectorize(inner_graph, in_axes)
     else:
         graph = trace(fn, *unvectorized)
@@ -212,14 +221,15 @@ def _derive_unvectorized_args(args, in_axes):
 def _collect_batch_dims(graph: Graph):
     """The fresh batch `Dim` objects this vectorization introduced.
 
-    `vectorize_graph` prepends ONE fresh symbolic `Dim("batch")` shared by all
-    mapped input specs of the pass (unmapped specs are reused unchanged), so
-    the batch dims of THIS vectorization are exactly the leading entries of
-    the input specs whose names follow that reserved pattern. Collected as
-    objects — nested vmap levels create their OWN fresh Dims with the same
-    names, and only the current level's objects must count (output detection
-    compares by identity, `is`). An empty list (no mapped inputs) makes every
-    output unmapped.
+    `vectorize_graph` prepends ONE fresh symbolic batch `Dim` (named from the
+    active pass depth — `"batch"` at depth 0, `"batch_1"` at depth 1, ...)
+    shared by all mapped input specs of the pass (unmapped specs are reused
+    unchanged), so the batch dims of THIS vectorization are exactly the
+    leading entries of the input specs whose names follow that reserved
+    pattern. Collected as objects — nested vmap levels create their OWN fresh
+    Dims with level-distinct names, and only the current level's objects must
+    count (output detection compares by identity, `is`). An empty list (no
+    mapped inputs) makes every output unmapped.
     """
     batch_dims = []
     for spec in graph.tensor_specs:
