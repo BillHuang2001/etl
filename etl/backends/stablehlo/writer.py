@@ -643,10 +643,36 @@ class Writer:
             "(dynamic broadcast)"
         )
 
+    def _reject_dynamic_dims(self, op: Op, shape, what: str, op_name=None) -> None:
+        """Raise ``core.BackendError`` when ``shape`` carries dynamic dims
+        (``Dim``/``DimExpr``/``None`` — ints are static; bool is an int
+        subclass and counts as static). ``what`` names the shape's role in
+        the op (e.g. ``"operand shape"``); ``op_name`` overrides the op name
+        in the message (the keepdims reshapes inside the reduce emitters
+        report as 'reshape'). This keeps invalid MLIR away from the
+        compilers: a dynamic-dims op must fail here, at export/lower time,
+        never with an obscure iree-compile parse error later."""
+        dynamic = tuple(d for d in shape if not isinstance(d, (int, np.integer)))
+        if not dynamic:
+            return
+        name = op_name or op.name
+        raise BackendError(
+            f"stablehlo export: op '{name}'{self._loc(op)} {what} has "
+            f"dynamic dims {tuple(shape)!r} (offending dims {dynamic!r}) — "
+            "dynamic shapes are not supported by the StableHLO compiler "
+            "backends in v1 (use concrete static shapes or the numpy backend)"
+        )
+
     def _emit_reshape(self, op: Op) -> str:
         """`stablehlo.reshape` uses the functional-type custom form
         (operand and result types differ — the single-type form is
-        rejected by the compiler as "invalid kind of type specified")."""
+        rejected by the compiler as "invalid kind of type specified").
+
+        The StableHLO verifier requires statically shaped (or single bounded
+        dimension) reshape operands/results, so any dynamic dim fails here
+        with a clear BackendError — never invalid MLIR."""
+        self._reject_dynamic_dims(op, tuple(op.operands[0].type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         result_name = self._bind_results(op)[0]
         return (
             f"{result_name} = stablehlo.reshape {self._name(op.operands[0])}"
@@ -668,6 +694,12 @@ class Writer:
 
     def _emit_slice(self, op: Op) -> str:
         x = op.operands[0]
+        # EMPIRICAL (iree 3.11.0): iree-compile parses a dynamic-operand
+        # slice but the runtime ABORTS on it ("hal.fence.await" failure) —
+        # reject here at export/lower time, never emit it (see
+        # _reject_dynamic_dims).
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         starts = tuple(op.attributes["start_indices"])
         limits = tuple(op.attributes["limit_indices"])
         strides = tuple(op.attributes.get("strides") or (1,) * len(starts))
@@ -693,6 +725,11 @@ class Writer:
 
     def _emit_pad(self, op: Op) -> str:
         x = op.operands[0]
+        # EMPIRICAL (iree 3.11.0): iree-compile parses dynamic-shape pad but
+        # the runtime ABORTS on it ("hal.fence.await" failure) — reject here
+        # at export/lower time, never emit it (see _reject_dynamic_dims).
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         pairs = [tuple(p) for p in op.attributes["padding_config"]]
         value = op.attributes.get("value", 0.0)
         dtype = np.dtype(x.type.dtype)
@@ -755,6 +792,14 @@ class Writer:
             )
             cur = converted
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
+            # The keepdims reshape must be static: a dynamic dim moved
+            # between reduced/result shapes is invalid StableHLO reshape.
+            self._reject_dynamic_dims(
+                op, tuple(reduced_shape), "keepdims reshape operand", op_name="reshape"
+            )
+            self._reject_dynamic_dims(
+                op, tuple(op.result.type.shape), "keepdims reshape result", op_name="reshape"
+            )
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
@@ -771,17 +816,22 @@ class Writer:
         axes = tuple(op.attributes.get("axes", ()))
         keepdims = bool(op.attributes.get("keepdims", False))
         dims = self._reduce_dims(x, axes)
+        dynamic_reduced = tuple(
+            x.type.shape[i] for i in dims
+            if not isinstance(x.type.shape[i], (int, np.integer))
+        )
+        if dynamic_reduced:
+            raise BackendError(
+                f"stablehlo export: op 'reduce_mean'{self._loc(op)} reduces "
+                f"over dynamic dims {dynamic_reduced!r} of shape "
+                f"{tuple(x.type.shape)!r} — the element count cannot be "
+                "computed statically; dynamic shapes are not supported by "
+                "the StableHLO compiler backends in v1 (decompose it "
+                "manually or use a future adapter)"
+            )
         count = 1
         for i in dims:
-            dim = x.type.shape[i]
-            if not isinstance(dim, int) or isinstance(dim, bool):
-                raise BackendError(
-                    f"stablehlo export: op 'reduce_mean'{self._loc(op)} "
-                    "reduces over a non-static dimension — the element "
-                    "count cannot be computed statically; decompose it "
-                    "manually or use a future adapter"
-                )
-            count *= dim
+            count *= x.type.shape[i]
         out_dtype = np.dtype(op.result.type.dtype)
         lines, sum_name, reduced_shape = self._emit_reduce_core(x, dims, "sum")
         converted = self._new_name()
@@ -808,6 +858,14 @@ class Writer:
         )
         cur = divided
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
+            # The keepdims reshape must be static: a dynamic dim moved
+            # between reduced/result shapes is invalid StableHLO reshape.
+            self._reject_dynamic_dims(
+                op, tuple(reduced_shape), "keepdims reshape operand", op_name="reshape"
+            )
+            self._reject_dynamic_dims(
+                op, tuple(op.result.type.shape), "keepdims reshape result", op_name="reshape"
+            )
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
@@ -950,6 +1008,12 @@ class Writer:
 
     def _emit_conv(self, op: Op) -> str:
         x, w = op.operands
+        # v1 uniformity: SAME padding already needed static dims; extend the
+        # rejection to ALL conv shapes — a dynamic dim anywhere (operand or
+        # result) fails here with a clear BackendError, never invalid MLIR.
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(w.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         rank = x.type.rank
         n_spatial = rank - 2
         attrs = op.attributes
