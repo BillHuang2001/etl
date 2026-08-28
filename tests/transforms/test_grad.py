@@ -282,6 +282,47 @@ def test_grad_zero_tangent_rules(fn_builder):
 
 
 # ---------------------------------------------------------------------------
+# sign has a zero derivative a.e. — an implemented VJP rule (not a deferral)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [etl.float32, etl.float64])
+def test_grad_sign_is_all_zeros(dtype):
+    def f(x):
+        return etl.ops.sum(etl.sign(x))
+
+    x = np.array([1.0, -2.0, 3.0, -0.5], dtype=dtype)
+    graph = etl.grad(f)(etl.TensorSpec((4,), dtype))
+    out = first(as_np(run_graph(graph, x)))
+    np.testing.assert_array_equal(out, np.zeros(4, dtype=dtype))
+
+
+def test_grad_mixed_sign_times_x_gradient_is_sign():
+    # sum(x * sign(x)) = sum(abs(x)) → d/dx = sign(x) for x ≠ 0; verified
+    # analytically and against a central difference (both in float64).
+    def f(x):
+        return etl.ops.sum(etl.multiply(x, etl.sign(x)))
+
+    x = np.array([1.5, -2.0, 0.5, -3.0])  # avoid the kink at 0
+    graph = etl.grad(f)(etl.TensorSpec((4,), np.float64))
+    out = first(as_np(run_graph(graph, x)))
+    np.testing.assert_array_equal(out, np.sign(x))
+
+    def fnp(z):
+        return float(np.sum(np.abs(z)))
+
+    eps = 1e-6
+    grad = np.empty_like(out)
+    for i in range(out.size):
+        xp = x.copy()
+        xm = x.copy()
+        xp[i] += eps
+        xm[i] -= eps
+        grad[i] = (fnp(xp) - fnp(xm)) / (2.0 * eps)
+    np.testing.assert_allclose(out, grad, rtol=1e-7, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Ops with no VJP rule raise TransformError — never a silent fallback
 # ---------------------------------------------------------------------------
 

@@ -296,6 +296,19 @@ def test_jvp_nondifferentiable_outputs_give_zero_tangent():
     assert np.asarray(tangent[0]) == 0.0
 
 
+def test_jvp_sign_gives_zero_tangent():
+    """sign has an implemented zero-derivative JVP rule (derivative 0 a.e.):
+    the pointwise tangent output is all zeros, whatever the tangent."""
+    spec = etl.TensorSpec((4,), np.float64)
+    x = np.linspace(-1.0, 1.0, 4)
+    t = np.array([0.3, -0.6, 0.9, 0.4])
+
+    _, primal, tangent = run_jvp(etl.sign, spec, (spec,), (x,), (t,))
+    np.testing.assert_allclose(primal, np.sign(x), rtol=1e-7, atol=1e-6)
+    assert np.asarray(tangent[0]).shape == x.shape
+    np.testing.assert_array_equal(np.asarray(tangent[0]), np.zeros(4))
+
+
 def _np_conv_valid(x, w):
     """NCHW 2D convolution with VALID padding (unit strides/dilations)."""
     x = np.asarray(x)

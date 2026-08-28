@@ -283,6 +283,25 @@ def test_vjp_stop_gradient_zero_cotangent():
 
 
 # ---------------------------------------------------------------------------
+# sign has a zero derivative a.e. — an implemented VJP rule (not a deferral)
+# ---------------------------------------------------------------------------
+
+
+def test_vjp_sign_gives_zero_cotangent():
+    """sign's implemented VJP rule (derivative 0 a.e.) zeroes any cotangent:
+    the input cotangent of a vector-output `sign(x)` is all zeros."""
+    spec = etl.TensorSpec((4,), np.float64)
+    x = np.linspace(-1.0, 1.0, 4)
+    c = np.array([0.7, -1.2, 0.4, 1.9])
+
+    graph = etl.vjp(etl.sign, spec)(spec)
+    graph.verify()
+    primal_out, (got,) = run_graph(graph, (x,), (c,))
+    np.testing.assert_allclose(as_np(primal_out), np.sign(x), rtol=1e-7, atol=1e-6)
+    np.testing.assert_array_equal(as_np(got), np.zeros(4))
+
+
+# ---------------------------------------------------------------------------
 # Ops with no VJP rule raise TransformError — never a silent fallback
 # ---------------------------------------------------------------------------
 
