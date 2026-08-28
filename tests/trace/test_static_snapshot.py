@@ -6,8 +6,11 @@ specialize the graph at TRACE time and are validated at RUN time
 (`Graph.flatten_inputs`). A fully-static dataclass config object is also
 legitimate static specialization: the tracer descends into dataclass pytree
 containers, so every static field becomes a specializing leaf. Non-static
-leaf values are still rejected. These tests pin specialization, run-time
-validation, trace-time snapshotting, and rejection of non-static values.
+leaf values are still rejected. etl value types (`Device`/`Dim`/`TensorSpec`/
+`TreeSpec`) are also static inputs, but as SINGLE leaves — no descent into
+their fields, unlike user dataclasses. These tests pin specialization,
+run-time validation, trace-time snapshotting, and rejection of non-static
+values.
 """
 
 import dataclasses
@@ -49,6 +52,14 @@ class PlainConfig:
 
     def __init__(self, lr):
         self.lr = lr
+
+
+@dataclasses.dataclass
+class TwoFieldConfig:
+    """A two-field fully-static config dataclass — descends into both fields."""
+
+    lr: float
+    steps: int
 
 
 def cast_to(x, dt):
@@ -222,6 +233,60 @@ def test_dataclass_config_spec_specializes(run_graph, as_numpy):
     # a mismatched config is rejected at run time, like any other static value
     with pytest.raises(etl.TraceError, match="graph was specialized on"):
         run_graph(g_small, x, Config(0.25))
+
+
+# --- etl value types are single leaves ---------------------------------------
+
+
+def test_device_static_arg_is_single_leaf(run_graph, as_numpy):
+    dev = etl.Device("cpu", 0)
+    graph = etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), dev)
+
+    # ONE static leaf — the tracer never descends into the Device's
+    # (kind, index) fields.
+    (record,) = graph.static_values
+    assert record.index == 1
+    assert record.path == (1,)
+    assert record.value == dev
+    assert record.kind == "Device"
+
+    # run-time validation treats the Device as one static value
+    x = np.array([1.0, 2.0], dtype=np.float32)
+    np.testing.assert_array_equal(as_numpy(run_graph(graph, x, dev)), x)
+    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+        run_graph(graph, x, etl.Device("cuda", 0))
+
+
+def test_dim_static_arg_is_single_leaf():
+    dim = etl.Dim("B")
+    graph = etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), dim)
+
+    # ONE static leaf — no descent into the Dim's (name, size) fields.
+    (record,) = graph.static_values
+    assert record.index == 1
+    assert record.path == (1,)
+    assert record.value == dim
+    assert record.kind == "Dim"
+
+    # flatten_inputs validates the Dim as a single static value (Dim
+    # equality is by name+size).
+    flat = graph.flatten_inputs((np.ones(2, dtype=np.float32), etl.Dim("B")))
+    assert len(flat) == 1
+    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+        graph.flatten_inputs((np.ones(2, dtype=np.float32), etl.Dim("C")))
+
+
+def test_user_dataclass_still_descends_field_by_field():
+    graph = etl.trace(
+        identity_fn, etl.TensorSpec((2,), etl.float32), TwoFieldConfig(0.5, 3)
+    )
+
+    # contrast with the single-leaf etl value types: a user dataclass is a
+    # pytree container, so every static field becomes a recorded leaf
+    assert len(graph.static_values) == 2
+    lr_rec, steps_rec = graph.static_values
+    assert (lr_rec.path, lr_rec.value, lr_rec.kind) == ((1, 0), 0.5, "float")
+    assert (steps_rec.path, steps_rec.value, steps_rec.kind) == ((1, 1), 3, "int")
 
 
 # --- run-time static validation via flatten_inputs ----------------------------

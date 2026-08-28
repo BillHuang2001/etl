@@ -285,6 +285,40 @@ def test_flatten_inputs_errors(args, error, match):
         g.flatten_inputs(args(x, w))
 
 
+@pytest.mark.parametrize(
+    ("builder", "args", "path"),
+    [
+        # container-type mismatch at element 1: tuple instead of dict
+        (_trace_wb_graph, lambda x, w: (x, (w, 5)), "[1]"),
+        # node_data mismatch (wrong dict key) at the dict node itself
+        (_trace_wb_graph, lambda x, w: (x, {"z": w, "b": 5}), "[1]"),
+        # deep node_data mismatch: wrong dict key at path (1,1)
+        (_trace_structured_graph, lambda x, w: (x, ([w, w], {"z": w, "b": 5})), "[1][1]"),
+        # deep arity mismatch: list of 1 vs 2 at path (1,0)
+        (_trace_structured_graph, lambda x, w: (x, ([w], {"w": w, "b": 5})), "[1][0]"),
+        # deep container-type mismatch: tuple instead of list at path (1,0)
+        (_trace_structured_graph, lambda x, w: (x, ((w, w), {"w": w, "b": 5})), "[1][0]"),
+    ],
+    ids=[
+        "tuple-instead-of-dict",
+        "wrong-dict-key",
+        "wrong-dict-key-deep",
+        "wrong-list-arity-deep",
+        "tuple-instead-of-list-deep",
+    ],
+)
+def test_flatten_inputs_mismatch_reports_first_mismatch_path(builder, args, path):
+    g = builder()
+    x = np.ones(SHAPE, np.float32)
+    w = np.zeros(SHAPE, np.float32)
+    with pytest.raises(etl.TraceError) as excinfo:
+        g.flatten_inputs(args(x, w))
+    msg = str(excinfo.value)
+    # the old lead-in is preserved, with the pytree path detail appended
+    assert "run-time input structure does not match the traced signature" in msg
+    assert f"first mismatch at pytree path {path}:" in msg
+
+
 def test_flatten_inputs_symbolic_and_static_dims():
     def f(a):
         return etl.add(a, a)
