@@ -24,9 +24,12 @@ class ExampleResult:
 
     Conformance fields: ``max_abs_error``, ``max_rel_error``, ``numpy_pass``,
     ``torch_pass`` (``None`` when torch comparisons were skipped or the
-    example has no torch reference). Benchmark fields: run times in
-    milliseconds per implementation plus speedup ratios vs the numpy
-    reference (``numpy_ms / etl_ms``) and vs the torch reference
+    example has no torch reference), and the EFFECTIVE per-example
+    tolerances used for the comparisons — ``rtol``/``atol``/``tolerance``
+    (:func:`etl.bench.conformance` records the resolved effective values on
+    every result; benchmark results leave them ``None``). Benchmark fields:
+    run times in milliseconds per implementation plus speedup ratios vs the
+    numpy reference (``numpy_ms / etl_ms``) and vs the torch reference
     (``torch_ms / etl_ms``). ``error`` records any execution failure
     (``"ExceptionType: message"``); on error all other fields stay ``None``.
     """
@@ -43,6 +46,9 @@ class ExampleResult:
     speedup_vs_numpy: Optional[float] = None
     speedup_vs_torch: Optional[float] = None
     error: Optional[str] = None
+    rtol: Optional[float] = None
+    atol: Optional[float] = None
+    tolerance: Optional[float] = None
 
 
 @dataclass
@@ -179,6 +185,26 @@ def _backend_device_prefix(report) -> str:
     return f"backend={report.backend} device={report.device}, "
 
 
+def _tol_cell(result: ExampleResult, report: ConformanceReport) -> str:
+    """Compact per-example tolerance cell for the conformance table.
+
+    ``"-"`` when the example used the global defaults (its effective
+    tolerances equal the report's); ``"abs 0.0001"`` for a max-abs-error
+    override; ``"rtol 0.001 atol 0.001"`` for rtol/atol overrides.
+    """
+    if result.error is not None:
+        return "-"  # errored results carry no tolerances
+    if (
+        result.rtol == report.rtol
+        and result.atol == report.atol
+        and result.tolerance == report.tolerance
+    ):
+        return "-"
+    if result.tolerance is not None:
+        return f"abs {result.tolerance:g}"
+    return f"rtol {result.rtol:g} atol {result.atol:g}"
+
+
 def _format_conformance(report: ConformanceReport) -> str:
     header = [
         "example",
@@ -186,6 +212,7 @@ def _format_conformance(report: ConformanceReport) -> str:
         "max_rel_error",
         "numpy",
         "torch",
+        "tol",
         "etl_ms",
         "error",
     ]
@@ -198,6 +225,7 @@ def _format_conformance(report: ConformanceReport) -> str:
                 _num(result.max_rel_error),
                 _verdict(result.numpy_pass),
                 _verdict(result.torch_pass),
+                _tol_cell(result, report),
                 _ms(result.etl_ms),
                 _short_error(result.error),
             ]
