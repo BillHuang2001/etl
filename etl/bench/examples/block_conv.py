@@ -162,13 +162,18 @@ register_all([
         ),
         graph=_conv_block_stride2_graph,
         numpy_ref=_conv_block_stride2_numpy,
-        # Strict defaults: measured max_abs_error 3.05e-05 (fp32 accumulation
-        # order in the stride-2 convs — the 3x3 convs pass exactly like the
+        # tolerance=1e-4: measured fp32 accumulation-order noise. numpy
+        # backend: max_abs 3.05e-05 (the 3x3 convs pass exactly like the
         # micro conv2d examples; the residual add of ~1-magnitude values
-        # accumulates the small kernel-level noise).
+        # accumulates the small kernel-level noise). iree: max_abs 3.91e-5
+        # (cpu) / 4.96e-5 (cuda) (~2x margin at 1e-4); verified NOT a
+        # wrong-result bug (iree cuda vs fp64 ground truth = 4.24e-5, fp32
+        # ref vs fp64 = 2.52e-5 — both in the fp32 noise band, |ref64| up to
+        # 160).
         # No torch ref: SAME stride-2 padding is asymmetric (pad (0,1) per
         # spatial axis), which torch's symmetric conv2d padding cannot
         # express — a torch ref would need F.pad shims (kept out on purpose).
+        tolerance=1e-4,
         category="block",
         tags=("conv",),
     ),

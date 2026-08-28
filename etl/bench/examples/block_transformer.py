@@ -436,10 +436,16 @@ register_all([
         graph=_mha_block_graph,
         numpy_ref=_mha_block_numpy,
         torch_ref=_mha_block_torch,
-        # numpy backend executes the same kernels as the reference — max_abs
-        # 0.0; the torch ref is an exact formula mirror (torch.softmax vs the
+        # tolerance=1e-3: measured iree fp32 accumulation-order noise, same
+        # class as the sibling ``transformer`` override — max_abs 2.37e-4
+        # (iree cpu) / 2.48e-4 (iree cuda) vs the fp32 ref (~4x margin);
+        # verified NOT a wrong-result bug (iree cuda vs fp64 ground truth =
+        # 1.34e-4 while the numpy fp32 ref's own error vs fp64 = 3.06e-4 —
+        # iree is closer to fp64). numpy backend stays exact (max_abs 0.0);
+        # the torch ref is an exact formula mirror (torch.softmax vs the
         # max-subtract formula differ only by fp32 noise, same class as the
         # micro attention example, which passes strict defaults).
+        tolerance=1e-3,
         category="block",
         tags=("transformer_block",),
     ),
