@@ -628,6 +628,32 @@ def test_dot_size1_rhs_batch_squeezed():
     )
 
 
+def test_dot_size1_rhs_batch_dynamic_squeeze_skipped():
+    # The size-1-batch squeeze path is gated on FULLY STATIC shapes (fix
+    # 16ced05): with a dynamic lhs, (B,16,8) @ (1,8,4) must fall through to
+    # the batched dynamic-broadcast path. The pre-fix emission — squeeze
+    # reshape of the rhs plus a NON-batched dot_general whose lhs carries
+    # the dynamic dim — made iree's import insert a `stablehlo.dynamic_
+    # reshape` that its llvm-cpu pipeline cannot legalize
+    # ("failed to legalize operation 'stablehlo.dynamic_reshape'").
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((_DYN, 16, 8), etl.float32),
+        etl.TensorSpec((1, 8, 4), etl.float32),
+    )
+    assert "-> tensor<?x16x4xf32>" in mlir
+    assert "stablehlo.dynamic_broadcast_in_dim" in mlir
+    assert (
+        "lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], "
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [1]"
+        in mlir
+    )
+    # The un-gated squeeze pattern is gone: no rhs matrix reshape
+    # ((1,8,4) -> (8,4)) and no non-batched dot_general.
+    assert ": (tensor<1x8x4xf32>) -> tensor<8x4xf32>" not in mlir
+    assert "lhs_batching_dimensions = [], rhs_batching_dimensions = []," not in mlir
+
+
 def test_dot_matched_multi_batch_direct():
     # Matched batch structure emits a direct batched dot_general with NO
     # broadcast/reshape ops — byte-identical to the pre-fix exporter output
