@@ -326,8 +326,15 @@ class Writer:
         share one shape (the verifier rejects mixed scalar/non-scalar
         operands), so scalar operands — Python scalars auto-promoted to
         scalar constants at trace time — are broadcast to the result shape
-        first. ``cast`` emits ``stablehlo.convert`` in the functional-type
-        custom form (operand and result types differ by definition).
+        first. They must ALSO share one element type: etl binary ops
+        promote operands per ``np.result_type`` while StableHLO keeps the
+        operand types, so after shape equalization every operand whose
+        dtype differs from the result dtype is ``stablehlo.convert``-ed to
+        it (the broadcast preserves the operand dtype, so converting after
+        equalization is always well-typed, including dynamic ``?`` dims).
+        Unary ops never need this (their dtype is preserved). ``cast``
+        emits ``stablehlo.convert`` in the functional-type custom form
+        (operand and result types differ by definition).
         """
         mnemonic = mapping.lookup_mapping(op.name)
         result_shape = tuple(op.result.type.shape)
@@ -346,6 +353,16 @@ class Writer:
                 f"({operand_type}) -> {self._vt(op.result.type)}"
             )
         else:
+            result_dtype = np.dtype(op.result.type.dtype)
+            for i, (name, operand) in enumerate(zip(names, op.operands)):
+                if np.dtype(operand.type.dtype) != result_dtype:
+                    converted = self._new_name()
+                    lines.append(
+                        f"{converted} = stablehlo.convert {name} : "
+                        f"({self._type_str(operand.type.dtype, result_shape)}) -> "
+                        f"{self._type_str(result_dtype, result_shape)}"
+                    )
+                    names[i] = converted
             lines.append(
                 f"{result_name} = {mnemonic} {', '.join(names)} : "
                 f"{self._vt(op.result.type)}"
@@ -546,8 +563,12 @@ class Writer:
         return name, lines
 
     def _emit_select(self, op: Op) -> str:
-        """`stablehlo.select` — all operands (pred included) equalized to
-        the result shape (StableHLO requires equal non-scalar shapes)."""
+        """`stablehlo.select` — all operands equalized to the result shape
+        (StableHLO requires equal non-scalar shapes), and the on_true /
+        on_false branches converted to the promoted result dtype (the
+        non-predicate operands and the result must share one element type;
+        the pred stays i1 — etl select promotes branches per
+        ``np.result_type`` while StableHLO keeps the operand types)."""
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
         shape_source = self._shape_source(op.operands, result_shape)
@@ -557,8 +578,23 @@ class Writer:
             name, extra = self._equalize_operand(operand, result_shape, shape_source)
             lines.extend(extra)
             names.append(name)
+        branch_dtype = np.dtype(op.result.type.dtype)
+        branch_types = []
+        for i, name in enumerate(names[1:], start=1):
+            dtype = np.dtype(op.operands[i].type.dtype)
+            if dtype != branch_dtype:
+                converted = self._new_name()
+                lines.append(
+                    f"{converted} = stablehlo.convert {name} : "
+                    f"({self._type_str(dtype, result_shape)}) -> "
+                    f"{self._type_str(branch_dtype, result_shape)}"
+                )
+                name = converted
+                names[i] = name
+            branch_types.append(self._type_str(branch_dtype, result_shape))
         op_types = ", ".join(
-            self._type_str(v.type.dtype, result_shape) for v in op.operands
+            [self._type_str(op.operands[0].type.dtype, result_shape)]
+            + branch_types
         )
         lines.append(
             f"{result_name} = stablehlo.select {', '.join(names)} : "
@@ -567,6 +603,13 @@ class Writer:
         return "\n".join(lines)
 
     def _emit_compare(self, op: Op) -> str:
+        """`stablehlo.compare` — both operands equalized to the result
+        shape (StableHLO requires equal non-scalar shapes) and converted to
+        their numpy-promoted dtype ``np.result_type(lhs, rhs)`` (etl
+        comparisons promote per numpy while StableHLO keeps the operand
+        types; the i1 result is NOT the conversion target — the operands
+        must keep the promoted numeric dtype, matching the numpy
+        interpreter's promotion)."""
         direction = mapping.lookup_mapping(op.name)
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
@@ -577,13 +620,23 @@ class Writer:
             name, extra = self._equalize_operand(operand, result_shape, shape_source)
             lines.extend(extra)
             names.append(name)
-        op_types = ", ".join(
-            self._type_str(v.type.dtype, result_shape) for v in op.operands
-        )
+        promoted = np.result_type(*(np.dtype(v.type.dtype) for v in op.operands))
+        op_types = []
+        for i, (name, operand) in enumerate(zip(names, op.operands)):
+            if np.dtype(operand.type.dtype) != promoted:
+                converted = self._new_name()
+                lines.append(
+                    f"{converted} = stablehlo.convert {name} : "
+                    f"({self._type_str(operand.type.dtype, result_shape)}) -> "
+                    f"{self._type_str(promoted, result_shape)}"
+                )
+                name = converted
+                names[i] = name
+            op_types.append(self._type_str(promoted, result_shape))
         lines.append(
             f'{result_name} = "stablehlo.compare"({", ".join(names)}) '
             f"{{comparison_direction = #stablehlo<comparison_direction "
-            f"{direction}>}} : ({op_types}) -> {self._vt(op.result.type)}"
+            f"{direction}>}} : ({', '.join(op_types)}) -> {self._vt(op.result.type)}"
         )
         return "\n".join(lines)
 
