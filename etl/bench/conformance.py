@@ -120,7 +120,9 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         use_torch: ``None`` = auto (torch comparisons run iff ``import torch``
             succeeds); ``True`` = require torch — raises a clear
             ``ImportError`` mentioning ``pip install etl[bench]`` when torch
-            is unavailable; ``False`` = numpy-only.
+            is unavailable; ``False`` = numpy-only. Examples without a torch
+            reference (``torch_ref`` None) are SKIPPED for the torch
+            comparison (``torch_pass`` None) — never an error.
         tolerance: optional absolute-error pass threshold (``None`` = the
             default ``rtol``/``atol`` allclose-style rule; see
             :func:`_compare`). Per-example overrides: when an example sets
@@ -206,11 +208,7 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
             expected = flatten_outputs(example.numpy_ref(inputs))
             comparison = _compare(actual, expected, e_rtol, e_atol, e_tolerance)
             torch_pass = None
-            if enabled:
-                if example.torch_ref is None:
-                    raise ValueError(
-                        f"example {name!r} has no torch reference"
-                    )
+            if enabled and example.torch_ref is not None:
                 torch_expected = flatten_outputs(
                     example.torch_ref(inputs, device=torch_device)
                 )

@@ -61,7 +61,9 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
         use_torch: ``None`` = auto (torch runs iff ``import torch``
             succeeds); ``True`` = require torch — raises a clear
             ``ImportError`` mentioning ``pip install etl[bench]`` when torch
-            is unavailable; ``False`` = numpy-only.
+            is unavailable; ``False`` = numpy-only. Examples without a torch
+            reference (``torch_ref`` None) are SKIPPED for the torch timing
+            (``torch_ms`` and ``speedup_vs_torch`` None) — never an error.
         repeats: number of timed runs per implementation (best-of-N
             reported); must be >= 1.
         warmup: number of untimed runs before timing; must be >= 0.
@@ -121,11 +123,7 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
                 lambda: example.numpy_ref(inputs), warmup, repeats
             )
             torch_ms = None
-            if enabled:
-                if example.torch_ref is None:
-                    raise ValueError(
-                        f"example {name!r} has no torch reference"
-                    )
+            if enabled and example.torch_ref is not None:
                 torch_ms = best_time_ms(
                     lambda: example.torch_ref(inputs, device=torch_device),
                     warmup, repeats,
