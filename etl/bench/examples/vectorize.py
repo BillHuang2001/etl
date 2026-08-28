@@ -16,52 +16,66 @@ references use batched torch ops (lazy import via ``require_torch``).
 
 Dev-time verification (numpy backend, recorded once at development time;
 seed 0 inputs):
-- All five forward examples (vmap_softmax/layernorm/linear/mlp/attention)
-  match their numpy references EXACTLY (max_abs error 0.0): the vectorized
-  graphs and the hand-written per-sample-loop references run the same fp32
-  kernels in the same order.
+
+- All six examples pass the strict defaults (rtol=atol=1e-5) against BOTH
+  references: the forward examples match their numpy references EXACTLY
+  (max_abs error 0.0 — the vectorized graphs and the hand-written
+  per-sample-loop references run the same fp32 kernels in the same order);
+  vmap_grad_mlp vs its float64 finite-difference reference measures
+  max_abs 5.9e-06 (fp32 backward accumulation noise — the previous
+  [1,8]-row formulation measured 1.28e-05; the [4,8] formulation is
+  numerically comparable and stays well within the strict defaults).
+  Torch references pass at the strict defaults as well.
 - vmap_softmax cross-checked against a manually batched ``@etl.defn``
   (identical formulas, explicit leading batch dim): max_abs diff 0.0 and an
   IDENTICAL op sequence (``reduce_max, subtract, exp, reduce_sum, divide``)
   — the vmap graph contains exactly the ordinary ops a hand-batched graph
   would.
-- vmap_grad_mlp vs the finite-difference reference: max_abs 1.28e-05 at a
-  gradient element of magnitude 108 (fp32 backward accumulation noise), max
-  relative error 6.3e-06 — passes the strict defaults (rtol=atol=1e-5)
-  elementwise. No tolerance relaxation needed.
-- Torch references (lazy ``require_torch`` pattern) are executed and
-  validated with torch present: all six examples pass conformance against
-  both references at the strict defaults (torch=enabled, rtol=atol=1e-5,
-  seed 0). Measured max_abs error vs the etl numpy-backend outputs: 0.0 for
-  the softmax/layernorm/linear/attention examples, 7.6e-06 for vmap_mlp,
-  and 1.14e-05 for vmap_grad_mlp (gradient magnitudes up to ~108) — within
-  ``atol + rtol*|b|`` elementwise. The MLP torch references use per-sample
-  einsum matmuls (a plain ``x @ w1`` with x[32,16] and w1[32,16,32]
-  broadcasts the matrix per batch), and vmap_grad_mlp's torch reference
-  differentiates only the first five tensors, mirroring
-  argnums=(0,1,2,3,4) (b2 excluded).
-- iree spot check (vmap_softmax, backend='iree', device cpu): FAILS at
-  compile time with a GENUINE core/backend limitation, not an example bug:
-  ``vectorize`` replaces each mapped static dim with a fresh symbolic
-  ``Dim("batch")`` by design (mapped-output detection keyed on those dims),
-  the StableHLO exporter renders symbolic dims as unbounded dynamic ``?``,
-  and iree-compile rejects ``stablehlo.reshape`` with a dynamic result dim
-  (``'stablehlo.reshape' op result #0 must be statically shaped or single
-  bounded dimension tensor ... got 'tensor<?x1xf32>'``) — the keepdims
-  reductions and the rank/batch-aligning reshapes of every shape-changing
-  vmap graph hit this. Minimal repro WITHOUT vmap: tracing the same softmax
-  ``@etl.defn`` with a symbolic spec ``TensorSpec((etl.dim("B"), 16))`` and
-  lowering to iree fails identically; a symbolic-spec graph without
-  reshapes (``relu(sum(x, axes=-1))``) compiles and runs on iree, as does a
-  reshape-free vmap graph (pure elementwise). Fix belongs in core (bound
-  dims or a reshape-free keepdims lowering); the numpy backend handles all
-  vmap examples exactly.
+- iree/llvm-cpu status (all measured at dev time on the merged StableHLO
+  exporter; "documented deferral" = an explicit BackendError, never a
+  silent fallback — recorded per-example like the cumsum deferral):
+  - vmap_mlp: COMPILES + RUNS (all-batched rank-matched formulation with
+    per-sample rank-2 rows — no reshape anywhere): max_abs_error 4.8e-06
+    vs the numpy reference (numpy backend exact).
+  - vmap_grad_mlp: COMPILES + RUNS (the no-size-one-dims formulation —
+    see below): max_abs_error 6.9e-06 vs the fd reference.
+  - vmap_linear: documented deferral — a NEW core exporter bug, not an
+    example problem. The exporter's non-batched dot fast path squeezes the
+    shared-weight batch dim (``_dot_batch_all_one`` in
+    ``etl/backends/stablehlo/writer.py``) via ``stablehlo.reshape`` +
+    non-batched ``dot_general`` with a DYNAMIC lhs dim; export succeeds,
+    but iree-compile fails with ``error: failed to legalize operation
+    'stablehlo.dynamic_reshape' that was explicitly marked illegal`` (the
+    plain-matrix fast path is correctly gated on fully static shapes; the
+    squeeze path is not). Diagnostic proof: the SAME per-sample fn with
+    matched-batch weights (in_axes=(0,0,None), w[32,16,8]) compiles and
+    runs on iree (max_abs_error 9.5e-07) — only the shared-weight squeeze
+    path is broken. The numpy backend computes vmap_linear exactly.
+  - vmap_softmax / vmap_layernorm / vmap_attention: documented deferral —
+    keepdims reductions are semantically REQUIRED here (a no-keepdims
+    reformulation is wrong: numpy trailing broadcasting would divide
+    per-COLUMN instead of per-row), and every keepdims reduction lowers to
+    a ``stablehlo.reshape`` whose operand carries the symbolic batch dim:
+    export-time BackendError ``op 'reshape' ... keepdims reshape operand
+    has dynamic dims (Dim('batch'),) — dynamic shapes are not supported by
+    the StableHLO compiler backends in v1``. A reshape-free symbolic graph
+    compiles and runs on iree; a reshape-free keepdims lowering (or bound
+    dims) belongs in core. The numpy backend handles all three exactly.
 - vmap_linear uses ``in_axes=(0, None, None)`` (shared per-sample
   weight/bias — the realistic linear layer); v1 vmap supports ``None``
-  entries.
+  entries. The per-sample input is a rank-2 row ``[1,16]`` — no per-sample
+  reshape anywhere: ``etl.dot`` is batched matmul (rank >= 2), so a rank-1
+  vector would need a ``[1,16]`` round-trip reshape, which the exporter
+  rejects on dynamic dims.
 - vmap_grad_mlp: batched per-sample gradients via the supported
   composition ``vmap(grad(loss))`` — ``etl.vmap(etl.grad(f, argnums),
-  in_axes=0)`` maps the per-sample loss gradient over the batch.
+  in_axes=0)`` maps the per-sample loss gradient over the batch. The
+  per-sample loss operates on ``[4,8]`` matrices (NOT ``[1,8]`` rows): v1's
+  reduce-vjp broadcast-back sums away size-one dims via ``reduce_sum`` + a
+  dynamic ``reshape`` (``_reduce_to_operand`` in
+  ``etl/transforms/rules.py``), which the exporter rejects — the ``[4,8]``
+  formulation has no size-one dims, so its vectorized graph is reshape-free
+  and compiles on iree.
   Plain ``etl.grad(vmap(loss)(*specs))`` (grad applied to the vmap'd graph)
   cannot work in v1: the vmap'd graph's single output is the batched
   per-sample-loss VECTOR ``[B]``, and ``etl.grad`` requires exactly one
@@ -87,6 +101,10 @@ from .._torch import require_torch
 from .base import Example, _F32, fd_gradient, register_all
 
 # --- vmap softmax: per-sample softmax [16] over a [32,16] batch -------------
+# keepdims is REQUIRED (row softmax): a no-keepdims reformulation would
+# divide per-COLUMN under numpy trailing broadcasting (wrong values), and
+# every keepdims reduction lowers to a stablehlo.reshape on the symbolic
+# batch dim — export-time BackendError on iree (documented deferral).
 
 
 @defn
@@ -117,6 +135,7 @@ def _vmap_softmax_torch(inputs, device=None):
 
 
 # --- vmap layernorm: per-sample layernorm [64] over a [32,64] batch ----------
+# Same keepdims-required / iree-deferral note as vmap_softmax.
 
 
 @defn
@@ -152,16 +171,21 @@ def _vmap_layernorm_torch(inputs, device=None):
 
 
 # --- vmap linear: relu(x @ w + b) with SHARED w/b (in_axes=(0, None, None)) --
-# v1 `etl.dot` requires rank >= 2 operands (batched matmul), so the per-sample
-# row vector x[16] is reshaped to [1,16] around the dot and back to [8] — a
-# numerical no-op that the vectorize reshape rule maps to [32,1,16]→[32,8].
+# Per-sample x is a rank-2 row [1,16] so no per-sample reshape is needed
+# (etl.dot is batched matmul, rank >= 2; a rank-1 vector would need a
+# [1,16] round-trip reshape, which the exporter rejects on dynamic dims).
+# iree: documented deferral — the exporter's shared-weight dot SQUEEZE path
+# (`_dot_batch_all_one` in etl/backends/stablehlo/writer.py) emits a
+# non-batched dot_general with a dynamic lhs dim after squeezing the
+# weight batch (1,) via static reshape; iree-compile fails with
+# "failed to legalize operation 'stablehlo.dynamic_reshape'" (core exporter
+# bug, write scope forbids fixing it here). Diagnostic proof in the module
+# docstring: the same fn with matched-batch weights compiles+runs on iree.
 
 
 @defn
 def _vmap_linear_sample(x, w, b):
-    x_row = etl.reshape(x, (1, x.shape[0]))
-    out = etl.add(etl.dot(x_row, w), b)
-    return etl.reshape(etl.relu(out), (out.shape[1],))
+    return etl.relu(etl.add(etl.dot(x, w), b))
 
 
 def _vmap_linear_graph(x_spec, w_spec, b_spec):
@@ -174,7 +198,7 @@ def _vmap_linear_graph(x_spec, w_spec, b_spec):
 
 def _vmap_linear_numpy(inputs):
     x, w, b = inputs
-    out = np.empty((x.shape[0], w.shape[1]), dtype=x.dtype)
+    out = np.empty((x.shape[0], 1, w.shape[1]), dtype=x.dtype)
     for i in range(x.shape[0]):
         out[i] = np.maximum(x[i] @ w + b, 0.0)
     return out
@@ -187,16 +211,16 @@ def _vmap_linear_torch(inputs, device=None):
 
 
 # --- vmap mlp: per-sample 2-layer relu MLP, all-batched weights -------------
-# Per-sample x[16] is rank 1 — same [1,16] reshape round-trip around the
-# rank-2 dots as vmap_linear (vectorized to [32,1,16] / [32,1,32]).
+# All-batched per-sample rank-2 shapes (x [1,16] rows, biases [1,32]/[1,8]):
+# every dot is a matched-batch dot and every elementwise op is same-rank —
+# the vectorized graph is reshape-free, so it COMPILES + RUNS on iree
+# (measured max_abs_error 4.8e-06 vs the numpy reference).
 
 
 @defn
 def _vmap_mlp_sample(x, w1, b1, w2, b2):
-    x_row = etl.reshape(x, (1, x.shape[0]))
-    h = etl.relu(etl.add(etl.dot(x_row, w1), b1))
-    out = etl.add(etl.dot(h, w2), b2)
-    return etl.reshape(out, (out.shape[1],))
+    h = etl.relu(etl.add(etl.dot(x, w1), b1))
+    return etl.add(etl.dot(h, w2), b2)
 
 
 def _vmap_mlp_graph(x_spec, w1_spec, b1_spec, w2_spec, b2_spec):
@@ -207,7 +231,7 @@ def _vmap_mlp_graph(x_spec, w1_spec, b1_spec, w2_spec, b2_spec):
 
 def _vmap_mlp_numpy(inputs):
     x, w1, b1, w2, b2 = inputs
-    out = np.empty((x.shape[0], w2.shape[2]), dtype=x.dtype)
+    out = np.empty((x.shape[0], 1, w2.shape[2]), dtype=x.dtype)
     for i in range(x.shape[0]):
         h = np.maximum(x[i] @ w1[i] + b1[i], 0.0)
         out[i] = h @ w2[i] + b2[i]
@@ -217,15 +241,17 @@ def _vmap_mlp_numpy(inputs):
 def _vmap_mlp_torch(inputs, device=None):
     torch = require_torch()
     x, w1, b1, w2, b2 = (torch.as_tensor(a, device=device) for a in inputs)
-    # Per-sample batched matmul via einsum: with x[32,16] and w1[32,16,32], a
-    # plain `x @ w1` would BROADCAST the matrix per batch → (32,16,8) instead
-    # of the per-sample (32,8) result. b1/b2 are the BATCHED per-sample
-    # biases [32,32]/[32,8], so plain `+` broadcasts correctly.
-    h = torch.relu(torch.einsum("bi,bij->bj", x, w1) + b1)
-    return (torch.einsum("bj,bjk->bk", h, w2) + b2).cpu().numpy()
+    # Plain batched matmul: x[32,1,16] @ w1[32,16,32] has MATCHED batch dims
+    # (left-aligned per-pair semantics — exactly what the vectorized graph
+    # computes), so no einsum is needed; b1/b2 are the batched per-sample
+    # biases [32,1,32]/[32,1,8] and plain `+` broadcasts correctly.
+    h = torch.relu(x @ w1 + b1)
+    return (h @ w2 + b2).cpu().numpy()
 
 
 # --- vmap attention: per-sample single-head attention [8,16] over [16,8,16] --
+# keepdims is REQUIRED here too (row softmax over 2-D scores) — same
+# iree-deferral note as vmap_softmax.
 
 
 @defn
@@ -269,21 +295,25 @@ def _vmap_attention_torch(inputs, device=None):
 
 
 # --- vmap_grad_mlp: batched per-sample gradients via vmap∘grad composition --
+# The per-sample loss operates on [4,8] matrices (4 rows x 8 features) —
+# deliberately NO size-one dims: v1's reduce-vjp broadcast-back sums away
+# size-one dims via reduce_sum + a dynamic reshape (`_reduce_to_operand` in
+# etl/transforms/rules.py), which the exporter rejects. The [4,8]
+# formulation's vectorized graph is reshape-free, so it COMPILES + RUNS on
+# iree (measured max_abs_error 6.9e-06 vs the fd reference; numpy backend
+# 5.9e-06).
 
 
 @defn
 def _vmap_grad_mlp_loss(x, y, w1, b1, w2, b2):
-    """Per-sample scalar loss: MSE of a tiny 2-layer relu MLP (x[8]→[16]→[8]).
-
-    x[8] is rank 1 — the same [1,8] reshape round-trip around the rank-2
-    dots as vmap_linear/vmap_mlp (vectorized to [8,1,8] over the batch).
-    """
-    x_row = etl.reshape(x, (1, x.shape[0]))
-    h = etl.relu(etl.add(etl.dot(x_row, w1), b1))
+    """Per-sample scalar loss: MSE of a tiny 2-layer relu MLP over a [4,8]
+    matrix (per-sample x[4,8] -> [4,16] -> [4,8]). No size-one dims (see
+    the section comment); the full reduction keeps the loss a per-sample
+    SCALAR (grad requires shape ())."""
+    h = etl.relu(etl.add(etl.dot(x, w1), b1))
     pred = etl.add(etl.dot(h, w2), b2)
-    pred = etl.reshape(pred, (pred.shape[1],))
     diff = etl.subtract(pred, y)
-    return etl.mean(etl.multiply(diff, diff), axes=-1)
+    return etl.mean(etl.multiply(diff, diff))
 
 
 def _vmap_grad_mlp_graph(x_spec, y_spec, w1_spec, b1_spec, w2_spec, b2_spec):
@@ -335,12 +365,12 @@ def _vmap_grad_mlp_torch(inputs, device=None):
     tensors = [x, y, w1, b1, w2, b2]
     for t in tensors:
         t.requires_grad_(True)
-    # Per-sample batched matmul via einsum (same broadcasting pitfall as
-    # vmap_mlp: x[8,8] @ w1[8,8,16] would broadcast the matrix per batch and
-    # differentiate a DIFFERENT loss).
-    h = torch.relu(torch.einsum("bi,bij->bj", x, w1) + b1)
-    pred = torch.einsum("bj,bjk->bk", h, w2) + b2
-    per_sample = ((pred - y) ** 2).mean(dim=-1)
+    # Plain batched matmul (matched batch dims — same per-pair semantics as
+    # the vectorized graph; no einsum needed). Per-sample MSE = mean over
+    # the two trailing dims; summed over the batch to stay separable.
+    h = torch.relu(x @ w1 + b1)
+    pred = h @ w2 + b2
+    per_sample = ((pred - y) ** 2).mean(dim=(-1, -2))
     loss = per_sample.sum()
     # Mirror argnums=(0, 1, 2, 3, 4): b2 (the last tensor) is not
     # differentiated.
@@ -355,7 +385,10 @@ def _vmap_grad_mlp_torch(inputs, device=None):
 register_all([
     Example(
         name="vmap_softmax",
-        description="per-sample softmax [16] vmap'd over a [32,16] batch",
+        description=(
+            "per-sample softmax [16] vmap'd over a [32,16] batch; "
+            "iree: documented deferral (keepdims-reshape export rejection)"
+        ),
         specs=(TensorSpec((32, 16), _F32),),
         graph=_vmap_softmax_graph,
         numpy_ref=_vmap_softmax_numpy,
@@ -364,7 +397,10 @@ register_all([
     ),
     Example(
         name="vmap_layernorm",
-        description="per-sample layernorm [64] vmap'd over a [32,64] batch",
+        description=(
+            "per-sample layernorm [64] vmap'd over a [32,64] batch; "
+            "iree: documented deferral (keepdims-reshape export rejection)"
+        ),
         specs=(TensorSpec((32, 64), _F32),),
         graph=_vmap_layernorm_graph,
         numpy_ref=_vmap_layernorm_numpy,
@@ -373,9 +409,13 @@ register_all([
     ),
     Example(
         name="vmap_linear",
-        description="per-sample relu(x @ w + b) vmap'd over x only (shared w/b)",
+        description=(
+            "per-sample relu(x @ w + b) vmap'd over x only (shared w/b); "
+            "iree: documented deferral (core dot-squeeze bug — "
+            "iree-compile dynamic_reshape legalization failure, not export)"
+        ),
         specs=(
-            TensorSpec((32, 16), _F32),
+            TensorSpec((32, 1, 16), _F32),
             TensorSpec((16, 8), _F32),
             TensorSpec((8,), _F32),
         ),
@@ -386,13 +426,16 @@ register_all([
     ),
     Example(
         name="vmap_mlp",
-        description="per-sample 2-layer relu MLP vmap'd, all-batched weights",
+        description=(
+            "per-sample 2-layer relu MLP vmap'd, all-batched weights; "
+            "compiles+runs on iree (cpu), max_abs 4.8e-06"
+        ),
         specs=(
-            TensorSpec((32, 16), _F32),
+            TensorSpec((32, 1, 16), _F32),
             TensorSpec((32, 16, 32), _F32),
-            TensorSpec((32, 32), _F32),
+            TensorSpec((32, 1, 32), _F32),
             TensorSpec((32, 32, 8), _F32),
-            TensorSpec((32, 8), _F32),
+            TensorSpec((32, 1, 8), _F32),
         ),
         graph=_vmap_mlp_graph,
         numpy_ref=_vmap_mlp_numpy,
@@ -401,7 +444,10 @@ register_all([
     ),
     Example(
         name="vmap_attention",
-        description="per-sample single-head attention [8,16] vmap'd over [16,8,16]",
+        description=(
+            "per-sample single-head attention [8,16] vmap'd over [16,8,16]; "
+            "iree: documented deferral (keepdims-reshape export rejection)"
+        ),
         specs=(
             TensorSpec((16, 8, 16), _F32),
             TensorSpec((16, 8, 16), _F32),
@@ -414,14 +460,18 @@ register_all([
     ),
     Example(
         name="vmap_grad_mlp",
-        description="per-sample MLP grads via vmap∘grad composition (batch 8)",
+        description=(
+            "per-sample MLP grads via vmap∘grad composition (batch 8, "
+            "[4,8] per-sample rows); compiles+runs on iree (cpu), "
+            "max_abs 6.9e-06"
+        ),
         specs=(
-            TensorSpec((8, 8), _F32),
-            TensorSpec((8, 8), _F32),
+            TensorSpec((8, 4, 8), _F32),
+            TensorSpec((8, 4, 8), _F32),
             TensorSpec((8, 8, 16), _F32),
-            TensorSpec((8, 16), _F32),
+            TensorSpec((8, 4, 16), _F32),
             TensorSpec((8, 16, 8), _F32),
-            TensorSpec((8, 8), _F32),
+            TensorSpec((8, 4, 8), _F32),
         ),
         graph=_vmap_grad_mlp_graph,
         numpy_ref=_vmap_grad_mlp_numpy,

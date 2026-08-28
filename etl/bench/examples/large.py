@@ -24,8 +24,13 @@ comments for exact numbers):
   ``get_dimension_size``); measured max_abs_error ≈7.25e-04 (fp32 fusion
   noise) covered by tolerance=1e-3; the numpy backend computes it exactly
   (max_abs 0.0).
-- vmap_mlp_large: iree compile fails with a BackendError (DimExpr broadcast
-  — documented v1 limitation).
+- vmap_mlp_large: COMPILES + RUNS on iree/llvm-cpu after the vmap examples
+  were reformulated to per-sample rank-2 rows (all-batched matched dots,
+  no per-sample reshape): measured max_abs_error 9.2e-05 (fp32
+  accumulation-order noise, covered by the existing atol=1.2e-4); the
+  numpy backend computes it exactly (max_abs 0.0 — identical per-sample
+  kernels). The previous per-sample-vector formulation (with a [1,64]
+  reshape round-trip) was an iree export-time rejection (dynamic reshape).
 
 Design notes:
 
@@ -43,7 +48,9 @@ Design notes:
   ``in_axes=(0, 0, 0, 0, 0)`` is used — identical semantics to the
   ``in_axes=0`` shorthand.
 - ``etl.dot`` is batched matmul only (rank >= 2), so the per-sample MLP
-  promotes its vector sample to a row via ``etl.reshape``.
+  uses rank-2 rows ``[1,64]`` — no per-sample ``etl.reshape`` anywhere (a
+  reshape round-trip would be rejected by the StableHLO exporter on the
+  symbolic batch dim).
 """
 from __future__ import annotations
 
@@ -325,35 +332,36 @@ def _layernorm_large_torch(inputs, device=None):
 
 @defn
 def _vmap_mlp_sample(x, w1, b1, w2, b2):
-    """Per-sample 2-layer MLP: [64] -> relu -> [128] -> [64].
+    """Per-sample 2-layer MLP over a rank-2 row: [1,64] -> relu -> [1,128]
+    -> [1,64].
 
-    ``etl.dot`` is batched matmul only (rank >= 2), so the vector sample is
-    promoted to a row ``[1,64]`` and squeezed back — identical math to a
-    matrix-vector product.
+    ``etl.dot`` is batched matmul only (rank >= 2), and the StableHLO
+    exporter rejects per-sample reshape round-trips on the symbolic batch
+    dim — so the sample is a ``[1,64]`` row and every op is same-rank /
+    matched-batch (no reshape anywhere; compiles+runs on iree).
     """
-    h = etl.add(etl.dot(etl.reshape(x, (1, 64)), w1), b1)  # [1,128]
-    h = etl.reshape(etl.relu(h), (128,))
-    y = etl.add(etl.dot(etl.reshape(h, (1, 128)), w2), b2)  # [1,64]
-    return etl.reshape(y, (64,))
+    h = etl.relu(etl.add(etl.dot(x, w1), b1))  # [1,128]
+    return etl.add(etl.dot(h, w2), b2)  # [1,64]
 
 
 def _vmap_mlp_numpy(inputs):
     x, w1, b1, w2, b2 = inputs
     # Manual batched loop (never vmap): per-sample mlp, stacked.
-    out = np.stack(
-        [
-            np.maximum(x[i] @ w1[i] + b1[i], 0.0) @ w2[i] + b2[i]
-            for i in range(x.shape[0])
-        ]
-    )
+    out = np.empty((x.shape[0], 1, w2.shape[2]), dtype=x.dtype)
+    for i in range(x.shape[0]):
+        h = np.maximum(x[i] @ w1[i] + b1[i], 0.0)
+        out[i] = h @ w2[i] + b2[i]
     return out
 
 
 def _vmap_mlp_torch(inputs, device=None):
     torch = require_torch()
     x, w1, b1, w2, b2 = (torch.as_tensor(a, device=device) for a in inputs)
-    h = torch.relu(torch.einsum("bi,bij->bj", x, w1) + b1)
-    return (torch.einsum("bj,bjk->bk", h, w2) + b2).cpu().numpy()
+    # Plain batched matmul: x[64,1,64] @ w1[64,64,128] has MATCHED batch
+    # dims (left-aligned per-pair semantics — exactly what the vectorized
+    # graph computes), so no einsum is needed.
+    h = torch.relu(x @ w1 + b1)
+    return (h @ w2 + b2).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -465,22 +473,23 @@ register_all([
         name="vmap_mlp_large",
         description=(
             "etl.vmap over a per-sample 2-layer MLP (batch 64, "
-            "per-sample [64] -> relu -> 128 -> [64])"
+            "per-sample [1,64] -> relu -> 128 -> [1,64]); "
+            "compiles+runs on iree (cpu), max_abs 9.2e-05"
         ),
         specs=(
-            TensorSpec((64, 64), _F32),
+            TensorSpec((64, 1, 64), _F32),
             TensorSpec((64, 64, 128), _F32),
-            TensorSpec((64, 128), _F32),
+            TensorSpec((64, 1, 128), _F32),
             TensorSpec((64, 128, 64), _F32),
-            TensorSpec((64, 64), _F32),
+            TensorSpec((64, 1, 64), _F32),
         ),
         graph=etl.vmap(_vmap_mlp_sample, in_axes=(0, 0, 0, 0, 0), out_axes=0),
         numpy_ref=_vmap_mlp_numpy,
         torch_ref=_vmap_mlp_torch,
         # torch ref: fp32 accumulation-order noise in the batched matmuls —
         # measured max_abs_error <= 9.16e-05 across 10 seeds (etl vs numpy
-        # ref: exactly 0 — per-sample loop). atol=1.2e-04 covers it with
-        # margin.
+        # ref: exactly 0 — per-sample loop). iree/llvm-cpu measured 9.2e-05
+        # (same noise class). atol=1.2e-04 covers it with margin.
         atol=1.2e-4,
         category="large",
     ),
