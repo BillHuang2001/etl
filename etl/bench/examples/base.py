@@ -206,6 +206,9 @@ def _conv2d_numpy(x, w, strides=(1, 1), padding="VALID"):
     ``"SAME"`` → TF convention — ``out = ceil(d / stride)`` and total pad
     ``(out - 1) * stride + k - d`` split as ``(total // 2, total - total // 2)``
     per spatial axis (matches ``etl/backends/numpy/kernels/linalg.py``).
+    A NEGATIVE total (kernel smaller than the stride-1 footprint, e.g. a 1x1
+    kernel at stride 2) CROPS the input — ``np.pad`` with a negative pad value
+    crops, exactly like the kernel's slicing.
     """
     n, c_in, h, win = x.shape
     c_out, _, kh, kw = w.shape
@@ -213,8 +216,8 @@ def _conv2d_numpy(x, w, strides=(1, 1), padding="VALID"):
     if padding == "SAME":
         out_h = (h + sh - 1) // sh
         out_w = (win + sw - 1) // sw
-        total_h = max((out_h - 1) * sh + kh - h, 0)
-        total_w = max((out_w - 1) * sw + kw - win, 0)
+        total_h = (out_h - 1) * sh + kh - h
+        total_w = (out_w - 1) * sw + kw - win
         pad_h = (total_h // 2, total_h - total_h // 2)
         pad_w = (total_w // 2, total_w - total_w // 2)
     elif padding == "VALID":
@@ -223,7 +226,19 @@ def _conv2d_numpy(x, w, strides=(1, 1), padding="VALID"):
         pad_h = pad_w = (0, 0)
     else:
         raise ValueError(f"unsupported padding mode {padding!r}")
-    xp = np.pad(x, ((0, 0), (0, 0), pad_h, pad_w))
+    # Clamp to non-negative for np.pad, then crop negative totals (kernel
+    # parity: etl/backends/numpy/kernels/linalg.py slices
+    # slice(-lo if lo<0 else None, hi if hi<0 else None) after clamping).
+    xp = np.pad(
+        x,
+        ((0, 0), (0, 0), (max(pad_h[0], 0), max(pad_h[1], 0)),
+         (max(pad_w[0], 0), max(pad_w[1], 0))),
+    )
+    lo_h, hi_h = pad_h
+    lo_w, hi_w = pad_w
+    if lo_h < 0 or hi_h < 0 or lo_w < 0 or hi_w < 0:
+        xp = xp[:, :, slice(-lo_h if lo_h < 0 else None, hi_h if hi_h < 0 else None),
+                slice(-lo_w if lo_w < 0 else None, hi_w if hi_w < 0 else None)]
     out = np.zeros(
         (n, c_out, out_h, out_w), dtype=np.result_type(x.dtype, w.dtype)
     )
@@ -240,7 +255,7 @@ def conv2d_im2col_numpy(x, w, strides=(1, 1), padding="VALID"):
     Same semantics as :func:`_conv2d_numpy`: ``"VALID"`` → no padding;
     ``"SAME"`` → TF convention — ``out = ceil(d / stride)`` and total pad
     ``(out - 1) * stride + k - d`` split as ``(total // 2, total - total // 2)``
-    per spatial axis.
+    per spatial axis (negative totals crop, exactly like the etl kernel).
 
     Implementation: ``np.lib.stride_tricks.sliding_window_view`` over the
     padded NCHW array's H/W axes yields windows of shape
@@ -256,8 +271,8 @@ def conv2d_im2col_numpy(x, w, strides=(1, 1), padding="VALID"):
     if padding == "SAME":
         out_h = (h + sh - 1) // sh
         out_w = (win + sw - 1) // sw
-        total_h = max((out_h - 1) * sh + kh - h, 0)
-        total_w = max((out_w - 1) * sw + kw - win, 0)
+        total_h = (out_h - 1) * sh + kh - h
+        total_w = (out_w - 1) * sw + kw - win
         pad_h = (total_h // 2, total_h - total_h // 2)
         pad_w = (total_w // 2, total_w - total_w // 2)
     elif padding == "VALID":
@@ -266,7 +281,19 @@ def conv2d_im2col_numpy(x, w, strides=(1, 1), padding="VALID"):
         pad_h = pad_w = (0, 0)
     else:
         raise ValueError(f"unsupported padding mode {padding!r}")
-    xp = np.pad(x, ((0, 0), (0, 0), pad_h, pad_w))
+    # Clamp to non-negative for np.pad, then crop negative totals (kernel
+    # parity: etl/backends/numpy/kernels/linalg.py slices
+    # slice(-lo if lo<0 else None, hi if hi<0 else None) after clamping).
+    xp = np.pad(
+        x,
+        ((0, 0), (0, 0), (max(pad_h[0], 0), max(pad_h[1], 0)),
+         (max(pad_w[0], 0), max(pad_w[1], 0))),
+    )
+    lo_h, hi_h = pad_h
+    lo_w, hi_w = pad_w
+    if lo_h < 0 or hi_h < 0 or lo_w < 0 or hi_w < 0:
+        xp = xp[:, :, slice(-lo_h if lo_h < 0 else None, hi_h if hi_h < 0 else None),
+                slice(-lo_w if lo_w < 0 else None, hi_w if hi_w < 0 else None)]
     # (N, C, out_h, out_w, kh, kw): stride-1 windows subsampled at `strides`.
     windows = np.lib.stride_tricks.sliding_window_view(
         xp, (kh, kw), axis=(2, 3)
