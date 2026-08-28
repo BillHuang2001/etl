@@ -39,14 +39,15 @@ _PYTREE_NODE_REGISTRY = _core_tree._PYTREE_NODE_REGISTRY
 class _TensorSpecLeaf:
     """Leaf marker standing for a tensor-INPUT position in a trace pytree.
 
-    ``core.flatten`` treats every dataclass instance as a pytree container,
-    so a ``TensorSpec`` leaf would be descended into (and ``core.unflatten``
-    counts dataclass-typed childless specs as zero-leaf containers). Trace
-    trees therefore record tensor-input positions with this plain
-    (non-dataclass) marker, which ``core.flatten``/``core.unflatten`` handle
-    as an ordinary leaf — keeping ``TreeSpec.num_leaves``, structural
-    equality, and downstream ``core.unflatten`` coherent. The marker carries
-    the original ``core.TensorSpec`` for classification/error messages.
+    Trace trees record tensor-input positions with this plain (non-dataclass)
+    marker so leaf-type equality tells tensor-input leaves apart from static
+    leaves — keeping ``TreeSpec.num_leaves``, structural equality, and
+    downstream ``core.unflatten`` coherent. (``core.flatten`` itself now
+    treats etl-module dataclasses — ``TensorSpec`` included — as single
+    leaves via its module check; the marker is still load-bearing for the
+    tree skeleton comparisons in ``graph.py`` and for signature encoding.)
+    The marker carries the original ``core.TensorSpec`` for
+    classification/error messages.
     """
 
     __slots__ = ("spec",)
@@ -61,8 +62,11 @@ class _TensorSpecLeaf:
 class _SymbolicLeaf:
     """Leaf marker standing for a symbolic RESULT position in a trace pytree.
 
-    Same rationale as ``_TensorSpecLeaf`` for ``core.SymbolicTensor`` (also a
-    frozen dataclass). Carries the ``core.SymbolicTensor`` result.
+    Same rationale as ``_TensorSpecLeaf`` for ``core.SymbolicTensor`` (also
+    a frozen dataclass, now treated as a single leaf by ``core.flatten``'s
+    module check): trace trees record symbolic-result positions with this
+    plain marker so leaf-type equality distinguishes them from static output
+    leaves. Carries the ``core.SymbolicTensor`` result.
     """
 
     __slots__ = ("symbolic",)
@@ -80,8 +84,10 @@ def _flatten_trace(obj: Any) -> Tuple[list, "core.TreeSpec"]:
 
     Mirrors ``core.tree._flatten_into``'s container rules exactly (registered
     custom nodes, namedtuple, dataclass, tuple, list, dict with sorted keys);
-    the only difference is the stop-set. The returned ``core.TreeSpec`` is
-    fully ``core.unflatten``-compatible.
+    the only difference is the stop-set: ``TensorSpec``/``SymbolicTensor``
+    are caught by the marker rules first, and etl-module dataclasses stay
+    leaves under the same module check ``core.tree`` applies. The returned
+    ``core.TreeSpec`` is fully ``core.unflatten``-compatible.
     """
     leaves: list = []
     return leaves, _flatten_trace_into(obj, leaves)
@@ -112,8 +118,15 @@ def _flatten_trace_into(obj: Any, leaves: list) -> "core.TreeSpec":
         return core.TreeSpec(
             type=obj_type, children=child_specs, node_data=obj_type._fields
         )
-    # 3. dataclass instances (never the class itself).
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    # 3. dataclass instances (never the class itself). etl's own value types
+    #    (Device, Dim, Group, ...) are LEAVES — the same module check as
+    #    core.tree._flatten_into; only user-defined dataclasses act as pytree
+    #    containers.
+    if (
+        dataclasses.is_dataclass(obj)
+        and not isinstance(obj, type)
+        and not obj_type.__module__.split(".")[0] == "etl"
+    ):
         fields = dataclasses.fields(obj)
         child_specs = tuple(
             _flatten_trace_into(getattr(obj, field.name), leaves) for field in fields
@@ -300,10 +313,12 @@ def _is_static_value(obj: Any) -> bool:
     """True iff `obj` is a static Python value that specializes the graph.
 
     Accepted (per the root value-model contract): `None`, bool, int, float,
-    complex, str, `enum.Enum`, numpy `dtype` objects, `slice`. Everything
-    else (including numpy scalars, arbitrary config objects) is NOT static in
-    v1 — `trace` raises `TraceError` for it. (Future extension point:
-    explicit registration of static types, e.g. config objects.)
+    complex, str, `enum.Enum`, numpy `dtype` objects, `slice`, and
+    `core.Device` (a static device spec — one leaf, snapshotted like any
+    other static value). Everything else (including numpy scalars, arbitrary
+    config objects) is NOT static in v1 — `trace` raises `TraceError` for
+    it. (Future extension point: explicit registration of static types, e.g.
+    config objects.)
     """
     if obj is None:
         return True
@@ -311,6 +326,8 @@ def _is_static_value(obj: Any) -> bool:
     if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
         return True
     if isinstance(obj, np.dtype):
+        return True
+    if isinstance(obj, core.Device):
         return True
     return False
 
@@ -359,7 +376,8 @@ def _flatten_specs(
                 f"{leaf!r} (type {type(leaf).__name__}) is neither a "
                 "core.TensorSpec nor a static Python value. Tensor inputs "
                 "must be declared as TensorSpec(shape, dtype); static values "
-                "may be None/bool/int/float/complex/str/Enum/dtype/slice. "
+                "may be None/bool/int/float/complex/str/Enum/dtype/slice/"
+                "Device. "
                 "Concrete tensors are never silently captured — declare them "
                 "as explicit inputs via TensorSpec, or embed their data "
                 "explicitly with etl.constant inside the traced function."
