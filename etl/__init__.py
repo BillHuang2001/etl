@@ -24,6 +24,14 @@ Convenience shorthands (documented compositions only)::
 
     exe = etl.build(f, *specs, device="cpu")   # trace→lower→compile→load
     y = etl.evaluate(f, x, w)                  # derive specs → build → run
+
+Pytree utilities (pure sugar over flatten/unflatten — no new semantics):
+
+    etl.tree_map(fn, *trees)        # map over leaves, structure-validated
+    etl.tree_leaves(tree)           # all leaves in pre-order
+    etl.tree_structure(tree)        # the TreeSpec of a tree
+    etl.tree_flatten(tree)          # (leaves, treespec)
+    etl.tree_unflatten(leaves, spec)  # rebuild a tree from leaves + spec
 """
 from __future__ import annotations
 
@@ -71,6 +79,11 @@ from .core import (  # noqa: F401
     replicate_tensor,
     split_tensor,
     tensor,
+    tree_flatten,
+    tree_leaves,
+    tree_map,
+    tree_structure,
+    tree_unflatten,
     uint8,
     uint16,
     uint32,
