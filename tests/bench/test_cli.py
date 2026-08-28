@@ -67,8 +67,10 @@ def test_main_in_process_success(capsys):
 def test_main_in_process_category_selection(capsys):
     from etl.bench.__main__ import main
 
-    # --examples accepts category names: "grad" expands to its 4 examples
-    # only — no micro/large examples in the report.
+    # --examples accepts names, categories, AND tags, expanded with precedence
+    # category name → exact example name → tag name. "grad" is now a TAG that
+    # expands to its 11 grad_* examples only — no micro/large examples in the
+    # report.
     assert (
         main(
             [
@@ -81,6 +83,8 @@ def test_main_in_process_category_selection(capsys):
     captured = capsys.readouterr()
     for name in ("grad_mlp", "grad_mix", "grad_stopgrad", "grad_structural"):
         assert name in captured.out
+    for name in ("grad_erf", "grad_cumsum"):
+        assert name in captured.out
     assert "matmul" not in captured.out
     assert "transformer" not in captured.out
 
@@ -88,7 +92,8 @@ def test_main_in_process_category_selection(capsys):
 def test_main_in_process_mixed_names_and_categories(capsys):
     from etl.bench.__main__ import main
 
-    # Categories and plain names mix: "grad,large" covers both categories.
+    # Names, categories, and tags mix: "grad,large" now expands via TAGS to
+    # 17 examples (11 grad_* + 6 large) — the union of both tag sets.
     assert (
         main(
             [
@@ -103,10 +108,32 @@ def test_main_in_process_mixed_names_and_categories(capsys):
     assert "transformer" in captured.out
     assert "matmul_1024" in captured.out
     assert "conv2d_large" in captured.out
-    # micro/vectorize examples are excluded (matmul_1024's "matmul" substring
-    # would also match the plain matmul row, so assert on absent names).
+    # micro-only examples are excluded from the grad/large tag sets (assert on
+    # absent names — "grad_cumsum" contains the "cumsum" substring, so that
+    # name can't be used for an absence check).
     assert "softmax" not in captured.out
-    assert "cumsum" not in captured.out
+    assert "attention" not in captured.out
+
+
+def test_main_in_process_tag_selection(capsys):
+    from etl.bench.__main__ import main
+
+    # "control-flow" is a TAG expanding to its 12 cond/while/e2e examples
+    # (none of which is a plain micro example). Measured runtime ≈ 2 s for 12
+    # small examples on the numpy backend.
+    assert (
+        main(
+            [
+                "--conformance", "--no-benchmark", "--no-torch",
+                "--examples", "control-flow",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "cond_basic" in captured.out
+    assert "while_fib" in captured.out
+    assert "matmul" not in captured.out
 
 
 def test_main_in_process_usage_error(capsys):

@@ -54,7 +54,7 @@ EXAMPLE_RESULT_FIELDS = {
 def test_conformance_numpy_only_all_examples():
     report = conformance(use_torch=False)
     assert isinstance(report, ConformanceReport)
-    assert len(report.results) == 26
+    assert len(report.results) == 97
     assert report.use_torch == "disabled"
     assert report.overall_pass is True
     for result in report.results:
@@ -62,10 +62,14 @@ def test_conformance_numpy_only_all_examples():
         assert result.error is None
         assert result.numpy_pass is True
         assert result.torch_pass is None
-        # Far below float32 noise across the registry: micro/vectorize are
-        # exact (shared kernels), grad ~1e-5, the large category's conv2d_large
-        # measures ~1.1e-4 (fp32 accumulation order; covered by its atol
-        # override).
+        # Every example's max_abs_error is far below the 1e-3 global bound.
+        # Measured on the full 97-example numpy run: worst is conv2d_large at
+        # ~1.1e-4 (fp32 accumulation order; covered by its atol=2e-4
+        # override), next-worst conv_block_stride2 ~3.1e-5, grad/vmap/custom
+        # examples ~1e-6..1e-5, micro/vectorize/basic exact (shared kernels).
+        # All per-example overrides (transformer tolerance=1e-3, etc.) sit
+        # above their measured errors, so the global bound holds for every
+        # result.
         assert result.max_abs_error < 1e-3
 
 
@@ -76,7 +80,7 @@ def test_conformance_to_dict_to_json_roundtrip():
     assert data["overall_pass"] is True
     assert json.loads(report.to_json()) == data
     # ExampleResult dicts inside the report carry the documented fields.
-    assert len(data["results"]) == 26
+    assert len(data["results"]) == 97
     for result_dict in data["results"]:
         assert set(result_dict) == EXAMPLE_RESULT_FIELDS
 
@@ -147,6 +151,35 @@ def test_conformance_grad_example_smoke():
     assert result.max_abs_error < 1e-3
 
 
+def test_conformance_tag_selection_smoke():
+    # Tag expansion: the "control-flow" tag selects 12 examples (8 cond/while
+    # op examples + e2e_infer_transformer/e2e_pso_optimize/e2e_kmeans/
+    # e2e_power_iteration). All are small — measured ~0.3 s on the numpy
+    # backend (far under the 4-5 s worst-case estimate).
+    report = conformance(["control-flow"], use_torch=False)
+    assert len(report.results) == 12
+    assert report.overall_pass is True
+    for result in report.results:
+        assert result.error is None
+        assert result.numpy_pass is True
+
+
+def test_conformance_runner_based_e2e_smoke():
+    # Runner-based e2e: e2e_train_mlp carries a `runner` callable (a
+    # Python-level training loop repeatedly executing etl.grad graphs) instead
+    # of the single stage+run path; conformance uses it uniformly.
+    # Measured ~0.1 s on the numpy backend.
+    report = conformance(["e2e_train_mlp"], use_torch=False)
+    assert report.overall_pass is True
+    (result,) = report.results
+    assert result.name == "e2e_train_mlp"
+    assert result.error is None
+    assert result.numpy_pass is True
+    # Measured max_abs_error ≈ 4.4e-7 (tolerance=1e-3 override); well under
+    # the 1e-3 global bound.
+    assert result.max_abs_error < 1e-3
+
+
 @requires_torch_absent
 def test_conformance_use_torch_true_without_torch_raises_import_error():
     with pytest.raises(ImportError) as excinfo:
@@ -172,7 +205,7 @@ def test_conformance_with_torch_enabled_all_examples():
     report = conformance(use_torch=True)
     assert report.use_torch == "enabled"
     assert report.torch_available is True
-    assert len(report.results) == 26
+    assert len(report.results) == 97
     assert report.overall_pass is True
     for result in report.results:
         # torch references must pass too; results are recorded, never
