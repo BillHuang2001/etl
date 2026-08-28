@@ -436,6 +436,8 @@ _UNARY_DERIV = {
     "cos": lambda a, y: ops.negate(ops.sin(a)), "tan": lambda a, y: ops.add(_c(a.dtype, 1.0), ops.square(y)),
     "tanh": lambda a, y: ops.subtract(_c(a.dtype, 1.0), ops.square(y)), "sigmoid": lambda a, y: ops.multiply(y, ops.subtract(_c(a.dtype, 1.0), y)),
     "gelu": lambda a, y: _gelu_coeff(a), "erf": lambda a, y: ops.multiply(_c(a.dtype, 1.1283791670955126), ops.exp(ops.negate(ops.square(a)))),
+    # sign: derivative is 0 a.e. — int 0 weak-promotes per NEP-50 to `a`'s dtype (same pattern as _zero_of); tangent/cotangent ⊙ 0 = 0.
+    "sign": lambda a, y: ops.multiply(a, 0),
 }
 def _unary_jvp(op, tangents):
     """Unary pointwise JVP: out-tangent = ta · deriv(a, y)."""

@@ -30,11 +30,12 @@ def vectorize(graph: Graph, axes) -> Graph:
 
     Returns:
         A new `Graph` of ordinary ops whose mapped inputs/outputs carry an
-        extra leading dimension (fresh symbolic dim named `batch`, `batch_1`,
-        ...). Unsupported ops — no registered batching rule, control-flow
-        regions in v1 — raise `core.TransformError` naming the op; there is
-        never a Python-loop fallback. `output_tree` and `static_values` are
-        preserved; the input graph is not mutated.
+        extra leading dimension (one fresh symbolic dim named `batch`, shared
+        by all mapped inputs of the pass). Unsupported ops — no registered
+        batching rule, control-flow regions in v1 — raise
+        `core.TransformError` naming the op; there is never a Python-loop
+        fallback. `output_tree` and `static_values` are preserved; the input
+        graph is not mutated.
 
     Example:
         g = etl.trace(fn, TensorSpec((3, 5), etl.float32))

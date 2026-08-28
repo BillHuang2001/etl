@@ -138,6 +138,12 @@ def _is_static_dim(dim) -> bool:
     return isinstance(dim, int) and not isinstance(dim, bool)
 
 
+def _is_static_one(dim) -> bool:
+    """True for a provable size-1 dim (a concrete int 1 only — symbolic
+    dims are never provably 1 at compile time)."""
+    return _is_static_dim(dim) and dim == 1
+
+
 def _shape_is_static(shape) -> bool:
     """True when every dim of ``shape`` is a concrete int."""
     return all(_is_static_dim(d) for d in shape)
@@ -643,10 +649,36 @@ class Writer:
             "(dynamic broadcast)"
         )
 
+    def _reject_dynamic_dims(self, op: Op, shape, what: str, op_name=None) -> None:
+        """Raise ``core.BackendError`` when ``shape`` carries dynamic dims
+        (``Dim``/``DimExpr``/``None`` — ints are static; bool is an int
+        subclass and counts as static). ``what`` names the shape's role in
+        the op (e.g. ``"operand shape"``); ``op_name`` overrides the op name
+        in the message (the keepdims reshapes inside the reduce emitters
+        report as 'reshape'). This keeps invalid MLIR away from the
+        compilers: a dynamic-dims op must fail here, at export/lower time,
+        never with an obscure iree-compile parse error later."""
+        dynamic = tuple(d for d in shape if not isinstance(d, (int, np.integer)))
+        if not dynamic:
+            return
+        name = op_name or op.name
+        raise BackendError(
+            f"stablehlo export: op '{name}'{self._loc(op)} {what} has "
+            f"dynamic dims {tuple(shape)!r} (offending dims {dynamic!r}) — "
+            "dynamic shapes are not supported by the StableHLO compiler "
+            "backends in v1 (use concrete static shapes or the numpy backend)"
+        )
+
     def _emit_reshape(self, op: Op) -> str:
         """`stablehlo.reshape` uses the functional-type custom form
         (operand and result types differ — the single-type form is
-        rejected by the compiler as "invalid kind of type specified")."""
+        rejected by the compiler as "invalid kind of type specified").
+
+        The StableHLO verifier requires statically shaped (or single bounded
+        dimension) reshape operands/results, so any dynamic dim fails here
+        with a clear BackendError — never invalid MLIR."""
+        self._reject_dynamic_dims(op, tuple(op.operands[0].type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         result_name = self._bind_results(op)[0]
         return (
             f"{result_name} = stablehlo.reshape {self._name(op.operands[0])}"
@@ -668,6 +700,12 @@ class Writer:
 
     def _emit_slice(self, op: Op) -> str:
         x = op.operands[0]
+        # EMPIRICAL (iree 3.11.0): iree-compile parses a dynamic-operand
+        # slice but the runtime ABORTS on it ("hal.fence.await" failure) —
+        # reject here at export/lower time, never emit it (see
+        # _reject_dynamic_dims).
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         starts = tuple(op.attributes["start_indices"])
         limits = tuple(op.attributes["limit_indices"])
         strides = tuple(op.attributes.get("strides") or (1,) * len(starts))
@@ -693,6 +731,11 @@ class Writer:
 
     def _emit_pad(self, op: Op) -> str:
         x = op.operands[0]
+        # EMPIRICAL (iree 3.11.0): iree-compile parses dynamic-shape pad but
+        # the runtime ABORTS on it ("hal.fence.await" failure) — reject here
+        # at export/lower time, never emit it (see _reject_dynamic_dims).
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         pairs = [tuple(p) for p in op.attributes["padding_config"]]
         value = op.attributes.get("value", 0.0)
         dtype = np.dtype(x.type.dtype)
@@ -755,6 +798,14 @@ class Writer:
             )
             cur = converted
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
+            # The keepdims reshape must be static: a dynamic dim moved
+            # between reduced/result shapes is invalid StableHLO reshape.
+            self._reject_dynamic_dims(
+                op, tuple(reduced_shape), "keepdims reshape operand", op_name="reshape"
+            )
+            self._reject_dynamic_dims(
+                op, tuple(op.result.type.shape), "keepdims reshape result", op_name="reshape"
+            )
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
@@ -771,17 +822,22 @@ class Writer:
         axes = tuple(op.attributes.get("axes", ()))
         keepdims = bool(op.attributes.get("keepdims", False))
         dims = self._reduce_dims(x, axes)
+        dynamic_reduced = tuple(
+            x.type.shape[i] for i in dims
+            if not isinstance(x.type.shape[i], (int, np.integer))
+        )
+        if dynamic_reduced:
+            raise BackendError(
+                f"stablehlo export: op 'reduce_mean'{self._loc(op)} reduces "
+                f"over dynamic dims {dynamic_reduced!r} of shape "
+                f"{tuple(x.type.shape)!r} — the element count cannot be "
+                "computed statically; dynamic shapes are not supported by "
+                "the StableHLO compiler backends in v1 (decompose it "
+                "manually or use a future adapter)"
+            )
         count = 1
         for i in dims:
-            dim = x.type.shape[i]
-            if not isinstance(dim, int) or isinstance(dim, bool):
-                raise BackendError(
-                    f"stablehlo export: op 'reduce_mean'{self._loc(op)} "
-                    "reduces over a non-static dimension — the element "
-                    "count cannot be computed statically; decompose it "
-                    "manually or use a future adapter"
-                )
-            count *= dim
+            count *= x.type.shape[i]
         out_dtype = np.dtype(op.result.type.dtype)
         lines, sum_name, reduced_shape = self._emit_reduce_core(x, dims, "sum")
         converted = self._new_name()
@@ -808,6 +864,14 @@ class Writer:
         )
         cur = divided
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
+            # The keepdims reshape must be static: a dynamic dim moved
+            # between reduced/result shapes is invalid StableHLO reshape.
+            self._reject_dynamic_dims(
+                op, tuple(reduced_shape), "keepdims reshape operand", op_name="reshape"
+            )
+            self._reject_dynamic_dims(
+                op, tuple(op.result.type.shape), "keepdims reshape result", op_name="reshape"
+            )
             reshaped = self._new_name()
             lines.append(
                 f"{reshaped} = stablehlo.reshape {cur} : "
@@ -914,27 +978,172 @@ class Writer:
 
     # --- Linear algebra ---
 
+    def _dot_batch_tuple(self, rank: int, shape: tuple) -> tuple:
+        """Batch dims of a dot operand under numpy matmul promotion: a
+        rank-1 operand is promoted to a matrix by prepending (lhs) or
+        appending (rhs) a 1, so it has NO batch dims of its own."""
+        return () if rank == 1 else tuple(shape[:-2])
+
+    def _dot_batch_dim_equal(self, d1, d2) -> bool:
+        """True when two aligned batch dims are provably equal at runtime:
+        equal statics, structurally equal symbolic dims, ``None`` pairs,
+        or same-named ``Dim``\ s (core semantics: same name unifies)."""
+        if d1 == d2:
+            return True
+        return (
+            isinstance(d1, Dim)
+            and isinstance(d2, Dim)
+            and d1.name == d2.name
+        )
+
+    def _dot_batch_all_one(self, batch: tuple) -> bool:
+        """True for a non-empty batch tuple of provable size-1 dims (the
+        tensor is identical across every batch position)."""
+        return bool(batch) and all(d == 1 for d in batch)
+
+    def _dot_broadcast_dim(self, da, db, op: Op):
+        """Broadcast one aligned batch-dim pair (numpy rule, mirroring
+        ``ir.inference._broadcast_dim``): 1 yields the other side; equal
+        dims pass through; two unequal concrete ints raise BackendError
+        (trace-time ShapeError already rejected them — defensive here);
+        ``None`` (unchecked) yields ``None``; otherwise a
+        ``DimExpr("max", ...)`` defers the check to runtime (the caller
+        rejects those dims when a broadcast would be needed)."""
+        if da == 1:
+            return db
+        if db == 1:
+            return da
+        if self._dot_batch_dim_equal(da, db):
+            return da
+        if da is None or db is None:
+            return None
+        if isinstance(da, int) and isinstance(db, int):
+            raise BackendError(
+                f"stablehlo export: op 'dot'{self._loc(op)} cannot "
+                f"broadcast incompatible static batch dims {da!r} and "
+                f"{db!r}"
+            )
+        return DimExpr("max", da, db)
+
+    def _dot_broadcast_batch(self, ba: tuple, bb: tuple, op: Op) -> tuple:
+        """Matmul batch broadcast of two dot-operand batch tuples: numpy
+        RIGHT-aligned rule, matching ``ir.inference.infer_dot`` exactly
+        (rank-1 operands are already reduced to an empty batch by
+        ``_dot_batch_tuple``)."""
+        rank = max(len(ba), len(bb))
+        out = []
+        for i in range(rank):
+            da = 1 if i < rank - len(ba) else ba[i - (rank - len(ba))]
+            db = 1 if i < rank - len(bb) else bb[i - (rank - len(bb))]
+            out.append(self._dot_broadcast_dim(da, db, op))
+        return tuple(out)
+
     def _emit_dot(self, op: Op) -> str:
         a, b = op.operands
         la, lb = a.type.rank, b.type.rank
-        # etl dot = batched matmul (numpy contract, rank >= 2 both sides):
-        # contracting dims are the last of `a` / second-to-last of `b`,
-        # batch dims are the leading ones.
+        a_batch = self._dot_batch_tuple(la, tuple(a.type.shape))
+        b_batch = self._dot_batch_tuple(lb, tuple(b.type.shape))
+        target = self._dot_broadcast_batch(a_batch, b_batch, op)
+        n = len(target)
+        # etl dot = numpy matmul: contracting dims are the last of `a` /
+        # second-to-last of `b`; batch dims are the leading ones.
+        lines: list[str] = []
+        a_name, b_name = self._name(a), self._name(b)
+        a_shape = tuple(a.type.shape)
+        b_shape = tuple(b.type.shape)
+        if la == 1 or lb == 1:
+            # Rank-1 operand (defensive — ``etl.dot`` requires rank >= 2,
+            # but IR can be built directly): numpy promotes it to a matrix
+            # with an empty batch tuple, so emit a NON-batched dot_general
+            # whose free dims reproduce the promotion exactly — v·v:
+            # contracting [0]x[0] (scalar result); M·v:
+            # lhs [la-1] x rhs [0]; v·M: lhs [0] x rhs [lb-2].
+            lhs_batch = rhs_batch = ()
+            if la == 1:
+                lhs_contract = (0,)
+                rhs_contract = (0,) if lb == 1 else (lb - 2,)
+            else:
+                lhs_contract = (la - 1,)
+                rhs_contract = (0,)
+        elif len(a_batch) == len(b_batch) and all(
+            self._dot_batch_dim_equal(x, y)
+            for x, y in zip(a_batch, b_batch)
+        ):
+            # Matched batch structure — direct batched dot_general (the
+            # original v1 behavior, byte-identical for existing cases).
+            lhs_batch = rhs_batch = tuple(range(n))
+            lhs_contract, rhs_contract = (la - 1,), (lb - 2,)
+        elif not b_batch and _shape_is_static(
+            tuple(a.type.shape)
+        ) and _shape_is_static(tuple(b.type.shape)):
+            # rhs is a plain matrix: emit a NON-batched dot_general whose
+            # lhs free dims ARE a's batch dims — the result
+            # (a_batch, m, n) matches infer_dot exactly with NO broadcast
+            # (avoids materializing the batch expansion). Only for fully
+            # static shapes: the iree llvm-cpu pipeline of this generation
+            # cannot legalize the dynamic_reshape its own import inserts
+            # for a non-batched dot_general with dynamic dims, so dynamic
+            # shapes fall through to the (batched, dynamic-safe) broadcast
+            # path below.
+            lhs_batch = rhs_batch = ()
+            lhs_contract, rhs_contract = (la - 1,), (lb - 2,)
+        else:
+            # Batch broadcasting required: expand each operand's batch
+            # dims up to the target batch shape (numpy right-aligned
+            # rule), then emit a matched batched dot_general. A rhs whose
+            # batch is provably all size-1 contributes no result dims —
+            # reshape it to a plain matrix and use the non-batched form
+            # instead of materializing the broadcast.
+            for d in target:
+                if isinstance(d, DimExpr):
+                    raise BackendError(
+                        f"stablehlo export: op 'dot'{self._loc(op)} cannot "
+                        f"broadcast batch dims {a_batch!r} and {b_batch!r} "
+                        f"(shapes {tuple(a.type.shape)!r} and "
+                        f"{tuple(b.type.shape)!r}) — symbolic dims that "
+                        "cannot be proven equal or size-1 at compile time "
+                        "(dynamic batch broadcast)"
+                    )
+            if (
+                self._dot_batch_all_one(b_batch)
+                and len(b_batch) <= len(a_batch)
+            ):
+                b_name, extra, b_shape = self._dot_squeeze(op, b)
+                lines.extend(extra)
+                lhs_batch = rhs_batch = ()
+                lhs_contract, rhs_contract = (la - 1,), (0,)
+            else:
+                a_name, extra, a_shape = self._dot_broadcast_operand(
+                    op, a_name, a.type.dtype, tuple(a.type.shape),
+                    b, target, n,
+                )
+                lines.extend(extra)
+                b_name, extra, b_shape = self._dot_broadcast_operand(
+                    op, b_name, b.type.dtype, tuple(b.type.shape),
+                    a, target, n,
+                )
+                lines.extend(extra)
+                lhs_batch = rhs_batch = tuple(range(n))
+                # Contracting dims are relative to the BROADCAST shapes
+                # (batch..., m, k) / (batch..., k, n): last / second-last.
+                lhs_contract, rhs_contract = (n + 1,), (n,)
         dnums = (
             "#stablehlo.dot<"
-            f"lhs_batching_dimensions = [{self._int_list(range(la - 2))}], "
-            f"rhs_batching_dimensions = [{self._int_list(range(lb - 2))}], "
-            f"lhs_contracting_dimensions = [{la - 1}], "
-            f"rhs_contracting_dimensions = [{lb - 2}]>"
+            f"lhs_batching_dimensions = [{self._int_list(lhs_batch)}], "
+            f"rhs_batching_dimensions = [{self._int_list(rhs_batch)}], "
+            f"lhs_contracting_dimensions = [{self._int_list(lhs_contract)}], "
+            f"rhs_contracting_dimensions = [{self._int_list(rhs_contract)}]>"
         )
         elem_dtype = np.dtype(a.type.dtype)
         dot_type = self._type_str(elem_dtype, op.result.type.shape)
         dot_name = self._new_name()
-        lines = [
-            f'{dot_name} = "stablehlo.dot_general"({self._name(a)}, '
-            f"{self._name(b)}) {{dot_dimension_numbers = {dnums}}} : "
-            f"({self._vt(a.type)}, {self._vt(b.type)}) -> {dot_type}"
-        ]
+        lines.append(
+            f'{dot_name} = "stablehlo.dot_general"({a_name}, '
+            f"{b_name}) {{dot_dimension_numbers = {dnums}}} : "
+            f"({self._type_str(a.type.dtype, a_shape)}, "
+            f"{self._type_str(b.type.dtype, b_shape)}) -> "
+            f"{dot_type}"
+        )
         cur = dot_name
         # dot_general does not promote (XLA keeps the operand element type);
         # etl dot promotes dtypes per numpy.
@@ -948,8 +1157,193 @@ class Writer:
         self._names[id(op.result)] = cur
         return "\n".join(lines)
 
+    def _dot_squeeze(self, op: Op, operand: Value) -> tuple[str, list, tuple]:
+        """Reshape an operand whose batch dims are provably all size-1 to
+        its plain matrix form — the tensor is identical across every batch
+        position, so dropping the batch dims lets the dot emit a
+        NON-batched dot_general (the size-1 batch dims must not appear as
+        free dims in the result). Returns ``(name, lines, matrix_shape)``."""
+        shape = tuple(operand.type.shape)
+        matrix = shape[-2:]
+        name = self._new_name()
+        line = (
+            f"{name} = stablehlo.reshape {self._name(operand)} : "
+            f"({self._vt(operand.type)}) -> "
+            f"{self._type_str(operand.type.dtype, matrix)}"
+        )
+        return name, [line], matrix
+
+    def _dot_broadcast_operand(
+        self,
+        op: Op,
+        name: str,
+        dtype,
+        shape: tuple,
+        other: Value,
+        target: tuple,
+        n: int,
+    ) -> tuple[str, list, tuple]:
+        """SSA name of a dot operand broadcast from its batch dims up to
+        the dot's target batch shape ``target`` (n = len(target)), plus
+        prepend lines and the broadcast result shape. Right-aligned numpy
+        mapping: the operand's batch dims land in the LAST
+        ``len(shape) - 2`` target positions and its two matrix dims in
+        positions n, n+1. ``other`` supplies the runtime size of
+        pure-broadcast dynamic dims (its aligned batch dims). Static
+        target shapes emit ``stablehlo.broadcast_in_dim``; dynamic targets
+        emit ``stablehlo.dynamic_broadcast_in_dim`` with the runtime
+        ``output_dimensions`` built from per-dim pieces (see
+        ``_dot_dynamic_sources``)."""
+        k = len(shape) - 2
+        target_shape = target + shape[-2:]
+        if shape == target_shape:
+            return name, [], shape
+        dims = list(range(n - k, n)) + [n, n + 1]
+        if _shape_is_static(target_shape):
+            bcast = self._new_name()
+            line = (
+                f'{bcast} = "stablehlo.broadcast_in_dim"({name}) '
+                f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+                f"({self._type_str(dtype, shape)}) -> "
+                f"{self._type_str(dtype, target_shape)}"
+            )
+            return bcast, [line], target_shape
+        src_map = self._dot_dynamic_sources(op, name, shape, other, target, n)
+        bcast, lines = self._dot_dynamic_bcast(
+            name, dtype, shape, target_shape, dims, src_map
+        )
+        return bcast, lines, target_shape
+
+    def _dot_dynamic_sources(
+        self,
+        op: Op,
+        name: str,
+        shape: tuple,
+        other: Value,
+        target: tuple,
+        n: int,
+    ) -> dict:
+        """Per-result-dim runtime-size providers for the dynamic broadcast
+        of ``(name, shape)`` up to ``target + shape[-2:]``:
+        ``{result_dim_index: (provider_name, provider_type, provider_dim)}``
+        for every dynamic dim, read via ``stablehlo.get_dimension_size``.
+        A dim is sourced from the operand's own mapped dims when those are
+        not provably 1, else from the other operand's aligned batch dim.
+        Raises BackendError when no provider exists (unprovable merge —
+        message names "dynamic")."""
+        k = len(shape) - 2
+        other_shape = tuple(other.type.shape)
+        ko = len(other_shape) - 2
+        other_name = self._name(other)
+        other_type = self._type_str(other.type.dtype, other_shape)
+        src_map: dict = {}
+        for j, dim in enumerate(target):
+            if _is_static_dim(dim):
+                continue
+            if isinstance(dim, DimExpr):
+                raise BackendError(
+                    f"stablehlo export: op 'dot'{self._loc(op)} cannot "
+                    f"broadcast batch dims {tuple(shape[:-2])!r} and "
+                    f"{other_shape[:-2]!r} (shapes {shape!r} and "
+                    f"{other_shape!r}) — symbolic dims that cannot be "
+                    "proven equal or size-1 at compile time (dynamic "
+                    "batch broadcast)"
+                )
+            prov = None
+            if (
+                n - k <= j < n
+                and not _is_static_one(shape[j - (n - k)])
+            ):
+                prov = (name, self._type_str(dtype, shape), j - (n - k))
+            elif (
+                n - ko <= j < n
+                and not _is_static_one(other_shape[j - (n - ko)])
+            ):
+                prov = (other_name, other_type, j - (n - ko))
+            if prov is None:
+                raise BackendError(
+                    f"stablehlo export: op 'dot'{self._loc(op)} cannot "
+                    f"broadcast batch dims {tuple(shape[:-2])!r} and "
+                    f"{other_shape[:-2]!r} (shapes {shape!r} and "
+                    f"{other_shape!r}) — no runtime size source for the "
+                    "dynamic batch dim (dynamic batch broadcast)"
+                )
+            src_map[j] = prov
+        # Matrix dims are passed through unchanged: symbolic ones are
+        # sourced from the operand itself.
+        for j in (n, n + 1):
+            if not _is_static_dim(shape[-2 + (j - n)]):
+                src_map[j] = (name, self._type_str(dtype, shape), k + (j - n))
+        return src_map
+
+    def _dot_dynamic_bcast(
+        self,
+        value_name: str,
+        dtype,
+        operand_shape: tuple,
+        result_shape: tuple,
+        dims: list,
+        src_map: dict,
+    ) -> tuple[str, list]:
+        """Emit ``stablehlo.dynamic_broadcast_in_dim`` for a dot operand
+        whose target batch has dynamic dims. The runtime
+        ``output_dimensions`` are built from per-dim pieces (mirroring
+        ``_emit_dynamic_broadcast``): static dims via constants, dynamic
+        dims via ``stablehlo.get_dimension_size`` (+ ``reshape`` to
+        ``tensor<1xi32>``) on the provider from ``src_map``, joined by
+        ``stablehlo.concatenate``. Returns ``(broadcast_name, lines)``."""
+        lines: list[str] = []
+        pieces: list[str] = []
+        for i, dim in enumerate(result_shape):
+            if _is_static_dim(dim):
+                piece = self._new_name()
+                lines.append(
+                    f"{piece} = stablehlo.constant "
+                    f"{self._constant_text(np.asarray([int(dim)], dtype=np.int32))}"
+                    f" : tensor<1xi32>"
+                )
+            else:
+                src_name, src_type, src_dim = src_map[i]
+                size_name = self._new_name()
+                lines.append(
+                    f'{size_name} = "stablehlo.get_dimension_size"'
+                    f"({src_name}) {{dimension = {int(src_dim)} : i64}} : "
+                    f"({src_type}) -> tensor<i32>"
+                )
+                piece = self._new_name()
+                lines.append(
+                    f"{piece} = stablehlo.reshape {size_name} : "
+                    f"(tensor<i32>) -> tensor<1xi32>"
+                )
+            pieces.append(piece)
+        if len(pieces) == 1:
+            dims_name = pieces[0]
+        else:
+            dims_name = self._new_name()
+            piece_types = ", ".join("tensor<1xi32>" for _ in pieces)
+            lines.append(
+                f"{dims_name} = stablehlo.concatenate {', '.join(pieces)}, "
+                f"dim = 0 : ({piece_types}) -> tensor<{len(pieces)}xi32>"
+            )
+        bcast_name = self._new_name()
+        lines.append(
+            f'{bcast_name} = "stablehlo.dynamic_broadcast_in_dim"'
+            f"({value_name}, {dims_name}) "
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(dtype, operand_shape)}, "
+            f"tensor<{len(pieces)}xi32>) -> "
+            f"{self._type_str(dtype, result_shape)}"
+        )
+        return bcast_name, lines
+
     def _emit_conv(self, op: Op) -> str:
         x, w = op.operands
+        # v1 uniformity: SAME padding already needed static dims; extend the
+        # rejection to ALL conv shapes — a dynamic dim anywhere (operand or
+        # result) fails here with a clear BackendError, never invalid MLIR.
+        self._reject_dynamic_dims(op, tuple(x.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(w.type.shape), "operand shape")
+        self._reject_dynamic_dims(op, tuple(op.result.type.shape), "result shape")
         rank = x.type.rank
         n_spatial = rank - 2
         attrs = op.attributes
