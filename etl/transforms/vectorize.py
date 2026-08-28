@@ -61,54 +61,6 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _format_path(path) -> str:
-    """Render a pytree key path readably, e.g. ``[0]['weights'][1]``."""
-    if not path:
-        return "()"
-    parts = []
-    for key in path:
-        if isinstance(key, str):
-            parts.append(f"[{key!r}]")
-        else:
-            parts.append(f"[{key}]")
-    return "".join(parts)
-
-
-def _first_structure_mismatch(spec, expected, prefix=()):
-    """The pytree path where `spec` first diverges from `expected`'s CONTAINER
-    structure, or None when the two structures match.
-
-    Leaf *types* are deliberately ignored (axes leaves are int/None while
-    input/output leaves are TensorSpec/SymbolicTensor/static values) — only
-    the container skeleton must agree: node type, dict keys (`node_data`),
-    and child arity. Both specs must be normalized such that leaf positions
-    have `num_leaves == 1` (see `vmap._derive_unvectorized_args` for the
-    etl-dataclass leaf caveat).
-    """
-    if not spec.children and not expected.children:
-        if spec.num_leaves == expected.num_leaves:
-            return None
-        return prefix  # leaf vs empty container
-    if not spec.children or not expected.children:
-        return prefix  # leaf vs container
-    if spec.type is not expected.type:
-        return prefix
-    if spec.node_data != expected.node_data:
-        return prefix
-    if len(spec.children) != len(expected.children):
-        return prefix
-    for index, (child, expected_child) in enumerate(
-        zip(spec.children, expected.children)
-    ):
-        key = spec.node_data[index] if spec.node_data is not None else index
-        mismatch = _first_structure_mismatch(
-            child, expected_child, prefix + (key,)
-        )
-        if mismatch is not None:
-            return mismatch
-    return None
-
-
 def _normalize_axis_entries(entries, tensor_positions, ranks, what):
     """Validate/normalize raw axes leaves into ``None``/``0`` entries.
 
@@ -197,12 +149,14 @@ def _normalize_axes(graph: Graph, axes):
         entries[sorted(tensor_positions)[0]] = axes
     else:
         axes_leaves, axes_spec = core.flatten(axes)
-        mismatch = _first_structure_mismatch(axes_spec, graph.input_specs)
+        mismatch = core.first_mismatch_path(
+            axes_spec, graph.input_specs, leaf_vs_empty_is_mismatch=True
+        )
         if mismatch is not None:
             raise core.TransformError(
                 "vectorize: the axes pytree does not match the graph's input "
                 f"structure — first mismatch at pytree path "
-                f"{_format_path(mismatch)}; axes must be a pytree with the "
+                f"{core.format_path(mismatch)}; axes must be a pytree with the "
                 "same container structure as the inputs (0 maps a tensor "
                 "input's leading axis, None leaves it unmapped)"
             )

@@ -79,7 +79,19 @@ from .tensor import (
     tensor,
     zeros,
 )
-from .tree import TreeSpec, flatten, register_pytree_node, unflatten
+from .tree import (
+    TreeSpec,
+    first_mismatch_path,  # internal cross-module contract (trace/pipeline/transforms)
+    flatten,
+    format_path,  # internal cross-module contract (trace/pipeline/transforms)
+    register_pytree_node,
+    tree_flatten,
+    tree_leaves,
+    tree_map,
+    tree_structure,
+    tree_unflatten,
+    unflatten,
+)
 
 __all__ = [
     # errors

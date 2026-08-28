@@ -98,50 +98,6 @@ def _single_scalar_output(graph: Graph, transform: str) -> "ir.Value":
     return value
 
 
-def _first_structure_mismatch(
-    user_spec: "core.TreeSpec",
-    graph_spec: "core.TreeSpec",
-    prefix: Tuple[Any, ...] = (),
-):
-    """Compare a `core.flatten` spec against a trace-time tree spec, ignoring
-    leaf *types* (trace trees record marker types at tensor leaves, which can
-    never equal the user's `TensorSpec`/`None`/static leaf types).
-
-    Returns `None` when the structures match, else the pytree path of the
-    first mismatching node. Container nodes must match exactly (same node
-    type, same `node_data` — e.g. sorted dict keys — same child count);
-    childless nodes match any childless node (leaf vs. empty-container
-    mismatches are caught by the caller's leaf-count check).
-    """
-    user_children = user_spec.children
-    graph_children = graph_spec.children
-    if user_children and graph_children:
-        if (
-            user_spec.type != graph_spec.type
-            or user_spec.node_data != graph_spec.node_data
-        ):
-            return prefix
-        if len(user_children) != len(graph_children):
-            return prefix
-        is_dict = isinstance(graph_spec.type, type) and issubclass(
-            graph_spec.type, dict
-        )
-        for index, (user_child, graph_child) in enumerate(
-            zip(user_children, graph_children)
-        ):
-            key = graph_spec.node_data[index] if is_dict else index
-            mismatch = _first_structure_mismatch(
-                user_child, graph_child, prefix + (key,)
-            )
-            if mismatch is not None:
-                return mismatch
-        return None
-    # Both childless: both leaves or both empty containers.
-    if bool(user_children) != bool(graph_children):
-        return prefix
-    return None
-
-
 def _single_entry_leaves(pytree, tree_spec, static_records):
     """Single-tensor fallback for `_normalize_extra_pytree`.
 
@@ -212,7 +168,7 @@ def _normalize_extra_pytree(
       `none_requires_scalar` is set).
     """
     leaves, user_spec = core.flatten(pytree)
-    mismatch = _first_structure_mismatch(user_spec, tree_spec)
+    mismatch = core.first_mismatch_path(user_spec, tree_spec)
     if mismatch is not None and len(primal_specs) == 1:
         leaves = _single_entry_leaves(pytree, tree_spec, static_records)
         if leaves is not None:
@@ -220,7 +176,7 @@ def _normalize_extra_pytree(
     if mismatch is not None:
         raise core.TransformError(
             f"{transform}: the {kind} structure does not match the graph's "
-            f"tree at path {_format_path(mismatch)}: got {user_spec}, "
+            f"tree at path {core.format_path(mismatch)}: got {user_spec}, "
             f"expected {tree_spec}"
         )
     if len(leaves) != tree_spec.num_leaves:

@@ -52,9 +52,10 @@ Exported from `__init__.py` (the public contract — exact names):
 2. Treat `specs` (positional args) as ONE pytree; flatten via
    `core.TreeSpec`. Leaves must be `TensorSpec` (tensor input; shape may
    hold `Dim`/`DimExpr`, `None` = dynamic) or static Python values
-   (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice` — see
-   `_is_static_value`). Anything else (concrete `Tensor`, ndarray,
-   `SymbolicTensor`, …) → `TraceError` with the pytree path. Capturing a
+   (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice`/
+   `core.Device` — see `_is_static_value`). Anything else (concrete
+   `Tensor`, ndarray, `SymbolicTensor`, …) → `TraceError` with the pytree
+   path. Capturing a
    concrete tensor is NEVER silently allowed.
 3. Build `ir.Module` + entry `ir.Function` "main" with one block arg per
    tensor leaf (arg type = (shape, dtype)). Wrap each block arg as
@@ -225,15 +226,21 @@ Graph save/load round-trips through the persist container.
 
 ## Notes for agents
 
-- **Tree leaf markers**: `core.flatten` descends into EVERY dataclass (incl.
-  `SymbolicTensor`/`TensorSpec`), so trace trees cannot record such leaves
-  by their real type. `trace.py` records them via private non-dataclass
-  markers (`_TensorSpecLeaf`/`_SymbolicLeaf`) carrying the original object;
-  `graph.py` compares trees by container SKELETON (leaf types differ by
-  design) and normalizes dataclass leaf types before `core.unflatten`
-  (`_normalize_leaf_types`). Any code touching `Graph.input_specs`/
-  `output_tree` must respect this. `control_flow.py` has its own local
-  `_flatten_tree` with the same principle.
+- **Leaf conventions match core**: `core.flatten` treats etl-module
+  dataclasses (`Device`, `Dim`, `TensorSpec`, `TreeSpec`, `SymbolicTensor`,
+  …) as single leaves, and trace's walkers apply the same etl-module leaf
+  check: `trace.py::_flatten_trace_into` and
+  `control_flow.py::_flatten_tree` both treat any etl-module dataclass as
+  ONE leaf (no descent into its fields; non-etl dataclasses are still
+  descended). A `Device` trace input is ONE static leaf — `_is_static_value`
+  accepts `core.Device` in both files. `trace.py` still records
+  `TensorSpec`/`SymbolicTensor` leaves via private non-dataclass markers
+  (`_TensorSpecLeaf`/`_SymbolicLeaf`) carrying the original object —
+  load-bearing for `graph.py`'s container-SKELETON comparison
+  (`_normalize_leaf_types` before `core.unflatten`) and for persist
+  signature encoding. Any code touching `Graph.input_specs`/`output_tree`
+  must respect this. `control_flow.py`'s local `_flatten_tree` records
+  `TreeSpec(type=None)`-style leaves (rebuilt fine by `core.unflatten`).
 - **`signature_info()` returns persist-ENCODED (JSON-safe) values** — it is
   metadata for the persistence container; its keys mirror the
   `etl.backends.Signature` fields exactly (`input_tree`, `output_tree`,
@@ -249,9 +256,7 @@ Graph save/load round-trips through the persist container.
   the FUNCTION after `etl/__init__.py` imports; the submodule is reachable
   via `import etl.trace as mod` or `from etl.trace import ...` (see
   `__init__.py` docstring).
-- Gaps found in lower layers (flagged to the package root): `core.flatten`
-  recursing into dataclass leaves (SymbolicTensor) is a footgun for
-  ops/backends that flatten SymbolicTensor trees; `core.Dim` has no
+- Gaps found in lower layers (flagged to the package root): `core.Dim` has no
   `evaluate()` (only `DimExpr`); registry has no `expand_dims` and no
   dynamic-index `slice` (scan works around via gather/reshape); `ir.verify`
   does not check `while` body-return types against operand types (checked

@@ -5,7 +5,8 @@ everywhere in etl: trace inputs, run outputs, bind. ``TreeSpec`` is the
 structural description that makes flattening reversible.
 
 Built-in node types: ``tuple``, ``list``, ``dict`` (keys sorted for
-determinism), ``namedtuple`` instances, ``dataclass`` instances. Custom
+determinism), ``defaultdict`` / ``Counter`` (dict subclasses with preserved
+rebuild semantics), ``namedtuple`` instances, ``dataclass`` instances. Custom
 containers register via ``register_pytree_node``.
 
 Invariants (binding):
@@ -15,15 +16,36 @@ Invariants (binding):
 - Dict keys are sorted (``sorted(keys)``) so specs are order-stable and
   hashable-consistent.
 - Treespecs compare structurally (frozen dataclass equality).
+- ``tree_map`` / ``tree_leaves`` / ``tree_structure`` / ``tree_flatten`` /
+  ``tree_unflatten`` are pure sugar over ``flatten``/``unflatten`` — no new
+  semantics.
+- ``first_mismatch_path`` / ``format_path`` are the shared structure-mismatch
+  contract consumed by trace/pipeline/transforms (NOT top-level ``etl``
+  surface; importable from ``etl.core``).
 """
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__all__ = ["TreeSpec", "flatten", "unflatten", "register_pytree_node"]
+__all__ = [
+    "TreeSpec",
+    "flatten",
+    "unflatten",
+    "register_pytree_node",
+    # pytree sugar (pure flatten/unflatten aliases and compositions)
+    "tree_map",
+    "tree_leaves",
+    "tree_structure",
+    "tree_flatten",
+    "tree_unflatten",
+    # cross-module structure-mismatch contract (trace/pipeline/transforms)
+    "first_mismatch_path",
+    "format_path",
+]
 
 # Registered custom pytree node types → (flatten_fn, unflatten_fn).
 # flatten_fn(obj) -> (children, context); unflatten_fn(context, children) -> obj.
@@ -41,7 +63,8 @@ class TreeSpec:
         context: Optional metadata supplied by a registered type's
             ``flatten_fn`` (used by its ``unflatten_fn``).
         node_data: Optional per-type data needed to rebuild the container:
-            sorted dict keys for ``dict``; field names for ``namedtuple`` and
+            sorted dict keys for ``dict`` (a ``(default_factory, keys)`` pair
+            for ``defaultdict``); field names for ``namedtuple`` and
             ``dataclass``.
     """
 
@@ -83,8 +106,15 @@ def register_pytree_node(
 
     Raises:
         TypeError: If ``node_type`` is not a type or the functions are not
-            callable.
+            callable; if ``node_type`` is ``object`` itself (every type's MRO
+            ends in ``object``, so registering it would hijack the lookup for
+            all types).
     """
+    if node_type is object:
+        raise TypeError(
+            "register_pytree_node: cannot register 'object' as a pytree node — "
+            "it would hijack the MRO lookup for all types"
+        )
     if not isinstance(node_type, type):
         raise TypeError(f"node_type must be a type, got {node_type!r}")
     if not callable(flatten_fn) or not callable(unflatten_fn):
@@ -118,8 +148,8 @@ def flatten(obj: Any) -> Tuple[List[Any], TreeSpec]:
 
     Traverses container nodes in pre-order, collecting leaves (non-container
     values). Built-in support: ``tuple``, ``list``, ``dict`` (keys sorted),
-    ``namedtuple``, ``dataclass``, plus types registered via
-    ``register_pytree_node``.
+    ``defaultdict`` / ``Counter``, ``namedtuple``, ``dataclass``, plus types
+    registered via ``register_pytree_node``.
 
     Args:
         obj: Any value (pytree or leaf).
@@ -173,9 +203,30 @@ def _flatten_into(obj: Any, leaves: List[Any]) -> TreeSpec:
         child_specs = tuple(_flatten_into(child, leaves) for child in obj)
         return TreeSpec(type=obj_type, children=child_specs)
     if isinstance(obj, dict):
-        keys = sorted(obj)
+        try:
+            keys = sorted(obj)
+        except TypeError:
+            # The raw sort TypeError must never leak: wrap it with guidance.
+            type_names: List[str] = []
+            for key in obj:
+                name = type(key).__name__
+                if name not in type_names:
+                    type_names.append(name)
+            raise TypeError(
+                f"flatten: cannot sort dict keys of mixed types (types: {type_names}); "
+                "dict keys are sorted for deterministic tree structure — use keys of one "
+                "type or register_pytree_node"
+            ) from None
         child_specs = tuple(_flatten_into(obj[key], leaves) for key in keys)
-        return TreeSpec(type=obj_type, children=child_specs, node_data=keys)
+        if isinstance(obj, collections.defaultdict):
+            # Record the factory alongside the sorted keys so unflatten can
+            # rebuild. Unpersistable factories (lambdas, partials, ...) are
+            # still recorded (for repr in the error) and rejected at
+            # unflatten time — flatten never fails on them.
+            node_data = (obj.default_factory, keys)
+        else:
+            node_data = keys
+        return TreeSpec(type=obj_type, children=child_specs, node_data=node_data)
     # Leaf: anything else (None, scalars, ndarrays, ...).
     leaves.append(obj)
     return TreeSpec(type=obj_type)
@@ -217,6 +268,26 @@ def _unflatten_into(leaves: Iterator[Any], spec: TreeSpec) -> Any:
     return _rebuild_container(spec, children)
 
 
+def _dataclass_init_rejecting_field_names(cls: type) -> List[str]:
+    """Field names a ``node_data``-driven ``cls(**...)`` rebuild rejects.
+
+    ``flatten`` records every real field name, but ``__init__`` will not
+    accept: (a) ``init=False`` fields (stored in ``node_data``, rejected as
+    unexpected keyword arguments) and (b) ``InitVar`` pseudo-fields (required
+    by ``__init__`` but never stored). ``ClassVar`` pseudo-fields are neither
+    recorded nor required. Declaration order is preserved.
+    """
+    names: List[str] = []
+    real_fields = {field.name: field for field in dataclasses.fields(cls)}
+    for name in cls.__dataclass_fields__:
+        entry = cls.__dataclass_fields__[name]
+        if isinstance(entry.type, dataclasses.InitVar):
+            names.append(name)
+        elif name in real_fields and not real_fields[name].init:
+            names.append(name)
+    return names
+
+
 def _rebuild_container(spec: TreeSpec, children: List[Any]) -> Any:
     """Reconstruct a container node from its (rebuilt) children."""
     registered = _PYTREE_NODE_REGISTRY.get(spec.type)
@@ -231,12 +302,215 @@ def _rebuild_container(spec: TreeSpec, children: List[Any]) -> Any:
         # namedtuple: rebuild positionally in recorded field order.
         return spec.type(*children)
     if isinstance(spec.type, type) and dataclasses.is_dataclass(spec.type):
-        # dataclass: rebuild by recorded field name.
-        return spec.type(**dict(zip(spec.node_data, children)))
+        # dataclass: rebuild by recorded field name. InitVar / init=False
+        # fields make __init__ reject the recorded mapping — wrap that
+        # TypeError only when such fields exist (namedtuple arity errors and
+        # unrelated TypeErrors from a dataclass's own __init__ keep their raw
+        # form).
+        try:
+            return spec.type(**dict(zip(spec.node_data, children)))
+        except TypeError:
+            rejecting = _dataclass_init_rejecting_field_names(spec.type)
+            if rejecting:
+                raise TypeError(
+                    f"unflatten: cannot rebuild dataclass {spec.type.__qualname__}: its "
+                    f"__init__ rejects field(s) {rejecting} "
+                    "(InitVar/init=False fields are not stored) — register the type via "
+                    "register_pytree_node for custom reconstruction"
+                ) from None
+            raise
     if isinstance(spec.type, type) and issubclass(spec.type, tuple):
         return spec.type(children)
     if isinstance(spec.type, type) and issubclass(spec.type, list):
         return spec.type(children)
     if isinstance(spec.type, type) and issubclass(spec.type, dict):
+        if issubclass(spec.type, collections.defaultdict):
+            factory, keys = spec.node_data
+            if factory is None or isinstance(factory, type):
+                return spec.type(factory, dict(zip(keys, children)))
+            raise TypeError(
+                f"unflatten: cannot rebuild {spec.type.__qualname__}: "
+                f"default_factory {factory!r} cannot be persisted — register the type "
+                "via register_pytree_node for custom reconstruction"
+            )
+        if issubclass(spec.type, collections.Counter):
+            # Mapping constructor (positional form) so non-str keys roundtrip.
+            return spec.type(dict(zip(spec.node_data, children)))
         return spec.type(zip(spec.node_data, children))
     raise TypeError(f"unflatten: no reconstruction rule for TreeSpec node type {spec.type!r}")
+
+
+# --- Structure-mismatch helpers (cross-module contract) ----------------------
+# Consumed by trace (graph.py), pipeline, and transforms (vectorize/vmap):
+# importable as ``from etl.core import first_mismatch_path, format_path``.
+# These are internal contract names, NOT part of the top-level ``etl`` surface.
+
+
+def _is_defaultdict_spec(spec: TreeSpec) -> bool:
+    """True when ``spec`` describes a ``defaultdict`` (or subclass) node."""
+    return (
+        isinstance(spec.type, type)
+        and issubclass(spec.type, collections.defaultdict)
+    )
+
+
+def _dict_keys(spec: TreeSpec) -> Optional[List[Any]]:
+    """The recorded sorted key list of a dict-subclass spec, or ``None`` when
+    the spec carries no ``node_data`` (hand-built specs).
+
+    ``defaultdict`` specs record ``(default_factory, keys)`` — the keys live
+    at index 1 so structural comparison covers the factory too.
+    """
+    if spec.node_data is None:
+        return None
+    if _is_defaultdict_spec(spec):
+        return spec.node_data[1]
+    return spec.node_data
+
+
+def first_mismatch_path(
+    spec_a: TreeSpec, spec_b: TreeSpec, *, leaf_vs_empty_is_mismatch: bool = False
+) -> Optional[Tuple[Any, ...]]:
+    """The pytree path where ``spec_a`` first diverges from ``spec_b`` in
+    CONTAINER structure, or ``None`` when the two structures match.
+
+    Cross-module contract (binding; consumed by trace/pipeline/transforms):
+
+    - Container nodes must match exactly: node ``type`` (``!=``),
+      ``node_data``, and child count.
+    - One childless node vs a node with children → mismatch at that prefix.
+    - Both childless (leaf vs leaf OR leaf vs empty container): match by
+      default (grad/graph/pipeline semantics). With
+      ``leaf_vs_empty_is_mismatch=True`` (vectorize's semantics), a
+      ``num_leaves`` difference (1 vs 0) at the same node IS a mismatch.
+    - Leaf *types* are deliberately ignored — childless nodes with equal
+      ``num_leaves`` always match.
+    - While descending, dict-subclass keys are sourced from ``node_data``
+      (positional index for all other container types).
+
+    Args:
+        spec_a: The first structure (the "expected" one).
+        spec_b: The second structure (the "got" one).
+        leaf_vs_empty_is_mismatch: Treat a leaf (1 leaf) vs an empty
+            container (0 leaves) at the same node as a mismatch.
+
+    Returns:
+        The path (tuple of int positional indices / dict keys) of the first
+        diverging node, or ``None`` when the structures match.
+    """
+
+    def walk(a: TreeSpec, b: TreeSpec, prefix: Tuple[Any, ...]):
+        if not a.children and not b.children:
+            if leaf_vs_empty_is_mismatch and a.num_leaves != b.num_leaves:
+                return prefix
+            return None
+        if not a.children or not b.children:
+            return prefix
+        if a.type != b.type:
+            return prefix
+        if a.node_data != b.node_data:
+            return prefix
+        if len(a.children) != len(b.children):
+            return prefix
+        keys = _dict_keys(a)
+        for index, (child_a, child_b) in enumerate(zip(a.children, b.children)):
+            key = keys[index] if keys is not None else index
+            mismatch = walk(child_a, child_b, prefix + (key,))
+            if mismatch is not None:
+                return mismatch
+        return None
+
+    return walk(spec_a, spec_b, ())
+
+
+def format_path(path) -> str:
+    """Render a pytree key path readably, e.g. ``[0]['weights'][1]``."""
+    if not path:
+        return "()"
+    parts = []
+    for key in path:
+        if isinstance(key, str):
+            parts.append(f"[{key!r}]")
+        else:
+            parts.append(f"[{key}]")
+    return "".join(parts)
+
+
+def _subtree_spec_at(spec: TreeSpec, path: Tuple[Any, ...]) -> TreeSpec:
+    """The subtree :class:`TreeSpec` at ``path`` (keys as produced by
+    :func:`first_mismatch_path`)."""
+    current = spec
+    for key in path:
+        keys = _dict_keys(current)
+        if keys is not None:
+            index = keys.index(key)
+        else:
+            index = key
+        current = current.children[index]
+    return current
+
+
+# --- Sugared pytree API (pure sugar over flatten/unflatten) -------------------
+
+
+def tree_map(fn: Callable, *trees) -> Any:
+    """Map ``fn`` over the leaves of one or more trees of identical structure.
+
+    Pure sugar over :func:`flatten` / :func:`unflatten` — no new semantics:
+
+    - One tree: ``unflatten([fn(leaf) for leaf in leaves], spec)``.
+    - Several trees: structures are validated pairwise against the first tree
+      (:func:`first_mismatch_path`); ``fn`` is applied per leaf position over
+      the zipped leaf lists; results are rebuilt into the first tree's
+      structure.
+
+    Args:
+        fn: Called as ``fn(leaf)`` for one tree, ``fn(*leaves)`` for several.
+        *trees: One or more pytrees sharing one structure.
+
+    Returns:
+        The rebuilt tree (first tree's structure).
+
+    Raises:
+        TypeError: If no trees are given, or the trees do not share one
+            structure.
+    """
+    if not trees:
+        raise TypeError("tree_map: expected at least one tree")
+    if len(trees) == 1:
+        leaves, spec = flatten(trees[0])
+        return unflatten([fn(leaf) for leaf in leaves], spec)
+    first_leaves, first_spec = flatten(trees[0])
+    leaf_lists = [first_leaves]
+    for tree in trees[1:]:
+        leaves, spec = flatten(tree)
+        mismatch = first_mismatch_path(first_spec, spec)
+        if mismatch is not None:
+            raise TypeError(
+                "tree_map: trees do not have the same structure — "
+                f"first mismatch at pytree path {format_path(mismatch)}: "
+                f"expected {_subtree_spec_at(first_spec, mismatch)!r}, "
+                f"got {_subtree_spec_at(spec, mismatch)!r}"
+            )
+        leaf_lists.append(leaves)
+    return unflatten([fn(*zipped) for zipped in zip(*leaf_lists)], first_spec)
+
+
+def tree_leaves(tree) -> List[Any]:
+    """All leaves of ``tree`` in pre-order (alias of ``flatten(tree)[0]``)."""
+    return flatten(tree)[0]
+
+
+def tree_structure(tree) -> TreeSpec:
+    """The :class:`TreeSpec` of ``tree`` (alias of ``flatten(tree)[1]``)."""
+    return flatten(tree)[1]
+
+
+def tree_flatten(tree) -> Tuple[List[Any], TreeSpec]:
+    """Alias of :func:`flatten` — returns ``(leaves, treespec)``."""
+    return flatten(tree)
+
+
+def tree_unflatten(leaves: List[Any], treespec: TreeSpec) -> Any:
+    """Alias of :func:`unflatten` — rebuilds a pytree from leaves and spec."""
+    return unflatten(leaves, treespec)

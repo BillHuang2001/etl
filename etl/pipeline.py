@@ -45,6 +45,7 @@ Implementation notes (binding):
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from dataclasses import is_dataclass
 from typing import Any, Iterator, Tuple
@@ -54,6 +55,7 @@ import numpy as np
 from etl import backends
 from etl import core
 from etl.backends import CompiledArtifact, LoweredProgram
+from etl.core import first_mismatch_path, format_path
 from etl.trace import Graph
 from etl.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
@@ -390,25 +392,95 @@ def _walk_leaves(spec: "core.TreeSpec", prefix=(), counter=None):
 def _structure_matches(spec_a: "core.TreeSpec", spec_b: "core.TreeSpec") -> bool:
     """True if two TreeSpecs describe the same container structure.
 
-    Container nodes must match exactly (same node type, same ``node_data`` —
-    e.g. sorted dict keys / dataclass field names, same child count); leaves
-    match any leaf. Leaf *types* are deliberately ignored: trace-time trees
-    record marker types (``_TensorSpecLeaf``/``_SymbolicLeaf``/static types)
-    while run-time trees record concrete types — these can never be
-    identical. The per-leaf static and tensor checks below validate leaf
-    positions/types with precise errors; the total leaf count is checked by
-    the caller against the recorded specs.
+    Delegates to ``core.first_mismatch_path`` with the default
+    ``leaf_vs_empty_is_mismatch=False``: container nodes must match exactly
+    (same node type, same ``node_data`` — e.g. sorted dict keys / dataclass
+    field names, same child count); leaves match any leaf, and a leaf vs an
+    empty container is NOT a mismatch here. Leaf *types* are deliberately
+    ignored: trace-time trees record marker types
+    (``_TensorSpecLeaf``/``_SymbolicLeaf``/static types) while run-time trees
+    record concrete types — these can never be identical. The per-leaf static
+    and tensor checks below validate leaf positions/types with precise errors;
+    the total leaf count is checked by the caller against the recorded specs.
     """
-    if spec_a.children and spec_b.children:
-        if spec_a.type != spec_b.type or spec_a.node_data != spec_b.node_data:
-            return False
-        return len(spec_a.children) == len(spec_b.children) and all(
-            _structure_matches(child_a, child_b)
-            for child_a, child_b in zip(spec_a.children, spec_b.children)
-        )
-    # Both childless: both leaves, or both empty containers (leaf-count
-    # validation elsewhere reports an empty-container-vs-leaf mismatch).
-    return bool(spec_a.children) == bool(spec_b.children)
+    return first_mismatch_path(spec_a, spec_b) is None
+
+
+def _subspec(spec: "core.TreeSpec", path: Tuple[Any, ...]) -> "core.TreeSpec":
+    """The subtree ``core.TreeSpec`` of ``spec`` at ``path`` (keys as
+    produced by ``first_mismatch_path``: positional indices for non-dict
+    nodes, dict keys for dict subclasses)."""
+    current = spec
+    for key in path:
+        node_data = current.node_data
+        if node_data is None:
+            index = key  # hand-built spec: path keys are positional
+        elif isinstance(current.type, type) and issubclass(current.type, dict):
+            keys = (
+                node_data[1]
+                if issubclass(current.type, collections.defaultdict)
+                else node_data
+            )
+            index = keys.index(key)
+        else:
+            index = key  # positional index (tuple/list/namedtuple/dataclass)
+        current = current.children[index]
+    return current
+
+
+def _structure_desc(spec: "core.TreeSpec") -> str:
+    """Human-readable description of the node a TreeSpec describes, for
+    structure-mismatch messages.
+
+    Containers are described by kind + arity (``dict with keys ['a', 'b']``,
+    ``tuple of length N``, ``list of length N``, ``namedtuple of length N``,
+    ``dataclass with fields ['f1', 'f2']``); childless leaves by their type
+    name (``Tensor``, ``int``, ``NoneType``); childless empty containers by
+    their container description with an empty list.
+    """
+    spec_type = spec.type
+    if isinstance(spec_type, type):
+        if issubclass(spec_type, dict):
+            keys = spec.node_data
+            if keys is not None and issubclass(spec_type, collections.defaultdict):
+                keys = keys[1]
+            return f"dict with keys {keys!r}"
+        if issubclass(spec_type, tuple):
+            if hasattr(spec_type, "_fields"):
+                return f"namedtuple of length {len(spec.children)}"
+            return f"tuple of length {len(spec.children)}"
+        if issubclass(spec_type, list):
+            return f"list of length {len(spec.children)}"
+        if (
+            is_dataclass(spec_type)
+            and not spec_type.__module__.split(".")[0] == "etl"
+        ):
+            return f"dataclass with fields {spec.node_data!r}"
+        return spec_type.__name__
+    return repr(spec_type)
+
+
+def _structure_mismatch_message(
+    lead_in: str, expected_tree: "core.TreeSpec", runtime_tree: "core.TreeSpec"
+) -> str:
+    """Build a run-time input structure-mismatch ``core.TraceError`` message.
+
+    ``lead_in`` is the site-specific, byte-identical lead-in; the appended
+    detail follows the shared trace/pipeline convention: ``— first mismatch at
+    pytree path {path}: expected {expected_desc}, got {got_desc} (expected
+    {expected_spec}, got {got_spec})`` — computed from
+    ``first_mismatch_path(expected_tree, runtime_tree)`` (expected =
+    ``expected_tree``, got = ``runtime_tree``).
+    """
+    mismatch = first_mismatch_path(expected_tree, runtime_tree)
+    expected_spec = _subspec(expected_tree, mismatch)
+    got_spec = _subspec(runtime_tree, mismatch)
+    return (
+        f"{lead_in} — first mismatch at pytree path {format_path(mismatch)}: "
+        f"expected {_structure_desc(expected_spec)}, got "
+        f"{_structure_desc(got_spec)} (expected {expected_spec!r}, "
+        f"got {got_spec!r})"
+    )
 
 
 def _reduce_tree(spec: "core.TreeSpec", bound: set, counter) -> "core.TreeSpec | None":
@@ -547,15 +619,22 @@ def _prepare_flat_inputs(signature, bound: dict, args) -> list:
         reduced = _reduce_tree(input_tree, set(bound), [0])
         if not _structure_matches(reduced, runtime_tree):
             raise core.TraceError(
-                f"run-time input structure does not match the unbound portion "
-                f"of the traced signature: got {runtime_tree}, expected "
-                f"{reduced}"
+                _structure_mismatch_message(
+                    "run-time input structure does not match the unbound "
+                    "portion of the traced signature",
+                    reduced,
+                    runtime_tree,
+                )
             )
     else:
         if not _structure_matches(input_tree, runtime_tree):
             raise core.TraceError(
-                f"run-time input structure does not match the traced "
-                f"signature: got {runtime_tree}, expected {input_tree}"
+                _structure_mismatch_message(
+                    "run-time input structure does not match the traced "
+                    "signature",
+                    input_tree,
+                    runtime_tree,
+                )
             )
     expected_user = total - len(bound)
     if len(user_leaves) != expected_user:

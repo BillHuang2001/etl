@@ -59,14 +59,16 @@ Static values: `*operands` / `init` / kwargs may contain static Python values
 passed to the callables unchanged. Static values are never loop-carried or
 op results.
 
-Local pytree note: `core.flatten` treats every dataclass (including
-`SymbolicTensor`) as a pytree container and recurses into SSA structure
-(infinite recursion) — so this module walks pytrees itself
-(`_flatten_tree`), treating `SymbolicTensor`, `core.Tensor`, `core` value
-objects, and `ir` structural dataclasses as LEAVES while mirroring
-`core.TreeSpec`'s container conventions (tuple/list/dict — keys sorted —
-namedtuple/dataclass), so `core.unflatten` can rebuild the trees. Leaf nodes
-use `TreeSpec(type=None)`, which `core.unflatten` treats as a plain leaf.
+Local pytree note: `core.flatten` treats etl-module dataclasses
+(`SymbolicTensor`, `Tensor`, `Device`, ir structures, ...) as LEAVES (the
+module check in `core.tree._flatten_into`); only user-defined dataclasses
+act as pytree containers. This module walks pytrees itself (`_flatten_tree`)
+so the leaf conventions stay explicit — `SymbolicTensor`, `core.Tensor`,
+`core` value objects, and `ir` structural dataclasses are LEAVES — while
+mirroring `core.TreeSpec`'s container conventions (tuple/list/dict — keys
+sorted — namedtuple/dataclass), so `core.unflatten` can rebuild the trees.
+Leaf nodes use `TreeSpec(type=None)`, which `core.unflatten` treats as a
+plain leaf.
 """
 
 from __future__ import annotations
@@ -86,9 +88,10 @@ __all__ = ["cond", "scan", "while_loop"]
 
 _BOOL = np.dtype("bool")
 
-#: Objects that must be treated as LEAVES by the local pytree walk despite
-#: being dataclasses (ir SSA structures would recurse/cycle; core value
-#: objects are not graph outputs).
+#: Objects that must be treated as LEAVES by the local pytree walk (etl
+#: value types — ir SSA structures and core value objects — are never
+#: containers; the explicit list keeps the leaf convention independent of
+#: the etl-module check alone).
 _LEAF_TYPES = (
     core.SymbolicTensor,
     core.Tensor,
@@ -111,7 +114,8 @@ def _is_static_value(obj: Any) -> bool:
 
     Local copy of the predicate in `./trace.py` (avoids coupling this module
     to the tracer's internals; keep the two in sync): `None`, bool, int,
-    float, complex, str, `enum.Enum`, numpy `dtype` objects, `slice`.
+    float, complex, str, `enum.Enum`, numpy `dtype` objects, `slice`,
+    `core.Device`.
     """
     if obj is None:
         return True
@@ -119,6 +123,8 @@ def _is_static_value(obj: Any) -> bool:
     if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
         return True
     if isinstance(obj, np.dtype):
+        return True
+    if isinstance(obj, core.Device):
         return True
     return False
 
@@ -162,7 +168,11 @@ def _flatten_tree(obj: Any, leaves: List[Any]) -> "core.TreeSpec":
         return core.TreeSpec(
             type=obj_type, children=child_specs, node_data=obj_type._fields
         )
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+    if (
+        dataclasses.is_dataclass(obj)
+        and not isinstance(obj, type)
+        and not obj_type.__module__.split(".")[0] == "etl"
+    ):
         field_names = [field.name for field in dataclasses.fields(obj)]
         child_specs = tuple(
             _flatten_tree(getattr(obj, name), leaves) for name in field_names
