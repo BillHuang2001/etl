@@ -44,6 +44,19 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 | `./persist/` | cache + container tests |
 | `./bench/` | `etl.bench` harness tests (importability w/o torch, conformance vs numpy/torch refs, benchmark timing, CLI exit codes) — torch-optionality pattern: torch-present tests use `pytest.importorskip("torch")`; torch-absent-only tests guard with `importlib.util.find_spec("torch") is None` and `pytest.mark.skipif` inverted |
 
+## Test strategy
+
+Coverage additions (tree/pytree UX contract — written against the pinned contract of the parallel tree-UX implementation in `../etl/`; until that branch merges, the new tests fail as expected, with no skips/xfails):
+
+- `core/test_tree_utils.py` — `tree_map` (single/multi-tree, empty containers, leaf-type-changing fns, multi-tree mismatch → `TypeError` with first-mismatch pytree path), `tree_leaves`/`tree_structure`/`tree_flatten`/`tree_unflatten` incl. alias identity with `flatten`/`unflatten`.
+- `core/test_tree.py` — `defaultdict`/`Counter` roundtrips (factory list/None, nested); structured errors: unpersistable lambda factory, mixed-type dict keys, dataclass InitVar/`init=False` rebuild; `register_pytree_node(object, ...)` → `TypeError` (with try/finally registry cleanup so a missing guard can't hijack the MRO dispatch for the session); plain user class stays a leaf; etl value types (`Device`/`Dim`/`TensorSpec`) flatten to exactly 1 leaf.
+- `test_spec_compliance.py` — `tree_map(f, t) == unflatten([f(l) for l in flatten(t)[0]], flatten(t)[1])` composition identity; exact structure preservation.
+- `pipeline_test.py` + `trace/test_graph.py` — run/bind/validate_inputs structure-mismatch errors include `first mismatch at pytree path {path}` (old lead-in preserved).
+- `trace/test_static_snapshot.py` — `Device`/`Dim` static args snapshot as ONE static value (no field descent); user dataclasses still descend.
+- `block/test_portable.py` — portable impls returning namedtuple/dataclass structures of symbolics (incl. vmap through them).
+
+Open coordination points until the parallel implementation lands (see the tree-UX work): path granularity for dict-key mismatches (key-level `[1]['w']` vs node-level `[1]` — tests assert both in different files); bind's unbound-portion lead-in wording vs the pinned unified shape (existing `pipeline_test.py:407` asserts the old wording).
+
 ## Notes for agents
 
 - Prefer small focused test files mirroring the module they test; test files may import from `etl` directly.
