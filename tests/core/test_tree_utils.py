@@ -204,10 +204,12 @@ def test_tree_map_empty_same_type_containers():
 # ---------------------------------------------------------------------------
 
 def test_tree_map_mismatched_dict_keys_raises_with_path():
-    # Pinned example: first mismatch at ['b'] (key present in one tree only).
+    # Dict-key mismatches report the dict NODE's path: the node types match
+    # but the sorted key lists (node_data) diverge, so the first mismatch is
+    # at the dict node itself — here the root, path ().
     with pytest.raises(
         TypeError,
-        match=r"tree_map: trees do not have the same structure — first mismatch at pytree path \['b'\]: expected .*, got .*",
+        match=r"tree_map: trees do not have the same structure — first mismatch at pytree path \(\): expected dict with keys \['a', 'b'\], got dict with keys \['a', 'c'\]",
     ):
         tree_map(_boom, {"a": 1, "b": 2}, {"a": 1, "c": 2})
 

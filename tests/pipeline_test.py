@@ -504,7 +504,8 @@ def _pair_inputs():
 
 def test_run_structure_mismatch_reports_pytree_path():
     """A wrong dict key at run time keeps the traced-signature lead-in AND
-    appends the first-mismatch pytree path (the missing key's position)."""
+    appends the first-mismatch pytree path (the diverging dict NODE; the
+    key difference shows up in the expected/got node descriptions)."""
     executable = etl.build(_linear_pair, *_pair_specs())
     x, w, b = _pair_inputs()
 
@@ -512,7 +513,9 @@ def test_run_structure_mismatch_reports_pytree_path():
         etl.run(executable, x, {"w2": w, "b": b})  # 'w' replaced by 'w2'
     message = str(excinfo.value)
     assert "run-time input structure does not match the traced signature" in message
-    assert "first mismatch at pytree path [1]['w']" in message
+    assert "first mismatch at pytree path [1]" in message
+    assert "expected dict with keys ['b', 'w']" in message
+    assert "got dict with keys ['b', 'w2']" in message
 
 
 def test_run_structure_mismatch_tuple_arity_reports_pytree_path():
@@ -542,7 +545,7 @@ def test_bind_structure_mismatch_reports_pytree_path():
     with pytest.raises(etl.TraceError) as excinfo:
         etl.run(bound, x, {"bogus": b})  # expected key 'b' at [1], got 'bogus'
     message = str(excinfo.value)
-    assert "run-time input structure does not match the traced signature" in message
+    assert "run-time input structure does not match the unbound portion of the traced signature" in message
     assert "first mismatch at pytree path [1]" in message
 
 
