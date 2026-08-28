@@ -23,7 +23,7 @@ There is deliberately **no execution here**: transforms never import `etl.backen
 1. Looks up the operand metadata from the env (`ValueEnv`).
 2. Fetches the op's rule: `batching_rules[op.def.name]`; for `block_call` ops the key is `block:<name>` taken from the op's block-name attribute. For a `block_call` with NO registered rule, the machinery honors the block's declared batching policy when it is visible: an `elementwise`/`map_over_batch` `batching_policy` attribute on the op selects the built-in pass-through rule (`batching.block_call_pass_through_rule()` — rebuilds the `block_call` over pointwise-aligned batched operands with batch-dims-prepended result types; `result_specs` and result types stay exactly equal as `ir.verify` requires); any other policy or no policy ⇒ `TransformError` naming the block. A registered rule always wins over the policy.
 3. Pushes its own `ir.Builder` onto the trace builder stack and invokes the rule; rules build replacement ops with ordinary `etl.ops.*` functions (resolved via `trace.current_builder()`).
-4. Records the returned values + metadata; seeds input metadata from `axes` (mapped input specs gain a fresh symbolic `Dim` named `batch`, `batch_1`, … as the leading dim; rank stays known).
+4. Records the returned values + metadata; seeds input metadata from `axes` (all mapped input specs share ONE fresh symbolic `Dim` named `batch` as the leading dim — one pass = one batch axis; rank stays known).
 
 The result `Graph` preserves `output_tree` and `static_values`; mapped outputs carry the leading batch dim; unmapped outputs are unchanged. Source locations of original ops are attached to replacement ops.
 
