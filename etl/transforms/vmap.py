@@ -26,8 +26,6 @@ from etl.trace.graph import _normalize_leaf_types
 from etl.transforms._wrappers import TransformCallable
 from etl.transforms.batching import with_batch_depth
 from etl.transforms.vectorize import (
-    _first_structure_mismatch,
-    _format_path,
     _is_int,
     _normalize_axis_entries,
     vectorize,
@@ -184,12 +182,14 @@ def _derive_unvectorized_args(args, in_axes):
         entries[sorted(tensor_positions)[0]] = in_axes
     else:
         axes_leaves, axes_spec = core.flatten(in_axes)
-        mismatch = _first_structure_mismatch(axes_spec, args_spec)
+        mismatch = core.first_mismatch_path(
+            axes_spec, args_spec, leaf_vs_empty_is_mismatch=True
+        )
         if mismatch is not None:
             raise core.TransformError(
                 "vmap: the in_axes pytree does not match the argument "
                 f"structure — first mismatch at pytree path "
-                f"{_format_path(mismatch)}; in_axes must be a pytree with "
+                f"{core.format_path(mismatch)}; in_axes must be a pytree with "
                 "the same container structure as the arguments (0 maps a "
                 "tensor spec's leading axis, None leaves it unmapped)"
             )
@@ -335,12 +335,14 @@ def _rearrange_outputs(graph: Graph, out_axes) -> Graph:
             entries[sorted(tensor_positions)[0]] = out_axes
     else:
         axes_leaves, axes_spec = core.flatten(out_axes)
-        mismatch = _first_structure_mismatch(axes_spec, graph.output_tree)
+        mismatch = core.first_mismatch_path(
+            axes_spec, graph.output_tree, leaf_vs_empty_is_mismatch=True
+        )
         if mismatch is not None:
             raise core.TransformError(
                 "vmap: the out_axes pytree does not match the output "
                 f"structure — first mismatch at pytree path "
-                f"{_format_path(mismatch)}; out_axes must be a pytree with "
+                f"{core.format_path(mismatch)}; out_axes must be a pytree with "
                 "the same container structure as the outputs (0 keeps a "
                 "mapped axis leading / inserts a size-one axis for an "
                 "unmapped output, None requires the output unmapped)"
