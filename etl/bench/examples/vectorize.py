@@ -29,10 +29,17 @@ seed 0 inputs):
   gradient element of magnitude 108 (fp32 backward accumulation noise), max
   relative error 6.3e-06 — passes the strict defaults (rtol=atol=1e-5)
   elementwise. No tolerance relaxation needed.
-- Torch references follow the micro.py lazy pattern but could not be run in
-  the dev environment (torch not installed); they were reviewed against the
-  graph semantics (batched matmul broadcasting, per-row softmax, summed
-  separable loss) and match the numpy references structurally.
+- Torch references (lazy ``require_torch`` pattern) are executed and
+  validated with torch present: all six examples pass conformance against
+  both references at the strict defaults (torch=enabled, rtol=atol=1e-5,
+  seed 0). Measured max_abs error vs the etl numpy-backend outputs: 0.0 for
+  the softmax/layernorm/linear/attention examples, 7.6e-06 for vmap_mlp,
+  and 1.14e-05 for vmap_grad_mlp (gradient magnitudes up to ~108) — within
+  ``atol + rtol*|b|`` elementwise. The MLP torch references use per-sample
+  einsum matmuls (a plain ``x @ w1`` with x[32,16] and w1[32,16,32]
+  broadcasts the matrix per batch), and vmap_grad_mlp's torch reference
+  differentiates only the first five tensors, mirroring
+  argnums=(0,1,2,3,4) (b2 excluded).
 - iree spot check (vmap_softmax, backend='iree', device cpu): FAILS at
   compile time with a GENUINE core/backend limitation, not an example bug:
   ``vectorize`` replaces each mapped static dim with a fresh symbolic
@@ -210,8 +217,12 @@ def _vmap_mlp_numpy(inputs):
 def _vmap_mlp_torch(inputs, device=None):
     torch = require_torch()
     x, w1, b1, w2, b2 = (torch.as_tensor(a, device=device) for a in inputs)
-    h = torch.relu(x @ w1 + b1)
-    return (h @ w2 + b2).cpu().numpy()
+    # Per-sample batched matmul via einsum: with x[32,16] and w1[32,16,32], a
+    # plain `x @ w1` would BROADCAST the matrix per batch → (32,16,8) instead
+    # of the per-sample (32,8) result. b1/b2 are the BATCHED per-sample
+    # biases [32,32]/[32,8], so plain `+` broadcasts correctly.
+    h = torch.relu(torch.einsum("bi,bij->bj", x, w1) + b1)
+    return (torch.einsum("bj,bjk->bk", h, w2) + b2).cpu().numpy()
 
 
 # --- vmap attention: per-sample single-head attention [8,16] over [16,8,16] --
@@ -310,7 +321,9 @@ def _vmap_grad_mlp_numpy(inputs):
         sample = [a[i] for a in inputs]
         for j, grad in enumerate(fd_gradient(_vmap_grad_mlp_loss_f64, sample)):
             grads[j][i] = grad
-    return tuple(grads)
+    # Mirror the etl graph's argnums=(0, 1, 2, 3, 4): b2 (index 5) is not
+    # differentiated, so only the first five gradients are returned.
+    return tuple(grads[j] for j in range(5))
 
 
 def _vmap_grad_mlp_torch(inputs, device=None):
@@ -322,11 +335,16 @@ def _vmap_grad_mlp_torch(inputs, device=None):
     tensors = [x, y, w1, b1, w2, b2]
     for t in tensors:
         t.requires_grad_(True)
-    h = torch.relu(x @ w1 + b1)
-    pred = h @ w2 + b2
+    # Per-sample batched matmul via einsum (same broadcasting pitfall as
+    # vmap_mlp: x[8,8] @ w1[8,8,16] would broadcast the matrix per batch and
+    # differentiate a DIFFERENT loss).
+    h = torch.relu(torch.einsum("bi,bij->bj", x, w1) + b1)
+    pred = torch.einsum("bj,bjk->bk", h, w2) + b2
     per_sample = ((pred - y) ** 2).mean(dim=-1)
     loss = per_sample.sum()
-    grads = torch.autograd.grad(loss, tensors)
+    # Mirror argnums=(0, 1, 2, 3, 4): b2 (the last tensor) is not
+    # differentiated.
+    grads = torch.autograd.grad(loss, tensors[:5])
     return tuple(g.detach().cpu().numpy() for g in grads)
 
 
