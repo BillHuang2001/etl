@@ -45,6 +45,8 @@ Decompositions (`DECOMPOSITIONS` — writer emits ordinary sub-ops, no direct mn
 
 Deferred in v1 (`DEFERRED_OPS` ⇒ `core.BackendError` naming the op): `gather`, `scatter`, `scan`, `runtime_call`, `block_call`, `rank`, `world_size` (dist graph scalars), complex-number elementwise beyond cast.
 
+**Dynamic-dim deferrals (v1, validated through iree):** every rejection names the op, the shape, the offending dims, and contains "dynamic" — raised at export/`lower()` time, never invalid MLIR: `reshape` with ANY dynamic dim (incl. the keepdims reshapes inside the reduce/reduce_mean emitters), `conv` with any dynamic dim in x/w/result, `slice` / `pad` with dynamic dims (iree-compile ACCEPTS the MLIR but the runtime ABORTs at every concrete size), `reduce_mean` reducing over a dynamic dim (element count not statically known), and `dot` batch structure that cannot be emitted (no shape source for the required dynamic broadcast / unprovable symbolic batch merge).
+
 Type map (`DTYPE_MAP`, keys are numpy dtype objects): float16→`f16`, float32→`f32`, float64→`f64`, int8→`i8`, int16→`i16`, int32→`i32`, int64→`i64`, uint8→`ui8`, uint16→`ui16`, uint32→`ui32`, uint64→`ui64`, bool→`i1`, complex64→`complex<f32>`, complex128→`complex<f64>`.
 
 Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tables, search order ELEMENTWISE→SHAPE→CONSTANT→CONTROL_FLOW→COLLECTIVE→COMPARISON→DECOMPOSITIONS; KeyError if absent), `status(op_name)` → `"v1"|"decompose"|"deferred"` (unmapped names count as deferred), `is_supported(op_name)`, `mlir_dtype(dtype)` (normalizes via `numpy.dtype`).
