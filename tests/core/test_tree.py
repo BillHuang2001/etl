@@ -32,7 +32,7 @@ import pytest
 
 from etl import dim
 from etl.core import Device, Tensor, TensorSpec, flatten, unflatten
-from etl.core.tree import TreeSpec, register_pytree_node
+from etl.core.tree import _PYTREE_NODE_REGISTRY, TreeSpec, register_pytree_node
 
 # ---------------------------------------------------------------------------
 # Test-local pytree types
