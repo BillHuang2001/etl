@@ -40,7 +40,7 @@ The `etl` package: an explicit, minimal tensor graph runtime. See root `../CONTE
 
 **Namespace**: `etl.numpy` (alias `enp`) + `etl.numpy.linalg` — numpy-style graph API producing the same IR as `ops`.
 
-**Structured I/O**: tuple/list/dict/namedtuple/dataclass supported everywhere (trace inputs, run outputs, bind). Custom containers register via `etl.register_pytree_node`.
+**Structured I/O**: tuple/list/dict/namedtuple/dataclass supported everywhere (trace inputs, run outputs, bind). Custom containers register via `etl.register_pytree_node`. **Pytree utilities** (owned by `core`, exported on `etl`): `tree_map(fn, *trees)`, `tree_leaves(tree)`, `tree_structure(tree)`, `tree_flatten(tree)`, `tree_unflatten(leaves, treespec)` — pure sugar over flatten/unflatten (no new semantics). Container edge behavior: `defaultdict`/`Counter` roundtrip (default_factory preserved when `None`/a class, else a clear `unflatten` error); unorderable dict keys, dataclass `InitVar`/`init=False` rebuilds, and `register_pytree_node(object, ...)` all raise plain `TypeError`/`ValueError` with actionable messages. **Structure-mismatch diagnostics**: every structural mismatch (tree_map, `Graph.flatten_inputs`/`validate_inputs`, `run`/`bind`, transforms' axes/tangent trees) reports the first divergent pytree path with expected/got node descriptions, e.g. `run-time input structure does not match the traced signature — first mismatch at pytree path [0]['z']: expected dict with keys ['a', 'b'], got list of length 3 (expected TreeSpec(...), got TreeSpec(...))` — via the shared `core.first_mismatch_path`/`format_path` helpers; per-caller lead-in wording is preserved (tests match the substrings).
 
 ## Cross-module contracts (must-expose names)
 
