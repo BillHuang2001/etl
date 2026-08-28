@@ -71,6 +71,93 @@ def symbolic_scale():
     return fn, (etl.TensorSpec((etl.dim("B"),), etl.float32),)
 
 
+def symbolic_softmax():
+    """``fn(x) = softmax(x)`` over a symbolic ``(B, 16)`` batch.
+
+    The keepdims reduces produce dynamic keepdims reshapes ((B,) -> (B, 1)),
+    which the StableHLO writer must reject at lower() time with etl's own
+    BackendError — never invalid MLIR that dies later with a compiler parse
+    error or runtime abort (see ``Writer._reject_dynamic_dims``).
+    """
+
+    def fn(x):
+        e = etl.exp(x - etl.max(x, axes=1, keepdims=True))
+        return e / etl.sum(e, axes=1, keepdims=True)
+
+    return fn, (etl.TensorSpec((etl.dim("B"), 16), etl.float32),)
+
+
+def symbolic_slice():
+    """``fn(x) = slice(x, [0:2, 0:4])`` over a symbolic ``(B, 4)`` batch.
+
+    The StableHLO writer rejects dynamic slice at export time: iree 3.11.0
+    parses dynamic-operand slice MLIR but the runtime ABORTS on it
+    ("hal.fence.await" failure) — the rejection must never be skipped.
+    """
+
+    def fn(x):
+        return etl.slice(x, (0, 0), (2, 4))
+
+    return fn, (etl.TensorSpec((etl.dim("B"), 4), etl.float32),)
+
+
+def symbolic_pad():
+    """``fn(x) = pad(x, [[0,0],[1,1]])`` over a symbolic ``(B, 4)`` batch.
+
+    Same empirical rationale as ``symbolic_slice`` (iree 3.11.0 runtime
+    abort on dynamic-shape pad).
+    """
+
+    def fn(x):
+        return etl.pad(x, [[0, 0], [1, 1]])
+
+    return fn, (etl.TensorSpec((etl.dim("B"), 4), etl.float32),)
+
+
+def _dot_fn(a, b):
+    return etl.dot(a, b)
+
+
+def batched_dot_cases():
+    """The three static batched-dot emission paths pinned by the writer
+    goldens (``tests/backends/test_stablehlo.py``): rank-3@rank-2
+    (non-batched dot_general), rhs-higher-rank (lhs broadcast_in_dim),
+    size-1 rhs batch (squeeze reshape). Returns ``{name: (fn, specs,
+    args)}`` with deterministic fixed-seed fp32 args matching the specs."""
+    return {
+        "rank3_rank2": (
+            _dot_fn,
+            (etl.TensorSpec((4, 512, 768), etl.float32),
+             etl.TensorSpec((768, 2304), etl.float32)),
+            (standard_normal((4, 512, 768)), standard_normal((768, 2304))),
+        ),
+        "rhs_higher_rank": (
+            _dot_fn,
+            (etl.TensorSpec((512, 768), etl.float32),
+             etl.TensorSpec((4, 768, 2304), etl.float32)),
+            (standard_normal((512, 768)), standard_normal((4, 768, 2304))),
+        ),
+        "size1_rhs_batch": (
+            _dot_fn,
+            (etl.TensorSpec((4, 512, 768), etl.float32),
+             etl.TensorSpec((1, 768, 2304), etl.float32)),
+            (standard_normal((4, 512, 768)), standard_normal((1, 768, 2304))),
+        ),
+    }
+
+
+def batched_dot_symbolic():
+    """``fn(a, b) = dot(a, b)`` over a symbolic batch
+    ``(B, 512, 768) @ (768, 2304)``: the rhs matrix is broadcast up to the
+    runtime batch via ``dynamic_broadcast_in_dim`` + ``get_dimension_size``,
+    so one compiled executable serves every concrete batch size."""
+
+    return _dot_fn, (
+        etl.TensorSpec((etl.dim("B"), 512, 768), etl.float32),
+        etl.TensorSpec((768, 2304), etl.float32),
+    )
+
+
 def _double_callback(x):
     return x * 2.0
 
