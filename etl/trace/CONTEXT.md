@@ -53,8 +53,9 @@ Exported from `__init__.py` (the public contract — exact names):
    `core.TreeSpec`. Leaves must be `TensorSpec` (tensor input; shape may
    hold `Dim`/`DimExpr`, `None` = dynamic) or static Python values
    (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice`/
-   `core.Device` — see `_is_static_value`). Anything else (concrete `Tensor`, ndarray,
-   `SymbolicTensor`, …) → `TraceError` with the pytree path. Capturing a
+   `core.Device` — see `_is_static_value`). Anything else (concrete
+   `Tensor`, ndarray, `SymbolicTensor`, …) → `TraceError` with the pytree
+   path. Capturing a
    concrete tensor is NEVER silently allowed.
 3. Build `ir.Module` + entry `ir.Function` "main" with one block arg per
    tensor leaf (arg type = (shape, dtype)). Wrap each block arg as
