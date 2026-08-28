@@ -115,7 +115,7 @@ def _is_static_value(obj: Any) -> bool:
     Local copy of the predicate in `./trace.py` (avoids coupling this module
     to the tracer's internals; keep the two in sync): `None`, bool, int,
     float, complex, str, `enum.Enum`, numpy `dtype` objects, `slice`,
-    `core.Device`.
+    `core.Dim` / `core.DimExpr`, `core.Device`.
     """
     if obj is None:
         return True
@@ -123,6 +123,8 @@ def _is_static_value(obj: Any) -> bool:
     if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
         return True
     if isinstance(obj, np.dtype):
+        return True
+    if isinstance(obj, (core.Dim, core.DimExpr)):
         return True
     if isinstance(obj, core.Device):
         return True

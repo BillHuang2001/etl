@@ -313,12 +313,12 @@ def _is_static_value(obj: Any) -> bool:
     """True iff `obj` is a static Python value that specializes the graph.
 
     Accepted (per the root value-model contract): `None`, bool, int, float,
-    complex, str, `enum.Enum`, numpy `dtype` objects, `slice`, and
-    `core.Device` (a static device spec — one leaf, snapshotted like any
-    other static value). Everything else (including numpy scalars, arbitrary
-    config objects) is NOT static in v1 — `trace` raises `TraceError` for
-    it. (Future extension point: explicit registration of static types, e.g.
-    config objects.)
+    complex, str, `enum.Enum`, numpy `dtype` objects, `slice`, `core.Dim` /
+    `core.DimExpr` (symbolic shape expressions — one leaf, snapshotted like
+    any other static value), and `core.Device` (a static device spec — one
+    leaf, snapshotted like any other static value). Everything else
+    (including numpy scalars and other config objects) is NOT static in v1 —
+    `trace` raises `TraceError` for it.
     """
     if obj is None:
         return True
@@ -326,6 +326,8 @@ def _is_static_value(obj: Any) -> bool:
     if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
         return True
     if isinstance(obj, np.dtype):
+        return True
+    if isinstance(obj, (core.Dim, core.DimExpr)):
         return True
     if isinstance(obj, core.Device):
         return True
@@ -377,7 +379,7 @@ def _flatten_specs(
                 "core.TensorSpec nor a static Python value. Tensor inputs "
                 "must be declared as TensorSpec(shape, dtype); static values "
                 "may be None/bool/int/float/complex/str/Enum/dtype/slice/"
-                "Device. "
+                "Dim/DimExpr/Device. "
                 "Concrete tensors are never silently captured — declare them "
                 "as explicit inputs via TensorSpec, or embed their data "
                 "explicitly with etl.constant inside the traced function."
