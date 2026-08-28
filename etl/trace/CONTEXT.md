@@ -52,8 +52,8 @@ Exported from `__init__.py` (the public contract — exact names):
 2. Treat `specs` (positional args) as ONE pytree; flatten via
    `core.TreeSpec`. Leaves must be `TensorSpec` (tensor input; shape may
    hold `Dim`/`DimExpr`, `None` = dynamic) or static Python values
-   (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice` — see
-   `_is_static_value`). Anything else (concrete `Tensor`, ndarray,
+   (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice`/
+   `core.Device` — see `_is_static_value`). Anything else (concrete `Tensor`, ndarray,
    `SymbolicTensor`, …) → `TraceError` with the pytree path. Capturing a
    concrete tensor is NEVER silently allowed.
 3. Build `ir.Module` + entry `ir.Function` "main" with one block arg per
@@ -249,9 +249,7 @@ Graph save/load round-trips through the persist container.
   the FUNCTION after `etl/__init__.py` imports; the submodule is reachable
   via `import etl.trace as mod` or `from etl.trace import ...` (see
   `__init__.py` docstring).
-- Gaps found in lower layers (flagged to the package root): `core.flatten`
-  recursing into dataclass leaves (SymbolicTensor) is a footgun for
-  ops/backends that flatten SymbolicTensor trees; `core.Dim` has no
+- Gaps found in lower layers (flagged to the package root): `core.Dim` has no
   `evaluate()` (only `DimExpr`); registry has no `expand_dims` and no
   dynamic-index `slice` (scan works around via gather/reshape); `ir.verify`
   does not check `while` body-return types against operand types (checked
