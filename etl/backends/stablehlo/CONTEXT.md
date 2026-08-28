@@ -66,7 +66,7 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 
 - Top-level imports restricted to `etl.core` and `etl.ir`; NEVER import `etl.pipeline` (cycle). `trace.Graph` is duck-typed via `.module` (no `etl.trace` import). numpy is allowed (DTYPE_MAP keys). `writer.py` uses TYPE_CHECKING imports for `etl.ir` annotations.
 - Export-only: never registers with the backend registry; no lower/compile/load/run.
-- Files < ~1000 lines; `writer.py` skeleton < ~300 lines; `ops.py` is data-only.
+- Files < ~1000 lines (`writer.py` is the known exception — the single emission file, ~1800 lines; splitting is deferred, see Notes for agents); `ops.py` is data-only.
 - CPU-neutral: MLIR text only, no device interaction.
 
 ## Test strategy
