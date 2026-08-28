@@ -311,6 +311,13 @@ def test_example_per_example_tolerance_overrides():
     assert get_example("matmul_1024").atol == 5e-4
     assert get_example("conv2d_large").atol == 2e-4
     assert get_example("vmap_mlp_large").atol == 1.2e-4
+    # xla/custom overrides (fd-reference noise on gradient examples).
+    assert get_example("xla_mlp").tolerance == 1e-4
+    for name in ("custom_l2norm_grad", "custom_relu2_grad"):
+        example = get_example(name)
+        assert example.rtol == 1e-3
+        assert example.atol == 1e-3
+        assert example.tolerance is None
     # Vectorize examples stay at the strict defaults.
     for name in VMAP_NAMES:
         example = get_example(name)
