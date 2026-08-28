@@ -8,7 +8,9 @@ examples — matmul_1024, conv2d_large, layernorm_large, vmap_mlp_large —
 live in :mod:`etl.bench.examples.op_large`, category "op"). They keep the
 "block" category because they compose whole blocks of ops into a single
 graph. All stay within the v1 numpy-backend budget on CPU (single etl run
-well under ~1 s each).
+well under ~1 s each). Both also carry the ``"transformer"`` tag so the
+CLI selector ``--examples transformer`` covers the whole transformer
+family (the two legacy blocks + the three small block examples below).
 
 Dev-time verification on iree/llvm-cpu (measured; see the per-example
 comments for exact numbers):
@@ -31,6 +33,17 @@ Design notes:
 - ``_layernorm_last`` (the etl-graph-side, SYMBOLIC layernorm helper) stays
   module-local; the numpy reference uses the shared
   :func:`~etl.bench.examples.base.layernorm_numpy` helper from base.
+- Three small transformer-block examples (tag ``"transformer"``) complement
+  the two large ones: ``mha_block`` (multi-head attention block — QKV
+  projection, per-head scaled softmax, concat heads, out-projection),
+  ``ffn_block`` (gelu MLP + residual + layernorm), and ``mha_ffn_block``
+  (attention + feed-forward composed into one small transformer block with
+  residuals). All three use static shapes ([2,16,32], 4 heads of dim 8),
+  mirror the shared numpy helpers (``softmax_numpy`` / ``gelu_numpy`` /
+  ``layernorm_numpy``) op-for-op, and pass the strict conformance defaults
+  on the numpy backend (max_abs 0.0 — identical kernels); torch references
+  are exact formula mirrors (fp32 accumulation-order noise only, same class
+  as the micro attention/layernorm examples).
 """
 from __future__ import annotations
 
@@ -42,7 +55,14 @@ import etl
 from etl import TensorSpec, defn
 
 from .._torch import require_torch
-from .base import Example, _F32, layernorm_numpy, register_all
+from .base import (
+    Example,
+    _F32,
+    gelu_numpy,
+    layernorm_numpy,
+    register_all,
+    softmax_numpy,
+)
 
 # --- transformer (dummy transformer block) -----------------------------------
 
@@ -222,8 +242,135 @@ def _nbody_torch(inputs, device=None):
     return (p_new.cpu().numpy(), v_new.cpu().numpy())
 
 
+# --- mha_block (multi-head attention block) ----------------------------------
+
+
+def _mha_etl(x, wqkv):
+    """Multi-head attention sub-block (etl side): QKV projection → per-head
+    scaled softmax → concat heads. Returns the [2,16,32] attention output
+    (no out-projection — callers add it). Shared by the ``mha_block`` and
+    ``mha_ffn_block`` graphs so the two examples cannot drift apart.
+    """
+    qkv = etl.reshape(etl.dot(x, wqkv), (2, 16, 3, 4, 8))
+    q = etl.reshape(etl.slice(qkv, (0, 0, 0, 0, 0), (2, 16, 1, 4, 8)), (2, 16, 4, 8))
+    k = etl.reshape(etl.slice(qkv, (0, 0, 1, 0, 0), (2, 16, 1, 4, 8)), (2, 16, 4, 8))
+    v = etl.reshape(etl.slice(qkv, (0, 0, 2, 0, 0), (2, 16, 1, 4, 8)), (2, 16, 4, 8))
+    scale = 1.0 / math.sqrt(8)
+    q = etl.transpose(q, (0, 2, 1, 3))  # [2,4,16,8]
+    kt = etl.transpose(k, (0, 2, 3, 1))  # [2,4,8,16]
+    v = etl.transpose(v, (0, 2, 1, 3))  # [2,4,16,8]
+    scores = etl.multiply(etl.dot(q, kt), scale)  # [2,4,16,16]
+    m = etl.max(scores, axes=-1, keepdims=True)
+    e = etl.exp(etl.subtract(scores, m))
+    probs = etl.divide(e, etl.sum(e, axes=-1, keepdims=True))
+    attn = etl.dot(probs, v)  # [2,4,16,8]
+    attn = etl.transpose(attn, (0, 2, 1, 3))  # [2,16,4,8]
+    heads = [etl.slice(attn, (0, 0, h, 0), (2, 16, 1, 8)) for h in range(4)]
+    return etl.reshape(etl.concatenate(heads, axis=3), (2, 16, 32))
+
+
+def _mha_numpy(x, wqkv):
+    """Multi-head attention sub-block (numpy side) — mirror of ``_mha_etl``,
+    reusing the shared :func:`~etl.bench.examples.base.softmax_numpy`
+    helper (identical max-subtract formula)."""
+    qkv = (x @ wqkv).reshape(2, 16, 3, 4, 8)
+    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+    scale = 1.0 / math.sqrt(8)
+    scores = (q.transpose(0, 2, 1, 3) @ k.transpose(0, 2, 3, 1)) * scale
+    probs = softmax_numpy(scores)
+    attn = (probs @ v.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+    attn = np.concatenate([attn[:, :, h : h + 1, :] for h in range(4)], axis=3)
+    return attn.reshape(2, 16, 32)
+
+
+def _mha_torch(x, wqkv, torch):
+    """Multi-head attention sub-block (torch side) — exact formula mirror."""
+    qkv = (x @ wqkv).reshape(2, 16, 3, 4, 8)
+    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+    scale = 1.0 / math.sqrt(8)
+    scores = (q.transpose(1, 2) @ k.permute(0, 2, 3, 1)) * scale
+    probs = torch.softmax(scores, dim=-1)
+    attn = (probs @ v.transpose(1, 2)).transpose(1, 2)
+    attn = torch.cat([attn[:, :, h : h + 1, :] for h in range(4)], dim=3)
+    return attn.reshape(2, 16, 32)
+
+
+@defn
+def _mha_block_graph(x, wqkv, wout):
+    """Multi-head attention block: QKV proj, per-head scaled softmax, concat
+    heads, out-projection. x[2,16,32], wqkv[32,96] (3*4*8), wout[32,32] (all
+    f32)."""
+    return etl.dot(_mha_etl(x, wqkv), wout)
+
+
+def _mha_block_numpy(inputs):
+    x, wqkv, wout = inputs
+    return _mha_numpy(x, wqkv) @ wout
+
+
+def _mha_block_torch(inputs, device=None):
+    torch = require_torch()
+    x, wqkv, wout = (torch.as_tensor(a, device=device) for a in inputs)
+    return (_mha_torch(x, wqkv, torch) @ wout).cpu().numpy()
+
+
+# --- ffn_block (gelu feed-forward block) -------------------------------------
+
+
+@defn
+def _ffn_block_graph(x, w1, w2):
+    """2-layer feed-forward block: gelu(x @ w1) @ w2 + residual, then
+    layernorm. x[2,16,32], w1[32,64], w2[64,32] (all f32)."""
+    h = etl.gelu(etl.dot(x, w1))  # [2,16,64] (erf-form gelu)
+    out = etl.add(etl.dot(h, w2), x)  # residual
+    return _layernorm_last(out, 32)
+
+
+def _ffn_block_numpy(inputs):
+    x, w1, w2 = inputs
+    out = gelu_numpy(x @ w1) @ w2 + x
+    return layernorm_numpy(out)
+
+
+def _ffn_block_torch(inputs, device=None):
+    torch = require_torch()
+    x, w1, w2 = (torch.as_tensor(a, device=device) for a in inputs)
+    h = 0.5 * (x @ w1) * (1.0 + torch.erf((x @ w1) / math.sqrt(2.0)))
+    out = h @ w2 + x
+    return _layernorm_torch(out, 32).cpu().numpy()
+
+
+# --- mha_ffn_block (attention + feed-forward, one small transformer block) ---
+
+
+@defn
+def _mha_ffn_block_graph(x, wqkv, wout, w1, w2):
+    """Small transformer block: MHA (4 heads, d=8) + residual + layernorm,
+    then gelu FFN + residual + layernorm. x[2,16,32], wqkv[32,96],
+    wout[32,32], w1[32,64], w2[64,32] (all f32)."""
+    h = _layernorm_last(etl.add(etl.dot(_mha_etl(x, wqkv), wout), x), 32)
+    out = etl.add(etl.dot(etl.gelu(etl.dot(h, w1)), w2), h)
+    return _layernorm_last(out, 32)
+
+
+def _mha_ffn_block_numpy(inputs):
+    x, wqkv, wout, w1, w2 = inputs
+    h = layernorm_numpy(_mha_numpy(x, wqkv) @ wout + x)
+    out = gelu_numpy(h @ w1) @ w2 + h
+    return layernorm_numpy(out)
+
+
+def _mha_ffn_block_torch(inputs, device=None):
+    torch = require_torch()
+    x, wqkv, wout, w1, w2 = (torch.as_tensor(a, device=device) for a in inputs)
+    h = _layernorm_torch(_mha_torch(x, wqkv, torch) @ wout + x, 32)
+    proj = h @ w1
+    out = (0.5 * proj * (1.0 + torch.erf(proj / math.sqrt(2.0)))) @ w2 + h
+    return _layernorm_torch(out, 32).cpu().numpy()
+
+
 # ---------------------------------------------------------------------------
-# Registry (category "block", tag "large")
+# Registry (category "block"; tags "large" + "transformer")
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -251,7 +398,7 @@ register_all([
         # backend computes it exactly (max_abs 0.0 — identical kernels).
         tolerance=1e-3,
         category="block",
-        tags=("large",),
+        tags=("large", "transformer"),
     ),
     Example(
         name="nbody",
@@ -273,6 +420,68 @@ register_all([
         # with margin while staying ~5x stricter than the micro mlp override.
         atol=2e-5,
         category="block",
-        tags=("large",),
+        tags=("large", "transformer"),
+    ),
+    Example(
+        name="mha_block",
+        description=(
+            "multi-head attention block: QKV proj, 4 heads (d=8) scaled "
+            "softmax, concat heads, out-proj (x[2,16,32])"
+        ),
+        specs=(
+            TensorSpec((2, 16, 32), _F32),
+            TensorSpec((32, 96), _F32),
+            TensorSpec((32, 32), _F32),
+        ),
+        graph=_mha_block_graph,
+        numpy_ref=_mha_block_numpy,
+        torch_ref=_mha_block_torch,
+        # numpy backend executes the same kernels as the reference — max_abs
+        # 0.0; the torch ref is an exact formula mirror (torch.softmax vs the
+        # max-subtract formula differ only by fp32 noise, same class as the
+        # micro attention example, which passes strict defaults).
+        category="block",
+        tags=("transformer",),
+    ),
+    Example(
+        name="ffn_block",
+        description=(
+            "2-layer feed-forward block: gelu MLP + residual + layernorm "
+            "(x[2,16,32], hidden 64)"
+        ),
+        specs=(
+            TensorSpec((2, 16, 32), _F32),
+            TensorSpec((32, 64), _F32),
+            TensorSpec((64, 32), _F32),
+        ),
+        graph=_ffn_block_graph,
+        numpy_ref=_ffn_block_numpy,
+        torch_ref=_ffn_block_torch,
+        # numpy backend: max_abs 0.0 (identical kernels, erf-form gelu
+        # mirrored by the shared gelu_numpy helper); torch ref uses the exact
+        # erf form via torch.erf — fp32 noise only.
+        category="block",
+        tags=("transformer",),
+    ),
+    Example(
+        name="mha_ffn_block",
+        description=(
+            "small transformer block: MHA (4 heads, d=8) + residual/layernorm "
+            "+ gelu FFN + residual/layernorm (x[2,16,32])"
+        ),
+        specs=(
+            TensorSpec((2, 16, 32), _F32),
+            TensorSpec((32, 96), _F32),
+            TensorSpec((32, 32), _F32),
+            TensorSpec((32, 64), _F32),
+            TensorSpec((64, 32), _F32),
+        ),
+        graph=_mha_ffn_block_graph,
+        numpy_ref=_mha_ffn_block_numpy,
+        torch_ref=_mha_ffn_block_torch,
+        # Same noise class as mha_block/ffn_block: numpy exact (max_abs 0.0),
+        # torch fp32 accumulation-order noise only.
+        category="block",
+        tags=("transformer",),
     ),
 ])
