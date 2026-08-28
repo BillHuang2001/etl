@@ -57,13 +57,17 @@ flow.
 
 Deliberately NOT used — ``etl.scan``
 ------------------------------------
-None of these examples use ``etl.scan``: dev probes reproduced an
-interpreter ``ShapeError`` in scan's internal while/scatter stacking path
-(core bug — scan lowers to a ``while`` + row-wise ``scatter`` stack whose
-types do not round-trip on the numpy backend). Simple scan forms happened to
-run at this HEAD in spot-probes, but scan is not exercised here: every
-example above is a plain ``while_loop`` over fixed-shape carried state, which
-is the fully validated path (6/6 back-to-back loops).
+None of these examples use ``etl.scan``: dev probes at the start of the bench
+expansion reproduced an interpreter ``ShapeError`` in scan's internal
+while/scatter stacking path (core bug — the 0-d loop counter was reshaped to
+``(1,)`` instead of the full-rank all-ones form in the scatter kernel). A core
+fix (commit ``c6fd423``, "numpy backend: fix 0-d scalar normalization in
+kernels + env-stack resolution for nested-region outer captures") landed
+during this work and scan now runs correctly on the numpy backend, but scan
+still stays OUT of this suite: it lowers to gather/scatter IR, a documented
+StableHLO v1 export deferral, so no compiler backend can run it. Every example
+above is a plain ``while_loop`` over fixed-shape carried state, which is the
+fully validated path (6/6 back-to-back loops).
 
 Compiler status (probed at dev time, recorded for the record)
 -------------------------------------------------------------
