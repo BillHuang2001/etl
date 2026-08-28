@@ -76,6 +76,7 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 - Symbolic-dims rendering: `tensor<?xNxf32>` etc.
 - Decomposition emission: square/relu/gelu/stop_gradient/reduce_mean.
 - Deferred ops (gather/scatter/scan/runtime_call/block_call/rank/world_size) ⇒ `BackendError` naming the op; unknown op ⇒ same.
+- Dynamic-dims rejection contract (pending — to be added by root): symbolic reshape/conv/slice/pad and dynamic-reduced-axis reduce_mean ⇒ `BackendError` naming op/dims/"dynamic"; positive: reduce_mean over a static axis with dynamic non-reduced dims exports; batched-dot goldens for rank-3@rank-2 (aligned batching dims after broadcast), rhs-higher-rank, size-1 batch squeeze, matched multi-batch (byte-identical), symbolic-batch dynamic-broadcast emission, and unprovable symbolic merge ⇒ `BackendError`; adapter-level: softmax-style symbolic reshape graph must raise from `etl.lower(..., backend='iree'|'tvm')` before any compiler invocation.
 - `verify()` failure surfaces `VerificationError`; non-Graph/non-Module input ⇒ `TypeError`.
 - CPU only, pytest, numpy-only deps.
 
