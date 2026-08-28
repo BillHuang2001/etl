@@ -82,7 +82,7 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | cast | `stablehlo.convert` |
 | select / broadcast / reshape / transpose / slice / concatenate / pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
 | reduce_sum/max/min/mean/prod | `stablehlo.reduce` (mean: reduce-sum then divide) |
-| dot / conv | `stablehlo.dot_general` (each operand's batch dims are pre-aligned to the matmul-broadcast target batch — `broadcast_in_dim` / `dynamic_broadcast_in_dim` / size-1 squeeze / non-batched form for a plain-matrix rhs; see `stablehlo/CONTEXT.md`) / `stablehlo.convolution` |
+| dot / conv | `stablehlo.dot_general` (each operand's batch dims are pre-aligned to the matmul-broadcast target batch — `broadcast_in_dim` / `dynamic_broadcast_in_dim` / size-1 squeeze and non-batched plain-matrix forms, both gated on fully-static shapes because iree cannot legalize the dynamic_reshape its import inserts for non-batched dot_general with dynamic dims; see `stablehlo/CONTEXT.md`) / `stablehlo.convolution` |
 | constant | `stablehlo.constant` |
 | cond / while_loop | `stablehlo.if` / `stablehlo.while` |
 | collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast_collective/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |

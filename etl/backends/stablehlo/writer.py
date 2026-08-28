@@ -1093,7 +1093,14 @@ class Writer:
             # rule), then emit a matched batched dot_general. A rhs whose
             # batch is provably all size-1 contributes no result dims —
             # reshape it to a plain matrix and use the non-batched form
-            # instead of materializing the broadcast.
+            # instead of materializing the broadcast. Only for fully
+            # static shapes (same gate as the plain-matrix fast path
+            # above): the iree llvm-cpu pipeline of this generation
+            # cannot legalize the dynamic_reshape its own import inserts
+            # for a non-batched dot_general with dynamic dims (the lhs
+            # free dims or the squeeze itself), so dynamic shapes fall
+            # through to the batched dynamic-broadcast path below, which
+            # legalizes fine.
             for d in target:
                 if isinstance(d, DimExpr):
                     raise BackendError(
@@ -1107,6 +1114,8 @@ class Writer:
             if (
                 self._dot_batch_all_one(b_batch)
                 and len(b_batch) <= len(a_batch)
+                and _shape_is_static(tuple(a.type.shape))
+                and _shape_is_static(tuple(b.type.shape))
             ):
                 b_name, extra, b_shape = self._dot_squeeze(op, b)
                 lines.extend(extra)
