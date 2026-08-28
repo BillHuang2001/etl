@@ -1,4 +1,4 @@
-"""MLP-block conformance examples (category "block", tag "mlp").
+"""MLP-block conformance examples (category "block", tag "mlp_block").
 
 Two whole-MLP-block graphs composed from etl primitives (dot + relu +
 layernorm + residual add): a 4-layer deep MLP with a middle layernorm and a
@@ -112,7 +112,7 @@ def _mlp_block_residual_torch(inputs, device=None):
 
 
 # ---------------------------------------------------------------------------
-# Registry (category "block", tag "mlp")
+# Registry (category "block", tag "mlp_block")
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -137,7 +137,7 @@ register_all([
         # differs only by fp32 accumulation order (~1e-7, the micro mlp
         # precedent).
         category="block",
-        tags=("mlp",),
+        tags=("mlp_block",),
     ),
     Example(
         name="mlp_block_residual",
@@ -155,6 +155,6 @@ register_all([
         torch_ref=_mlp_block_residual_torch,
         # Strict defaults: measured max_abs_error 0.0 (identical kernels).
         category="block",
-        tags=("mlp",),
+        tags=("mlp_block",),
     ),
 ])

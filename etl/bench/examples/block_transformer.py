@@ -8,8 +8,8 @@ examples — matmul_1024, conv2d_large, layernorm_large, vmap_mlp_large —
 live in :mod:`etl.bench.examples.op_large`, category "op"). They keep the
 "block" category because they compose whole blocks of ops into a single
 graph. All stay within the v1 numpy-backend budget on CPU (single etl run
-well under ~1 s each). Both also carry the ``"transformer"`` tag so the
-CLI selector ``--examples transformer`` covers the whole transformer
+well under ~1 s each). Both also carry the ``"transformer_block"`` tag so the
+CLI selector ``--examples transformer_block`` covers the whole transformer
 family (the two legacy blocks + the three small block examples below).
 
 Dev-time verification on iree/llvm-cpu (measured; see the per-example
@@ -33,7 +33,7 @@ Design notes:
 - ``_layernorm_last`` (the etl-graph-side, SYMBOLIC layernorm helper) stays
   module-local; the numpy reference uses the shared
   :func:`~etl.bench.examples.base.layernorm_numpy` helper from base.
-- Three small transformer-block examples (tag ``"transformer"``) complement
+- Three small transformer-block examples (tag ``"transformer_block"``) complement
   the two large ones: ``mha_block`` (multi-head attention block — QKV
   projection, per-head scaled softmax, concat heads, out-projection),
   ``ffn_block`` (gelu MLP + residual + layernorm), and ``mha_ffn_block``
@@ -370,7 +370,7 @@ def _mha_ffn_block_torch(inputs, device=None):
 
 
 # ---------------------------------------------------------------------------
-# Registry (category "block"; tags "large" + "transformer")
+# Registry (category "block"; tags "large" + "transformer_block")
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -398,7 +398,7 @@ register_all([
         # backend computes it exactly (max_abs 0.0 — identical kernels).
         tolerance=1e-3,
         category="block",
-        tags=("large", "transformer"),
+        tags=("large", "transformer_block"),
     ),
     Example(
         name="nbody",
@@ -420,7 +420,7 @@ register_all([
         # with margin while staying ~5x stricter than the micro mlp override.
         atol=2e-5,
         category="block",
-        tags=("large", "transformer"),
+        tags=("large", "transformer_block"),
     ),
     Example(
         name="mha_block",
@@ -441,7 +441,7 @@ register_all([
         # max-subtract formula differ only by fp32 noise, same class as the
         # micro attention example, which passes strict defaults).
         category="block",
-        tags=("transformer",),
+        tags=("transformer_block",),
     ),
     Example(
         name="ffn_block",
@@ -461,7 +461,7 @@ register_all([
         # mirrored by the shared gelu_numpy helper); torch ref uses the exact
         # erf form via torch.erf — fp32 noise only.
         category="block",
-        tags=("transformer",),
+        tags=("transformer_block",),
     ),
     Example(
         name="mha_ffn_block",
@@ -482,6 +482,6 @@ register_all([
         # Same noise class as mha_block/ffn_block: numpy exact (max_abs 0.0),
         # torch fp32 accumulation-order noise only.
         category="block",
-        tags=("transformer",),
+        tags=("transformer_block",),
     ),
 ])

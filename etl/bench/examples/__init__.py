@@ -27,8 +27,9 @@ example also carries a tuple of ``tags`` (subgroup selectors such as
 
 The CLI ``--examples`` (and :func:`expand_names`) accepts example names,
 category names, or tag names — resolution precedence per entry: (1) category
-name → all examples of that category; (2) tag name → all examples carrying
-that tag; (3) otherwise validate as an example name via :func:`get_example`.
+name → all examples of that category; (2) exact example name via
+:func:`get_example` (an exact name wins over a same-named tag); (3) tag name
+→ all examples carrying that tag.
 Registry order follows module import order: ``op`` category first (``micro``,
 ``grad``, ``vectorize``, ``op_large``, then the later-phase ``op_*``
 modules), then ``block`` (``block_transformer`` + the later-phase ``block_*``
@@ -108,10 +109,10 @@ def expand_names(entries) -> list:
     Resolution precedence per entry (documented):
     (1) a category name (see :func:`list_categories`) expands to all example
         names of that category (registry order);
-    (2) otherwise a tag name (see :func:`list_tags`) expands to all example
-        names carrying that tag (registry order);
-    (3) otherwise the entry is validated as an example name via
-        :func:`get_example` and kept as-is.
+    (2) otherwise an exact example name (see :func:`get_example`) is kept
+        as-is — an exact name wins over a tag of the same string;
+    (3) otherwise a tag name (see :func:`list_tags`) expands to all example
+        names carrying that tag (registry order).
 
     Unknown names raise :class:`UnknownExampleError`.
     """
@@ -125,6 +126,9 @@ def expand_names(entries) -> list:
                 for example in base._REGISTRY.values()
                 if example.category == entry
             )
+        elif entry in base._REGISTRY:
+            # Exact example name — wins over a same-named tag.
+            names.append(entry)
         elif entry in tags:
             names.extend(
                 example.name
@@ -133,5 +137,4 @@ def expand_names(entries) -> list:
             )
         else:
             get_example(entry)  # validates; raises UnknownExampleError
-            names.append(entry)
     return names

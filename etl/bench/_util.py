@@ -165,8 +165,9 @@ def resolve_examples(examples):
     ``None`` → all registered examples; a ``str`` → a single entry; any
     iterable → a list. Each entry is then expanded via
     :func:`~etl.bench.examples.expand_names`: a category name (e.g. ``'grad'``,
-    ``'large'``) expands to all its example names (registry order); anything
-    else is validated as an example name. Unknown names raise
+    ``'large'``) expands to all its example names (registry order); an exact
+    example name is kept as-is; a tag name expands to all examples carrying
+    that tag. Unknown names raise
     :class:`~etl.bench.examples.UnknownExampleError` (a ``ValueError``)
     listing the available names.
     """
