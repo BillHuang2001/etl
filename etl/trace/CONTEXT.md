@@ -53,7 +53,8 @@ Exported from `__init__.py` (the public contract — exact names):
    `core.TreeSpec`. Leaves must be `TensorSpec` (tensor input; shape may
    hold `Dim`/`DimExpr`, `None` = dynamic) or static Python values
    (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice`/
-   `core.Device` — see `_is_static_value`). Anything else (concrete
+   `core.Dim`/`core.DimExpr`/`core.Device` — see `_is_static_value`).
+   Anything else (concrete
    `Tensor`, ndarray, `SymbolicTensor`, …) → `TraceError` with the pytree
    path. Capturing a
    concrete tensor is NEVER silently allowed.
@@ -232,8 +233,10 @@ Graph save/load round-trips through the persist container.
   check: `trace.py::_flatten_trace_into` and
   `control_flow.py::_flatten_tree` both treat any etl-module dataclass as
   ONE leaf (no descent into its fields; non-etl dataclasses are still
-  descended). A `Device` trace input is ONE static leaf — `_is_static_value`
-  accepts `core.Device` in both files. `trace.py` still records
+  descended). `Device`/`Dim`/`DimExpr` trace inputs are each ONE static leaf
+  — `_is_static_value` accepts `core.Device` and `core.Dim`/`core.DimExpr`
+  in both files (keep the two `_is_static_value` implementations in sync).
+  `trace.py` still records
   `TensorSpec`/`SymbolicTensor` leaves via private non-dataclass markers
   (`_TensorSpecLeaf`/`_SymbolicLeaf`) carrying the original object —
   load-bearing for `graph.py`'s container-SKELETON comparison
