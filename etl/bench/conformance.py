@@ -5,7 +5,10 @@ Each selected example is staged through the explicit pipeline
 ``backend``/``device`` with ``backend_options`` passthrough) with inputs
 generated from a seeded RNG, then compared elementwise against the example's
 pure-numpy reference — and, when torch is available/requested, against its
-torch reference.
+torch reference. Staging goes through :func:`~etl.bench._util.stage_example`,
+which routes ``@etl.defn`` graphs through ``etl.build`` and transform-produced
+graphs (``etl.grad``/``etl.vmap`` TransformCallables) through the explicit
+``etl.lower`` → ``etl.compile`` → ``etl.load`` pipeline.
 
 Per-example execution failures are recorded in the report (``error`` field,
 ``overall_pass`` False) rather than aborting the whole run — nothing is
@@ -31,6 +34,7 @@ from ._util import (
     resolve_examples,
     resolve_torch_device,
     resolve_torch_mode,
+    stage_example,
 )
 from .examples import get_example
 from .report import ConformanceReport, ExampleResult
@@ -108,17 +112,22 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
     """Run conformance checks for the selected examples.
 
     Args:
-        examples: ``None`` (all registered examples), a single name, or an
-            iterable of names.
+        examples: ``None`` (all registered examples), a single name or
+            category name, or an iterable of names and/or category names
+            (categories expand to their examples).
         use_torch: ``None`` = auto (torch comparisons run iff ``import torch``
             succeeds); ``True`` = require torch — raises a clear
             ``ImportError`` mentioning ``pip install etl[bench]`` when torch
             is unavailable; ``False`` = numpy-only.
         tolerance: optional absolute-error pass threshold (``None`` = the
             default ``rtol``/``atol`` allclose-style rule; see
-            :func:`_compare`).
-        rtol: relative tolerance for the default rule.
-        atol: absolute tolerance for the default rule.
+            :func:`_compare`). Per-example overrides: when an example sets
+            ``example.tolerance`` (not ``None``) it wins; the three
+            tolerances are resolved independently.
+        rtol: relative tolerance for the default rule (per-example
+            ``example.rtol`` overrides it when set).
+        atol: absolute tolerance for the default rule (per-example
+            ``example.atol`` overrides it when set).
         seed: RNG seed for generated inputs (``numpy.random.default_rng``).
         backend: etl backend name to stage the graphs on (default
             ``"numpy"``; e.g. ``"iree"`` — validated up front through
@@ -135,10 +144,18 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
             device, ``["llvm-cpu"]`` otherwise (an explicit option always
             wins).
 
+    Per-example tolerance resolution (documented): each example's EFFECTIVE
+    ``rtol``/``atol``/``tolerance`` is the example's own value when it is not
+    ``None``, else the corresponding global argument — the three are resolved
+    independently. Effective values are recorded on each
+    :class:`ExampleResult` and used for BOTH the numpy and the torch
+    comparison.
+
     Returns:
         :class:`ConformanceReport` with one :class:`ExampleResult` per
         example (``max_abs_error``, ``max_rel_error``, numpy/torch
-        pass flags, etl run time in ms, or an ``error`` string).
+        pass flags, effective per-example tolerances, etl run time in ms, or
+        an ``error`` string).
 
     Raises:
         TypeError: invalid ``backend``/``device`` argument types.
@@ -147,7 +164,8 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
             (raised up front, before any example runs).
         ImportError: ``use_torch=True`` without torch (clear hint, never a
             raw ``ModuleNotFoundError``).
-        UnknownExampleError: unknown example name (lists available names).
+        UnknownExampleError: unknown example name or category (lists
+            available names).
     """
     if tolerance is not None and not isinstance(tolerance, (int, float)):
         raise TypeError(
@@ -164,17 +182,21 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
     results: List[ExampleResult] = []
     for name in names:
         example = get_example(name)
+        # Effective per-example tolerances: the example's own value when set,
+        # else the global argument (each resolved independently).
+        e_rtol = example.rtol if example.rtol is not None else rtol
+        e_atol = example.atol if example.atol is not None else atol
+        e_tolerance = (
+            example.tolerance if example.tolerance is not None else tolerance
+        )
         try:
             inputs = example.generate_inputs(seed)
-            executable = etl.build(
-                example.graph, *example.specs,
-                backend=backend, device=dev, **opts
-            )
+            executable = stage_example(example, backend, dev, opts)
             start = time.perf_counter()
             actual = flatten_outputs(etl.run(executable, *inputs))
             etl_ms = (time.perf_counter() - start) * 1000.0
             expected = flatten_outputs(example.numpy_ref(inputs))
-            comparison = _compare(actual, expected, rtol, atol, tolerance)
+            comparison = _compare(actual, expected, e_rtol, e_atol, e_tolerance)
             torch_pass = None
             if enabled:
                 if example.torch_ref is None:
@@ -185,7 +207,7 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
                     example.torch_ref(inputs, device=torch_device)
                 )
                 torch_comparison = _compare(
-                    actual, torch_expected, rtol, atol, tolerance
+                    actual, torch_expected, e_rtol, e_atol, e_tolerance
                 )
                 torch_pass = torch_comparison.passed
             results.append(
@@ -197,6 +219,9 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
                     numpy_pass=comparison.passed,
                     torch_pass=torch_pass,
                     etl_ms=etl_ms,
+                    rtol=e_rtol,
+                    atol=e_atol,
+                    tolerance=e_tolerance,
                 )
             )
         except Exception as exc:  # record per-example failures in the report

@@ -24,6 +24,7 @@ from ._util import (
     resolve_examples,
     resolve_torch_device,
     resolve_torch_mode,
+    stage_example,
 )
 from .examples import get_example
 from .report import BenchmarkReport, ExampleResult
@@ -37,10 +38,12 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
     """Benchmark the selected examples.
 
     For each example: generate inputs, stage the etl graph once through the
-    explicit pipeline (``etl.build``), then time — best-of-``repeats`` runs
-    after ``warmup`` untimed runs — the etl graph on the chosen backend (by
-    default the numpy backend), the pure-numpy reference, and (when torch is
-    available / requested) the torch reference.
+    explicit pipeline (:func:`~etl.bench._util.stage_example` — ``etl.build``
+    for ``@etl.defn`` graphs, the explicit ``lower``/``compile``/``load``
+    pipeline for transform-produced graphs), then time — best-of-``repeats``
+    runs after ``warmup`` untimed runs — the etl graph on the chosen backend
+    (by default the numpy backend), the pure-numpy reference, and (when torch
+    is available / requested) the torch reference.
 
     Args:
         examples: ``None`` (all registered examples), a single name, or an
@@ -100,10 +103,7 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
         example = get_example(name)
         try:
             inputs = example.generate_inputs(seed)
-            executable = etl.build(
-                example.graph, *example.specs,
-                backend=backend, device=dev, **opts
-            )
+            executable = stage_example(example, backend, dev, opts)
             etl_ms = best_time_ms(
                 lambda: etl.run(executable, *inputs), warmup, repeats
             )

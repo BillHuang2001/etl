@@ -27,13 +27,26 @@ Quick start::
                          target_backends=["llvm-cpu"])
     # device accepts None | core.Device | "KIND[:INDEX]" (e.g. "cuda:3").
 
+    # Examples can be selected by name or by category:
+    from etl.bench import list_categories
+    list_categories()                      # e.g. ["micro", "grad", ...]
+    report = conformance("micro")          # every micro example
+
 CLI: ``python -m etl.bench --help`` (exit code 1 when any conformance check
-fails).
+fails). ``--examples`` accepts comma-separated example names OR category
+names (e.g. ``--examples micro,matmul``; categories expand to their
+examples; default: all).
 """
 from . import report  # noqa: F401  (submodule, public)
 from .benchmark import benchmark
 from .conformance import conformance
-from .examples import Example, UnknownExampleError, get_example, list_examples
+from .examples import (
+    Example,
+    UnknownExampleError,
+    get_example,
+    list_categories,
+    list_examples,
+)
 from .report import BenchmarkReport, ConformanceReport, ExampleResult, print_report
 
 __all__ = [
@@ -46,5 +59,6 @@ __all__ = [
     "benchmark",
     "list_examples",
     "get_example",
+    "list_categories",
     "print_report",
 ]

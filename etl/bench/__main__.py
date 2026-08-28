@@ -15,7 +15,7 @@ from etl.core import BackendError
 from ._util import resolve_device
 from .benchmark import benchmark
 from .conformance import conformance
-from .examples import UnknownExampleError, list_examples
+from .examples import UnknownExampleError, list_categories
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -33,9 +33,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--examples",
         default=None,
         metavar="NAME[,NAME...]",
-        help="comma-separated example names (default: all: "
-        + ", ".join(list_examples())
-        + ")",
+        help="comma-separated example names OR categories (default: all); "
+        "categories: " + ", ".join(list_categories()),
     )
     parser.add_argument(
         "--conformance",

@@ -6,12 +6,14 @@ import time
 
 import numpy as np
 
+import etl
 from etl import backends, core
 from ._torch import require_torch, torch_available
-from .examples import get_example, list_examples
+from .examples import expand_names, list_examples
 
 __all__ = [
     "resolve_examples",
+    "stage_example",
     "resolve_torch_mode",
     "best_time_ms",
     "flatten_outputs",
@@ -139,8 +141,11 @@ def resolve_torch_device(device, torch_mod):
 def resolve_examples(examples):
     """Normalize the ``examples`` argument to a list of registered names.
 
-    ``None`` → all registered examples; a ``str`` → a single name; any
-    iterable of names → a list. Unknown names raise
+    ``None`` → all registered examples; a ``str`` → a single entry; any
+    iterable → a list. Each entry is then expanded via
+    :func:`~etl.bench.examples.expand_names`: a category name (e.g. ``'grad'``,
+    ``'large'``) expands to all its example names (registry order); anything
+    else is validated as an example name. Unknown names raise
     :class:`~etl.bench.examples.UnknownExampleError` (a ``ValueError``)
     listing the available names.
     """
@@ -150,9 +155,28 @@ def resolve_examples(examples):
         names = [examples]
     else:
         names = list(examples)
-    for name in names:
-        get_example(name)  # validates; raises UnknownExampleError if unknown
-    return names
+    return expand_names(names)
+
+
+def stage_example(example, backend, device, opts):
+    """Stage an example's graph to an executable on the chosen backend/device.
+
+    ``@etl.defn`` graphs go through ``etl.build``; transform-produced graphs
+    (``etl.grad``/``etl.vmap`` TransformCallables — ``example.graph`` lacks
+    the ``__etl_defn__`` marker) are materialized with
+    ``example.graph(*example.specs) -> Graph`` and staged through the explicit
+    pipeline ``etl.lower`` → ``etl.compile`` → ``etl.load`` (options go to
+    BOTH lower and compile, exactly like build does).
+    """
+    if getattr(example.graph, "__etl_defn__", False):
+        return etl.build(
+            example.graph, *example.specs,
+            backend=backend, device=device, **opts
+        )
+    graph = example.graph(*example.specs)
+    lp = etl.lower(graph, backend=backend, **opts)
+    ca = etl.compile(lp, **opts)
+    return etl.load(ca, device=device)
 
 
 def resolve_torch_mode(use_torch):
