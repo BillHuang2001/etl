@@ -8,7 +8,8 @@ field, ``overall_pass`` False) — never swallowed. torch optionality is
 binding: ``use_torch=True`` without torch raises a clear ``ImportError``
 mentioning ``pip install etl[bench]``; ``use_torch=None`` (auto) silently
 skips torch comparisons when torch is absent (``torch_pass`` None,
-``use_torch`` "disabled").
+``use_torch`` "disabled"). In torch mode, examples without a ``torch_ref``
+are skipped for the torch comparison (``torch_pass`` None) — never an error.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from etl.bench import (
     ConformanceReport,
     ExampleResult,
     conformance,
+    get_example,
+    list_examples,
     print_report,
 )
 
@@ -207,9 +210,18 @@ def test_conformance_with_torch_enabled_all_examples():
     assert report.torch_available is True
     assert len(report.results) == 97
     assert report.overall_pass is True
+    # Registry-driven: examples without a torch_ref are skipped for the torch
+    # comparison (torch_pass None) — never an error. Future example additions
+    # must not re-break this test, so don't hard-pin names/counts here.
+    torch_ref_names = {
+        name for name in list_examples() if get_example(name).torch_ref is not None
+    }
     for result in report.results:
         # torch references must pass too; results are recorded, never
         # swallowed.
         assert result.error is None
         assert result.numpy_pass is True
-        assert result.torch_pass is True
+        if result.name in torch_ref_names:
+            assert result.torch_pass is True
+        else:
+            assert result.torch_pass is None
