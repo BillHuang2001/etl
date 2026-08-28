@@ -11,6 +11,15 @@ Covers the binding contract from ``etl/block/CONTEXT.md``:
 * Errors: non-defn portables fail at declaration (``BlockError``); a portable
   returning a non-tensor or a shape that mismatches the declared outputs
   fails loudly at lower time (``BackendError``).
+* Structured portable returns: a portable body may return a namedtuple or a
+  dataclass of SymbolicTensors (including a namedtuple nested around plain
+  tuples). The return annotation is NOT part of the pinned contract, so
+  structured-return blocks declare ``outputs=`` explicitly. Direct
+  evaluate/lowering works for both shapes; vmap works through the
+  namedtuple return, and through the dataclass return once the parallel
+  ``etl/block`` implementation lands — at base the dataclass-through-vmap
+  case fails with ``BlockError`` from ``etl/block/rules.py::_flatten_outputs``
+  (see the ``BUG(etl)`` marker on ``test_vmap_through_dataclass_portable``).
 
 Notes:
 
@@ -26,11 +35,17 @@ Notes:
   linspace pairing is unsatisfiable as written.
 """
 
+from collections import namedtuple
+from dataclasses import dataclass
+
 import numpy as np
 import pytest
 
 import etl
 from etl.block.errors import BlockError
+
+BATCH = 8
+DIM = 4
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,6 +74,16 @@ def _count_block_calls(module):
 
 def _sigmoid_np(x):
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def _run(graph, *args):
+    """Explicit pipeline: lower -> compile -> load -> run (returns structure)."""
+    return etl.run(etl.load(etl.compile(etl.lower(graph))), *args)
+
+
+def _batched_rows():
+    """BATCH rows of DIM floats (module-level BATCH/DIM constants)."""
+    return np.linspace(-1, 1, BATCH * DIM, dtype=np.float32).reshape(BATCH, DIM)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +142,75 @@ def port_shape_mismatch_fn(x):
     return port_shape_mismatch(x)
 
 
+# --- Structured portable returns (namedtuple / dataclass) -------------------
+#
+# The return annotation of a namedtuple/dataclass-returning portable is NOT
+# part of the pinned contract (the spec-derivation path cannot see through
+# these annotations), so output specs are declared EXPLICITLY via
+# ``outputs=``, exactly like port_badtensor above.
+
+_PortNT = namedtuple("_PortNT", "a b")
+
+
+@etl.block(
+    outputs=[
+        etl.TensorSpec((None,), etl.float32),
+        etl.TensorSpec((None,), etl.float32),
+    ]
+)
+@etl.defn
+def port_nt(x: etl.TensorSpec((None,), etl.float32)):
+    return _PortNT(etl.sigmoid(x) * x, etl.tanh(x))
+
+
+@etl.defn
+def port_nt_fn(x):
+    return port_nt(x)
+
+
+@dataclass
+class _PortDC:
+    a: object
+    b: object
+
+
+@etl.block(
+    outputs=[
+        etl.TensorSpec((None,), etl.float32),
+        etl.TensorSpec((None,), etl.float32),
+    ]
+)
+@etl.defn
+def port_dc(x: etl.TensorSpec((None,), etl.float32)):
+    return _PortDC(etl.sigmoid(x) * x, etl.tanh(x))
+
+
+@etl.defn
+def port_dc_fn(x):
+    return port_dc(x)
+
+
+# A namedtuple whose ``tail`` field holds a plain tuple: three tensor leaves.
+_PortHeadTail = namedtuple("_PortHeadTail", "head tail")
+
+
+@etl.block(
+    outputs=[
+        etl.TensorSpec((None,), etl.float32),
+        etl.TensorSpec((None,), etl.float32),
+        etl.TensorSpec((None,), etl.float32),
+    ]
+)
+@etl.defn
+def port_nt_nested(x: etl.TensorSpec((None,), etl.float32)):
+    return _PortHeadTail(etl.sigmoid(x) * x, (etl.tanh(x), etl.sigmoid(x)))
+
+
+@etl.defn
+def port_nt_nested_fn(x):
+    return port_nt_nested(x)
+
+
 # ---------------------------------------------------------------------------
 # Inlining + numerics
 # ---------------------------------------------------------------------------
@@ -163,6 +257,93 @@ def test_multi_output_portable():
     a, b = out
     assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
     assert np.allclose(b.numpy(), np.tanh(x), rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Structured portable returns (namedtuple / dataclass)
+# ---------------------------------------------------------------------------
+
+
+def test_namedtuple_portable_runs_with_correct_fields():
+    """A namedtuple-returning portable runs with both fields correct."""
+    x = np.linspace(-2, 2, 32, dtype=np.float32)
+    out = etl.evaluate(port_nt_fn, x)
+    assert isinstance(out, tuple) and len(out) == 2
+    a, b = out
+    assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
+    assert np.allclose(b.numpy(), np.tanh(x), rtol=1e-6)
+
+
+def test_dataclass_portable_runs_with_correct_fields():
+    """A dataclass-returning portable runs with both fields correct."""
+    x = np.linspace(-2, 2, 32, dtype=np.float32)
+    out = etl.evaluate(port_dc_fn, x)
+    assert isinstance(out, tuple) and len(out) == 2
+    a, b = out
+    assert np.allclose(a.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
+    assert np.allclose(b.numpy(), np.tanh(x), rtol=1e-6)
+
+
+def test_namedtuple_portable_lowering_inlines_the_block_call():
+    """lower() inlines a namedtuple-returning portable like any other."""
+    graph = etl.trace(port_nt_fn, etl.TensorSpec((None,), etl.float32))
+    assert _count_block_calls(graph.module) == 1  # the traced graph has it
+
+    lowered = etl.lower(graph)
+    module = etl.ir.deserialize_module(lowered.payload)
+    assert _count_block_calls(module) == 0
+
+
+def test_nested_namedtuple_portable_mixed_return():
+    """A namedtuple field holding a plain tuple flattens to 3 outputs."""
+    x = np.linspace(-2, 2, 32, dtype=np.float32)
+    out = etl.evaluate(port_nt_nested_fn, x)
+    assert isinstance(out, tuple) and len(out) == 3
+    head, tail1, tail2 = out
+    assert np.allclose(head.numpy(), _sigmoid_np(x) * x, rtol=1e-6)
+    assert np.allclose(tail1.numpy(), np.tanh(x), rtol=1e-6)
+    assert np.allclose(tail2.numpy(), _sigmoid_np(x), rtol=1e-6)
+
+
+def test_vmap_through_namedtuple_portable():
+    """vmap through a namedtuple-returning portable == per-row reference."""
+    tf = etl.vmap(port_nt_fn, out_axes=(0, 0))
+    graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    x = _batched_rows()
+    out = _run(graph, x)
+    assert isinstance(out, tuple) and len(out) == 2
+
+    # Reference: the unvectorized computation, row by row (build once, run
+    # per row — the documented explicit form of etl.evaluate).
+    exe = etl.build(port_nt_fn, etl.TensorSpec((DIM,), etl.float32))
+    ref_a = np.stack([etl.run(exe, row)[0].numpy() for row in x])
+    ref_b = np.stack([etl.run(exe, row)[1].numpy() for row in x])
+    a, b = out
+    assert np.allclose(a.numpy(), ref_a, rtol=1e-6)
+    assert np.allclose(b.numpy(), ref_b, rtol=1e-6)
+
+
+# BUG(etl): dataclass portable returns are rejected by the portable batching
+# fallback in etl/block/rules.py::_flatten_outputs — it only accepts
+# SymbolicTensor / tuple / list / dict, so a dataclass raises BlockError at
+# vmap time. The pinned contract requires dataclass returns to work through
+# vmap; this test passes once the parallel etl implementation lands. Do NOT
+# skip/xfail/weaken it.
+def test_vmap_through_dataclass_portable():
+    """vmap through a dataclass-returning portable == per-row reference."""
+    tf = etl.vmap(port_dc_fn, out_axes=(0, 0))
+    graph = tf(etl.TensorSpec((BATCH, DIM), etl.float32))
+    x = _batched_rows()
+    out = _run(graph, x)
+    assert isinstance(out, tuple) and len(out) == 2
+
+    # Reference: the unvectorized computation, row by row.
+    exe = etl.build(port_dc_fn, etl.TensorSpec((DIM,), etl.float32))
+    ref_a = np.stack([etl.run(exe, row)[0].numpy() for row in x])
+    ref_b = np.stack([etl.run(exe, row)[1].numpy() for row in x])
+    a, b = out
+    assert np.allclose(a.numpy(), ref_a, rtol=1e-6)
+    assert np.allclose(b.numpy(), ref_b, rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------
