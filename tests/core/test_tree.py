@@ -486,13 +486,16 @@ def test_etl_value_types_are_single_leaves():
 def test_register_pytree_node_object_raises():
     # 'object' would hijack the MRO lookup for every type — rejected.
     # Placed last: registry-hygiene caution (must not affect other tests).
-    with pytest.raises(
-        TypeError,
-        match=r"register_pytree_node: cannot register 'object' as a pytree node — it would hijack the MRO lookup for all types",
-    ):
-        register_pytree_node(object, _tagged_flatten, _tagged_unflatten)
-    # Defensive cleanup: while the rejection guard is missing (parallel
-    # implementation not yet merged), the registration succeeds and would
-    # hijack the MRO dispatch for every type for the rest of the session —
-    # undo it so pre-existing tests stay green. No-op once the guard lands.
-    _PYTREE_NODE_REGISTRY.pop(object, None)
+    try:
+        with pytest.raises(
+            TypeError,
+            match=r"register_pytree_node: cannot register 'object' as a pytree node — it would hijack the MRO lookup for all types",
+        ):
+            register_pytree_node(object, _tagged_flatten, _tagged_unflatten)
+    finally:
+        # Defensive cleanup: while the rejection guard is missing (parallel
+        # implementation not yet merged), the registration succeeds and would
+        # hijack the MRO dispatch for every type for the rest of the session
+        # — undo it so pre-existing tests stay green. No-op once the guard
+        # lands. Runs even when the pytest.raises assertion above fails.
+        _PYTREE_NODE_REGISTRY.pop(object, None)
