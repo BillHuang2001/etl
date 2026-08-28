@@ -17,6 +17,8 @@ contract in `../etl/CONTEXT.md`). Groups (one class per group, in file order):
 10. `TestPythonSemantics`    — Python values stay Python; no silent specialization.
 11. `TestLocalTensorSemantics` — collectives are explicit ops, never implicit.
 12. `TestErrorLocations`     — error messages carry `file.py:line` locations.
+13. `TestTreeMapIsComposition` — `tree_map` is transparent sugar over
+                               `flatten`/`unflatten` (structure-preserving).
 
 Conventions: small shapes, CPU only, fast. Tests assert the documented
 contract; a test exposing a contract violation stays failing with a
@@ -26,9 +28,11 @@ contract; a test exposing a contract violation stays failing with a
 from __future__ import annotations
 
 import copy
+import dataclasses
 import importlib
 import re
 import warnings
+from collections import namedtuple
 
 import numpy as np
 import pytest
@@ -791,3 +795,59 @@ class TestErrorLocations:
         assert _LOCATION_RE.search(message), (
             f"shape error must carry a source location like `model.py:83`, got: {message}"
         )
+
+
+# ===========================================================================
+# 13. tree_map is transparent sugar over flatten/unflatten
+# ===========================================================================
+
+
+_Point = namedtuple("_Point", ["x", "y"])
+
+
+@dataclasses.dataclass(frozen=True)
+class _Box:
+    """A user-defined dataclass pytree node with two scalar fields."""
+
+    lo: object
+    hi: object
+
+
+#: Nested mixed structure: dict → tuple / list / namedtuple / dataclass / leaf.
+_MIXED_TREE = {
+    "pair": (1, 2),
+    "seq": [3, 4],
+    "point": _Point(5, 6),
+    "box": _Box(7, 8),
+    "scalar": 9,
+}
+
+
+def _double_leaf(leaf):
+    """Type-preserving leaf transform (int → int), so `tree_map`'s structure
+    is unaffected whether `tree_structure` records leaf types or not."""
+    return leaf * 2
+
+
+class TestTreeMapIsComposition:
+    """`tree_map` is exactly the documented composition — ``flatten``, map
+    the leaves, ``unflatten`` — and preserves the input structure exactly."""
+
+    def test_tree_map_equals_flatten_map_unflatten(self):
+        """`tree_map(f, t) == unflatten([f(l) for l in flatten(t)[0]],
+        flatten(t)[1])`: mapping a nested mixed structure is precisely
+        leaf-mapping plus rebuild — sugar over the explicit primitives, never
+        new semantics."""
+
+        leaves, spec = etl.flatten(_MIXED_TREE)
+        expected = etl.unflatten([_double_leaf(leaf) for leaf in leaves], spec)
+        assert etl.tree_map(_double_leaf, _MIXED_TREE) == expected
+
+    def test_tree_map_preserves_structure(self):
+        """`tree_structure(tree_map(f, t)) == tree_structure(t)`: the mapped
+        tree keeps the exact container skeleton — dict keys, tuple/list
+        arity, namedtuple fields, dataclass fields."""
+
+        assert etl.tree_structure(
+            etl.tree_map(_double_leaf, _MIXED_TREE)
+        ) == etl.tree_structure(_MIXED_TREE)
