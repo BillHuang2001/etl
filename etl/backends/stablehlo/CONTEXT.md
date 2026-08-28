@@ -42,7 +42,7 @@ Decompositions (`DECOMPOSITIONS` — writer emits ordinary sub-ops, no direct mn
 - `stop_gradient` → identity passthrough (emit operand directly)
 - `reduce_mean` → reduce-sum then divide by element count
 
-Deferred in v1 (`DEFERRED_OPS` ⇒ `core.BackendError` naming the op): `gather`, `scatter`, `scan`, `runtime_call`, `block_call`, `rank`, `world_size` (dist graph scalars), complex-number elementwise beyond cast.
+Deferred in v1 (`DEFERRED_OPS` ⇒ `core.BackendError` naming the op): `gather`, `scatter`, `scan`, `runtime_call`, `block_call`, `rank`, `world_size` (dist graph scalars), `argmax`/`argmin` (no such ops in the StableHLO opset — ArgMax/ArgMin are open feature requests), complex-number elementwise beyond cast.
 
 **Dynamic-dim deferrals (v1, validated through iree):** every rejection names the op, the shape, the offending dims, and contains "dynamic" — raised at export/`lower()` time, never invalid MLIR: `reshape` with ANY dynamic dim (incl. the keepdims reshapes inside the reduce/reduce_mean emitters), `conv` with any dynamic dim in x/w/result, `slice` / `pad` with dynamic dims (iree-compile ACCEPTS the MLIR but the runtime ABORTs at every concrete size), `reduce_mean` reducing over a dynamic dim (element count not statically known), and `dot` batch structure that cannot be emitted (no shape source for the required dynamic broadcast / unprovable symbolic batch merge).
 
