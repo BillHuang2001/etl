@@ -38,7 +38,7 @@ All names below are re-exported from `etl/core/__init__.py` (see also `../CONTEX
 | `tensor.py` | `Tensor` data holder + DLPack passthrough (implemented); creators/`from_numpy`/`from_dlpack` implemented |
 | `symbolic.py` | `SymbolicTensor` + operator-handler registry + `constant` hook (implemented; op building lives in `../ops/`) |
 | `device.py` | `Device` (implemented); `devices`/`split_tensor`/`replicate_tensor` implemented — `split_tensor`/`replicate_tensor` validate inputs up-front and raise `DeviceError` for invalid axis/input kind (no raw numpy/AttributeError leaks) |
-| `tree.py` | `TreeSpec` + pytree registry (implemented); `flatten`/`unflatten` implemented |
+| `tree.py` | `TreeSpec` + pytree registry (implemented); `flatten`/`unflatten` implemented; sugared `tree_map`/`tree_leaves`/`tree_structure`/`tree_flatten`/`tree_unflatten`; cross-module mismatch contract `first_mismatch_path`/`format_path`; container edge handling for `defaultdict`/`Counter` |
 
 Cross-references: `../ops/` registers operator handlers + the constant builder into `core` at import time; `../ir/` provides the real `Value`/`Location` types that `SymbolicTensor.value`/`.location` duck-type; `../../tests/core/` is the test mirror (sibling — read-only from here, escalate writes to root).
 
@@ -46,7 +46,7 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 
 - **Operator-handler dispatch**: `SymbolicTensor.__add__` etc. call `_get_operator_handler(kind)(...)`. Kinds: `add, sub, mul, matmul, truediv, pow, neg, lt, gt, le, ge, eq, getitem`. Calling convention: binary `handler(left, right)`; `neg` `handler(operand)`; `getitem` `handler(obj, key)`. Missing handler (e.g. `etl.ops` not imported) → `TraceError` naming the kind and the fix. Reflected dunders (`__radd__`, ..., `__rpow__`) dispatch with swapped operands. `__eq__` returns a symbolic `equal` op (graph semantics), never a Python bool; `__bool__` raises `TraceError` pointing to `etl.cond`/`while_loop`/`scan`; `__hash__ = None` (unhashable, since `__eq__` is not a bool). `!=` is intentionally not defined (Python inverts `__eq__` → hits `__bool__` → clear `TraceError`).
 - **`constant` hook**: `etl.constant` is listed under core's value model in the package contract, but building a Constant op requires `ops`. Resolved by the same hook pattern as operators: `ops` registers a builder via `register_constant_builder`; `core.constant` calls it or raises `TraceError`.
-- **`bool_` naming**: the dtype constant is `bool_`, not `bool` (the package contract's `etl.bool` would shadow the builtin inside every consumer — see contract conflicts below).
+- **`bool_` naming**: the dtype constant is `bool_`, not `bool` (avoiding shadowing the builtin inside every consumer; the package contract uses `bool_`).
 - **`Dim`/`DimExpr` as pure ASTs**: arithmetic dunders only construct nodes (shared `_DimArithmeticMixin`); `evaluate(dim_sizes)` does substitution/arithmetic with explicit bindings taking precedence over known sizes. `==` on dims/exprs is structural; comparisons (`< <= > >=`) evaluate "constraint-free" (known sizes only, no bindings) and raise `ShapeError` when unresolved; `bool()` on symbolic dims raises `ShapeError`. `dim(5)` → `Dim(name="dim_5", size=5)` (deterministic name, known size ⇒ exact evaluation).
 - **DLPack zero-copy**: `Tensor.__dlpack__` delegates to the ndarray (same memory); `from_dlpack` must consume capsules without copies. `.numpy()` returns the underlying array reference (no copy). `Tensor` is unhashable (like ndarray) and compares structurally (dtype+shape+device+`array_equal`).
 - **`TensorSpec` normalization**: shape tuple-ified and element-validated; dtype normalized via `dtype()`; rank always known. `SymbolicTensor.shape` additionally accepts `Dim` entries (callers resolve to `DimExpr`).
@@ -67,7 +67,3 @@ Cross-references: `../ops/` registers operator handlers + the constant builder i
 ## Notes for agents
 
 - **numpy-2.x DLPack gotcha**: numpy >= 2.0 requires the keyword-only `max_version` argument on `ndarray.__dlpack__` (numpy < 2.0 rejects it). `Tensor.__dlpack__` therefore tries the plain `self.data.__dlpack__(stream=stream)` call first and retries with `max_version=(1, 0)` on `TypeError`. Do not "simplify" this back to a single call — that breaks on one numpy generation or the other.
-
-## Known issues (current state)
-
-- Contract conflict noted for the root/parent docs: package contract says dtype constant `etl.bool`; implemented as `bool_` (safer, per this node's architecture directive) — parent docs should be updated to `etl.bool_`. `VerificationError` lives here per the root error strategy (not in the parent's API-surface list).
