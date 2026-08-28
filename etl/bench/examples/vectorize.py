@@ -39,18 +39,13 @@ seed 0 inputs):
     vs the numpy reference (numpy backend exact).
   - vmap_grad_mlp: COMPILES + RUNS (the no-size-one-dims formulation —
     see below): max_abs_error 6.9e-06 vs the fd reference.
-  - vmap_linear: documented deferral — a NEW core exporter bug, not an
-    example problem. The exporter's non-batched dot fast path squeezes the
-    shared-weight batch dim (``_dot_batch_all_one`` in
-    ``etl/backends/stablehlo/writer.py``) via ``stablehlo.reshape`` +
-    non-batched ``dot_general`` with a DYNAMIC lhs dim; export succeeds,
-    but iree-compile fails with ``error: failed to legalize operation
-    'stablehlo.dynamic_reshape' that was explicitly marked illegal`` (the
-    plain-matrix fast path is correctly gated on fully static shapes; the
-    squeeze path is not). Diagnostic proof: the SAME per-sample fn with
-    matched-batch weights (in_axes=(0,0,None), w[32,16,8]) compiles and
-    runs on iree (max_abs_error 9.5e-07) — only the shared-weight squeeze
-    path is broken. The numpy backend computes vmap_linear exactly.
+  - vmap_linear: COMPILES + RUNS on iree (shared w/b — the exporter's
+    size-1-batch squeeze fast path is gated on fully static shapes, so the
+    dynamic batch dim falls through to the batched
+    ``dynamic_broadcast_in_dim`` + batched ``dot_general`` path, which
+    legalizes on iree): max_abs_error 9.54e-07 (cpu) / 1.43e-06 (cuda) vs
+    the numpy reference; the numpy backend computes it exactly (max_abs
+    0.0).
   - vmap_softmax / vmap_layernorm / vmap_attention: documented deferral —
     keepdims reductions are semantically REQUIRED here (a no-keepdims
     reformulation is wrong: numpy trailing broadcasting would divide
@@ -174,13 +169,11 @@ def _vmap_layernorm_torch(inputs, device=None):
 # Per-sample x is a rank-2 row [1,16] so no per-sample reshape is needed
 # (etl.dot is batched matmul, rank >= 2; a rank-1 vector would need a
 # [1,16] round-trip reshape, which the exporter rejects on dynamic dims).
-# iree: documented deferral — the exporter's shared-weight dot SQUEEZE path
-# (`_dot_batch_all_one` in etl/backends/stablehlo/writer.py) emits a
-# non-batched dot_general with a dynamic lhs dim after squeezing the
-# weight batch (1,) via static reshape; iree-compile fails with
-# "failed to legalize operation 'stablehlo.dynamic_reshape'" (core exporter
-# bug, write scope forbids fixing it here). Diagnostic proof in the module
-# docstring: the same fn with matched-batch weights compiles+runs on iree.
+# iree: COMPILES + RUNS — the shared-weight (size-1-batch) dot goes through
+# the exporter's batched dynamic_broadcast_in_dim + batched dot_general
+# path (the size-1-batch squeeze fast path is gated on fully static shapes,
+# etl/backends/stablehlo/writer.py); measured max_abs_error 9.54e-07 (cpu)
+# / 1.43e-06 (cuda) vs the numpy reference (numpy backend exact).
 
 
 @defn
@@ -411,8 +404,7 @@ register_all([
         name="vmap_linear",
         description=(
             "per-sample relu(x @ w + b) vmap'd over x only (shared w/b); "
-            "iree: documented deferral (core dot-squeeze bug — "
-            "iree-compile dynamic_reshape legalization failure, not export)"
+            "compiles+runs on iree (cpu max_abs 9.54e-07, cuda 1.43e-06)"
         ),
         specs=(
             TensorSpec((32, 1, 16), _F32),
