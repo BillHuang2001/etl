@@ -706,3 +706,110 @@ def test_dot_unprovable_symbolic_merge_rejected():
     assert "dynamic batch broadcast" in msg
     assert "symbolic dims that cannot be proven equal or size-1" in msg
     assert "dynamic" in msg
+
+
+# --- 14. mixed-dtype operand equalization (regression for 6aec043) ----------
+
+# etl IR allows mixed-dtype operands on binary elementwise ops / compare /
+# select (the result dtype follows numpy promotion — e.g. a Python scalar
+# like ``3`` becomes a scalar i64 weak constant at trace time). StableHLO
+# requires every non-predicate operand AND the result to share one element
+# type, so the writer equalizes dtypes by inserting ``stablehlo.convert``
+# AFTER shape equalization (fix 6aec043): elementwise ops convert operands
+# to the result dtype (skipped for ``cast``/unary — cast IS a convert),
+# compare converts both operands to ``np.result_type(lhs, rhs)`` — the
+# promoted NUMERIC dtype, never the i1 result — and select converts
+# on_true/on_false to the promoted result dtype while the predicate stays
+# i1. Matching-dtype graphs emit byte-identical MLIR (no converts).
+
+
+def _line_containing(mlir, needle):
+    """The first non-empty line of ``mlir`` containing ``needle``."""
+    return next(line for line in mlir.splitlines() if needle in line)
+
+
+def test_elementwise_mixed_dtype_operand_converted_to_result_dtype():
+    # bitwise_and(cast(x, i32), 3) over f32: the cast emits its own
+    # convert (f32 -> i32) while the Python scalar 3 promotes to a scalar
+    # i64 constant, so the equalization convert is i32 -> i64 — the
+    # promoted result dtype, distinct from the cast's convert.
+    def f(x):
+        return etl.bitwise_and(etl.cast(x, etl.int32), 3)
+
+    mlir = _export(f, etl.TensorSpec((8, 16), etl.float32))
+    assert "(tensor<8x16xf32>) -> tensor<8x16xi32>" in mlir  # the cast
+    assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir  # equalization
+    and_line = _line_containing(mlir, "stablehlo.and")
+    assert ": tensor<8x16xi64>" in and_line  # operands share the result type
+
+
+def test_elementwise_mixed_dtype_only_mismatched_operand_converted():
+    # add(x, 3) over i32: exactly ONE convert — only the i32 operand needs
+    # equalization; the promoted i64 scalar constant is already the result
+    # dtype. Pre-fix this graph emitted mixed-dtype stablehlo.add operands
+    # that iree rejected at compile.
+    def f(x):
+        return etl.add(x, 3)
+
+    mlir = _export(f, etl.TensorSpec((8, 16), etl.int32))
+    assert mlir.count("stablehlo.convert") == 1
+    assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir
+    add_line = _line_containing(mlir, "stablehlo.add")
+    assert ": tensor<8x16xi64>" in add_line
+
+
+def test_compare_mixed_dtype_operands_promoted_numeric_dtype():
+    # equal(x, 3) over i32: both operands are converted to the promoted
+    # NUMERIC dtype i64 (np.result_type(i32, i64)) — never to the i1
+    # result type — so both operand slots render as tensor<8x16xi64>.
+    def f(x):
+        return etl.equal(x, 3)
+
+    mlir = _export(f, etl.TensorSpec((8, 16), etl.int32))
+    assert "(tensor<8x16xi64>, tensor<8x16xi64>) -> tensor<8x16xi1>" in mlir
+    assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir
+
+
+def test_select_mixed_dtype_branches_converted_pred_stays_i1():
+    # select(p, a, b) over bool/i32/i64: on_true is converted to the
+    # promoted result dtype i64 while the predicate keeps its i1 type.
+    def f(p, a, b):
+        return etl.select(p, a, b)
+
+    mlir = _export(
+        f,
+        etl.TensorSpec((8, 16), etl.bool_),
+        etl.TensorSpec((8, 16), etl.int32),
+        etl.TensorSpec((8, 16), etl.int64),
+    )
+    assert (
+        "(tensor<8x16xi1>, tensor<8x16xi64>, tensor<8x16xi64>) -> tensor<8x16xi64>"
+        in mlir
+    )
+    assert "(tensor<8x16xi32>) -> tensor<8x16xi64>" in mlir
+
+
+NO_CONVERT_CASES = [
+    ("add_f32", lambda x: etl.add(x, x),
+     (etl.TensorSpec((8, 16), etl.float32),)),
+    ("equal_i64_i64", lambda a, b: etl.equal(a, b),
+     (etl.TensorSpec((8, 16), etl.int64), etl.TensorSpec((8, 16), etl.int64))),
+    ("select_bool_i32_i32", lambda p, a, b: etl.select(p, a, b),
+     (etl.TensorSpec((8, 16), etl.bool_),
+      etl.TensorSpec((8, 16), etl.int32),
+      etl.TensorSpec((8, 16), etl.int32))),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,specs",
+    [(fn, specs) for _, fn, specs in NO_CONVERT_CASES],
+    ids=[case_id for case_id, _, _ in NO_CONVERT_CASES],
+)
+def test_matching_dtype_graphs_emit_no_convert(fn, specs):
+    # Negative guard: when every operand already shares the result dtype,
+    # the exporter emits byte-identical MLIR — no stablehlo.convert is
+    # inserted (these graphs contain no casts at all). Covers all three op
+    # families: elementwise / compare / select.
+    mlir = _export(fn, *specs)
+    assert "stablehlo.convert" not in mlir
