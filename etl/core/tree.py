@@ -45,6 +45,7 @@ __all__ = [
     # cross-module structure-mismatch contract (trace/pipeline/transforms)
     "first_mismatch_path",
     "format_path",
+    "describe_node",
 ]
 
 # Registered custom pytree node types → (flatten_fn, unflatten_fn).
@@ -342,8 +343,9 @@ def _rebuild_container(spec: TreeSpec, children: List[Any]) -> Any:
 
 # --- Structure-mismatch helpers (cross-module contract) ----------------------
 # Consumed by trace (graph.py), pipeline, and transforms (vectorize/vmap):
-# importable as ``from etl.core import first_mismatch_path, format_path``.
-# These are internal contract names, NOT part of the top-level ``etl`` surface.
+# importable as ``from etl.core import first_mismatch_path, format_path,
+# describe_node``. These are internal contract names, NOT part of the
+# top-level ``etl`` surface.
 
 
 def _is_defaultdict_spec(spec: TreeSpec) -> bool:
@@ -369,7 +371,11 @@ def _dict_keys(spec: TreeSpec) -> Optional[List[Any]]:
 
 
 def first_mismatch_path(
-    spec_a: TreeSpec, spec_b: TreeSpec, *, leaf_vs_empty_is_mismatch: bool = False
+    spec_a: TreeSpec,
+    spec_b: TreeSpec,
+    *,
+    strict: bool = False,
+    leaf_vs_empty_is_mismatch: bool = False,
 ) -> Optional[Tuple[Any, ...]]:
     """The pytree path where ``spec_a`` first diverges from ``spec_b`` in
     CONTAINER structure, or ``None`` when the two structures match.
@@ -381,8 +387,14 @@ def first_mismatch_path(
     - One childless node vs a node with children → mismatch at that prefix.
     - Both childless (leaf vs leaf OR leaf vs empty container): match by
       default (grad/graph/pipeline semantics). With
-      ``leaf_vs_empty_is_mismatch=True`` (vectorize's semantics), a
-      ``num_leaves`` difference (1 vs 0) at the same node IS a mismatch.
+      ``leaf_vs_empty_is_mismatch=True`` (vectorize's semantics) or
+      ``strict=True``, a ``num_leaves`` difference (1 vs 0) at the same node
+      IS a mismatch (``strict=True`` subsumes
+      ``leaf_vs_empty_is_mismatch=True``, which stays for the legacy
+      callers).
+    - ``strict=True`` additionally treats two childless EMPTY containers with
+      differing ``type`` or ``node_data`` as a mismatch; leaf vs leaf always
+      matches regardless of leaf type.
     - Leaf *types* are deliberately ignored — childless nodes with equal
       ``num_leaves`` always match.
     - While descending, dict-subclass keys are sourced from ``node_data``
@@ -391,8 +403,13 @@ def first_mismatch_path(
     Args:
         spec_a: The first structure (the "expected" one).
         spec_b: The second structure (the "got" one).
+        strict: Full structural strictness — leaf (1 leaf) vs empty container
+            (0 leaves) and empty-vs-empty containers with differing
+            type/node_data are mismatches. Subsumes
+            ``leaf_vs_empty_is_mismatch=True``.
         leaf_vs_empty_is_mismatch: Treat a leaf (1 leaf) vs an empty
-            container (0 leaves) at the same node as a mismatch.
+            container (0 leaves) at the same node as a mismatch (legacy flag;
+            superseded by ``strict=True``).
 
     Returns:
         The path (tuple of int positional indices / dict keys) of the first
@@ -401,6 +418,12 @@ def first_mismatch_path(
 
     def walk(a: TreeSpec, b: TreeSpec, prefix: Tuple[Any, ...]):
         if not a.children and not b.children:
+            if strict:
+                if a.num_leaves != b.num_leaves:
+                    return prefix
+                if a.num_leaves == 0 and (a.type != b.type or a.node_data != b.node_data):
+                    return prefix
+                return None
             if leaf_vs_empty_is_mismatch and a.num_leaves != b.num_leaves:
                 return prefix
             return None
@@ -450,6 +473,59 @@ def _subtree_spec_at(spec: TreeSpec, path: Tuple[Any, ...]) -> TreeSpec:
     return current
 
 
+def describe_node(spec: TreeSpec) -> str:
+    """One-line human description of the node ``spec`` describes, for
+    structure-mismatch messages.
+
+    Canonical node-description contract (consumed by ``tree_map`` here and by
+    trace/pipeline/transforms — e.g. ``dict with keys ['a', 'b']``, ``tuple
+    of length 2``, ``namedtuple of length 2``, ``dataclass with fields
+    ['f1', 'f2']``):
+
+    - Childless leaf → its type name (``int``, ``Tensor``, ``NoneType``, ...).
+    - Containers → kind + arity/keys, in this precedence (mirroring
+      ``flatten``'s node precedence): namedtuple, dataclass, tuple, list,
+      dict, then registered custom containers.
+    - Childless empty containers fall through to the container wording with
+      an empty list/keys (``dict with keys []``).
+    """
+    if not spec.children:
+        if spec.num_leaves == 0:
+            return _container_desc(spec)
+        spec_type = spec.type
+        return spec_type.__name__ if isinstance(spec_type, type) else str(spec_type)
+    return _container_desc(spec)
+
+
+def _container_desc(spec: TreeSpec) -> str:
+    """One-line description of the container node ``spec`` describes.
+
+    Kind + arity/keys, e.g. ``dict with keys ['a', 'b']``, ``tuple of length
+    2``, ``namedtuple of length 2``, ``dataclass with fields ['f1', 'f2']``.
+    Childless (empty) containers yield the same wording with an empty list
+    (``dict with keys []``). Kind detection mirrors ``flatten``'s node
+    precedence (namedtuple before tuple; dataclass before plain containers).
+    """
+    spec_type = spec.type
+    if (
+        isinstance(spec_type, type)
+        and issubclass(spec_type, tuple)
+        and hasattr(spec_type, "_fields")
+    ):
+        return f"namedtuple of length {len(spec.children)}"
+    if isinstance(spec_type, type) and dataclasses.is_dataclass(spec_type):
+        return f"dataclass with fields {spec.node_data!r}"
+    if isinstance(spec_type, type) and issubclass(spec_type, tuple):
+        return f"tuple of length {len(spec.children)}"
+    if isinstance(spec_type, type) and issubclass(spec_type, list):
+        return f"list of length {len(spec.children)}"
+    if isinstance(spec_type, type) and issubclass(spec_type, dict):
+        return f"dict with keys {_dict_keys(spec)!r}"
+    # Registered custom container types (no pinned wording).
+    name = spec_type.__name__ if isinstance(spec_type, type) else str(spec_type)
+    return f"{name} of length {len(spec.children)}"
+
+
 # --- Sugared pytree API (pure sugar over flatten/unflatten) -------------------
 
 
@@ -460,9 +536,10 @@ def tree_map(fn: Callable, *trees) -> Any:
 
     - One tree: ``unflatten([fn(leaf) for leaf in leaves], spec)``.
     - Several trees: structures are validated pairwise against the first tree
-      (:func:`first_mismatch_path`); ``fn`` is applied per leaf position over
-      the zipped leaf lists; results are rebuilt into the first tree's
-      structure.
+      (:func:`first_mismatch_path` with ``strict=True`` — leaf vs empty
+      container and empty-vs-empty container mismatches are errors); ``fn``
+      is applied per leaf position over the zipped leaf lists; results are
+      rebuilt into the first tree's structure.
 
     Args:
         fn: Called as ``fn(leaf)`` for one tree, ``fn(*leaves)`` for several.
@@ -484,13 +561,16 @@ def tree_map(fn: Callable, *trees) -> Any:
     leaf_lists = [first_leaves]
     for tree in trees[1:]:
         leaves, spec = flatten(tree)
-        mismatch = first_mismatch_path(first_spec, spec)
+        mismatch = first_mismatch_path(first_spec, spec, strict=True)
         if mismatch is not None:
+            expected_spec = _subtree_spec_at(first_spec, mismatch)
+            got_spec = _subtree_spec_at(spec, mismatch)
             raise TypeError(
                 "tree_map: trees do not have the same structure — "
                 f"first mismatch at pytree path {format_path(mismatch)}: "
-                f"expected {_subtree_spec_at(first_spec, mismatch)!r}, "
-                f"got {_subtree_spec_at(spec, mismatch)!r}"
+                f"expected {describe_node(expected_spec)}, "
+                f"got {describe_node(got_spec)} "
+                f"(expected {expected_spec!r}, got {got_spec!r})"
             )
         leaf_lists.append(leaves)
     return unflatten([fn(*zipped) for zipped in zip(*leaf_lists)], first_spec)
@@ -506,11 +586,7 @@ def tree_structure(tree) -> TreeSpec:
     return flatten(tree)[1]
 
 
-def tree_flatten(tree) -> Tuple[List[Any], TreeSpec]:
-    """Alias of :func:`flatten` — returns ``(leaves, treespec)``."""
-    return flatten(tree)
-
-
-def tree_unflatten(leaves: List[Any], treespec: TreeSpec) -> Any:
-    """Alias of :func:`unflatten` — rebuilds a pytree from leaves and spec."""
-    return unflatten(leaves, treespec)
+# Identity aliases (pure sugar): ``tree_flatten is flatten`` and
+# ``tree_unflatten is unflatten`` — the inherited docstrings apply.
+tree_flatten = flatten
+tree_unflatten = unflatten

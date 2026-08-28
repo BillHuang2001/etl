@@ -81,6 +81,7 @@ from .tensor import (
 )
 from .tree import (
     TreeSpec,
+    describe_node,  # internal cross-module contract (trace/pipeline/transforms)
     first_mismatch_path,  # internal cross-module contract (trace/pipeline/transforms)
     flatten,
     format_path,  # internal cross-module contract (trace/pipeline/transforms)
