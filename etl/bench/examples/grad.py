@@ -1,4 +1,5 @@
-"""Gradient conformance examples (category 'grad') — autodiff via ``etl.grad``.
+"""Gradient conformance examples (category "op", tag "grad") — autodiff via
+``etl.grad``.
 
 Each example bundles a ``@etl.defn`` scalar loss and the ``etl.grad(...)``
 ``TransformCallable`` as ``example.graph`` (a ``TransformCallable`` is NOT a
@@ -438,7 +439,8 @@ register_all([
         torch_ref=_grad_mlp_torch,
         rtol=1e-3,
         atol=1e-3,
-        category="grad",
+        category="op",
+        tags=("grad",),
     ),
     Example(
         name="grad_mix",
@@ -451,7 +453,8 @@ register_all([
         torch_ref=_grad_mix_torch,
         rtol=1e-3,
         atol=1e-3,
-        category="grad",
+        category="op",
+        tags=("grad",),
     ),
     Example(
         name="grad_stopgrad",
@@ -462,7 +465,8 @@ register_all([
         torch_ref=_grad_stopgrad_torch,
         rtol=1e-3,
         atol=1e-3,
-        category="grad",
+        category="op",
+        tags=("grad",),
     ),
     Example(
         name="grad_structural",
@@ -484,6 +488,7 @@ register_all([
         inputs_fn=_grad_structural_inputs,
         rtol=1e-3,
         atol=1e-3,
-        category="grad",
+        category="op",
+        tags=("grad",),
     ),
 ])

@@ -16,14 +16,35 @@ a tuple of ndarrays for multi-output graphs).
 Shapes are deliberately small so a full conformance run stays well under a
 couple of seconds on the default numpy backend.
 
-Examples are grouped by ``category`` (``"micro"``, ``"grad"``,
-``"vectorize"``, ``"large"``); the CLI ``--examples`` accepts either example
-names or category names (expanded via :func:`expand_names`). Registry order
-follows module import order (``micro`` first, then ``grad``, ``vectorize``,
-``large`` — later modules self-register via ``register_all`` at import time).
+Examples are grouped by ``category`` into THREE groups — ``"op"`` (single
+ops and op-level compositions: micro, grad, vectorize, op_large, and the
+later-phase ``op_*`` modules), ``"block"`` (whole-block compositions: the
+``block_*`` modules), and ``"e2e"`` (multi-run end-to-end procedures: the
+``e2e_*`` modules, driven through the optional ``Example.runner`` path). Each
+example also carries a tuple of ``tags`` (subgroup selectors such as
+``"micro"``, ``"grad"``, ``"vectorize"``, ``"large"``, ``"control-flow"``,
+``"vmap"``, ``"custom"``, ``"xla"``).
+
+The CLI ``--examples`` (and :func:`expand_names`) accepts example names,
+category names, or tag names — resolution precedence per entry: (1) category
+name → all examples of that category; (2) tag name → all examples carrying
+that tag; (3) otherwise validate as an example name via :func:`get_example`.
+Registry order follows module import order: ``op`` category first (``micro``,
+``grad``, ``vectorize``, ``op_large``, then the later-phase ``op_*``
+modules), then ``block`` (``block_transformer`` + the later-phase ``block_*``
+modules), then ``e2e`` (``e2e_train``, ``e2e_infer``) — later modules
+self-register via ``register_all`` at import time.
 """
 from . import base  # noqa: F401  (registry + shared infra; import first)
-from . import micro, grad, vectorize, large  # noqa: F401  (self-register on import)
+from . import micro, grad, vectorize, op_large  # noqa: F401  (op category)
+from . import (  # noqa: F401  (op category, filled by a later phase)
+    op_basic, op_matmul, op_control_flow, op_grad2,
+    op_vmap2, op_custom, op_xla,
+)
+from . import (  # noqa: F401  (block category)
+    block_transformer, block_rnn, block_conv, block_mlp, block_opt,
+)
+from . import e2e_train, e2e_infer  # noqa: F401  (e2e category)
 
 from .base import Example, UnknownExampleError, generate_inputs
 
@@ -34,6 +55,7 @@ __all__ = [
     "get_example",
     "generate_inputs",
     "list_categories",
+    "list_tags",
     "expand_names",
 ]
 
@@ -69,15 +91,32 @@ def list_categories() -> list:
     return seen
 
 
+def list_tags() -> list:
+    """Return the distinct example tags in order of first appearance in the
+    registry (like :func:`list_categories`)."""
+    seen = []
+    for example in base._REGISTRY.values():
+        for tag in example.tags:
+            if tag not in seen:
+                seen.append(tag)
+    return seen
+
+
 def expand_names(entries) -> list:
     """Expand ``entries`` into a flat list of example names.
 
-    Each entry that equals a category name (see :func:`list_categories`)
-    expands to all example names of that category (registry order); any
-    other entry is validated via :func:`get_example` and kept as-is. Unknown
-    names raise :class:`UnknownExampleError`.
+    Resolution precedence per entry (documented):
+    (1) a category name (see :func:`list_categories`) expands to all example
+        names of that category (registry order);
+    (2) otherwise a tag name (see :func:`list_tags`) expands to all example
+        names carrying that tag (registry order);
+    (3) otherwise the entry is validated as an example name via
+        :func:`get_example` and kept as-is.
+
+    Unknown names raise :class:`UnknownExampleError`.
     """
     categories = list_categories()
+    tags = list_tags()
     names = []
     for entry in entries:
         if entry in categories:
@@ -85,6 +124,12 @@ def expand_names(entries) -> list:
                 example.name
                 for example in base._REGISTRY.values()
                 if example.category == entry
+            )
+        elif entry in tags:
+            names.extend(
+                example.name
+                for example in base._REGISTRY.values()
+                if entry in example.tags
             )
         else:
             get_example(entry)  # validates; raises UnknownExampleError

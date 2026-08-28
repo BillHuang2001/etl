@@ -1,4 +1,25 @@
-"""Shared private helpers for ``etl.bench`` (stdlib + numpy + etl only)."""
+"""Shared private helpers for ``etl.bench`` (stdlib + numpy + etl only).
+
+Runner contract (binding) — see :func:`stage_example` for routing:
+
+``Example.runner(backend: str, device: core.Device, opts: dict) ->
+callable(inputs) -> outputs`` is an optional runner FACTORY for multi-run
+end-to-end procedures (e.g. a Python-level training loop). It receives the
+resolved backend name, the resolved :class:`~etl.core.Device`, and the
+resolved backend options dict (with the device-derived ``target_backends``
+default already injected, exactly what ``stage_example``'s single-run path
+passes to ``etl.build``), and returns a RUN-CALLABLE taking the SAME inputs
+list the single-run path uses (``example.generate_inputs(seed)``, a list of
+numpy arrays) and returning the same outputs structure as ``numpy_ref``
+(single ndarray or tuple). The runner builds its executables ONCE (its own
+staging: ``@etl.defn`` graph → ``etl.build(..., backend=backend,
+device=device, **opts)``; TransformCallable/Graph-builder →
+``graph(*specs)`` → ``etl.lower`` → ``etl.compile`` → ``etl.load``) and runs
+them N times internally. Runner bodies MUST NEVER call
+:func:`stage_example` — ``stage_example`` routes examples with a ``runner``
+straight to the runner factory, so a runner calling it would recurse
+infinitely.
+"""
 from __future__ import annotations
 
 import math
@@ -158,25 +179,41 @@ def resolve_examples(examples):
     return expand_names(names)
 
 
-def stage_example(example, backend, device, opts):
-    """Stage an example's graph to an executable on the chosen backend/device.
+def stage_example(example, backend, device, opts) -> callable:
+    """Stage an example's graph and return a RUN-CALLABLE ``run(inputs)``.
 
-    ``@etl.defn`` graphs go through ``etl.build``; transform-produced graphs
-    (``etl.grad``/``etl.vmap`` TransformCallables — ``example.graph`` lacks
-    the ``__etl_defn__`` marker) are materialized with
-    ``example.graph(*example.specs) -> Graph`` and staged through the explicit
-    pipeline ``etl.lower`` → ``etl.compile`` → ``etl.load`` (options go to
-    BOTH lower and compile, exactly like build does).
+    The returned callable takes the SAME inputs list the single-run path
+    uses (``example.generate_inputs(seed)``, a list of numpy arrays) and
+    returns the same outputs structure as ``example.numpy_ref`` (single
+    ndarray or tuple). Routing (documented):
+
+    - ``example.runner`` set → ``return example.runner(backend, device, opts)``
+      (the runner factory builds its own executables ONCE — see the runner
+      contract in this module's docstring; a runner must NEVER call
+      ``stage_example``, that would recurse infinitely).
+    - ``@etl.defn`` graphs → ``etl.build(..., backend=backend,
+      device=device, **opts)`` then ``lambda inputs: etl.run(executable,
+      *inputs)``.
+    - Transform-produced graphs (``etl.grad``/``etl.vmap`` TransformCallables
+      — ``example.graph`` lacks the ``__etl_defn__`` marker) are materialized
+      with ``example.graph(*example.specs) -> Graph`` and staged through the
+      explicit pipeline ``etl.lower`` → ``etl.compile`` → ``etl.load``
+      (options go to BOTH lower and compile, exactly like build does), then
+      the same run lambda.
     """
+    if example.runner is not None:
+        return example.runner(backend, device, opts)
     if getattr(example.graph, "__etl_defn__", False):
-        return etl.build(
+        executable = etl.build(
             example.graph, *example.specs,
             backend=backend, device=device, **opts
         )
-    graph = example.graph(*example.specs)
-    lp = etl.lower(graph, backend=backend, **opts)
-    ca = etl.compile(lp, **opts)
-    return etl.load(ca, device=device)
+    else:
+        graph = example.graph(*example.specs)
+        lp = etl.lower(graph, backend=backend, **opts)
+        ca = etl.compile(lp, **opts)
+        executable = etl.load(ca, device=device)
+    return lambda inputs: etl.run(executable, *inputs)
 
 
 def resolve_torch_mode(use_torch):

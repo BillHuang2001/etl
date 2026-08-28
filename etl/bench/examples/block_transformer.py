@@ -1,0 +1,278 @@
+"""Block-category large examples (category "block", tag "large").
+
+Two heavier examples that stress the numpy backend with production-sized
+tensors: a full dummy transformer block (multi-head attention + layernorm +
+MLP residual block) and one unrolled N-body step (multi-output). Both moved
+verbatim from the former ``large.py`` (the other four former ``large``
+examples — matmul_1024, conv2d_large, layernorm_large, vmap_mlp_large —
+live in :mod:`etl.bench.examples.op_large`, category "op"). They keep the
+"block" category because they compose whole blocks of ops into a single
+graph. All stay within the v1 numpy-backend budget on CPU (single etl run
+well under ~1 s each).
+
+Dev-time verification on iree/llvm-cpu (measured; see the per-example
+comments for exact numbers):
+
+- transformer: compiles+runs on iree/llvm-cpu after the merged StableHLO
+  exporter fix (rank-mismatched 3D@2D dots now emit a valid
+  ``stablehlo.dot_general`` via ``dynamic_broadcast_in_dim`` +
+  ``get_dimension_size``); measured max_abs_error ≈7.25e-04 (fp32 fusion
+  noise) covered by tolerance=1e-3; the numpy backend computes it exactly
+  (max_abs 0.0).
+- nbody: PASS on iree/llvm-cpu (small fp32 noise).
+
+Design notes:
+
+- Every graph mirrors the corresponding numpy reference op-for-op in f32
+  (the etl numpy backend executes the same numpy kernels), so etl-vs-numpy
+  errors are ~0; torch references are exact formula mirrors (never
+  ``nn.TransformerEncoderLayer`` etc.) and only differ by fp32 accumulation
+  order, so their error is measured and covered by the per-example tolerance.
+- ``_layernorm_last`` (the etl-graph-side, SYMBOLIC layernorm helper) stays
+  module-local; the numpy reference uses the shared
+  :func:`~etl.bench.examples.base.layernorm_numpy` helper from base.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+import etl
+from etl import TensorSpec, defn
+
+from .._torch import require_torch
+from .base import Example, _F32, layernorm_numpy, register_all
+
+# --- transformer (dummy transformer block) -----------------------------------
+
+
+@defn
+def _transformer_graph(x, wqkv, wout, w1, w2):
+    """One transformer block: MHA (12 heads) + layernorm + MLP + layernorm.
+
+    Shapes: x[1,512,768], wqkv[768,2304], wout[768,768], w1[768,3072],
+    w2[3072,768] (all f32). No biases (kept out on purpose — the graph is a
+    compute/ops stress test, not a realistic model).
+
+    Pipeline: QKV = x @ wqkv -> reshape [1,512,3,12,64] -> slice the 3-axis
+    into q/k/v -> per-tensor transpose to [1,12,512,64] -> scaled
+    softmax(Q K^T) V (3D batched dots over [1,12,...]) -> transpose back ->
+    concatenate the 12 heads along the feature axis (12 single-head slices
+    along the head axis, concatenated on the last axis) -> reshape
+    [1,512,768] -> out-proj -> residual + x -> layernorm (mean/var from sum
+    primitives, eps 1e-5) -> relu MLP -> residual -> layernorm.
+    """
+    # NOTE: this rank-mismatched 3D@2D batched dot ([1,512,768] @ [768,2304])
+    # previously failed to COMPILE on compiler backends (invalid
+    # ``stablehlo.dot_general``: lhs_batching_dimensions = [0] vs rhs = []).
+    # The merged StableHLO exporter fix emits a valid ``dot_general`` for
+    # rank-mismatched batched dots (``dynamic_broadcast_in_dim`` +
+    # ``get_dimension_size``), so the example compiles+runs on iree; the
+    # numpy backend computes it exactly (max_abs 0.0 vs ref). Kept in the
+    # prescribed 3D@2D form.
+    qkv = etl.dot(x, wqkv)  # [1,512,2304]
+    qkv = etl.reshape(qkv, (1, 512, 3, 12, 64))
+    q = etl.reshape(etl.slice(qkv, (0, 0, 0, 0, 0), (1, 512, 1, 12, 64)), (1, 512, 12, 64))
+    k = etl.reshape(etl.slice(qkv, (0, 0, 1, 0, 0), (1, 512, 1, 12, 64)), (1, 512, 12, 64))
+    v = etl.reshape(etl.slice(qkv, (0, 0, 2, 0, 0), (1, 512, 1, 12, 64)), (1, 512, 12, 64))
+
+    scale = 1.0 / math.sqrt(64)
+    q = etl.transpose(q, (0, 2, 1, 3))  # [1,12,512,64]
+    kt = etl.transpose(k, (0, 2, 3, 1))  # [1,12,64,512]
+    v = etl.transpose(v, (0, 2, 1, 3))  # [1,12,512,64]
+    scores = etl.multiply(etl.dot(q, kt), scale)  # [1,12,512,512]
+    m = etl.max(scores, axes=-1, keepdims=True)
+    e = etl.exp(etl.subtract(scores, m))
+    probs = etl.divide(e, etl.sum(e, axes=-1, keepdims=True))
+    attn = etl.dot(probs, v)  # [1,12,512,64]
+    attn = etl.transpose(attn, (0, 2, 1, 3))  # [1,512,12,64]
+
+    # Concatenate the 12 heads along the feature axis (classic concat-heads).
+    heads = [etl.slice(attn, (0, 0, h, 0), (1, 512, 1, 64)) for h in range(12)]
+    attn = etl.reshape(etl.concatenate(heads, axis=3), (1, 512, 768))
+
+    out = etl.add(etl.dot(attn, wout), x)  # out-proj + residual
+    out = _layernorm_last(out, 768)
+    out = etl.add(etl.dot(etl.relu(etl.dot(out, w1)), w2), out)  # MLP + residual
+    return _layernorm_last(out, 768)
+
+
+def _layernorm_last(x, dim):
+    """Layer norm over the last axis from sum primitives (eps 1e-5)."""
+    mean = etl.divide(etl.sum(x, axes=-1, keepdims=True), float(dim))
+    diff = etl.subtract(x, mean)
+    var = etl.divide(
+        etl.sum(etl.multiply(diff, diff), axes=-1, keepdims=True), float(dim)
+    )
+    return etl.divide(diff, etl.sqrt(etl.add(var, 1e-5)))
+
+
+def _transformer_numpy(inputs):
+    x, wqkv, wout, w1, w2 = inputs
+    qkv = x @ wqkv
+    qkv = qkv.reshape(1, 512, 3, 12, 64)
+    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+    scale = 1.0 / math.sqrt(64)
+    scores = (q.transpose(0, 2, 1, 3) @ k.transpose(0, 2, 3, 1)) * scale
+    m = scores.max(axis=-1, keepdims=True)
+    e = np.exp(scores - m)
+    probs = e / e.sum(axis=-1, keepdims=True)
+    attn = (probs @ v.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+    attn = np.concatenate([attn[:, :, h : h + 1, :] for h in range(12)], axis=3)
+    attn = attn.reshape(1, 512, 768)
+    out = attn @ wout + x
+    out = layernorm_numpy(out)  # shared base helper (mean/var, eps 1e-5)
+    out = np.maximum(out @ w1, 0.0) @ w2 + out
+    return layernorm_numpy(out)
+
+
+def _transformer_torch(inputs, device=None):
+    torch = require_torch()
+    x, wqkv, wout, w1, w2 = (torch.as_tensor(a, device=device) for a in inputs)
+    qkv = x @ wqkv
+    qkv = qkv.reshape(1, 512, 3, 12, 64)
+    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+    scale = 1.0 / math.sqrt(64)
+    scores = (q.transpose(1, 2) @ k.permute(0, 2, 3, 1)) * scale
+    m = scores.max(dim=-1, keepdim=True).values
+    e = torch.exp(scores - m)
+    probs = e / e.sum(dim=-1, keepdim=True)
+    attn = (probs @ v.transpose(1, 2)).transpose(1, 2)
+    attn = torch.cat([attn[:, :, h : h + 1, :] for h in range(12)], dim=3)
+    attn = attn.reshape(1, 512, 768)
+    out = attn @ wout + x
+    out = _layernorm_torch(out, 768)
+    out = torch.relu(out @ w1) @ w2 + out
+    return _layernorm_torch(out, 768).cpu().numpy()
+
+
+def _layernorm_torch(x, dim):
+    mean = x.sum(dim=-1, keepdim=True) / float(dim)
+    diff = x - mean
+    var = (diff * diff).sum(dim=-1, keepdim=True) / float(dim)
+    return diff / (var + 1e-5).sqrt()
+
+
+# --- nbody (one unrolled step, multi-output) ---------------------------------
+
+
+@defn
+def _nbody_graph(p, v, m):
+    """One unrolled N-body step (G=1.0, dt=0.01), output ``(p, v)``.
+
+    No ``while_loop``: exactly one step. ``diff = p[:,None,:] - p[None,:,:]``
+    via ``etl.reshape`` + implicit broadcast (newaxis indexing is not
+    supported), softened ``r2 + 1e-6``, ``inv_r3 = r2 ** -1.5``, pairwise
+    forces, accelerations, then leapfrog-ish ``v += a*dt; p += v*dt``.
+    """
+    n = p.shape[0]
+    diff = etl.subtract(etl.reshape(p, (n, 1, 3)), etl.reshape(p, (1, n, 3)))
+    r2 = etl.add(etl.sum(etl.multiply(diff, diff), axes=-1), 1e-6)
+    inv_r3 = etl.power(r2, -1.5)
+    force = etl.multiply(
+        etl.multiply(
+            etl.multiply(
+                etl.reshape(m, (n, 1, 1)), etl.reshape(m, (1, n, 1))
+            ),
+            diff,
+        ),
+        etl.reshape(inv_r3, (n, n, 1)),
+    )
+    accel = etl.divide(etl.sum(force, axes=-2), etl.reshape(m, (n, 1)))
+    v_new = etl.add(v, etl.multiply(accel, 0.01))
+    p_new = etl.add(p, etl.multiply(v_new, 0.01))
+    return (p_new, v_new)
+
+
+def _nbody_numpy(inputs):
+    p, v, m = inputs
+    n = p.shape[0]
+    diff = p.reshape(n, 1, 3) - p.reshape(1, n, 3)
+    r2 = (diff * diff).sum(axis=-1) + 1e-6
+    inv_r3 = r2 ** -1.5
+    force = (
+        m.reshape(n, 1, 1)
+        * m.reshape(1, n, 1)
+        * diff
+        * inv_r3.reshape(n, n, 1)
+    )
+    accel = force.sum(axis=-2) / m.reshape(n, 1)
+    v_new = v + accel * 0.01
+    p_new = p + v_new * 0.01
+    return (p_new, v_new)
+
+
+def _nbody_torch(inputs, device=None):
+    torch = require_torch()
+    p, v, m = (torch.as_tensor(a, device=device) for a in inputs)
+    n = p.shape[0]
+    diff = p.reshape(n, 1, 3) - p.reshape(1, n, 3)
+    r2 = (diff * diff).sum(dim=-1) + 1e-6
+    inv_r3 = r2 ** -1.5
+    force = (
+        m.reshape(n, 1, 1)
+        * m.reshape(1, n, 1)
+        * diff
+        * inv_r3.reshape(n, n, 1)
+    )
+    accel = force.sum(dim=-2) / m.reshape(n, 1)
+    v_new = v + accel * 0.01
+    p_new = p + v_new * 0.01
+    return (p_new.cpu().numpy(), v_new.cpu().numpy())
+
+
+# ---------------------------------------------------------------------------
+# Registry (category "block", tag "large")
+# ---------------------------------------------------------------------------
+
+register_all([
+    Example(
+        name="transformer",
+        description=(
+            "dummy transformer block: 12-head MHA + layernorm + relu MLP "
+            "(x[1,512,768], no biases)"
+        ),
+        specs=(
+            TensorSpec((1, 512, 768), _F32),
+            TensorSpec((768, 2304), _F32),
+            TensorSpec((768, 768), _F32),
+            TensorSpec((768, 3072), _F32),
+            TensorSpec((3072, 768), _F32),
+        ),
+        graph=_transformer_graph,
+        numpy_ref=_transformer_numpy,
+        torch_ref=_transformer_torch,
+        # iree/llvm-cpu fp32 fusion noise — same class as the micro mlp
+        # example's tolerance=1e-4 precedent (accumulation-order/FMA
+        # contraction), larger because the transformer is much deeper:
+        # measured max_abs_error ≈7.25e-04, exceeding the strict default
+        # atol+rtol*|b|. tolerance=1e-3 covers it with margin; the numpy
+        # backend computes it exactly (max_abs 0.0 — identical kernels).
+        tolerance=1e-3,
+        category="block",
+        tags=("large",),
+    ),
+    Example(
+        name="nbody",
+        description=(
+            "one unrolled N-body step (N=1024, G=1.0, dt=0.01), "
+            "multi-output (p, v)"
+        ),
+        specs=(
+            TensorSpec((1024, 3), _F32),
+            TensorSpec((1024, 3), _F32),
+            TensorSpec((1024,), _F32),
+        ),
+        graph=_nbody_graph,
+        numpy_ref=_nbody_numpy,
+        torch_ref=_nbody_torch,
+        # torch ref: fp32 accumulation-order noise in the 1024-term force
+        # reduction — measured max_abs_error 1.24e-05 across 10 seeds (etl vs
+        # numpy ref: exactly 0 — identical kernels). atol=2e-05 covers it
+        # with margin while staying ~5x stricter than the micro mlp override.
+        atol=2e-5,
+        category="block",
+        tags=("large",),
+    ),
+])

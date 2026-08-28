@@ -7,6 +7,14 @@ compares the results against pure-numpy references — and, when torch is
 installed and requested, against PyTorch references. Reports precision
 (conformance) and speed (benchmark) per example.
 
+Examples are grouped into three registry categories — ``"op"`` (single ops
+and op-level compositions), ``"block"`` (whole-block compositions), and
+``"e2e"`` (multi-run end-to-end procedures, driven through the optional
+``Example.runner`` path) — and each example carries ``tags`` (subgroup
+selectors such as ``"micro"``, ``"grad"``, ``"vectorize"``, ``"large"``).
+``--examples`` / ``conformance()`` / ``benchmark()`` accept example names,
+category names, or tag names (see ``etl.bench.examples.expand_names``).
+
 torch-optionality contract (binding): ``import etl`` and ``import etl.bench``
 MUST always succeed without torch installed. torch is imported lazily inside
 function bodies only (see ``_torch.py``); missing torch yields a clear
@@ -27,14 +35,16 @@ Quick start::
                          target_backends=["llvm-cpu"])
     # device accepts None | core.Device | "KIND[:INDEX]" (e.g. "cuda:3").
 
-    # Examples can be selected by name or by category:
-    from etl.bench import list_categories
-    list_categories()                      # e.g. ["micro", "grad", ...]
-    report = conformance("micro")          # every micro example
+    # Examples can be selected by name, category, or tag:
+    from etl.bench import list_categories, list_tags
+    list_categories()                      # e.g. ["op", "block", "e2e"]
+    list_tags()                            # e.g. ["micro", "grad", ...]
+    report = conformance("micro")          # tag "micro" (10 examples)
+    report = conformance("op")             # every op-category example
 
 CLI: ``python -m etl.bench --help`` (exit code 1 when any conformance check
-fails). ``--examples`` accepts comma-separated example names OR category
-names (e.g. ``--examples micro,matmul``; categories expand to their
+fails). ``--examples`` accepts comma-separated example names, categories, or
+tags (e.g. ``--examples micro,matmul``; categories and tags expand to their
 examples; default: all).
 """
 from . import report  # noqa: F401  (submodule, public)
@@ -46,6 +56,7 @@ from .examples import (
     get_example,
     list_categories,
     list_examples,
+    list_tags,
 )
 from .report import BenchmarkReport, ConformanceReport, ExampleResult, print_report
 
@@ -60,5 +71,6 @@ __all__ = [
     "list_examples",
     "get_example",
     "list_categories",
+    "list_tags",
     "print_report",
 ]

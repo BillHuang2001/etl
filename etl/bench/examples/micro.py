@@ -249,7 +249,7 @@ def _attention_torch(inputs, device=None):
 
 
 # ---------------------------------------------------------------------------
-# Registry (category defaults to "micro")
+# Registry (category "op", tag "micro")
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -260,6 +260,8 @@ register_all([
         graph=_matmul_graph,
         numpy_ref=_matmul_numpy,
         torch_ref=_matmul_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="conv2d",
@@ -268,6 +270,8 @@ register_all([
         graph=_conv2d_graph,
         numpy_ref=_conv2d_numpy_ref,
         torch_ref=_conv2d_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="conv2d_same",
@@ -276,6 +280,8 @@ register_all([
         graph=_conv2d_same_graph,
         numpy_ref=_conv2d_same_numpy,
         torch_ref=_conv2d_same_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="conv2d_stride2",
@@ -284,6 +290,8 @@ register_all([
         graph=_conv2d_stride2_graph,
         numpy_ref=_conv2d_stride2_numpy,
         torch_ref=_conv2d_stride2_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="elementwise_fusion",
@@ -296,6 +304,8 @@ register_all([
         graph=_elementwise_fusion_graph,
         numpy_ref=_elementwise_fusion_numpy,
         torch_ref=_elementwise_fusion_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="softmax",
@@ -304,6 +314,8 @@ register_all([
         graph=_softmax_graph,
         numpy_ref=_softmax_numpy,
         torch_ref=_softmax_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="layernorm",
@@ -312,6 +324,8 @@ register_all([
         graph=_layernorm_graph,
         numpy_ref=_layernorm_numpy,
         torch_ref=_layernorm_torch,
+        category="op",
+        tags=("micro",),
     ),
     # mlp tolerance override: documented iree fp32 accumulation-order noise —
     # deterministic max_abs_error ≈3.8e-05 (iree cpu) / ≈6.1e-05 (iree cuda);
@@ -332,6 +346,8 @@ register_all([
         numpy_ref=_mlp_numpy,
         torch_ref=_mlp_torch,
         tolerance=1e-4,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="cumsum",
@@ -340,6 +356,8 @@ register_all([
         graph=_cumsum_graph,
         numpy_ref=_cumsum_numpy,
         torch_ref=_cumsum_torch,
+        category="op",
+        tags=("micro",),
     ),
     Example(
         name="attention",
@@ -352,5 +370,7 @@ register_all([
         graph=_attention_graph,
         numpy_ref=_attention_numpy,
         torch_ref=_attention_torch,
+        category="op",
+        tags=("micro",),
     ),
 ])

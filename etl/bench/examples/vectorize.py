@@ -372,7 +372,7 @@ def _vmap_grad_mlp_torch(inputs, device=None):
 
 
 # ---------------------------------------------------------------------------
-# Registry (category "vectorize")
+# Registry (category "op", tag "vectorize")
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -386,7 +386,8 @@ register_all([
         graph=_vmap_softmax_graph,
         numpy_ref=_vmap_softmax_numpy,
         torch_ref=_vmap_softmax_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
     Example(
         name="vmap_layernorm",
@@ -398,7 +399,8 @@ register_all([
         graph=_vmap_layernorm_graph,
         numpy_ref=_vmap_layernorm_numpy,
         torch_ref=_vmap_layernorm_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
     Example(
         name="vmap_linear",
@@ -414,7 +416,8 @@ register_all([
         graph=_vmap_linear_graph,
         numpy_ref=_vmap_linear_numpy,
         torch_ref=_vmap_linear_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
     Example(
         name="vmap_mlp",
@@ -432,7 +435,8 @@ register_all([
         graph=_vmap_mlp_graph,
         numpy_ref=_vmap_mlp_numpy,
         torch_ref=_vmap_mlp_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
     Example(
         name="vmap_attention",
@@ -448,7 +452,8 @@ register_all([
         graph=_vmap_attention_graph,
         numpy_ref=_vmap_attention_numpy,
         torch_ref=_vmap_attention_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
     Example(
         name="vmap_grad_mlp",
@@ -468,6 +473,7 @@ register_all([
         graph=_vmap_grad_mlp_graph,
         numpy_ref=_vmap_grad_mlp_numpy,
         torch_ref=_vmap_grad_mlp_torch,
-        category="vectorize",
+        category="op",
+        tags=("vectorize",),
     ),
 ])

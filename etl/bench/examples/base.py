@@ -2,14 +2,18 @@
 
 Holds the :class:`Example` dataclass, the module-level registry
 (``_REGISTRY`` + ``register``/``register_all``), the shared input generator
-(:func:`generate_inputs`), the shared numpy conv reference
-(:func:`_conv2d_numpy` / :func:`conv2d_im2col_numpy`), and the finite-
-difference gradient helper (:func:`fd_gradient`) used by the gradient
-examples. Concrete examples live in sibling modules (``micro``, ``grad``,
-``vectorize``, ``large``) which self-register at import time.
+(:func:`generate_inputs`), the shared numpy references — conv
+(:func:`_conv2d_numpy` / :func:`conv2d_im2col_numpy`), activation/norm
+helpers (:func:`softmax_numpy` / :func:`layernorm_numpy` /
+:func:`sigmoid_numpy` / :func:`gelu_numpy`) — and the finite-difference
+gradient helper (:func:`fd_gradient`) used by the gradient examples.
+Concrete examples live in sibling modules (``micro``, ``grad``,
+``vectorize``, ``op_large``, the ``op_*`` / ``block_*`` / ``e2e_*``
+modules) which self-register at import time.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -24,6 +28,10 @@ __all__ = [
     "register_all",
     "generate_inputs",
     "conv2d_im2col_numpy",
+    "softmax_numpy",
+    "layernorm_numpy",
+    "sigmoid_numpy",
+    "gelu_numpy",
     "fd_gradient",
 ]
 
@@ -54,12 +62,23 @@ class Example:
         tolerance: per-example max-abs-error override (``None`` = fall back
             to the global ``conformance()`` value). Independent of
             ``rtol``/``atol``.
-        category: grouping key; used by the CLI ``--examples`` category
-            expansion (e.g. ``"micro"``, ``"grad"``, ``"vectorize"``,
-            ``"large"``).
+        category: grouping key — one of the three registry categories
+            ``"op"``, ``"block"``, ``"e2e"``; used by the CLI ``--examples``
+            category expansion (default ``"op"``).
         inputs_fn: optional custom input generator ``(seed) -> list[np.ndarray]``
             producing one numpy array per spec (e.g. non-negative integer
             indices for gather); :meth:`generate_inputs` uses it when set.
+        tags: tuple of subgroup selector strings (e.g. ``"micro"``,
+            ``"grad"``, ``"control-flow"``, ``"vmap"``, ``"custom"``,
+            ``"xla"``, ``"large"``). Tags are also accepted by the CLI
+            ``--examples`` expansion (after categories, before bare names).
+        runner: optional runner factory for multi-run procedures (e.g. a
+            Python-level training loop): ``runner(backend, device, opts) ->
+            callable(inputs) -> outputs`` — builds executables ONCE and
+            returns a run-callable taking the same inputs list the single-run
+            path uses and returning the same outputs structure as
+            ``numpy_ref``. See the runner contract in
+            ``etl.bench._util``'s docstring.
     """
 
     name: str
@@ -71,8 +90,10 @@ class Example:
     rtol: Optional[float] = None
     atol: Optional[float] = None
     tolerance: Optional[float] = None
-    category: str = "micro"
+    category: str = "op"
     inputs_fn: Optional[Callable[[int], list]] = None
+    tags: tuple = ()
+    runner: Optional[Callable] = None
 
     def generate_inputs(self, seed: int = 0):
         """Generate a list of numpy arrays matching ``specs`` (see module
@@ -251,6 +272,55 @@ def conv2d_im2col_numpy(x, w, strides=(1, 1), padding="VALID"):
         xp, (kh, kw), axis=(2, 3)
     )[..., ::sh, ::sw, :, :]
     return np.einsum("ncpqkl,fckl->nfpq", windows, w)
+
+
+def softmax_numpy(x):
+    """Row-wise softmax over the last axis (max-subtracted, stable).
+
+    Mirrors the etl softmax formula used by the examples (``max`` →
+    ``exp`` → normalized ``sum`` over the last axis, keepdims).
+    """
+    x = np.asarray(x)
+    m = x.max(axis=-1, keepdims=True)
+    e = np.exp(x - m)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def layernorm_numpy(x, eps=1e-5):
+    """Layer norm over the last axis (mean/var from sum primitives).
+
+    ``mean = x.mean(axis=-1, keepdims=True)``, ``var = mean((x - mean)**2)``,
+    output ``(x - mean) / sqrt(var + eps)`` — the same formula the etl
+    layernorm graphs build from ``sum`` primitives.
+    """
+    x = np.asarray(x)
+    mean = x.mean(axis=-1, keepdims=True)
+    diff = x - mean
+    var = (diff * diff).mean(axis=-1, keepdims=True)
+    return diff / np.sqrt(var + eps)
+
+
+def sigmoid_numpy(x):
+    """Elementwise logistic sigmoid ``1 / (1 + exp(-x))``."""
+    x = np.asarray(x)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def gelu_numpy(x):
+    """etl's ``gelu`` — the EXACT erf form ``0.5 * x * (1 + erf(x / sqrt(2)))``.
+
+    Verified against ``etl/ops/elementwise.py`` and the numpy backend kernel
+    (``etl/backends/numpy/kernels/elementwise.py``): etl implements gelu as
+    the exact erf form, NOT the tanh approximation
+    ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))`` (the two
+    differ by up to ~1e-3 — far beyond the strict conformance defaults, so
+    the reference MUST match the erf form). ``math.erf`` is vectorized via
+    ``np.frompyfunc`` with the result cast back to ``x``'s dtype — the same
+    technique as the numpy backend kernel (no scipy dependency).
+    """
+    x = np.asarray(x)
+    erf = np.frompyfunc(math.erf, 1, 1)(x / np.sqrt(2.0)).astype(x.dtype)
+    return 0.5 * x * (1.0 + erf)
 
 
 # ---------------------------------------------------------------------------

@@ -6,9 +6,12 @@ Each selected example is staged through the explicit pipeline
 generated from a seeded RNG, then compared elementwise against the example's
 pure-numpy reference — and, when torch is available/requested, against its
 torch reference. Staging goes through :func:`~etl.bench._util.stage_example`,
-which routes ``@etl.defn`` graphs through ``etl.build`` and transform-produced
-graphs (``etl.grad``/``etl.vmap`` TransformCallables) through the explicit
-``etl.lower`` → ``etl.compile`` → ``etl.load`` pipeline.
+which returns a RUN-CALLABLE ``run(inputs)`` per example: ``@etl.defn``
+graphs are routed through ``etl.build``, transform-produced graphs
+(``etl.grad``/``etl.vmap`` TransformCallables) through the explicit
+``etl.lower`` → ``etl.compile`` → ``etl.load`` pipeline, and examples with
+an ``Example.runner`` set (e2e multi-run procedures) through the runner
+factory (see the runner contract in ``etl.bench._util``'s docstring).
 
 Per-example execution failures are recorded in the report (``error`` field,
 ``overall_pass`` False) rather than aborting the whole run — nothing is
@@ -23,7 +26,6 @@ from typing import List, Optional
 
 import numpy as np
 
-import etl
 from ._torch import require_torch
 from ._util import (
     flatten_outputs,
@@ -151,6 +153,12 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
     :class:`ExampleResult` and used for BOTH the numpy and the torch
     comparison.
 
+    Examples with ``Example.runner`` set (e2e multi-run procedures) are
+    executed through the runner path: ``stage_example`` returns the runner
+    factory's run-callable and ``run_fn(inputs)`` runs the whole multi-run
+    procedure once (see the runner contract in ``etl.bench._util``'s
+    docstring).
+
     Returns:
         :class:`ConformanceReport` with one :class:`ExampleResult` per
         example (``max_abs_error``, ``max_rel_error``, numpy/torch
@@ -191,9 +199,9 @@ def conformance(examples=None, *, use_torch=None, tolerance=None,
         )
         try:
             inputs = example.generate_inputs(seed)
-            executable = stage_example(example, backend, dev, opts)
+            run_fn = stage_example(example, backend, dev, opts)
             start = time.perf_counter()
-            actual = flatten_outputs(etl.run(executable, *inputs))
+            actual = flatten_outputs(run_fn(inputs))
             etl_ms = (time.perf_counter() - start) * 1000.0
             expected = flatten_outputs(example.numpy_ref(inputs))
             comparison = _compare(actual, expected, e_rtol, e_atol, e_tolerance)

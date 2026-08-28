@@ -7,13 +7,19 @@ noise-prone summary for small CPU workloads. Speedup ratios are
 ``reference_ms / etl_ms`` (``> 1`` means etl is faster).
 
 The etl graph is staged on the default numpy backend — or a chosen
-``backend``/``device`` with ``backend_options`` passthrough.
+``backend``/``device`` with ``backend_options`` passthrough. Staging goes
+through :func:`~etl.bench._util.stage_example`, which returns a RUN-CALLABLE
+``run(inputs)`` per example: ``@etl.defn`` graphs are routed through
+``etl.build``, transform-produced graphs through the explicit
+``lower``/``compile``/``load`` pipeline, and examples with an
+``Example.runner`` set (e2e multi-run procedures) through the runner factory
+— the timing lambda then calls ``run_fn(inputs)`` (see the runner contract
+in ``etl.bench._util``'s docstring).
 """
 from __future__ import annotations
 
 from typing import List
 
-import etl
 from ._torch import require_torch
 from ._util import (
     best_time_ms,
@@ -40,10 +46,14 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
     For each example: generate inputs, stage the etl graph once through the
     explicit pipeline (:func:`~etl.bench._util.stage_example` — ``etl.build``
     for ``@etl.defn`` graphs, the explicit ``lower``/``compile``/``load``
-    pipeline for transform-produced graphs), then time — best-of-``repeats``
+    pipeline for transform-produced graphs, and the runner factory for
+    examples with ``Example.runner`` set), then time — best-of-``repeats``
     runs after ``warmup`` untimed runs — the etl graph on the chosen backend
     (by default the numpy backend), the pure-numpy reference, and (when torch
-    is available / requested) the torch reference.
+    is available / requested) the torch reference. The etl timing lambda is
+    ``lambda: run_fn(inputs)`` — examples with a runner execute the whole
+    multi-run procedure per timed call (see the runner contract in
+    ``etl.bench._util``'s docstring).
 
     Args:
         examples: ``None`` (all registered examples), a single name, or an
@@ -103,9 +113,9 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
         example = get_example(name)
         try:
             inputs = example.generate_inputs(seed)
-            executable = stage_example(example, backend, dev, opts)
+            run_fn = stage_example(example, backend, dev, opts)
             etl_ms = best_time_ms(
-                lambda: etl.run(executable, *inputs), warmup, repeats
+                lambda: run_fn(inputs), warmup, repeats
             )
             numpy_ms = best_time_ms(
                 lambda: example.numpy_ref(inputs), warmup, repeats
