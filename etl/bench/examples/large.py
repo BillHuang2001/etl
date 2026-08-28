@@ -2,10 +2,28 @@
 
 Six heavier examples that stress the numpy backend with production-sized
 tensors: a full dummy transformer block (multi-head attention + layernorm +
-MLP residual block), one unrolled N-body step (multi-output), a 4096x4096
+MLP residual block), one unrolled N-body step (multi-output), a 1024x1024
 matmul, a large NCHW conv, a wide layernorm, and a ``vmap`` over a per-sample
 MLP. All stay within the v1 numpy-backend budget on CPU (single etl run well
 under ~1 s each; full conformance of the category < ~60 s).
+
+Dev-time verification on iree/llvm-cpu (measured; see the per-example
+comments for exact numbers):
+
+- matmul_1024: compile ~1 s + ~3.9 s/run; max_abs_error 1.91e-04..2.37e-04
+  across 4 seeds (numpy backend exactly 0). Sized 1024 because 4096 measured
+  384 s/run (~0.18 GFLOPS generic codegen; 2048 → 26 s/run) — a full default
+  iree/cpu CLI run would take hours; 1024 keeps the full harness ≈5-7 min
+  (budget guardrail).
+- conv2d_large: max_abs_error 1.45e-04 on iree/llvm-cpu (numpy worst-over-
+  seeds 1.22e-04).
+- layernorm_large / nbody: PASS on iree/llvm-cpu (small fp32 noise).
+- transformer: iree compile FAILS with a reported core StableHLO exporter
+  bug (``stablehlo.dot_general`` batching mismatch on the rank-mismatched
+  3D@2D QKV dot) — a documented per-example failure; the numpy backend
+  computes it correctly (max_abs 0.0).
+- vmap_mlp_large: iree compile fails with a BackendError (DimExpr broadcast
+  — documented v1 limitation).
 
 Design notes:
 
@@ -56,6 +74,13 @@ def _transformer_graph(x, wqkv, wout, w1, w2):
     [1,512,768] -> out-proj -> residual + x -> layernorm (mean/var from sum
     primitives, eps 1e-5) -> relu MLP -> residual -> layernorm.
     """
+    # NOTE: this rank-mismatched 3D@2D batched dot ([1,512,768] @ [768,2304])
+    # fails to COMPILE on compiler backends — a reported core StableHLO
+    # exporter bug (invalid ``stablehlo.dot_general``: lhs_batching_dimensions
+    # = [0] vs rhs = [] — "lhs and rhs should have the same number of batching
+    # dimensions"), NOT a harness problem. iree records it as a documented
+    # per-example BackendError; the numpy backend computes it correctly
+    # (max_abs 0.0 vs ref). Kept in the prescribed 3D@2D form.
     qkv = etl.dot(x, wqkv)  # [1,512,2304]
     qkv = etl.reshape(qkv, (1, 512, 3, 12, 64))
     q = etl.reshape(etl.slice(qkv, (0, 0, 0, 0, 0), (1, 512, 1, 12, 64)), (1, 512, 12, 64))
@@ -214,20 +239,20 @@ def _nbody_torch(inputs, device=None):
     return (p_new.cpu().numpy(), v_new.cpu().numpy())
 
 
-# --- matmul_4096 --------------------------------------------------------------
+# --- matmul_1024 --------------------------------------------------------------
 
 
 @defn
-def _matmul_4096_graph(x, w):
+def _matmul_1024_graph(x, w):
     return etl.dot(x, w)
 
 
-def _matmul_4096_numpy(inputs):
+def _matmul_1024_numpy(inputs):
     x, w = inputs
     return x @ w
 
 
-def _matmul_4096_torch(inputs, device=None):
+def _matmul_1024_torch(inputs, device=None):
     torch = require_torch()
     x, w = (torch.as_tensor(a, device=device) for a in inputs)
     return (x @ w).cpu().numpy()
@@ -372,22 +397,26 @@ register_all([
         category="large",
     ),
     Example(
-        name="matmul_4096",
-        description="[4096,4096] x [4096,4096] fp32 matmul (etl.dot)",
+        name="matmul_1024",
+        description="[1024,1024] x [1024,1024] fp32 matmul (etl.dot)",
         specs=(
-            TensorSpec((4096, 4096), _F32),
-            TensorSpec((4096, 4096), _F32),
+            TensorSpec((1024, 1024), _F32),
+            TensorSpec((1024, 1024), _F32),
         ),
-        graph=_matmul_4096_graph,
-        numpy_ref=_matmul_4096_numpy,
-        torch_ref=_matmul_4096_torch,
-        # torch ref: fp32 accumulation-order noise vs numpy's BLAS on a
-        # 4096-term dot — measured max_abs_error 1.9e-04..2.44e-04 across 10
-        # seeds, concentrated on near-zero outputs (catastrophic cancellation;
-        # relative error on large outputs stays ~1e-6, well under rtol). etl
-        # vs numpy ref: exactly 0 (identical np.matmul). atol=3e-04 is the
-        # smallest value with margin.
-        atol=3e-4,
+        graph=_matmul_1024_graph,
+        numpy_ref=_matmul_1024_numpy,
+        torch_ref=_matmul_1024_torch,
+        # Sized 1024: 4096 measured 384 s/run on iree llvm-cpu (~0.18 GFLOPS
+        # generic codegen; 2048 → 26 s/run) — a full default iree/cpu CLI run
+        # would take hours; 1024 keeps single-run ≈3.9 s and the full harness
+        # ≈5-7 min per the budget guardrail (tune down only with justification
+        # — measured). numpy backend still exercises a 2 GFLOP matmul.
+        # Error budget: etl vs numpy ref exactly 0 (identical np.matmul
+        # kernels); torch ref noise 8.4e-05 at seed 0; iree/llvm-cpu measured
+        # max_abs_error 1.91e-04..2.37e-04 across 4 seeds (fp32 accumulation-
+        # order + FMA contraction noise). atol=5e-04 gives ~2.1x margin over
+        # the largest measured error (2.37e-04).
+        atol=5e-4,
         category="large",
     ),
     Example(
@@ -406,8 +435,10 @@ register_all([
         # fp32 accumulation-order noise: etl's conv kernel (sliding_window_view
         # + tensordot) vs the im2col einsum reference — measured max_abs_error
         # 9.2e-05..1.22e-04 vs numpy and <= 8.4e-05 vs torch across 10 seeds.
-        # atol=1.5e-04 is the smallest value with margin.
-        atol=1.5e-4,
+        # iree/llvm-cpu measured 1.45e-04 (only ~3% headroom at atol=1.5e-04
+        # — flaky across seeds/backends); numpy worst-over-seeds 1.22e-04;
+        # atol=2e-04 gives ~1.4x margin over both.
+        atol=2e-4,
         category="large",
     ),
     Example(
