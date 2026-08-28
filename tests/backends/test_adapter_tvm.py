@@ -145,6 +145,39 @@ def test_symbolic_dims(adapter_backend):
         )
 
 
+def test_symbolic_dynamic_reshape_rejected_at_lower(adapter_backend):
+    # Same writer regression as the iree file: a softmax-style graph over a
+    # symbolic batch contains a dynamic keepdims reshape ((B,) -> (B, 1)).
+    # etl.lower must raise etl's OWN BackendError — never invalid MLIR that
+    # dies later with a compiler parse error.
+    fn, specs = u.symbolic_softmax()
+    graph = etl.trace(fn, *specs)
+    graph.verify()  # negative control: valid IR — rejection is export-time
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.lower(graph, backend=NAME)
+    msg = str(excinfo.value)
+    assert "op 'reshape'" in msg
+    assert "dynamic" in msg
+
+
+@pytest.mark.parametrize(
+    "builder", [u.symbolic_slice, u.symbolic_pad], ids=["slice", "pad"]
+)
+def test_dynamic_slice_pad_rejected_at_lower(builder, adapter_backend):
+    # Writer._reject_dynamic_dims also covers slice/pad (iree 3.11.0 parses
+    # dynamic slice/pad MLIR but the runtime ABORTS on it) — the rejection
+    # must surface through the tvm adapter's lower path as etl's own error,
+    # never as a tvm MLIR parse failure.
+    fn, specs = builder()
+    graph = etl.trace(fn, *specs)
+    graph.verify()  # negative control: valid IR — rejection is export-time
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.lower(graph, backend=NAME)
+    msg = str(excinfo.value)
+    assert "op '" in msg
+    assert "dynamic" in msg
+
+
 # ---------------------------------------------------------------------------
 # 4. payload contract + name resolution
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ no silent fallbacks.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Callable, Dict, Optional, Tuple
 
 from etl import core
@@ -215,10 +216,11 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
     structure, and builds a NEW `Graph` (new module/function — the input graph
     is never mutated) whose mapped inputs/outputs carry an extra leading
     dimension. All mapped input specs share ONE fresh symbolic `Dim` (named
-    `batch`) as the leading dim — a single pass introduces exactly one batch
-    axis; `output_tree` and `static_values` are preserved. Region-bearing
-    control-flow ops (`cond`/`while_loop`/`scan`) are not vectorizable in v1
-    and raise `TransformError`.
+    from the active pass depth — `_batch_dim`: `"batch"` at depth 0,
+    `"batch_1"` at depth 1, ...) as the leading dim — a single pass
+    introduces exactly one batch axis; `output_tree` and `static_values` are
+    preserved. Region-bearing control-flow ops (`cond`/`while_loop`/`scan`)
+    are not vectorizable in v1 and raise `TransformError`.
 
     Args:
         graph: the traced graph to rewrite.
@@ -339,20 +341,79 @@ def _tensor_input_axes(graph: Graph, axes) -> Tuple[Optional[int], ...]:
     return tuple(tensor_axes)
 
 
+# --- active vectorize-pass depth (level-distinct batch dim names) -----------
+
+
+#: Active vectorize-pass depth, contextvars-backed (the same pattern as the
+#: builder stack in `etl/trace/builder.py`). `_batched_input_specs` names each
+#: pass's shared batch dim from the CURRENT depth: depth 0 → `"batch"`,
+#: depth 1 → `"batch_1"`, depth 2 → `"batch_2"`, ... — nested vmap levels get
+#: level-distinct dim NAMES. The numpy interpreter binds symbolic dims BY
+#: NAME, so same-named dims from different nesting levels would collide at
+#: run time (equal extents accidentally pass; unequal extents raise a
+#: misleading ShapeError on a valid graph). The depth is incremented only
+#: around the invocation of a nested `TransformCallable` (vmap composition —
+#: see `vmap._vmap_fn`); top-level `vectorize`/`vmap` calls always run at
+#: depth 0 and keep the name `"batch"`.
+_batch_depth: ContextVar[int] = ContextVar(
+    "etl_transforms_batch_depth", default=0
+)
+
+
+class with_batch_depth:
+    """Context manager running a nested transform composition one level deeper.
+
+    `_vmap_fn` invokes a nested `TransformCallable` (e.g. `vmap(vmap(f))`)
+    under this context: the inner pass then names its batch dim `batch_1`,
+    while the outer pass (vectorizing the inner graph after the call returns)
+    runs at the parent depth and names its dim `batch`. Nestable (LIFO) —
+    depth-3+ recursion composes through the same path; the saved parent depth
+    is restored on exit even on error.
+    """
+
+    def __init__(self) -> None:
+        self._parent: Optional[int] = None
+
+    def __enter__(self) -> int:
+        self._parent = _batch_depth.get()
+        depth = self._parent + 1
+        _batch_depth.set(depth)
+        return depth
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        _batch_depth.set(self._parent if self._parent is not None else 0)
+        return False
+
+
+def _batch_dim() -> core.Dim:
+    """The fresh shared batch `Dim` of the CURRENT vectorize pass.
+
+    Named from the active pass depth (`"batch"` at depth 0, `"batch_1"` at
+    depth 1, ...) so nested passes get level-distinct names — the numpy
+    interpreter binds symbolic dims by name, so a same-named dim from a
+    different nesting level would collide at run time.
+    """
+    depth = _batch_depth.get()
+    return core.Dim("batch" if depth <= 0 else f"batch_{depth}")
+
+
 def _batched_input_specs(
     graph: Graph, tensor_axes: Tuple[Optional[int], ...]
 ) -> Tuple[Tuple, Tuple[MappedAxes, ...]]:
     """New flat tensor specs + per-input `MappedAxes`.
 
-    Mapped inputs all share ONE fresh symbolic `core.Dim` (named `batch`) as
-    their leading dim: a single vectorize pass introduces exactly one batch
-    axis, so every mapped input carries the same Dim object — object identity
-    IS the logical axis. Same-level dims therefore compare equal in shape
-    inference (no `max(batch, batch_1)` DimExprs in batched result types),
-    and the runtime's name-keyed dim binding rejects mismatched batch extents
-    with a clear ShapeError. Unmapped specs are reused unchanged.
+    Mapped inputs all share ONE fresh symbolic `core.Dim` (named from the
+    active pass depth — `_batch_dim`; `"batch"` at depth 0, `"batch_1"` at
+    depth 1, ...) as their leading dim: a single vectorize pass introduces
+    exactly one batch axis, so every mapped input carries the same Dim object
+    — object identity IS the logical axis. Same-level dims therefore compare
+    equal in shape inference (no `max(batch, batch_1)` DimExprs in batched
+    result types), and the runtime's name-keyed dim binding rejects mismatched
+    batch extents WITHIN a level with a clear ShapeError. Level-distinct
+    names keep nested vmap levels from colliding at run time (unequal extents
+    run; equal extents keep working). Unmapped specs are reused unchanged.
     """
-    batch_dim = core.Dim("batch")
+    batch_dim = _batch_dim()
     new_specs = []
     mapped_axes = []
     for spec, entry in zip(graph.tensor_specs, tensor_axes):

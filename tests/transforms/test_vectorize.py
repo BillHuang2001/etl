@@ -210,19 +210,45 @@ def test_mapped_input_and_output_gain_leading_batch_dim():
     assert tuple(output.type.shape[1:]) == (3, 4)
 
 
-def test_two_mapped_inputs_output_leads_with_batch_dim_expression():
-    # Two mapped inputs of the same row shape broadcast their batch dims into
-    # a symbolic leading entry (max(batch, batch_1)) — still the mapped axis.
+def test_two_mapped_inputs_share_one_batch_dim():
+    # All mapped inputs of one pass share a SINGLE fresh `Dim("batch")`
+    # (object identity IS the logical axis) — no per-input `batch_1` dims, no
+    # max(batch, batch_1) DimExprs in the batched result types.
     graph = etl.vectorize(
         etl.trace(_add, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((3, 4), etl.float32)),
         (0, 0),
     )
-    assert graph.tensor_specs[0].shape[0].name == "batch"
-    assert graph.tensor_specs[1].shape[0].name == "batch_1"
+    batch_dim = graph.tensor_specs[0].shape[0]
+    assert isinstance(batch_dim, core.Dim)
+    assert batch_dim.name == "batch"
+    assert graph.tensor_specs[1].shape[0] is batch_dim  # same Dim OBJECT
 
+    # The mapped output leads with the SAME Dim object.
     output = graph.module.main.entry_block.terminator.operands[0]
     leading = output.type.shape[0]
-    assert isinstance(leading, (core.Dim, core.DimExpr))
+    assert leading is batch_dim
+    assert tuple(output.type.shape[1:]) == (3, 4)
+
+
+def test_vectorize_on_symbolic_row_specs():
+    # Row specs may already contain a symbolic dim (e.g. (B, 16)): the batch
+    # dim is prepended and the symbolic row dim is preserved by identity; the
+    # numpy backend binds both dims from the concrete runtime shape.
+    B = etl.dim("B")
+    graph = etl.vectorize(etl.trace(_add1, etl.TensorSpec((B, 16), etl.float32)), 0)
+
+    spec = graph.tensor_specs[0]
+    assert len(spec.shape) == 3
+    assert isinstance(spec.shape[0], core.Dim)
+    assert spec.shape[0].name == "batch"
+    assert spec.shape[1] is B  # symbolic row dim preserved by identity
+    assert spec.shape[2] == 16
+
+    rng = np.random.default_rng(5)
+    x = rng.standard_normal((5, 4, 16)).astype(np.float32)
+    out = np.asarray(to_np(run_graph(graph, x)))
+    ref = np.stack([to_np(etl.evaluate(_add1, x[i])) for i in range(5)])
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
 
 
 def test_unmapped_axes_none_keeps_input_unmapped():

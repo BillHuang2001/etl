@@ -454,3 +454,229 @@ COLLECTIVE_CASES = [
 def test_collectives_export_direct_mnemonics(fn, mnemonic):
     mlir = _export(fn, etl.TensorSpec((2,), etl.float32))
     assert mnemonic in mlir
+
+
+# --- 12. dynamic dims → BackendError at export time ----------------------------
+
+# `Writer._reject_dynamic_dims` (etl/backends/stablehlo/writer.py) keeps
+# invalid MLIR away from the compilers: reshape/conv/slice/pad with any
+# symbolic dim, the keepdims reshapes inside the reduce emitters, and
+# reduce_mean over a dynamic REDUCED dim all fail at export/lower time with a
+# clear BackendError naming the op and the offending dims — never an obscure
+# iree-compile parse error or a runtime abort (dynamic slice/pad were
+# EMPIRICALLY verified through iree 3.11.0 to parse but ABORT at runtime:
+# "hal.fence.await" failure).
+
+_DYN = etl.dim("B")
+
+DYNAMIC_DIM_REJECT_CASES = [
+    ("reshape_operand",
+     lambda x: etl.reshape(x, (3, 2)),
+     (etl.TensorSpec((_DYN, 6), etl.float32),),
+     "reshape", "operand shape has dynamic dims"),
+    ("reshape_result",
+     lambda x: etl.reshape(x, (_DYN, 3, 2)),
+     (etl.TensorSpec((4, 6), etl.float32),),
+     "reshape", "result shape has dynamic dims"),
+    ("conv",
+     lambda x, w: etl.conv(x, w),
+     (etl.TensorSpec((_DYN, 3, 8, 8), etl.float32),
+      etl.TensorSpec((4, 3, 3, 3), etl.float32)),
+     "conv", "operand shape has dynamic dims"),
+    ("slice",
+     lambda x: etl.slice(x, (0, 0), (2, 4)),
+     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     "slice", "operand shape has dynamic dims"),
+    ("pad",
+     lambda x: etl.pad(x, [[0, 0], [1, 1]]),
+     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     "pad", "operand shape has dynamic dims"),
+    ("reduce_mean_dynamic_reduced_dim",
+     lambda x: etl.mean(x, axes=0),
+     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     "reduce_mean", "reduces over dynamic dims"),
+    ("keepdims_reduce_reshape",
+     lambda x: etl.sum(x, axes=1, keepdims=True),
+     (etl.TensorSpec((_DYN, 4), etl.float32),),
+     "reshape", "keepdims reshape operand has dynamic dims"),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,specs,expected_op,fragment",
+    [(fn, specs, expected_op, fragment)
+     for _, fn, specs, expected_op, fragment in DYNAMIC_DIM_REJECT_CASES],
+    ids=[case_id for case_id, _, _, _, _ in DYNAMIC_DIM_REJECT_CASES],
+)
+def test_dynamic_dims_rejected_at_export(fn, specs, expected_op, fragment):
+    msg = _export_error(fn, *specs)
+    assert f"op '{expected_op}'" in msg
+    assert fragment in msg
+    assert "dynamic" in msg
+
+
+def test_dynamic_dims_rejection_message_format():
+    # Exact wording of Writer._reject_dynamic_dims. The location sits
+    # between the op name and the shape description, so only the trailing
+    # part (which follows the location) is pinned verbatim.
+    msg = _export_error(
+        lambda x: etl.reshape(x, (3, 2)),
+        etl.TensorSpec((_DYN, 6), etl.float32),
+    )
+    assert msg.endswith(
+        "operand shape has dynamic dims (Dim('B'), 6) "
+        "(offending dims (Dim('B'),)) — dynamic shapes are not supported "
+        "by the StableHLO compiler backends in v1 (use concrete static "
+        "shapes or the numpy backend)"
+    )
+
+
+def test_reduce_mean_dynamic_reduced_dim_message_format():
+    # reduce_mean's rejection is its own message: dynamic REDUCED dims make
+    # the element count uncomputable statically.
+    msg = _export_error(
+        lambda x: etl.mean(x, axes=0),
+        etl.TensorSpec((_DYN, 4), etl.float32),
+    )
+    assert msg.endswith(
+        "reduces over dynamic dims (Dim('B'),) of shape (Dim('B'), 4) — "
+        "the element count cannot be computed statically; dynamic shapes "
+        "are not supported by the StableHLO compiler backends in v1 "
+        "(decompose it manually or use a future adapter)"
+    )
+
+
+def test_reduce_mean_dynamic_non_reduced_dim_still_exports():
+    # Only the REDUCED dims must be static: a dynamic non-reduced dim keeps
+    # working — the divide's scalar count broadcasts to the dynamic reduced
+    # shape via dynamic_broadcast_in_dim + get_dimension_size.
+    mlir = _export(
+        lambda x: etl.mean(x, axes=1),
+        etl.TensorSpec((_DYN, 4), etl.float32),
+    )
+    assert "-> tensor<?xf32>" in mlir
+    assert "stablehlo.reduce" in mlir
+    assert "stablehlo.get_dimension_size" in mlir
+    assert "stablehlo.dynamic_broadcast_in_dim" in mlir
+    assert "stablehlo.divide" in mlir
+
+
+# --- 13. dot_general with mismatched batch ranks -------------------------------
+
+# `Writer._emit_dot` must handle batched dots whose operands disagree on
+# batch rank exactly like numpy matmul (right-aligned batch broadcast):
+# rank-3@rank-2, rhs-higher-rank, size-1 batch squeeze, matched multi-batch,
+# and symbolic-batch dynamic broadcast. Unbalanced batching dims (the pre-fix
+# emission) produced invalid MLIR that iree-compile rejected; unprovable
+# symbolic merges raise BackendError naming "dynamic".
+
+
+def _fn_dot_batched(a, b):
+    return etl.dot(a, b)
+
+
+def test_dot_rank3_rank2_non_batched():
+    # rhs is a plain matrix: non-batched dot_general whose lhs free dims ARE
+    # a's batch dims — no broadcast materialization.
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((4, 512, 768), etl.float32),
+        etl.TensorSpec((768, 2304), etl.float32),
+    )
+    assert "-> tensor<4x512x2304xf32>" in mlir
+    assert (
+        "lhs_batching_dimensions = [], rhs_batching_dimensions = [], "
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [0]"
+        in mlir
+    )
+    assert "stablehlo.broadcast_in_dim" not in mlir
+    assert "stablehlo.reshape" not in mlir
+
+
+def test_dot_rhs_higher_rank_lhs_broadcast():
+    # (512,768) @ (4,768,2304): the lhs matrix broadcasts up to the batch
+    # (4,512,768), then a matched batched dot_general runs.
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((512, 768), etl.float32),
+        etl.TensorSpec((4, 768, 2304), etl.float32),
+    )
+    assert "-> tensor<4x512x2304xf32>" in mlir
+    assert "stablehlo.broadcast_in_dim" in mlir
+    assert (
+        "lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], "
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [1]"
+        in mlir
+    )
+
+
+def test_dot_size1_rhs_batch_squeezed():
+    # A provably size-1 rhs batch is reshaped to its plain matrix form —
+    # non-batched dot_general, no broadcast materialized.
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((4, 512, 768), etl.float32),
+        etl.TensorSpec((1, 768, 2304), etl.float32),
+    )
+    assert "-> tensor<4x512x2304xf32>" in mlir
+    assert "stablehlo.reshape" in mlir
+    assert "tensor<768x2304xf32>" in mlir
+    assert (
+        "lhs_batching_dimensions = [], rhs_batching_dimensions = [], "
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [0]"
+        in mlir
+    )
+
+
+def test_dot_matched_multi_batch_direct():
+    # Matched batch structure emits a direct batched dot_general with NO
+    # broadcast/reshape ops — byte-identical to the pre-fix exporter output
+    # for already-correct cases.
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((4, 8, 512, 768), etl.float32),
+        etl.TensorSpec((4, 8, 768, 2304), etl.float32),
+    )
+    assert "-> tensor<4x8x512x2304xf32>" in mlir
+    assert (
+        "lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], "
+        "lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]"
+        in mlir
+    )
+    assert "stablehlo.broadcast_in_dim" not in mlir
+    assert "stablehlo.reshape" not in mlir
+
+
+def test_dot_symbolic_batch_dynamic_broadcast():
+    # (B,512,768) @ (768,2304): the rhs matrix is broadcast up to the RUNTIME
+    # batch via dynamic_broadcast_in_dim with output_dimensions built from
+    # get_dimension_size on the lhs batch dim — one executable serves every
+    # concrete B.
+    mlir = _export(
+        _fn_dot_batched,
+        etl.TensorSpec((_DYN, 512, 768), etl.float32),
+        etl.TensorSpec((768, 2304), etl.float32),
+    )
+    assert "-> tensor<?x512x2304xf32>" in mlir
+    assert "stablehlo.get_dimension_size" in mlir
+    assert "stablehlo.dynamic_broadcast_in_dim" in mlir
+    assert (
+        "lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], "
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [1]"
+        in mlir
+    )
+
+
+def test_dot_unprovable_symbolic_merge_rejected():
+    # (4,512,768) @ (B,768,2304): the aligned batch pair (512, B) can be
+    # neither proven equal nor size-1 at compile time — BackendError naming
+    # the op and "dynamic", never invalid MLIR.
+    msg = _export_error(
+        _fn_dot_batched,
+        etl.TensorSpec((4, 512, 768), etl.float32),
+        etl.TensorSpec((_DYN, 768, 2304), etl.float32),
+    )
+    assert "op 'dot'" in msg
+    assert "dynamic batch broadcast" in msg
+    assert "symbolic dims that cannot be proven equal or size-1" in msg
+    assert "dynamic" in msg

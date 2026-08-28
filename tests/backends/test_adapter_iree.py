@@ -143,6 +143,21 @@ def test_symbolic_dims(adapter_backend):
         )
 
 
+def test_symbolic_dynamic_reshape_rejected_at_lower(adapter_backend):
+    # Writer regression: a softmax-style graph over a symbolic batch contains
+    # a dynamic keepdims reshape ((B,) -> (B, 1)). Writer._reject_dynamic_dims
+    # must reject it at lower() time with etl's OWN BackendError — never
+    # invalid MLIR that dies later with an obscure iree-compile parse error.
+    fn, specs = u.symbolic_softmax()
+    graph = etl.trace(fn, *specs)
+    graph.verify()  # negative control: valid IR — rejection is export-time
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.lower(graph, backend=NAME)
+    msg = str(excinfo.value)
+    assert "op 'reshape'" in msg
+    assert "dynamic" in msg
+
+
 # ---------------------------------------------------------------------------
 # 4. payload contract + name resolution
 # ---------------------------------------------------------------------------
@@ -246,3 +261,50 @@ def test_unsupported_features_rejected_naming_feature(adapter_backend):
         with pytest.raises(etl.BackendError) as excinfo:
             adapter_backend.lower(graph)
         assert feature in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# 8. batched dot_general with mismatched batch ranks (writer regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def batched_dot_artifacts(adapter_backend):
+    """One compiled iree artifact per static batched-dot emission path."""
+    return {
+        name: u.stage(NAME, fn, specs)[2]
+        for name, (fn, specs, _args) in u.batched_dot_cases().items()
+    }
+
+
+@pytest.mark.parametrize(
+    "name", ["rank3_rank2", "rhs_higher_rank", "size1_rhs_batch"]
+)
+def test_batched_dot_mismatched_batch_ranks_parity(name, batched_dot_artifacts):
+    # The pre-fix writer emitted unbalanced batching dims for these shapes
+    # (invalid MLIR that iree-compile rejected). Compile+run must now match
+    # numpy matmul exactly in shape and value.
+    fn, _specs, args = u.batched_dot_cases()[name]
+    exe = etl.load(batched_dot_artifacts[name])
+    expected = np.matmul(args[0], args[1])
+    actual = etl.run(exe, *args).numpy()
+    assert actual.shape == expected.shape
+    # K=768 fp32 accumulation-order differences across compilers measure
+    # below 2e-4, so the cross-compiler bound is 1e-3 (same bound the bench
+    # harness uses for large fp32 reductions).
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+def test_batched_dot_symbolic_batch_parity(adapter_backend):
+    # One compiled executable serves every concrete batch size: the rhs
+    # matrix is broadcast up to the runtime batch via
+    # dynamic_broadcast_in_dim + get_dimension_size.
+    fn, specs = u.batched_dot_symbolic()
+    exe = etl.build(fn, *specs, backend=NAME)
+    for b in (2, 5):
+        a = u.standard_normal((b, 512, 768))
+        w = u.standard_normal((768, 2304))
+        expected = np.matmul(a, w)
+        actual = etl.run(exe, a, w).numpy()
+        assert actual.shape == expected.shape
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)

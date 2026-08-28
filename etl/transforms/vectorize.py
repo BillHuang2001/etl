@@ -30,8 +30,10 @@ def vectorize(graph: Graph, axes) -> Graph:
 
     Returns:
         A new `Graph` of ordinary ops whose mapped inputs/outputs carry an
-        extra leading dimension (one fresh symbolic dim named `batch`, shared
-        by all mapped inputs of the pass). Unsupported ops — no registered
+        extra leading dimension (one fresh symbolic dim per pass, named from
+        the active pass depth — `"batch"` at depth 0, `"batch_1"` at depth 1,
+        ... — shared by all mapped inputs of the pass; see
+        `batching._batched_input_specs`). Unsupported ops — no registered
         batching rule, control-flow regions in v1 — raise
         `core.TransformError` naming the op; there is never a Python-loop
         fallback. `output_tree` and `static_values` are preserved; the input
