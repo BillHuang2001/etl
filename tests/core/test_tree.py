@@ -24,12 +24,13 @@ Authoritative source: ``etl/core/tree.py``. Contract under test:
 """
 
 import dataclasses
-from collections import namedtuple
+from collections import Counter, defaultdict, namedtuple
 from dataclasses import FrozenInstanceError, dataclass
 
 import numpy as np
 import pytest
 
+from etl import dim
 from etl.core import Device, Tensor, TensorSpec, flatten, unflatten
 from etl.core.tree import TreeSpec, register_pytree_node
 
@@ -370,3 +371,123 @@ def test_unflatten_does_not_mutate_leaves():
     )
     assert unflatten(leaves, spec) == [1, 2, 3]
     assert leaves == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# flatten/unflatten extensions: defaultdict, Counter, explicit errors
+# (contract: defaultdict with a None/class ``default_factory`` and ``Counter``
+# roundtrip; an unpreservable factory, mixed-type dict keys and dataclasses
+# with InitVar/init=False fields fail with explicit messages; plain
+# unregistered classes stay leaves; etl value types are single leaves;
+# 'object' itself can never be registered.)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrickyFields:
+    x: int
+    y: dataclasses.InitVar[int]
+    z: int = dataclasses.field(init=False, default=7)
+
+
+class PlainObj:
+    """Plain user class — NOT registered: must stay a single leaf."""
+
+    def __init__(self, value=1):
+        self.value = value
+
+
+def test_defaultdict_roundtrip():
+    obj = defaultdict(list, {"a": [1]})
+    leaves, spec = flatten(obj)
+    rebuilt = unflatten(leaves, spec)
+    assert isinstance(rebuilt, defaultdict)
+    assert rebuilt.default_factory is list
+    assert rebuilt == obj
+
+
+def test_defaultdict_none_factory_roundtrip():
+    obj = defaultdict(None, {"a": 1})
+    leaves, spec = flatten(obj)
+    rebuilt = unflatten(leaves, spec)
+    assert isinstance(rebuilt, defaultdict)
+    assert rebuilt.default_factory is None
+    assert rebuilt == obj
+
+
+def test_defaultdict_and_counter_nested_roundtrip():
+    obj = {"d": defaultdict(list, {"x": [1]}), "c": Counter({"a": 2})}
+    leaves, spec = flatten(obj)
+    rebuilt = unflatten(leaves, spec)
+    assert isinstance(rebuilt["d"], defaultdict)
+    assert isinstance(rebuilt["c"], Counter)
+    assert rebuilt == obj
+
+
+def test_counter_roundtrip():
+    obj = Counter({"a": 2, "b": 1})
+    leaves, spec = flatten(obj)
+    rebuilt = unflatten(leaves, spec)
+    assert isinstance(rebuilt, Counter)
+    assert rebuilt == obj
+
+
+def test_counter_nested_roundtrip():
+    obj = [Counter({"a": 2}), {"k": Counter({"b": 1, "c": 3})}]
+    leaves, spec = flatten(obj)
+    rebuilt = unflatten(leaves, spec)
+    assert isinstance(rebuilt[0], Counter)
+    assert isinstance(rebuilt[1]["k"], Counter)
+    assert rebuilt == obj
+
+
+def test_defaultdict_unpersistable_factory_raises_on_unflatten():
+    d = defaultdict(lambda: 42)
+    leaves, spec = flatten(d)  # flatten succeeds; the failure is at rebuild
+    with pytest.raises(
+        (TypeError, ValueError),
+        match=r"unflatten: cannot rebuild defaultdict: default_factory .* cannot be persisted — register the type via register_pytree_node for custom reconstruction",
+    ):
+        unflatten(leaves, spec)
+
+
+def test_flatten_mixed_type_dict_keys_raises():
+    with pytest.raises(
+        (TypeError, ValueError),
+        match=r"flatten: cannot sort dict keys of mixed types \(types: .*\); dict keys are sorted for deterministic tree structure — use keys of one type or register_pytree_node",
+    ):
+        flatten({1: "a", "x": "b"})
+
+
+def test_dataclass_initvar_and_init_false_unflatten_raises():
+    obj = TrickyFields(1, 2)
+    leaves, spec = flatten(obj)  # flatten succeeds; rebuild via __init__ fails
+    with pytest.raises(
+        (TypeError, ValueError),
+        match=r"unflatten: cannot rebuild dataclass TrickyFields: its __init__ rejects field\(s\) .* \(InitVar/init=False fields are not stored\) — register the type via register_pytree_node for custom reconstruction",
+    ):
+        unflatten(leaves, spec)
+
+
+def test_unregistered_plain_class_stays_a_leaf():
+    obj = PlainObj()
+    leaves, spec = flatten(obj)
+    assert len(leaves) == 1
+    assert leaves[0] is obj
+    assert unflatten(leaves, spec) is obj
+
+
+def test_etl_value_types_are_single_leaves():
+    assert len(flatten(Device("cpu", 0))[0]) == 1
+    assert len(flatten(dim(3))[0]) == 1
+    assert len(flatten(TensorSpec((2, 3), np.float32))[0]) == 1
+
+
+def test_register_pytree_node_object_raises():
+    # 'object' would hijack the MRO lookup for every type — rejected.
+    # Placed last: registry-hygiene caution (must not affect other tests).
+    with pytest.raises(
+        TypeError,
+        match=r"register_pytree_node: cannot register 'object' as a pytree node — it would hijack the MRO lookup for all types",
+    ):
+        register_pytree_node(object, _tagged_flatten, _tagged_unflatten)
