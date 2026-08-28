@@ -82,13 +82,15 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | cast | `stablehlo.convert` |
 | select / broadcast / reshape / transpose / slice / concatenate / pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
 | reduce_sum/max/min/mean/prod | `stablehlo.reduce` (mean: reduce-sum then divide) |
-| dot / conv | `stablehlo.dot_general` / `stablehlo.convolution` |
+| dot / conv | `stablehlo.dot_general` (each operand's batch dims are pre-aligned to the matmul-broadcast target batch — `broadcast_in_dim` / `dynamic_broadcast_in_dim` / size-1 squeeze / non-batched form for a plain-matrix rhs; see `stablehlo/CONTEXT.md`) / `stablehlo.convolution` |
 | constant | `stablehlo.constant` |
 | cond / while_loop | `stablehlo.if` / `stablehlo.while` |
 | collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast_collective/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
 | symbolic dims | `?` dynamic dims in tensor types, e.g. `tensor<?xNxf32>` |
 
 **Deferred in v1** (⇒ `core.BackendError` naming the op, message suggests decomposition or a future adapter): `gather`, `scatter`, `scan`, `runtime_call`, `block_call` (blocks with no portable decomposition), `dist.rank()`/`dist.world_size()` graph scalars, `erf`, `gelu`, `argmax`, `argmin`, `call`, `tril`/`triu`/`cumsum`/`solve`, complex-number elementwise beyond cast. Mnemonics were verified against the official StableHLO spec at implementation time: `stablehlo.erf` and `stablehlo.argmax/argmin` do NOT exist in the StableHLO opset (erf is a CHLO op; ArgMax/ArgMin are open feature requests), so those ops are deferred rather than emitted with invented mnemonics. The unlisted data-movement ops (tril/triu/cumsum/solve/call) have no v1 mapping and fail explicitly.
+
+**Dynamic dims — v1 per-op policy (validated through iree; see `stablehlo/CONTEXT.md` for the full allow/reject lists):** `reshape` with any dynamic dim (incl. the keepdims reshapes inside the reduce/reduce_mean emitters), `conv` with dynamic dims, `slice`/`pad` with dynamic dims (iree parses but the RUNTIME aborts), `reduce_mean` reducing over a dynamic dim, and `dot` batch merges that cannot be emitted (no shape source / unprovable symbolic merge) all raise `core.BackendError` at export/`lower()` time — naming the op, the shape, the offending dims, containing "dynamic" — NEVER invalid MLIR reaching a compiler. Elementwise dynamic shapes, dynamic broadcasts with a shape source, reductions over dynamic dims, and dot_general with matched batch structure ARE exported and run on iree/tvm (pinned by the adapter `test_symbolic_dims`).
 
 Type map (dtype → MLIR): float16→f16, float32→f32, float64→f64, int8→i8, int16→i16, int32→i32, int64→i64, uint8→ui8, uint16→ui16, uint32→ui32, uint64→ui64, bool→i1, complex64→`complex<f32>`, complex128→`complex<f64>`.
 
