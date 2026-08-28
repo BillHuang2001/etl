@@ -1,0 +1,330 @@
+"""Shared infrastructure for the etl.bench example registry.
+
+Holds the :class:`Example` dataclass, the module-level registry
+(``_REGISTRY`` + ``register``/``register_all``), the shared input generator
+(:func:`generate_inputs`), the shared numpy conv reference
+(:func:`_conv2d_numpy` / :func:`conv2d_im2col_numpy`), and the finite-
+difference gradient helper (:func:`fd_gradient`) used by the gradient
+examples. Concrete examples live in sibling modules (``micro``, ``grad``,
+``vectorize``, ``large``) which self-register at import time.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import numpy as np
+
+from etl import float32
+
+__all__ = [
+    "Example",
+    "UnknownExampleError",
+    "register",
+    "register_all",
+    "generate_inputs",
+    "conv2d_im2col_numpy",
+    "fd_gradient",
+]
+
+_F32 = float32
+
+
+class UnknownExampleError(ValueError):
+    """Raised by :func:`get_example` for unknown example names."""
+
+
+@dataclass(frozen=True)
+class Example:
+    """A registered benchmark/conformance example.
+
+    Attributes:
+        name: stable registry key.
+        description: one-line human-readable description.
+        specs: tuple of ``etl.TensorSpec`` (static integer shapes).
+        graph: ``@etl.defn`` graph taking one symbolic tensor per spec.
+        numpy_ref: ``(inputs) -> ndarray | tuple[ndarray]``; pure numpy.
+        torch_ref: optional ``(inputs, device=None) -> ndarray | tuple[ndarray]``
+            factory that imports torch inside its body (never at module scope);
+            ``device`` is an optional ``torch.device`` (``None`` = CPU).
+        rtol: per-example relative-tolerance override (``None`` = fall back
+            to the global ``conformance()`` value).
+        atol: per-example absolute-tolerance override (``None`` = fall back
+            to the global ``conformance()`` value).
+        tolerance: per-example max-abs-error override (``None`` = fall back
+            to the global ``conformance()`` value). Independent of
+            ``rtol``/``atol``.
+        category: grouping key; used by the CLI ``--examples`` category
+            expansion (e.g. ``"micro"``, ``"grad"``, ``"vectorize"``,
+            ``"large"``).
+        inputs_fn: optional custom input generator ``(seed) -> list[np.ndarray]``
+            producing one numpy array per spec (e.g. non-negative integer
+            indices for gather); :meth:`generate_inputs` uses it when set.
+    """
+
+    name: str
+    description: str
+    specs: tuple
+    graph: Callable
+    numpy_ref: Callable
+    torch_ref: Optional[Callable] = None
+    rtol: Optional[float] = None
+    atol: Optional[float] = None
+    tolerance: Optional[float] = None
+    category: str = "micro"
+    inputs_fn: Optional[Callable[[int], list]] = None
+
+    def generate_inputs(self, seed: int = 0):
+        """Generate a list of numpy arrays matching ``specs`` (see module
+        :func:`generate_inputs`)."""
+        return generate_inputs(self, seed)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+#: Registered examples in insertion order (name -> Example). Later modules
+#: call :func:`register_all` at import time; import order in the package
+#: ``__init__`` defines the registry order.
+_REGISTRY: dict = {}
+
+
+def register(example: Example) -> None:
+    """Register ``example`` under its name (duplicate names raise ValueError)."""
+    if example.name in _REGISTRY:
+        raise ValueError(f"duplicate example registration: {example.name!r}")
+    _REGISTRY[example.name] = example
+
+
+def register_all(examples) -> None:
+    """Register every example from the iterable (registry order preserved)."""
+    for example in examples:
+        register(example)
+
+
+def generate_inputs(example: Example, seed: int = 0):
+    """Generate a list of numpy arrays matching ``example.specs``.
+
+    Uses ``numpy.random.default_rng(seed)``: standard-normal draws for
+    floating dtypes, small integers for integer dtypes, uniform bools for
+    bool specs. Specs must have static integer shapes (``Dim``/``DimExpr``
+    shapes are not supported by the harness — explicit error).
+
+    When ``example.inputs_fn`` is set it is called with ``seed`` instead and
+    its result is validated (a list of numpy arrays matching the specs in
+    length, shape, and dtype — ``ValueError`` otherwise).
+    """
+    if example.inputs_fn is not None:
+        arrays = example.inputs_fn(seed)
+        _validate_inputs_fn_result(example, arrays)
+        return arrays
+    rng = np.random.default_rng(seed)
+    arrays = []
+    for index, spec in enumerate(example.specs):
+        shape = []
+        for dim in spec.shape:
+            if not isinstance(dim, (int, np.integer)):
+                raise ValueError(
+                    f"example {example.name!r}: spec {index} has non-static "
+                    f"shape dim {dim!r}; bench examples require static "
+                    "integer shapes"
+                )
+            shape.append(int(dim))
+        dtype = np.dtype(spec.dtype)
+        if np.issubdtype(dtype, np.floating):
+            arrays.append(rng.standard_normal(shape).astype(dtype))
+        elif np.issubdtype(dtype, np.integer):
+            arrays.append(rng.integers(-5, 6, size=shape, dtype=dtype))
+        elif dtype == np.dtype("bool"):
+            arrays.append(rng.integers(0, 2, size=shape).astype(dtype))
+        else:
+            raise ValueError(
+                f"example {example.name!r}: unsupported spec dtype {dtype} "
+                "for input generation"
+            )
+    return arrays
+
+
+def _validate_inputs_fn_result(example: Example, arrays) -> None:
+    if not isinstance(arrays, list) or not all(
+        isinstance(a, np.ndarray) for a in arrays
+    ):
+        raise ValueError(
+            f"example {example.name!r}: inputs_fn must return a list of "
+            "numpy arrays"
+        )
+    if len(arrays) != len(example.specs):
+        raise ValueError(
+            f"example {example.name!r}: inputs_fn returned {len(arrays)} "
+            f"arrays but {len(example.specs)} specs are declared"
+        )
+    for index, (spec, array) in enumerate(zip(example.specs, arrays)):
+        if tuple(array.shape) != tuple(spec.shape):
+            raise ValueError(
+                f"example {example.name!r}: inputs_fn array {index} has "
+                f"shape {tuple(array.shape)} but spec shape "
+                f"{tuple(spec.shape)}"
+            )
+        if array.dtype != np.dtype(spec.dtype):
+            raise ValueError(
+                f"example {example.name!r}: inputs_fn array {index} has "
+                f"dtype {array.dtype} but spec dtype {np.dtype(spec.dtype)}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Shared reference implementations
+# ---------------------------------------------------------------------------
+
+
+def _conv2d_numpy(x, w, strides=(1, 1), padding="VALID"):
+    """Loop-based NCHW 2D convolution reference.
+
+    Mirrors etl's conv semantics exactly: ``"VALID"`` → no padding;
+    ``"SAME"`` → TF convention — ``out = ceil(d / stride)`` and total pad
+    ``(out - 1) * stride + k - d`` split as ``(total // 2, total - total // 2)``
+    per spatial axis (matches ``etl/backends/numpy/kernels/linalg.py``).
+    """
+    n, c_in, h, win = x.shape
+    c_out, _, kh, kw = w.shape
+    sh, sw = strides
+    if padding == "SAME":
+        out_h = (h + sh - 1) // sh
+        out_w = (win + sw - 1) // sw
+        total_h = max((out_h - 1) * sh + kh - h, 0)
+        total_w = max((out_w - 1) * sw + kw - win, 0)
+        pad_h = (total_h // 2, total_h - total_h // 2)
+        pad_w = (total_w // 2, total_w - total_w // 2)
+    elif padding == "VALID":
+        out_h = (h - kh) // sh + 1
+        out_w = (win - kw) // sw + 1
+        pad_h = pad_w = (0, 0)
+    else:
+        raise ValueError(f"unsupported padding mode {padding!r}")
+    xp = np.pad(x, ((0, 0), (0, 0), pad_h, pad_w))
+    out = np.zeros(
+        (n, c_out, out_h, out_w), dtype=np.result_type(x.dtype, w.dtype)
+    )
+    for i in range(out_h):
+        for j in range(out_w):
+            patch = xp[:, :, i * sh : i * sh + kh, j * sw : j * sw + kw]
+            out[:, :, i, j] = np.einsum("nchw,fchw->nf", patch, w)
+    return out
+
+
+def conv2d_im2col_numpy(x, w, strides=(1, 1), padding="VALID"):
+    """Vectorized NCHW 2D convolution reference (im2col + einsum).
+
+    Same semantics as :func:`_conv2d_numpy`: ``"VALID"`` → no padding;
+    ``"SAME"`` → TF convention — ``out = ceil(d / stride)`` and total pad
+    ``(out - 1) * stride + k - d`` split as ``(total // 2, total - total // 2)``
+    per spatial axis.
+
+    Implementation: ``np.lib.stride_tricks.sliding_window_view`` over the
+    padded NCHW array's H/W axes yields windows of shape
+    ``(N, C, out_h, out_w, kh, kw)`` (subsampled at ``strides``), then a
+    single ``np.einsum`` contraction with the weight
+    ``(F, C, kh, kw) -> (N, F, out_h, out_w)``. Verified against
+    :func:`_conv2d_numpy` on random inputs (max abs error < 1e-12 in
+    float64).
+    """
+    n, c_in, h, win = x.shape
+    c_out, _, kh, kw = w.shape
+    sh, sw = strides
+    if padding == "SAME":
+        out_h = (h + sh - 1) // sh
+        out_w = (win + sw - 1) // sw
+        total_h = max((out_h - 1) * sh + kh - h, 0)
+        total_w = max((out_w - 1) * sw + kw - win, 0)
+        pad_h = (total_h // 2, total_h - total_h // 2)
+        pad_w = (total_w // 2, total_w - total_w // 2)
+    elif padding == "VALID":
+        out_h = (h - kh) // sh + 1
+        out_w = (win - kw) // sw + 1
+        pad_h = pad_w = (0, 0)
+    else:
+        raise ValueError(f"unsupported padding mode {padding!r}")
+    xp = np.pad(x, ((0, 0), (0, 0), pad_h, pad_w))
+    # (N, C, out_h, out_w, kh, kw): stride-1 windows subsampled at `strides`.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        xp, (kh, kw), axis=(2, 3)
+    )[..., ::sh, ::sw, :, :]
+    return np.einsum("ncpqkl,fckl->nfpq", windows, w)
+
+
+# ---------------------------------------------------------------------------
+# Finite-difference gradient helper
+# ---------------------------------------------------------------------------
+
+
+def fd_gradient(value_fn, inputs, h=1e-4, sg_inputs=()):
+    """Central-difference gradient of a pure-numpy scalar loss.
+
+    ``value_fn(inputs, frozen) -> float`` is a pure-numpy scalar loss that
+    MUST compute in float64 (the helper converts every floating input array
+    to float64 before calling). Non-floating inputs (int/bool) are passed
+    through unchanged and get a zero float64 gradient array of the same
+    shape (they are never perturbed).
+
+    Stop-gradient modeling (``sg_inputs``): freezing input ``i`` while
+    perturbing it makes the sg-term independent of ``i`` — the sg-term's
+    contribution to ``d/di`` vanishes, exactly like ``etl.stop_gradient``.
+    Mechanically: for each perturbed floating input ``i in sg_inputs`` the
+    call is ``value_fn(inputs_perturbed, {i: original_float64_copy})``, and
+    ``value_fn`` models the stop-gradient term(s) by substituting
+    ``frozen.get(i, inputs[i])`` for ``inputs[i]`` wherever the sg'd value
+    appears (e.g. ``loss = sum(frozen.get(0, x) * w) + 0.5 * sum(x ** 2)``
+    with ``sg_inputs=(0,)`` gives ``d/dx = x`` — the ``x * w`` term frozen).
+    When perturbing an input ``j not in sg_inputs``, ``frozen`` is ``{}``
+    (empty dict) and is passed through to ``value_fn`` as-is, so the full
+    gradient flows.
+
+    Args:
+        value_fn: ``(inputs, frozen) -> float`` pure-numpy scalar loss.
+        inputs: list of numpy arrays.
+        h: central-difference step.
+        sg_inputs: iterable of input indices whose stop-gradient terms are
+            frozen while their own gradient is computed.
+
+    Returns:
+        A list with one float64 gradient array per input (same shapes):
+        for each floating input, every element is perturbed in turn and the
+        central difference ``(f(x + h) - f(x - h)) / (2h)`` fills the
+        corresponding gradient element; non-floating inputs get zeros.
+    """
+    sg = set(sg_inputs)
+    f64 = _float64_inputs(inputs)
+    grads = []
+    for i, arr in enumerate(inputs):
+        arr = np.asarray(arr)
+        if not np.issubdtype(arr.dtype, np.floating):
+            grads.append(np.zeros(arr.shape, dtype=np.float64))
+            continue
+        base = f64[i]
+        frozen = {i: base.copy()} if i in sg else {}
+        grad = np.zeros(base.shape, dtype=np.float64)
+        for j in range(base.size):
+            plus = list(f64)
+            minus = list(f64)
+            plus[i] = base.copy()
+            minus[i] = base.copy()
+            plus[i].reshape(-1)[j] = base.reshape(-1)[j] + h
+            minus[i].reshape(-1)[j] = base.reshape(-1)[j] - h
+            f_plus = value_fn(plus, frozen)
+            f_minus = value_fn(minus, frozen)
+            grad.reshape(-1)[j] = (f_plus - f_minus) / (2.0 * h)
+        grads.append(grad)
+    return grads
+
+
+def _float64_inputs(inputs):
+    """Floating inputs as float64 copies; non-floating inputs unchanged."""
+    out = []
+    for arr in inputs:
+        arr = np.asarray(arr)
+        if np.issubdtype(arr.dtype, np.floating):
+            out.append(arr.astype(np.float64))
+        else:
+            out.append(arr)
+    return out
