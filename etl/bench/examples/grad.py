@@ -37,10 +37,6 @@ rule → where exercised:
   - grad_stopgrad: stop_gradient.
   - grad_structural: gather, scatter, solve.
   - NOT covered (one-line justification):
-    - sign — GENUINE GAP: registry lists it but ``_pointwise_vjp`` has no
-      entry → ``TransformError: grad/vjp: no VJP rule for op 'sign'``
-      (reported; the op works in forward graphs, only its derivative is
-      missing).
     - conv — documented v1 deferral: ``TransformError: grad/vjp: no VJP
       rule for op 'conv' — the IR has no transposed-convolution op (v1
       gap)`` (probed at dev time; conv is deliberately NOT in any example).
@@ -61,13 +57,16 @@ rule → where exercised:
 FD-robustness design (why the mix has no kinks): elementwise non-smooth ops
 are shifted away from the data range (``relu(x+5)``, ``abs(x+5)``,
 ``maximum(x, -5)``, ``minimum(x, 5)`` — always-linear regimes, gradient
-exact), ``remainder`` runs in its identity regime (``a < 1000``), reduction
-``max``/``min`` are scaled 1e-4 (a central-difference tie-flip error is
-bounded by 0.5·scale), the comparison/logical zero-grad terms are scaled
-1e-8 (FD boundary flip ≤ 1e-8/h), and ``select``'s branches differ by 1e-8
-(mask flips bounded while both branch gradients still flow). The cast term
-is an exact f32→f64→f32 round trip (f32 values are exactly representable in
-f64), so the numpy ref treats it as the identity — the FD must not quantize.
+exact; ``sign(x+5)`` runs in an always-constant regime — its gradient is
+exactly 0, so the FD and torch refs agree identically while the VJP rule
+still fires), ``remainder`` runs in its identity regime (``a < 1000``),
+reduction ``max``/``min`` are scaled 1e-4 (a central-difference tie-flip
+error is bounded by 0.5·scale), the comparison/logical zero-grad terms are
+scaled 1e-8 (FD boundary flip ≤ 1e-8/h), and ``select``'s branches differ
+by 1e-8 (mask flips bounded while both branch gradients still flow). The
+cast term is an exact f32→f64→f32 round trip (f32 values are exactly
+representable in f64), so the numpy ref treats it as the identity — the FD
+must not quantize.
 """
 from __future__ import annotations
 
@@ -152,6 +151,10 @@ def _grad_mix_loss(x1, x2, w, y):
     terms.append(etl.sum(etl.tanh(x1)))                     # vjp: tanh
     terms.append(etl.sum(etl.sigmoid(x2)))                  # vjp: sigmoid
     terms.append(etl.sum(etl.relu(etl.add(x1, 5.0))))       # vjp: relu (linear regime)
+    # sign(x1+5): x1+5 > 0 always -> always-constant regime; the gradient is
+    # exactly 0 (FD and torch agree identically), but the VJP rule fires —
+    # which is the coverage point
+    terms.append(etl.sum(etl.sign(etl.add(x1, 5.0))))       # vjp: sign (constant regime)
     terms.append(etl.sum(etl.negate(x1)))                   # vjp: negate
     terms.append(etl.sum(etl.maximum(x1, -5.0)))            # vjp: maximum (x1 > -5 always)
     terms.append(etl.sum(etl.minimum(x2, 5.0)))             # vjp: minimum (x2 < 5 always)
@@ -220,6 +223,7 @@ def _grad_mix_value(inputs, frozen):
         np.sum(np.tanh(x1)),
         np.sum(1.0 / (1.0 + np.exp(-x2))),
         np.sum(np.maximum(x1 + 5.0, 0.0)),
+        np.sum(np.sign(x1 + 5.0)),
         np.sum(-x1),
         np.sum(np.maximum(x1, -5.0)),
         np.sum(np.minimum(x2, 5.0)),
@@ -272,6 +276,7 @@ def _grad_mix_torch(inputs, device=None):
     t10 = torch.tanh(x1).sum()
     t11 = torch.sigmoid(x2).sum()
     t12 = torch.relu(x1 + 5.0).sum()
+    t13 = torch.sign(x1 + 5.0).sum()
     t15 = (-x1).sum()
     t16 = torch.maximum(x1, torch.tensor(-5.0, device=device)).sum()
     t17 = torch.minimum(x2, torch.tensor(5.0, device=device)).sum()
@@ -298,7 +303,7 @@ def _grad_mix_torch(inputs, device=None):
     t40 = torch.broadcast_to(x1.mean(axis=0), (6, 10)).sum()
     t41 = torch.where(x1 > 0.0, x1, x1 + 1e-8).sum()
     t42 = x1.sum()  # cast f32->f64->f32 is the exact identity for f32 inputs
-    loss = t1 + t2 + t3 + t4 + t5 + t6 + t7 + t8 + t9 + t10 + t11 + t12 + t15 + t16 + t17 + t18 + t19 + t20 + t21 + t22 + t23 + t24 + t25 + t26 + t27 + t28 + t29 + t30 + t31 + t32 + t33 + t36 + t37 + t38 + t39 + t40 + t41 + t42
+    loss = t1 + t2 + t3 + t4 + t5 + t6 + t7 + t8 + t9 + t10 + t11 + t12 + t13 + t15 + t16 + t17 + t18 + t19 + t20 + t21 + t22 + t23 + t24 + t25 + t26 + t27 + t28 + t29 + t30 + t31 + t32 + t33 + t36 + t37 + t38 + t39 + t40 + t41 + t42
     grads = torch.autograd.grad(loss, (x1, x2, w, y))
     return tuple(g.cpu().numpy() for g in grads)
 
