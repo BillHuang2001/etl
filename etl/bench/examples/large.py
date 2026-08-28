@@ -275,6 +275,7 @@ def _conv2d_large_numpy(inputs):
 
 def _conv2d_large_torch(inputs, device=None):
     torch = require_torch()
+    torch.backends.cudnn.allow_tf32 = False  # cuDNN TF32 (torch default) degrades fp32 conv precision ~0.036 abs on cuda; TF32 is a perf optimization, not fp32 semantics — keep the reference accurate
     x, w = (torch.as_tensor(a, device=device) for a in inputs)
     return torch.nn.functional.conv2d(x, w, stride=1, padding=0).cpu().numpy()
 
