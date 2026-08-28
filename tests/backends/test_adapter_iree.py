@@ -308,3 +308,40 @@ def test_batched_dot_symbolic_batch_parity(adapter_backend):
         actual = etl.run(exe, a, w).numpy()
         assert actual.shape == expected.shape
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+@etl.defn
+def _vmap_shared_weight_fn(x, w, b):
+    """``relu(dot(x, w) + b)`` — the vmap shared-weight repro below."""
+    return etl.relu(etl.add(etl.dot(x, w), b))
+
+
+def test_batched_dot_vmap_shared_weight_parity(adapter_backend):
+    # Bug-report repro: vmap with in_axes=(0, None, None) — x is mapped
+    # over its leading axis, w and b are unmapped (shared), so the traced
+    # graph's dot is (B,1,16) @ (1,16,8): a size-1-batch rhs under a
+    # SYMBOLIC batch. The writer's size-1-batch squeeze path is gated on
+    # fully static shapes (fix 16ced05), so the dot must fall through to
+    # the batched dynamic-broadcast path (dynamic_broadcast_in_dim +
+    # batched dot_general) and COMPILE + RUN on iree. Before the fix the
+    # squeeze emitted a non-batched dot_general with a dynamic lhs and
+    # iree-compile failed: "failed to legalize operation
+    # 'stablehlo.dynamic_reshape'".
+    graph = etl.vmap(_vmap_shared_weight_fn, in_axes=(0, None, None), out_axes=0)(
+        etl.TensorSpec((32, 1, 16), etl.float32),
+        etl.TensorSpec((16, 8), etl.float32),
+        etl.TensorSpec((8,), etl.float32),
+    )
+    graph.verify()
+    numpy_exe = etl.load(etl.compile(etl.lower(graph)))
+    adapter_exe = etl.load(etl.compile(etl.lower(graph, backend=NAME)))
+    x = u.standard_normal((32, 1, 16))
+    w = u.standard_normal((16, 8))
+    b = u.standard_normal((8,))
+    expected = etl.run(numpy_exe, x, w, b)
+    actual = etl.run(adapter_exe, x, w, b)
+    assert isinstance(actual, etl.Tensor)
+    assert actual.dtype == expected.dtype
+    assert actual.numpy().shape == expected.numpy().shape
+    # Cross-compiler fp32 bound, same as the other batched-dot parity tests.
+    np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=1e-3, atol=1e-3)
