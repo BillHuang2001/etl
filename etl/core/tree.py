@@ -304,17 +304,21 @@ def _rebuild_container(spec: TreeSpec, children: List[Any]) -> Any:
     if isinstance(spec.type, type) and dataclasses.is_dataclass(spec.type):
         # dataclass: rebuild by recorded field name. InitVar / init=False
         # fields make __init__ reject the recorded mapping — wrap that
-        # TypeError only (namedtuple arity errors keep their raw form).
+        # TypeError only when such fields exist (namedtuple arity errors and
+        # unrelated TypeErrors from a dataclass's own __init__ keep their raw
+        # form).
         try:
             return spec.type(**dict(zip(spec.node_data, children)))
         except TypeError:
-            raise TypeError(
-                f"unflatten: cannot rebuild dataclass {spec.type.__qualname__}: its "
-                f"__init__ rejects field(s) "
-                f"{_dataclass_init_rejecting_field_names(spec.type)} "
-                "(InitVar/init=False fields are not stored) — register the type via "
-                "register_pytree_node for custom reconstruction"
-            ) from None
+            rejecting = _dataclass_init_rejecting_field_names(spec.type)
+            if rejecting:
+                raise TypeError(
+                    f"unflatten: cannot rebuild dataclass {spec.type.__qualname__}: its "
+                    f"__init__ rejects field(s) {rejecting} "
+                    "(InitVar/init=False fields are not stored) — register the type via "
+                    "register_pytree_node for custom reconstruction"
+                ) from None
+            raise
     if isinstance(spec.type, type) and issubclass(spec.type, tuple):
         return spec.type(children)
     if isinstance(spec.type, type) and issubclass(spec.type, list):
