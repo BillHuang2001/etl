@@ -33,6 +33,7 @@ under `block:<name>` — see `register_policy_pass_through`.
 
 from __future__ import annotations
 
+import collections
 from typing import Any, Callable, Tuple
 
 from . import registry
@@ -141,8 +142,13 @@ def register_portable_diff_fallback(name: str) -> None:
 def _flatten_outputs(name: str, node: Any, out: list) -> None:
     """Flatten a portable's return value into symbolic tensors.
 
-    Mirrors decl's `_collect_specs` order (tuple/list items, dict values) so
-    the flattened outputs align with the declared `output_specs`.
+    Routed through `core.flatten` so every container core supports
+    (tuple/list/dict with sorted keys, namedtuple, dataclass, registered
+    pytree nodes) is handled identically to core: `SymbolicTensor` and the
+    other etl value types are single leaves, containers recurse. Leaf
+    order is core.flatten's pre-order, which matches decl's
+    `_collect_specs` order (tuple/list items, dict values) so the flattened
+    outputs align with the declared `output_specs`.
 
     Raises:
         BlockError: A non-symbolic return value (portables must produce
@@ -150,22 +156,57 @@ def _flatten_outputs(name: str, node: Any, out: list) -> None:
     """
     from etl import core
 
-    if isinstance(node, core.SymbolicTensor):
-        out.append(node)
-        return
-    if isinstance(node, (tuple, list)):
-        for item in node:
-            _flatten_outputs(name, item, out)
-        return
-    if isinstance(node, dict):
-        for item in node.values():
-            _flatten_outputs(name, item, out)
-        return
-    raise BlockError(
-        f"portable implementation for block '{name}' must return symbolic "
-        f"tensors (SymbolicTensor or a tuple/list/dict thereof), got "
-        f"{type(node).__name__}"
-    )
+    leaves, spec = core.flatten(node)
+    for index, leaf in enumerate(leaves):
+        if not isinstance(leaf, core.SymbolicTensor):
+            raise BlockError(
+                f"portable implementation for block '{name}' must return "
+                f"symbolic tensors (SymbolicTensor or a pytree thereof), got "
+                f"{type(leaf).__name__} at "
+                f"{core.format_path(_leaf_path(spec, index))}"
+            )
+    out.extend(leaves)
+
+
+def _leaf_path(spec: Any, leaf_index: int) -> Tuple[Any, ...]:
+    """Pre-order pytree path of the leaf at ``leaf_index`` in a flatten spec.
+
+    Keys follow the documented `TreeSpec.node_data` contract: sorted dict
+    keys (a ``(default_factory, keys)`` pair for ``defaultdict``), field
+    names for ``namedtuple``/``dataclass``; all other containers use
+    positional indices. Only reached on the error path.
+    """
+    counter = [0]
+
+    def walk(s: Any, prefix: Tuple[Any, ...]):
+        if not s.children:
+            if counter[0] == leaf_index:
+                return prefix
+            counter[0] += 1
+            return None
+        keys = _spec_keys(s)
+        for index, child in enumerate(s.children):
+            key = keys[index] if keys is not None else index
+            found = walk(child, prefix + (key,))
+            if found is not None:
+                return found
+        return None
+
+    return walk(spec, ())
+
+
+def _spec_keys(spec: Any) -> Any:
+    """Per-child path keys for a container spec, or None for positional."""
+    if spec.node_data is None:
+        return None
+    spec_type = spec.type
+    if isinstance(spec_type, type) and issubclass(spec_type, dict):
+        # dict: sorted keys; defaultdict records (default_factory, keys).
+        if issubclass(spec_type, collections.defaultdict):
+            return spec.node_data[1]
+        return spec.node_data
+    # namedtuple / dataclass: field names.
+    return spec.node_data
 
 
 def _inline_portable(
