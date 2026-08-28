@@ -30,7 +30,6 @@ Direct mnemonics (etl op → StableHLO, emitted with `stablehlo.` prefix):
 | COMPARISON_MAP | equal/not_equal/less/less_equal/greater/greater_equal | `stablehlo.compare` + `comparison_direction` attr (EQ/NE/LT/LE/GT/GE) |
 | SHAPE_MAP | select/broadcast/reshape/transpose/slice/concatenate/pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
 | SHAPE_MAP | reduce_sum/max/min/prod | `stablehlo.reduce` (reduction kind comes from the op's attrs) |
-| SHAPE_MAP | argmax/argmin | `stablehlo.argmax/argmin` |
 | SHAPE_MAP | dot/conv | `stablehlo.dot_general` / `stablehlo.convolution` |
 | CONSTANT_MAP | constant | `stablehlo.constant` (dense elements attr) |
 | CONTROL_FLOW_MAP | cond/while_loop | `stablehlo.if` / `stablehlo.while` |
