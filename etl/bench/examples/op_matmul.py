@@ -174,7 +174,10 @@ def _diagonal_matmul_torch(inputs, device=None):
 
 # ---------------------------------------------------------------------------
 # Registry (category "op", tag "basic"). Strict defaults — no per-example
-# tolerance overrides (numpy backend is exact; see the module docstring).
+# tolerance overrides (numpy backend is exact; see the module docstring),
+# except matmul_square: tolerance=2e-4 (iree fp32 accumulation-order noise,
+# measured 6.1e-05 cpu / 9.16e-05 cuda vs the fp32 ref; iree is closer to
+# fp64 than the numpy fp32 ref).
 # ---------------------------------------------------------------------------
 
 register_all([
@@ -240,6 +243,7 @@ register_all([
         graph=_matmul_square_graph,
         numpy_ref=_matmul_square_numpy,
         torch_ref=_matmul_square_torch,
+        tolerance=2e-4,
         category="op",
         tags=("basic",),
     ),
