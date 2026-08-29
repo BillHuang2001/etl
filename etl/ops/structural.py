@@ -13,11 +13,14 @@ Implementation choices (design notes — see this node's CONTEXT.md):
   (numpy's flattened-roll semantics).
 - ``clamp``: pure composition over ``maximum``/``minimum`` (no dedicated
   IR op) — the composition inherits their vjp/batching rules and reproduces
-  numpy 2.x ``np.clip`` dtype behavior EXACTLY through weak scalar
-  promotion (float bound on an int tensor promotes to float64 — numpy 2.x;
-  numpy 1.x raised ``TypeError`` via ``same_kind`` casts; we match the
-  installed numpy). ``min > max`` yields all-``max`` (numpy semantics) and
-  NaN bounds propagate.
+  numpy 2.x ``np.clip`` dtype behavior EXACTLY: Python-scalar bounds whose
+  natural dtype ``can_cast`` to ``x``'s dtype with ``same_kind`` are
+  pre-cast to ``x``'s dtype (int bound on an int tensor stays int; int
+  bound on a float tensor stays float), and bounds the rule rejects fall
+  back to weak scalar promotion (float bound on an int tensor promotes to
+  float64 — numpy 2.x; numpy 1.x raised ``TypeError`` via ``same_kind``
+  casts; we match the installed numpy). ``min > max`` yields all-``max``
+  (numpy semantics) and NaN bounds propagate.
 - ``isnan``: composition over ``not_equal(x, x)`` (complex-safe comparison
   kernel — True iff a real or imaginary part is NaN, matching ``np.isnan``).
 - ``nan_to_num``: dedicated IR op + numpy kernel; scalar replacements
@@ -358,13 +361,17 @@ def clamp(x, min, max) -> "core.SymbolicTensor":
     """Clamp values into ``[min, max]`` (numpy ``clip`` semantics).
 
     Pure composition over ``maximum``/``minimum`` (no dedicated IR op):
-    ``minimum(maximum(x, min), max)``. Scalar bounds are weak-promoted per
-    NEP 50 exactly like ``np.clip`` in numpy 2.x (a float bound on an int
-    tensor promotes the result to float64 — numpy 1.x raised ``TypeError``
-    via ``same_kind`` casts; etl matches the installed numpy); symbolic
-    (tensor) bounds broadcast per ``DimExpr`` rules and promote with the
-    tensor. ``min > max`` returns the all-``max`` result and NaN bounds
-    propagate, matching numpy.
+    ``minimum(maximum(x, min), max)``. Python-scalar bounds whose natural
+    dtype ``np.can_cast(..., casting="same_kind")`` accepts are pre-cast to
+    ``x``'s dtype exactly like ``np.clip``'s scalar handling (int bound on
+    an int tensor stays int; int bound on a float tensor stays float; float
+    bound on a float tensor stays float). Bounds the rule rejects (a float
+    bound on an int tensor) fall back to weak promotion per NEP 50 — the
+    result promotes to float64, matching the installed numpy 2.x (numpy 1.x
+    raised ``TypeError`` via ``same_kind`` casts); symbolic (tensor) bounds
+    broadcast per ``DimExpr`` rules and promote with the tensor.
+    ``min > max`` returns the all-``max`` result and NaN bounds propagate,
+    matching numpy.
 
     Args:
         x: ``SymbolicTensor`` or Python scalar.
@@ -386,8 +393,48 @@ def clamp(x, min, max) -> "core.SymbolicTensor":
     """
     if min is None and max is None:
         raise TypeError("clamp: at least one of min/max must be given")
+    if isinstance(x, core.SymbolicTensor):
+        # Symbolic operand: pre-cast scalar bounds per np.clip's same_kind
+        # rule, then the usual maximum/minimum composition. Scalar/concrete
+        # ``x`` keeps the plain composition path below (identical error
+        # semantics — no eager two-scalar mode).
+        builder = _utils.check_in_trace()
+        loc = _utils.get_location(depth=2)
+        lo = x
+        if min is not None:
+            lo = _elementwise.maximum(x, _clip_bound(builder, x, min, loc))
+        if max is not None:
+            return _elementwise.minimum(lo, _clip_bound(builder, x, max, loc))
+        return lo
     lo = _elementwise.maximum(x, min) if min is not None else x
     return _elementwise.minimum(lo, max) if max is not None else lo
+
+
+#: Exact Python scalar kinds eligible for the np.clip-style same_kind
+#: pre-cast (numpy scalars deliberately excluded — they fall through to the
+#: canonical ``maximum``/``minimum`` operand errors).
+_CLIP_SCALAR_KINDS = (bool, int, float, complex)
+
+
+def _clip_bound(builder, x, bound, loc):
+    """Normalize one clamp bound against ``x`` per ``np.clip`` scalar rules.
+
+    A Python scalar whose natural dtype ``can_cast`` to ``x.dtype`` with
+    ``casting="same_kind"`` (int bound on an int/float tensor, float bound
+    on a float tensor) becomes a 0-d Constant of ``x.dtype``. Bounds the
+    rule rejects (float bound on an int tensor) and symbolic tensor bounds
+    pass through unchanged to the ``maximum``/``minimum`` weak-promotion /
+    broadcast path.
+    """
+    if type(bound) not in _CLIP_SCALAR_KINDS:
+        return bound
+    if not np.can_cast(np.asarray(bound).dtype, x.dtype, casting="same_kind"):
+        return bound
+    payload = np.asarray(bound, dtype=x.dtype)
+    op = builder.create("constant", attributes={"value": payload}, location=loc)
+    return core.SymbolicTensor(
+        value=op.result, dtype=np.dtype(x.dtype), shape=(), location=loc
+    )
 
 
 def eye(n, m=None, dtype=core.float32) -> "core.SymbolicTensor":

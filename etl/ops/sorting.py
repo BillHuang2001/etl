@@ -42,10 +42,20 @@ def _wrap(op, loc) -> "core.SymbolicTensor":
     )
 
 
-def _sort_axis(axis, rank: int) -> int:
+def _sort_axis(axis, rank: int, op_name: str | None = None) -> int:
     """Normalize a single sort axis; ``None`` is handled by the caller
-    (flatten composition). Scalar operands fail like numpy's AxisError."""
-    return _utils.normalize_axes(axis, rank)[0]
+    (flatten composition). Scalar operands fail like numpy's AxisError.
+
+    ``op_name`` optionally prefixes the ``ShapeError`` message (used by
+    ``topk`` to name the failing op); ``sort``/``argsort`` leave it unset so
+    their error text is unchanged.
+    """
+    try:
+        return _utils.normalize_axes(axis, rank)[0]
+    except core.ShapeError as exc:
+        if op_name is None:
+            raise
+        raise core.ShapeError(f"{op_name}: {exc}") from exc
 
 
 def _emit_sort(builder, x, axis, descending, stable, op_name: str, loc):
