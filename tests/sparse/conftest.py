@@ -76,6 +76,7 @@ def csr_spec(dtype=etl.float32):
         etl.TensorSpec((None,), etl.int64),
         etl.TensorSpec((None,), dtype),
         dense_shape=(3, 4),
+        format="csr",
     )
 
 
@@ -86,6 +87,7 @@ def csc_spec(dtype=etl.float32):
         etl.TensorSpec((None,), etl.int64),
         etl.TensorSpec((None,), dtype),
         dense_shape=(3, 4),
+        format="csc",
     )
 
 

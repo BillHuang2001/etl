@@ -849,18 +849,21 @@ def test_batched_to_dense_dim_at_position_zero():
     np.testing.assert_array_equal(out[1], dense_example() * 2.0)
 
 
-def test_batched_concrete_to_dense_input_side_convention():
-    # BUG(etl): `batched_coo_example()` follows the documented input-side
-    # batched convention — batched leaves with dense_shape UNCHANGED (3, 4)
-    # (conftest docstring; CONTEXT.md "Batched sparse = leading batch dim on
-    # the tensor leaves with dense_shape UNCHANGED at the input I/O
-    # boundary"). The concrete `to_dense` batched branch (value.py) assumes
-    # dense_shape[0] is a core.Dim and CRASHES with a raw IndexError
-    # ("too many indices for array: array is 2-dimensional, but 3 were
-    # indexed") instead of materializing (B, 3, 4) — never an explicit error.
-    # Minimal repro:
+def test_batched_concrete_input_side_pytree_layout():
+    # The input-side batched convention (CONTEXT.md: "Batched sparse =
+    # leading batch dim on the tensor leaves with dense_shape UNCHANGED at
+    # the input I/O boundary"): `batched_coo_example()` carries (B, nnz, ndim)
+    # leaves but its static leaves stay the UNBATCHED (3, 4) dense_shape —
+    # exactly what the vectorize input tree expects (input statics are never
+    # remapped). `to_dense` on this convention is NOT contracted (only the
+    # Dim-at-position-0 batched case is — see
+    # test_batched_to_dense_dim_at_position_zero); these values exist to be
+    # run() inputs of vectorized graphs.
     b = batched_coo_example()
-    out = b.to_dense()
-    assert out.shape == (2, 3, 4)
-    np.testing.assert_array_equal(out[0], dense_example())
-    np.testing.assert_array_equal(out[1], dense_example() * 2.0)
+    children, tree = etl.core.flatten(b)
+    assert tree.type is sparse.SparseTensor
+    assert children[0].shape == (2, 4, 2)  # indices (B, nnz, ndim)
+    assert children[1].shape == (2, 4)  # values (B, nnz)
+    assert children[2] == 3 and children[3] == 4  # dense_shape UNCHANGED
+    assert children[4] == np.dtype("float32")
+    assert children[5] == "coo"
