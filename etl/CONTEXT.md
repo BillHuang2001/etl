@@ -102,6 +102,10 @@ Public API (see `./bench/CONTEXT.md`): `etl.bench.conformance(examples=None, *, 
 
 **torch-optionality (binding):** `import etl` / `import etl.bench` MUST always succeed without torch — torch never appears at module scope anywhere in this subpackage (same discipline as `./backends/adapters/`). torch is probed/imported lazily inside function bodies (`./bench/_torch.py`); when absent, torch comparisons are skipped with `torch_pass=None`/`torch_available=False` (auto mode), and `use_torch=True` raises a clear `ImportError` mentioning `pip install etl[bench]` — never a raw `ModuleNotFoundError`.
 
+## Design decisions (15-op batch)
+
+`sort/argsort/topk` (sorting), `tile/stack/flip/roll/clamp/diag/isnan/nan_to_num/eye/linspace` (structural), and `matmul/cumprod` (linalg): 8 new IR ops (`sort`, `argsort`, `tile`, `flip`, `roll`, `diag`, `cumprod`, `nan_to_num` — registry 105 total incl. `return`), 7 frontend compositions (`topk` = sort/argsort + gather, `stack` = reshape + concatenate, `clamp` = maximum/minimum, `eye`/`linspace` = Constant compositions, `matmul` = dot sugar, `isnan` = comparison composition). `linspace` defaults to float64 — deviation from the etl float32 creation convention (explicit `dtype` param; symbolic bounds → `TraceError`, v2 deferral). No vjp/batching rules for the 8 new IR ops + eye/linspace (`TransformError`, the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Numpy backend = full reference; compiler backends defer the 8 new IR ops with explicit `BackendError` (compositions work via their components). Detailed notes in `./ops/CONTEXT.md` and `./ir/CONTEXT.md`.
+
 ## Test strategy
 
 pytest; unit tests per module in `../tests/<module>/`; integration tests for the full pipeline and design-principle compliance (`../tests/test_spec_compliance.py`): staging explicitness, closure-capture errors, SymbolicTensor purity, bind-as-sugar, vmap≡vectorize sugar, collectives local-shape semantics, serialization round-trips, DLPack interop (torch via `importorskip`). CPU only.

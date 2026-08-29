@@ -18,7 +18,7 @@ golden output, the `Builder`, shape-inference hooks, and the SSA data model.
 | `test_serialize.py` | payload schema, multi-feature round-trips (symbolic dims, constants as base64 npy, all effect kinds, if/while regions, multi-function + `call`), original id preservation, fast-forwarded counters, tamper detection (sha256), version/format rejection (PersistenceError) |
 | `test_pretty_print.py` | exact-string goldens: SSA headers, %N renumbering, attribute rendering (sorted keys, `?` for None, ndarray summaries), locations, multi-arg header wrapping, nested `^bbN` region labels |
 | `test_builder.py` | Builder contracts: eager arity/attr/region validation, result-type resolution order (explicit → shape_fn → op-specific), attribute normalization (dtype→name string, lists→tuples, nullable-int rule), insertion-point stack, set_terminator rules, per-module id counters |
-| `test_inference.py` | all 23 shape-inference hooks: static + symbolic (`Dim`/`DimExpr`) + `None` dims, numpy dtype promotion/reduction rules, ShapeError/ValueError cases, world-group collectives (group_size=None → None dims) |
+| `test_inference.py` | 23 of the 49 shape-inference hooks (the argsort/tile/diag/random/sparse-era hooks are not exercised here): static + symbolic (`Dim`/`DimExpr`) + `None` dims, numpy dtype promotion/reduction rules, ShapeError/ValueError cases, world-group collectives (group_size=None → None dims) |
 | `test_model.py` | structural attrs of Module/Function/Region/Block/Op/Value/Use/ValueType/Location/effects, use-def chains, RAUW (`replace_all_uses_with`), Dim/DimExpr interop |
 
 ## Known etl bugs
