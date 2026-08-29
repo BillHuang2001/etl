@@ -817,6 +817,66 @@ def infer_identity(
     return tuple(input_types)
 
 
+def infer_argsort(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``argsort``: the operand's exact shape (numpy
+    ``argsort`` keeps the sorted axis extent), dtype ``int64``."""
+    t = _one(input_types, "argsort")
+    return (ValueType(np.dtype("int64"), t.shape),)
+
+
+def infer_tile(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``tile``: numpy tile shape rule — output rank is
+    ``max(rank, len(reps))``; the operand is promoted with leading size-1
+    dims (and ``reps`` with leading 1s), then each aligned dim multiplies
+    (symbolic dims via ``DimExpr`` mul; ``None`` stays dynamic)."""
+    t = _one(input_types, "tile")
+    reps = attributes["reps"]
+    if not isinstance(reps, (tuple, list)) or not all(
+        isinstance(r, int) and not isinstance(r, bool) for r in reps
+    ):
+        raise ShapeError(f"tile: reps must be a tuple of ints, got {reps!r}")
+    reps = tuple(reps)
+    if any(r < 0 for r in reps):
+        raise ShapeError(
+            f"tile: reps entries must be non-negative, got {reps!r}"
+        )
+    rank = t.rank
+    d = max(rank, len(reps))
+    out = []
+    for i in range(d):
+        x_dim = 1 if i < d - rank else t.shape[i - (d - rank)]
+        rep = reps[i - (d - len(reps))] if i >= d - len(reps) else 1
+        out.append(_mul_dim(x_dim, rep))
+    return (ValueType(t.dtype, tuple(out)),)
+
+
+def infer_diag(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``diag`` (numpy semantics): rank-1 ``(n,)`` →
+    ``(n, n)``; rank-2 ``(m, n)`` → the main diagonal ``(min(m, n),)``
+    (symbolic dims via ``DimExpr`` min; ``None`` dims stay dynamic). Dtype
+    preserved both directions."""
+    t = _one(input_types, "diag")
+    if t.rank == 1:
+        (n,) = t.shape
+        return (ValueType(t.dtype, (n, n)),)
+    if t.rank == 2:
+        m, n = t.shape
+        if m is None or n is None:
+            return (ValueType(t.dtype, (None,)),)
+        if isinstance(m, int) and isinstance(n, int):
+            return (ValueType(t.dtype, (min(m, n),)),)
+        return (ValueType(t.dtype, (DimExpr("min", m, n),)),)
+    raise ShapeError(
+        f"diag: input must have rank 1 or 2, got rank {t.rank}"
+    )
+
+
 def infer_dot(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:

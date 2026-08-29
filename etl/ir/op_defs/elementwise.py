@@ -16,7 +16,7 @@ from ..inference import (
     infer_elementwise_binary,
     infer_elementwise_unary,
 )
-from . import ATTR_DTYPE, AttrSpec, OpDef, register_opdef
+from . import ATTR_DTYPE, ATTR_FLOAT, AttrSpec, OpDef, register_opdef
 
 _CATEGORY = "elementwise"
 
@@ -145,8 +145,48 @@ def _register_comparisons() -> None:
         )
 
 
+def _register_nan_to_num() -> None:
+    register_opdef(
+        OpDef(
+            name="nan_to_num",
+            category=_CATEGORY,
+            description="Replace NaN/positive-inf/negative-inf entries with "
+            "the given values (numpy nan_to_num semantics: None keeps the "
+            "value; defaults replace infinities with the dtype's max finite "
+            "value).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="nan",
+                    type=ATTR_FLOAT,
+                    default=0.0,
+                    description="Replacement for NaN entries.",
+                ),
+                AttrSpec(
+                    name="posinf",
+                    type=ATTR_FLOAT,
+                    default=None,
+                    description="Replacement for +inf entries (None = keep; "
+                    "default semantics per numpy: max finite of the dtype).",
+                ),
+                AttrSpec(
+                    name="neginf",
+                    type=ATTR_FLOAT,
+                    default=None,
+                    description="Replacement for -inf entries (None = keep; "
+                    "default semantics per numpy: min finite of the dtype).",
+                ),
+            ),
+            shape_fn=infer_elementwise_unary,
+        )
+    )
+
+
 _register_binary()
 _register_unary()
 _register_abs()
 _register_cast()
+_register_nan_to_num()
 _register_comparisons()

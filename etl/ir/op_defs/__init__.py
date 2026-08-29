@@ -167,4 +167,14 @@ def all_opdefs() -> tuple[OpDef, ...]:
 
 
 # Importing the category tables registers the canonical v1 op set.
-from . import collective, control, elementwise, linalg, random, reduction, sparse, structure  # noqa: E402,F401
+from . import (  # noqa: E402,F401
+    collective,
+    control,
+    elementwise,
+    linalg,
+    random,
+    reduction,
+    sorting,
+    sparse,
+    structure,
+)

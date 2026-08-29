@@ -7,15 +7,19 @@ from ..effects import EFFECT_PURE
 from ..inference import (
     infer_broadcast_to,
     infer_concatenate,
+    infer_diag,
     infer_gather,
+    infer_identity,
     infer_pad,
     infer_reshape,
     infer_scatter,
     infer_select,
     infer_slice,
+    infer_tile,
     infer_transpose,
 )
 from . import (
+    ATTR_ANY,
     ATTR_FLOAT,
     ATTR_INT,
     ATTR_INTS,
@@ -213,4 +217,90 @@ def _register_structure() -> None:
     )
 
 
+def _register_structural_ops() -> None:
+    register_opdef(
+        OpDef(
+            name="tile",
+            category=_CATEGORY,
+            description="Repeat the operand per numpy tile semantics: output "
+            "rank is max(rank, len(reps)), the operand is promoted with "
+            "leading size-1 dims and each aligned dim multiplies by its rep.",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="reps",
+                    type=ATTR_INTS,
+                    description="Per-dimension repetition counts "
+                    "(non-negative ints).",
+                ),
+            ),
+            shape_fn=infer_tile,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="flip",
+            category=_CATEGORY,
+            description="Reverse the operand along the given axes (numpy flip "
+            "semantics: axes None = all axes, negative axes supported).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="axes",
+                    type=ATTR_ANY,
+                    default=None,
+                    description="Axis or tuple of axes to reverse (None = all "
+                    "axes; negative indices supported).",
+                ),
+            ),
+            shape_fn=infer_identity,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="roll",
+            category=_CATEGORY,
+            description="Roll the operand by a per-axis shift (numpy roll "
+            "semantics: axis None = flattened roll; shifts are static tuples).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="shift",
+                    type=ATTR_INTS,
+                    description="Per-axis shift amounts (tuple; a single int "
+                    "is normalized to a tuple frontend-side).",
+                ),
+                AttrSpec(
+                    name="axis",
+                    type=ATTR_INT,
+                    default=None,
+                    description="Axis or axes to roll along (None = flattened "
+                    "roll; a single int rolls only that axis).",
+                ),
+            ),
+            shape_fn=infer_identity,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="diag",
+            category=_CATEGORY,
+            description="Extract the main diagonal of a rank-2 tensor, or "
+            "build a diagonal matrix from a rank-1 tensor (numpy diag "
+            "semantics; dtype preserved).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            shape_fn=infer_diag,
+        )
+    )
+
+
 _register_structure()
+_register_structural_ops()

@@ -105,6 +105,32 @@ def _register_reductions() -> None:
             shape_fn=infer_identity,
         )
     )
+    register_opdef(
+        OpDef(
+            name="cumprod",
+            category=_CATEGORY,
+            description="Cumulative product along an axis (shape-preserving; "
+            "bool operands are cast to int64 frontend-side, mirroring "
+            "cumsum).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="axis",
+                    type=ATTR_INT,
+                    description="Axis along which to accumulate.",
+                ),
+                AttrSpec(
+                    name="reverse",
+                    type=ATTR_BOOL,
+                    default=False,
+                    description="Accumulate in reverse order.",
+                ),
+            ),
+            shape_fn=infer_identity,
+        )
+    )
 
 
 _register_reductions()
