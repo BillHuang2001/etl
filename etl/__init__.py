@@ -198,6 +198,9 @@ from .block import BlockOp, block, get_block  # noqa: F401
 # --- NumPy-like namespace (etl.numpy) --------------------------------------
 from . import numpy  # noqa: F401
 from . import numpy as enp  # noqa: F401  (documented alias)
+from .numpy import arange  # noqa: F401  (GRAPH creation op — same object as
+# enp.arange; top-level etl.zeros/ones/full/empty are the CONCRETE core
+# creators, arange has no concrete counterpart)
 
 # --- Persistence / cache (etl.persist) -------------------------------------
 from . import persist  # noqa: F401

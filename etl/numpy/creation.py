@@ -69,11 +69,14 @@ def full(shape, fill_value, dtype=None):
     """numpy.full → Constant op filled with fill_value (graph op).
 
     dtype=None → numpy dtype inference of the static fill_value at trace
-    time (fill_value is a Python scalar; it specializes the graph).
+    time (fill_value is a Python scalar; it specializes the graph), except an
+    inferred float64 becomes float32 (etl default-dtype rule, matching the
+    concrete creators in core and TensorSpec; integer fills keep int64).
     """
     s = _concrete_shape(shape, "full")
     if dtype is None:
-        dtype = np.result_type(fill_value)
+        inferred = np.result_type(fill_value)
+        dtype = np.float32 if inferred == np.dtype("float64") else inferred
     return ops.constant(core.tensor(np.full(s, fill_value, dtype=dtype)))
 
 
