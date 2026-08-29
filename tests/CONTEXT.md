@@ -41,6 +41,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 | `./transforms/` | vmap/grad/jvp/vjp tests |
 | `./backends/` | backend interface + stablehlo export tests + compiler-framework & IREE/XLA/TVM adapter tests |
 | `./dist/` | collective semantics tests |
+| `./sparse/` | sparse-tensor suite (etl.sparse): value model / ops / errors / transforms / control flow / pipeline / backends / deferrals — see `./sparse/CONTEXT.md` |
 | `./persist/` | cache + container tests |
 | `./bench/` | `etl.bench` harness tests (importability w/o torch, conformance vs numpy/torch refs, benchmark timing, CLI exit codes) — torch-optionality pattern: torch-present tests use `pytest.importorskip("torch")`; torch-absent-only tests guard with `importlib.util.find_spec("torch") is None` and `pytest.mark.skipif` inverted |
 
