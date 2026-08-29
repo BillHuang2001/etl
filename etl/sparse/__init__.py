@@ -92,3 +92,7 @@ __all__ = [
     "concatenate",
     "matmul",
 ]
+
+# Import-time side effect: registers the 16 sparse batching rules +
+# the sparse batched-output aux remap into etl.transforms (see rules.py).
+from . import rules  # noqa: F401

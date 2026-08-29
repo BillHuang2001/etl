@@ -535,7 +535,11 @@ class SparseTensor:
 
         Duplicate rows accumulate (``np.add.at``). The result dtype is the
         sparse values dtype. A ``core.Dim`` at ``dense_shape[0]`` is
-        substituted with ``indices.shape[0]``.
+        substituted with ``indices.shape[0]`` (its extent) — the BATCHED
+        case: the tensor leaves carry leading batch dims (COO indices
+        ``(B, nnz, ndim)``; CSR/CSC indices/values ``(B, nnz)`` with indptr
+        ``(B, rows+1)``), and the batch id is scatter-added as the leading
+        coordinate axis.
 
         Returns:
             The dense :class:`numpy.ndarray` of shape ``dense_shape``.
@@ -547,18 +551,50 @@ class SparseTensor:
             dense_shape[0] = indices.shape[0]
         if self.format == "coo":
             out = np.zeros(dense_shape, dtype=self.dtype)
-            np.add.at(out, tuple(indices.T), values)
+            if indices.ndim == 3:
+                # Batched: (B, nnz, ndim) — batch id + per-axis coordinates.
+                batch_ids = np.broadcast_to(
+                    np.arange(indices.shape[0])[:, None], indices.shape[:2]
+                )
+                np.add.at(
+                    out,
+                    (batch_ids,)
+                    + tuple(indices[..., d] for d in range(indices.shape[2])),
+                    values,
+                )
+            else:
+                np.add.at(out, tuple(indices.T), values)
             return out
         indptr = _leaf_numpy(self.indptr, "to_dense")
+        if indptr.ndim == 2:
+            # Batched: one (rows+1,) pointer row per batch element; the
+            # per-batch row/col ids repeat over a COMMON nnz (batched sparse
+            # tensors are padded to one nnz per batch).
+            nnz = indices.shape[1]
+            batch_ids = np.broadcast_to(
+                np.arange(indptr.shape[0])[:, None], (indptr.shape[0], nnz)
+            )
+            ids = np.stack(
+                [
+                    np.repeat(np.arange(indptr.shape[1] - 1), np.diff(ip))
+                    for ip in indptr
+                ],
+                axis=0,
+            )
+        else:
+            ids = np.repeat(np.arange(indptr.shape[0] - 1), np.diff(indptr))
+        out = np.zeros(dense_shape, dtype=self.dtype)
         if self.format == "csr":
-            row_ids = np.repeat(np.arange(indptr.shape[0] - 1), np.diff(indptr))
-            out = np.zeros(dense_shape, dtype=self.dtype)
-            np.add.at(out, (row_ids, indices), values)
+            if indptr.ndim == 2:
+                np.add.at(out, (batch_ids, ids, indices), values)
+            else:
+                np.add.at(out, (ids, indices), values)
             return out
         # csc
-        col_ids = np.repeat(np.arange(indptr.shape[0] - 1), np.diff(indptr))
-        out = np.zeros(dense_shape, dtype=self.dtype)
-        np.add.at(out, (indices, col_ids), values)
+        if indptr.ndim == 2:
+            np.add.at(out, (batch_ids, indices, ids), values)
+        else:
+            np.add.at(out, (indices, ids), values)
         return out
 
     def to_coo(self):
@@ -953,7 +989,17 @@ def _unflatten_sparse(context, children):
     elif isinstance(first, core.SymbolicTensor):
         result = SparseTensor.from_parts(*leaves, dense_shape=dense_shape, format=format)
     elif isinstance(first, (core.Tensor, np.ndarray)):
-        if format == "coo":
+        if any(isinstance(d, core.Dim) for d in dense_shape):
+            # Batched/vmap output: dense_shape[0] is the batch Dim (its
+            # extent is indices.shape[0]); the tensor leaves carry leading
+            # batch dims ((B..., nnz, ndim) / (B..., nnz)), which the
+            # per-element validating constructors reject. The interpreter
+            # already applied canonical validation per batch element, so
+            # rebuild validation-free via from_parts (same variant dispatch).
+            result = SparseTensor.from_parts(
+                *leaves, dense_shape=dense_shape, format=format
+            )
+        elif format == "coo":
             result = SparseTensor(*leaves, dense_shape=dense_shape, format="coo")
         elif format == "csr":
             result = CSRTensor(*leaves, dense_shape=dense_shape)

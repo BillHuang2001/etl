@@ -56,6 +56,7 @@ from etl import backends
 from etl import core
 from etl.backends import CompiledArtifact, LoweredProgram
 from etl.core import first_mismatch_path, format_path
+from etl.core import tree as _core_tree
 from etl.trace import Graph
 from etl.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
@@ -895,30 +896,129 @@ def evaluate(fn, *args, backend=None, device=None, **options):
 
     Documented shorthand: derive a TensorSpec per concrete-tensor argument
     (snapshotting shape + dtype only), then build and run — no other
-    behavior. Arguments that are not concrete tensors raise TypeError::
+    behavior. Arguments that are not concrete tensors raise TypeError;
+    concrete sparse tensors (``etl.sparse`` COO/CSR/CSC) are accepted and
+    each derives a ``SparseTensorSpec`` instead::
 
         leaves, tree = core.flatten(args)
         specs = unflatten([TensorSpec(shape, dtype) for each leaf], tree)
         exe = build(fn, *specs, backend=backend, device=device, **options)
         return run(exe, *args)
     """
-    leaves, tree = core.flatten(args)
     spec_leaves = []
-    for index, leaf in enumerate(leaves):
-        if isinstance(leaf, core.Tensor):
-            tensor = leaf
-        elif isinstance(leaf, np.ndarray):
-            tensor = core.from_numpy(leaf)
-        else:
-            raise TypeError(
-                f"evaluate: arguments that are not concrete tensors raise "
-                f"TypeError — argument at flat leaf index {index} is "
-                f"{type(leaf).__name__}; pass core.Tensor/numpy ndarray "
-                f"values (and trace static values explicitly with etl.trace)"
+    leaf_index = 0  # flat leaf index in core.flatten(args) — error messages
+
+    def _specs_tree(x):
+        """Structure-recursive spec derivation — mirrors
+        ``core.tree._flatten_into`` (same node precedence and registry):
+        tensor leaves become ``core.TensorSpec``, concrete sparse tensors
+        become ``SparseTensorSpec`` via ``SparseTensorSpec.from_concrete``;
+        every other leaf raises the evaluate TypeError (with its flat leaf
+        index in ``core.flatten(args)``)."""
+        nonlocal leaf_index
+        # 1. Concrete tensor leaves (unchanged behavior).
+        if isinstance(x, core.Tensor):
+            leaf_index += 1
+            spec_leaves.append(
+                core.TensorSpec(shape=tuple(x.shape), dtype=x.dtype)
             )
-        spec_leaves.append(
-            core.TensorSpec(shape=tuple(tensor.shape), dtype=tensor.dtype)
+            return core.TreeSpec(type=None)
+        if isinstance(x, np.ndarray):
+            leaf_index += 1
+            tensor = core.from_numpy(x)
+            spec_leaves.append(
+                core.TensorSpec(shape=tuple(tensor.shape), dtype=tensor.dtype)
+            )
+            return core.TreeSpec(type=None)
+        # 2. Concrete sparse tensors (the base class covers COO/CSR/CSC —
+        #    SparseTensorSpec.from_concrete validates concreteness and raises
+        #    clear TypeErrors for spec/symbolic instances). Lazy import:
+        #    etl.sparse imports core/ir/trace/ops/transforms only, never
+        #    pipeline, so a function-local import cannot cycle.
+        from etl.sparse import SparseTensor, SparseTensorSpec
+
+        if isinstance(x, SparseTensor):
+            spec = SparseTensorSpec.from_concrete(x)
+            spec_children, spec_tree = core.flatten(spec)
+            spec_leaves.extend(spec_children)
+            leaf_index += len(core.flatten(x)[0])
+            return spec_tree
+        obj_type = type(x)
+        # 3. Registered custom pytree nodes (MRO walk — same registry and
+        #    order as core.tree._flatten_into; the sparse check above runs
+        #    first because SparseTensor is itself a registered node).
+        for base in obj_type.__mro__:
+            registered = _core_tree._PYTREE_NODE_REGISTRY.get(base)
+            if registered is not None:
+                flatten_fn, _ = registered
+                children, context = flatten_fn(x)
+                child_specs = tuple(_specs_tree(child) for child in children)
+                return core.TreeSpec(
+                    type=base, children=child_specs, context=context
+                )
+        # 4. namedtuple instances (checked before plain tuples).
+        if isinstance(x, tuple) and hasattr(obj_type, "_fields"):
+            child_specs = tuple(_specs_tree(child) for child in x)
+            return core.TreeSpec(
+                type=obj_type, children=child_specs, node_data=obj_type._fields
+            )
+        # 5. dataclass instances (never the class itself; etl's own dataclass
+        #    value types are leaves, like in core.tree._flatten_into).
+        if (
+            is_dataclass(x)
+            and not isinstance(x, type)
+            and not obj_type.__module__.split(".")[0] == "etl"
+        ):
+            fields = dataclasses.fields(x)
+            child_specs = tuple(
+                _specs_tree(getattr(x, field.name)) for field in fields
+            )
+            return core.TreeSpec(
+                type=obj_type,
+                children=child_specs,
+                node_data=[field.name for field in fields],
+            )
+        # 6. Plain containers: tuple, list, dict (keys sorted — same
+        #    unorderable-keys error as core.flatten).
+        if isinstance(x, tuple):
+            child_specs = tuple(_specs_tree(child) for child in x)
+            return core.TreeSpec(type=obj_type, children=child_specs)
+        if isinstance(x, list):
+            child_specs = tuple(_specs_tree(child) for child in x)
+            return core.TreeSpec(type=obj_type, children=child_specs)
+        if isinstance(x, dict):
+            try:
+                keys = sorted(x)
+            except TypeError:
+                # The raw sort TypeError must never leak: wrap it with the
+                # same guidance core.flatten gives.
+                type_names = []
+                for key in x:
+                    name = type(key).__name__
+                    if name not in type_names:
+                        type_names.append(name)
+                raise TypeError(
+                    f"flatten: cannot sort dict keys of mixed types (types: {type_names}); "
+                    "dict keys are sorted for deterministic tree structure — use keys of one "
+                    "type or register_pytree_node"
+                ) from None
+            child_specs = tuple(_specs_tree(x[key]) for key in keys)
+            if isinstance(x, collections.defaultdict):
+                node_data = (x.default_factory, keys)
+            else:
+                node_data = keys
+            return core.TreeSpec(
+                type=obj_type, children=child_specs, node_data=node_data
+            )
+        # 7. Any other leaf (static Python values) — traced explicitly.
+        raise TypeError(
+            f"evaluate: arguments that are not concrete tensors raise "
+            f"TypeError — argument at flat leaf index {leaf_index} is "
+            f"{obj_type.__name__}; pass core.Tensor/numpy ndarray "
+            f"values (and trace static values explicitly with etl.trace)"
         )
+
+    tree = _specs_tree(args)
     structured = core.unflatten(spec_leaves, tree)
     if not isinstance(structured, tuple):
         structured = (structured,)

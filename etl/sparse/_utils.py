@@ -1,4 +1,5 @@
-"""Internal helpers shared by the sparse frontend (``etl.sparse.ops``).
+"""Internal helpers shared by the sparse frontend (``etl.sparse.ops``) and
+the sparse transform rules (``etl.sparse.rules``).
 
 NOT part of the public API — nothing outside ``etl.sparse`` may import from
 this module. The helpers mirror the ``etl.dist`` frontend discipline
@@ -6,9 +7,12 @@ this module. The helpers mirror the ``etl.dist`` frontend discipline
 operand normalization with the mandated three-option ``TraceError``, and
 result wrapping that reads dtype/shape from the IR ``ValueType``.
 
-Import layering (binding, root CONTEXT.md): this module imports ``etl.core``
-and ``etl.ir`` only — never ``etl.backends`` / ``etl.pipeline`` /
-``etl.persist`` (``import etl`` must stay clean).
+Import layering (binding, root CONTEXT.md): this module imports ``etl.core``,
+``etl.ir``, ``etl.ops``, and ``etl.trace`` (active-builder hook) only — never
+``etl.backends`` / ``etl.pipeline`` / ``etl.persist`` (``import etl`` must
+stay clean). ``etl.ops`` / ``etl.trace`` are loaded before ``etl.sparse`` in
+``etl/__init__.py`` and import nothing from ``etl.sparse``, so the module
+level imports below cannot cycle.
 """
 from __future__ import annotations
 
@@ -20,6 +24,8 @@ import numpy as np
 
 from etl import core
 from etl import ir
+from etl import ops
+from etl.trace import current_builder
 
 from etl.sparse.value import is_sparse
 
@@ -28,6 +34,8 @@ __all__ = [
     "_require_symbolic_sparse",
     "_require_symbolic_dense",
     "_wrap_dense",
+    "_raw_reshape",
+    "_row_lookup",
 ]
 
 #: Absolute path of the ``etl`` package directory (frames inside it are
@@ -172,3 +180,92 @@ def _wrap_dense(value: Any, location: Any) -> "core.SymbolicTensor":
     if any(dim is None for dim in shape):
         object.__setattr__(result, "shape", tuple(shape))
     return result
+
+
+def _raw_reshape(value: Any, shape: tuple, location: Any = None) -> "core.SymbolicTensor":
+    """Build a raw ``reshape`` op into the active builder (dynamic-dim safe).
+
+    The frontend ``ops.reshape`` rejects target shapes that resolve to a
+    runtime-dynamic dim — a ``-1`` wildcard over a dynamic element count
+    (``SymbolicTensor`` cannot carry the inferred ``None`` dim) — but the IR
+    ``reshape`` op and the numpy kernel handle ``-1`` natively (inferred from
+    the element count at run time; the inferred dim stays ``None`` in the
+    result type). The sparse transform rules need exactly this to expand /
+    contract the runtime-dynamic ``nnz`` dim (e.g. ``(nnz, ndim)`` →
+    ``(nnz, 1, ndim)`` or ``(prod,)``).
+
+    Args:
+        value: An ``ir.Value`` (not a ``SymbolicTensor``).
+        shape: Target shape; may contain a single ``-1`` wildcard and/or
+            ``None`` entries (the latter just pass through the inferred
+            result type).
+
+    Returns:
+        A ``SymbolicTensor`` wrapping the reshape result (``None`` dims
+        preserved in ``.shape``, like :func:`_wrap_dense`).
+    """
+    op = current_builder().create(
+        "reshape", operands=(value,), attributes={"shape": tuple(shape)},
+        location=location,
+    )
+    return _wrap_dense(op.result, location)
+
+
+def _row_lookup(
+    input_indices: Any,
+    merged_indices: Any,
+    ndim: int,
+    location: Any = None,
+) -> tuple:
+    """For each row of ``input_indices``, its row position in
+    ``merged_indices``, plus a validity mask.
+
+    Used by the sparse vjp rules to pull a merged-values cotangent back to
+    each merge operand's values: ``sparse_add`` (union merge) and
+    ``sparse_multiply`` (intersection merge) produce merged indices that
+    contain every *surviving* input row exactly once, and
+    ``sparse_transpose`` reorders rows 1:1 — in all three cases each input
+    row's contribution to the merged cotangent is the merged cotangent entry
+    at the input row's position in the merged indices (zero where the row is
+    absent from the merge, i.e. ``sparse_multiply``).
+
+    The lookup is built from ordinary ``etl.ops`` (all dynamic-dim safe):
+
+    - expand both index tensors to rank 3 via raw ``-1``-wildcard reshapes:
+      ``(nnz_in, 1, ndim)`` vs ``(1, nnz_m, ndim)``;
+    - elementwise ``equal`` (broadcast) -> ``(nnz_in, nnz_m, ndim)`` bool;
+    - ``reduce_all`` over the coord axis = ``reduce_sum(cast(bool, int64),
+      axes=(-1,)) == ndim`` -> ``(nnz_in, nnz_m)`` bool row-match matrix;
+    - ``argmax`` over the merged axis -> the position (0 when absent);
+    - the mask = ``reduce_sum(match, axes=(1,)) > 0`` (the ``where`` arm).
+
+    O(nnz_in * nnz_m) in space — acceptable for the vjp rules (documented).
+
+    Args:
+        input_indices: The input sparse indices ``ir.Value`` ``(nnz, ndim)``.
+        merged_indices: The merged sparse indices ``ir.Value``
+            ``(nnz_m, ndim)``.
+        ndim: The (static) coordinate count.
+        location: Optional ``ir.Location`` for the emitted ops.
+
+    Returns:
+        ``(positions, mask)`` — two ``SymbolicTensor``s of shape ``(nnz,)``:
+        ``positions`` is int64 (the merged row of each input row, 0 when
+        absent), ``mask`` is bool (True where the input row exists in the
+        merged indices).
+    """
+    a = _raw_reshape(input_indices, (-1, 1, ndim), location)
+    b = _raw_reshape(merged_indices, (1, -1, ndim), location)
+    eq = ops.equal(a, b)  # (nnz_in, nnz_m, ndim) bool
+    match_int = ops.reduce_sum(ops.cast(eq, np.dtype("int64")), axes=(-1,))
+    match = ops.equal(match_int, ndim)  # (nnz_in, nnz_m) bool
+    positions = ops.argmax(match, axis=1)  # (nnz_in,) int64
+    # mask must be based on FULL row matches (the `match` matrix), not the
+    # per-coordinate counts: an input row absent from the merged indices can
+    # still share individual coordinates with different merged rows (e.g. the
+    # intersection merge of sparse_multiply), which would make the sum of
+    # per-coordinate counts positive.
+    mask = ops.greater(
+        ops.reduce_sum(ops.cast(match, np.dtype("int64")), axes=(1,)), 0
+    )  # (nnz_in,) bool
+    return positions, mask
