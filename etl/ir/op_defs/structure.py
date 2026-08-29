@@ -274,14 +274,15 @@ def _register_structural_ops() -> None:
                     name="shift",
                     type=ATTR_INTS,
                     description="Per-axis shift amounts (tuple; a single int "
-                    "is normalized to a tuple frontend-side).",
+                    "is normalized to a tuple frontend-side; with axis=None "
+                    "a tuple folds to its sum — numpy flat-roll semantics).",
                 ),
                 AttrSpec(
                     name="axis",
-                    type=ATTR_INT,
+                    type=ATTR_ANY,
                     default=None,
-                    description="Axis or axes to roll along (None = flattened "
-                    "roll; a single int rolls only that axis).",
+                    description="Axis, tuple of axes, or None (flattened "
+                    "roll).",
                 ),
             ),
             shape_fn=infer_identity,

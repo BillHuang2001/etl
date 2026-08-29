@@ -16,7 +16,7 @@ from ..inference import (
     infer_elementwise_binary,
     infer_elementwise_unary,
 )
-from . import ATTR_DTYPE, ATTR_FLOAT, AttrSpec, OpDef, register_opdef
+from . import ATTR_ANY, ATTR_DTYPE, AttrSpec, OpDef, register_opdef
 
 _CATEGORY = "elementwise"
 
@@ -160,23 +160,25 @@ def _register_nan_to_num() -> None:
             attributes=(
                 AttrSpec(
                     name="nan",
-                    type=ATTR_FLOAT,
+                    type=ATTR_ANY,
                     default=0.0,
-                    description="Replacement for NaN entries.",
+                    description="Replacement for NaN entries (int or float).",
                 ),
                 AttrSpec(
                     name="posinf",
-                    type=ATTR_FLOAT,
+                    type=ATTR_ANY,
                     default=None,
-                    description="Replacement for +inf entries (None = keep; "
-                    "default semantics per numpy: max finite of the dtype).",
+                    description="Replacement for +inf entries (int/float; "
+                    "None = keep, i.e. the numpy default of the dtype's max "
+                    "finite value).",
                 ),
                 AttrSpec(
                     name="neginf",
-                    type=ATTR_FLOAT,
+                    type=ATTR_ANY,
                     default=None,
-                    description="Replacement for -inf entries (None = keep; "
-                    "default semantics per numpy: min finite of the dtype).",
+                    description="Replacement for -inf entries (int/float; "
+                    "None = keep, i.e. the numpy default of the dtype's min "
+                    "finite value).",
                 ),
             ),
             shape_fn=infer_elementwise_unary,
