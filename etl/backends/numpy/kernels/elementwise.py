@@ -278,10 +278,28 @@ _UNARY_OPS = {
     "sin": np.sin,
     "cos": np.cos,
     "tan": np.tan,
+    "acos": np.arccos,
     "tanh": np.tanh,
     "sign": np.sign,
     "logical_not": np.logical_not,
 }
+def _rounding(np_fn: Callable[..., Any]) -> Callable[..., core.Tensor]:
+    """Kernel factory for the rounding family (``floor``/``ceil``/``round``).
+    Numpy defines no rounding of complex numbers (raises TypeError); the etl
+    contract requires an explicit ``core.BackendError`` naming the op instead
+    (matching the ``_max_min`` complex-rejection precedent).
+    """
+    def kernel(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+        (x,) = operands
+        x_arr = x.numpy()
+        _check_supported(op.name, x_arr)
+        if x_arr.dtype.kind == "c":
+            raise core.BackendError(
+                f"op '{op.name}': complex input is not supported (numpy "
+                "defines no rounding for complex numbers)"
+            )
+        return core.Tensor(np.asarray(np_fn(x_arr)))
+    return kernel
 
 
 def register_kernels(table: dict) -> None:
@@ -300,6 +318,9 @@ def register_kernels(table: dict) -> None:
     table["sigmoid"] = _sigmoid
     table["relu"] = _relu
     table["gelu"] = _gelu
+    table["floor"] = _rounding(np.floor)
+    table["ceil"] = _rounding(np.ceil)
+    table["round"] = _rounding(np.round)
     table["cast"] = _cast
     table["select"] = _select
     table["broadcast"] = _broadcast

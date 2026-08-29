@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from ..effects import EFFECT_PURE
-from ..inference import infer_conv, infer_dot, infer_identity, infer_solve
+from ..inference import (
+    infer_conv,
+    infer_diagonal,
+    infer_dot,
+    infer_identity,
+    infer_solve,
+)
 from . import (
     ATTR_ANY,
     ATTR_BOOL,
@@ -115,6 +121,57 @@ def _register_linalg() -> None:
                 ),
             ),
             shape_fn=infer_identity,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="sort",
+            category=_CATEGORY,
+            description="Sort along an axis in ascending order (numpy semantics).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="axis",
+                    type=ATTR_INT,
+                    default=-1,
+                    description="Sort axis (numpy convention).",
+                ),
+            ),
+            shape_fn=infer_identity,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="diagonal",
+            category=_CATEGORY,
+            description="Extract the (axis1, axis2) diagonal with an offset "
+            "(numpy semantics); the diagonal becomes a new last axis.",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="offset",
+                    type=ATTR_INT,
+                    default=0,
+                    description="Diagonal offset (numpy convention).",
+                ),
+                AttrSpec(
+                    name="axis1",
+                    type=ATTR_INT,
+                    default=0,
+                    description="First diagonal axis.",
+                ),
+                AttrSpec(
+                    name="axis2",
+                    type=ATTR_INT,
+                    default=1,
+                    description="Second diagonal axis.",
+                ),
+            ),
+            shape_fn=infer_diagonal,
         )
     )
     register_opdef(

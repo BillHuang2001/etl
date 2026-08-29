@@ -469,6 +469,25 @@ def _solve(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     return core.Tensor(result)
 
 
+def _sort(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``sort``: ascending sort along the ``axis`` attribute (numpy
+    ``np.sort`` semantics; dtype and shape preserved)."""
+    (x,) = operands
+    x_arr = x.numpy()
+    _check_dtypes("sort", x_arr)
+    axis = op.attributes["axis"]
+    return core.Tensor(np.sort(x_arr, axis=axis))
+def _diagonal(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``diagonal``: extract the (``axis1``, ``axis2``) diagonal with an
+    ``offset`` (numpy ``np.diagonal`` semantics; dtype preserved)."""
+    (x,) = operands
+    x_arr = x.numpy()
+    _check_dtypes("diagonal", x_arr)
+    attrs = op.attributes
+    return core.Tensor(
+        np.diagonal(x_arr, offset=attrs["offset"], axis1=attrs["axis1"],
+                    axis2=attrs["axis2"])
+    )
 def register_kernels(table: dict) -> None:
     """Register this module's linalg kernels into the dispatch table.
 
@@ -478,3 +497,5 @@ def register_kernels(table: dict) -> None:
     table["dot"] = _dot
     table["conv"] = _conv
     table["solve"] = _solve
+    table["sort"] = _sort
+    table["diagonal"] = _diagonal

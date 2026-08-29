@@ -348,6 +348,30 @@ def tan(x) -> "core.SymbolicTensor":
     return _unary("tan", x, math=True)
 
 
+def acos(x) -> "core.SymbolicTensor":
+    """Elementwise arccosine. Integer/bool input → ``float64``; float keeps
+    dtype. Shape preserved."""
+    return _unary("acos", x, math=True)
+
+
+def floor(x) -> "core.SymbolicTensor":
+    """Elementwise floor (numpy semantics; integer input is unchanged).
+    Shape and dtype preserved."""
+    return _unary("floor", x)
+
+
+def ceil(x) -> "core.SymbolicTensor":
+    """Elementwise ceiling (numpy semantics; integer input is unchanged).
+    Shape and dtype preserved."""
+    return _unary("ceil", x)
+
+
+def round(x) -> "core.SymbolicTensor":
+    """Elementwise round-half-to-even (numpy ``round`` semantics; integer
+    input is unchanged). Shape and dtype preserved."""
+    return _unary("round", x)
+
+
 def tanh(x) -> "core.SymbolicTensor":
     """Elementwise hyperbolic tangent. Integer/bool input → ``float64``;
     float keeps dtype. Shape preserved."""

@@ -1,7 +1,7 @@
 """etl.ops — frontend tensor operations.
 
 Every numerical op that can appear in an EvoXIR graph. This module defines
-the full public op surface (67 functions), the unified operand/construction/
+the full public op surface (79 functions), the unified operand/construction/
 inference semantics (see this directory's ``CONTEXT.md`` — binding), and the
 ``SymbolicTensor`` operator handlers registered into ``etl.core`` at import
 time.
@@ -41,9 +41,10 @@ from . import reductions
 
 # Elementwise arithmetic / math / bitwise.
 from .elementwise import (  # noqa: F401
-    abs, add, bitwise_and, bitwise_or, bitwise_xor, cast, cos, divide, erf,
-    exp, gelu, log, log1p, maximum, minimum, multiply, negate, power, relu,
-    remainder, sign, sigmoid, sin, sqrt, square, subtract, tan, tanh,
+    abs, acos, add, bitwise_and, bitwise_or, bitwise_xor, cast, ceil, cos,
+    divide, erf, exp, floor, gelu, log, log1p, maximum, minimum, multiply,
+    negate, power, relu, remainder, round, sign, sigmoid, sin, sqrt, square,
+    subtract, tan, tanh,
 )
 
 # Comparison / logical / selection.
@@ -64,7 +65,13 @@ from .reductions import (  # noqa: F401
 )
 
 # Linalg.
-from .linalg import conv, cumsum, dot, solve, tril, triu  # noqa: F401
+from .linalg import (  # noqa: F401
+    conv, cumsum, diagonal, dot, norm, solve, sort, trace, tril, triu,
+)
+
+# Statistics (documented compositions over ordinary ops — no dedicated IR ops).
+from . import stats  # noqa: F401
+from .stats import median, nansum, std, var  # noqa: F401
 
 # Constants / escape hatches.
 from .constant import constant, runtime_call, stop_gradient  # noqa: F401
@@ -76,8 +83,9 @@ __all__ = [
     # elementwise
     "add", "subtract", "multiply", "divide", "power", "remainder",
     "maximum", "minimum", "abs", "negate", "square", "sqrt", "exp", "log",
-    "log1p", "sin", "cos", "tan", "tanh", "sigmoid", "relu", "gelu", "erf",
-    "sign", "cast", "bitwise_and", "bitwise_or", "bitwise_xor",
+    "log1p", "sin", "cos", "tan", "acos", "floor", "ceil", "round", "tanh",
+    "sigmoid", "relu", "gelu", "erf", "sign", "cast", "bitwise_and",
+    "bitwise_or", "bitwise_xor",
     # comparison / logical / selection
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "logical_and", "logical_or", "logical_not", "select",
@@ -88,7 +96,10 @@ __all__ = [
     "reduce_sum", "reduce_max", "reduce_min", "reduce_mean", "reduce_prod",
     "sum", "max", "min", "mean", "prod", "argmax", "argmin",
     # linalg
-    "dot", "conv", "tril", "triu", "cumsum", "solve",
+    "dot", "conv", "tril", "triu", "cumsum", "solve", "sort", "diagonal",
+    "trace", "norm",
+    # statistics
+    "var", "std", "median", "nansum",
     # constants / escape hatches
     "constant", "runtime_call", "stop_gradient",
 ]

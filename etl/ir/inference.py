@@ -815,6 +815,46 @@ def infer_identity(
     ``stop_gradient``, identity collectives, ``while``): each result mirrors
     the corresponding operand type exactly."""
     return tuple(input_types)
+def infer_diagonal(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``diagonal``: numpy ``np.diagonal`` semantics — the two
+    diagonal axes (``axis1``/``axis2``) are removed (remaining dims keep
+    their order) and the diagonal is appended as a NEW LAST axis of length
+    ``max(0, min(n, m - offset) - max(0, -offset))`` where ``n``/``m`` are
+    the extents of ``axis1``/``axis2`` (DimExpr arithmetic keeps symbolic
+    dims symbolic; the numpy kernel enforces at runtime). Dtype preserved.
+    """
+    t = _one(input_types, "diagonal")
+    rank = len(t.shape)
+    if rank < 2:
+        raise ShapeError(
+            f"diagonal: input must have rank >= 2, got rank {rank}"
+        )
+    offset = attributes["offset"]
+    axis1 = _normalize_axis(attributes["axis1"], rank, "diagonal.axis1")
+    axis2 = _normalize_axis(attributes["axis2"], rank, "diagonal.axis2")
+    if axis1 == axis2:
+        raise ShapeError("diagonal: axis1 and axis2 must be different")
+    n, m = t.shape[axis1], t.shape[axis2]
+
+    def _dim_min(a: Any, b: Any) -> Any:
+        if isinstance(a, int) and isinstance(b, int):
+            return min(a, b)
+        return DimExpr("min", a, b)
+
+    def _dim_max(a: Any, b: Any) -> Any:
+        if isinstance(a, int) and isinstance(b, int):
+            return max(a, b)
+        return DimExpr("max", a, b)
+
+    # Valid diagonal entries are (i, i + offset) with 0 <= i < n and
+    # 0 <= i + offset < m, i.e. i in [max(0, -offset), min(n, m - offset)).
+    diag_len = _dim_max(_dim_min(n, m - offset) - max(0, -offset), 0)
+    out_shape = tuple(
+        d for i, d in enumerate(t.shape) if i not in (axis1, axis2)
+    )
+    return (ValueType(t.dtype, out_shape + (diag_len,)),)
 
 
 def infer_dot(
