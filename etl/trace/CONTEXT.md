@@ -290,3 +290,32 @@ Graph save/load round-trips through the persist container.
   `type`/`node_data`/children only), so aux-bearing nodes get no automatic
   run-time aux-equality validation via `Graph.flatten_inputs` — aux equality
   must be checked explicitly or the aux must live as static leaves.
+  Registered-node support in `control_flow.py` (generic — it NEVER imports
+  the registering module, e.g. `etl.sparse`; `_is_registered_node` /
+  `_leaf_registered_flags` walk the registry only):
+  (a) **cond registered-node rule** — a registered-node operand is flattened
+  via `_flatten`; its tensor leaves are captured as `if`-op operands (bound
+  to region entry args) and rebuilt per the node's tree inside `_run_branch`,
+  its static leaves pass through unchanged; every operand leaf must be a
+  `SymbolicTensor` or a static value (else `TraceError`). Branch outputs may
+  carry static leaves ONLY inside registered nodes; such leaves must be
+  equal across branches (mirroring `while_loop`'s static-leaf semantics) —
+  bare static output leaves (top-level or in plain containers) still raise
+  the old `TraceError` ("branches yield tensors only"). The `if` op's
+  `result_types`/results stay tensor-leaves only; static positions are
+  re-inserted at unflatten.
+  (b) **while shape-unify rule** — `while_loop`'s trace-time shape check is
+  positional (`_shapes_compatible`): same rank; per position equal entries
+  pass, and a `None` (runtime-dynamic) on ONE side passes when the other
+  side is a symbolic `core.Dim`/`core.DimExpr` (sparse nnz: the traced
+  input's `Dim("_dynamic_...")` wrapper vs the sparse-op result's true
+  `None`); the INIT (loop-carried) type wins — the while-op result types
+  mirror the operand/IR types carrying the true `None`, and the numpy
+  interpreter treats `None` result dims as unchecked. Int-vs-Dim, different
+  ints, Dim-vs-Dim, and rank mismatches still raise `core.ShapeError`.
+  (c) **scan with sparse** — a sparse CARRY (init with tensor + static
+  leaves) works via the `while_loop` desugar (step-0/carry leaf validation
+  accepts ST-or-static leaves; `while_loop` carries the node generically);
+  sparse `xs` and sparse `y` stacking remain v1 deferrals with explicit
+  `TraceError`s ("xs leaf i must be a core.SymbolicTensor" /
+  "f's y outputs must be SymbolicTensors") — no sparse scatter/stack path.
