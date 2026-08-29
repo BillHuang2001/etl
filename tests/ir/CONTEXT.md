@@ -4,21 +4,21 @@
 
 pytest suite validating the `etl.ir` package (sibling — the contract lives in
 `../etl/ir/CONTEXT.md`, read it before touching these tests). These tests are
-the executable spec of the IR layer: the op registry (canonical 75-op v1 set),
+the executable spec of the IR layer: the op registry (canonical 105-op v1 set),
 `verify()` invariants, serialization round-trips/integrity, `pretty_print`
 golden output, the `Builder`, shape-inference hooks, and the SSA data model.
-728 tests, all fast (whole file set runs <2s).
+803 tests, all fast (whole file set runs <2s).
 
 ## Test files
 
 | File | Covers |
 |---|---|
-| `test_registry.py` | 75-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_registry.py` | 105-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
 | `test_verify.py` | valid modules + one test per violation class from `verify()`'s docstring: module/function/region/op/SSA/use-bookkeeping/shape_fn-agreement/attr-schema violations, location-annotated messages, TypeError on non-Module |
 | `test_serialize.py` | payload schema, multi-feature round-trips (symbolic dims, constants as base64 npy, all effect kinds, if/while regions, multi-function + `call`), original id preservation, fast-forwarded counters, tamper detection (sha256), version/format rejection (PersistenceError) |
 | `test_pretty_print.py` | exact-string goldens: SSA headers, %N renumbering, attribute rendering (sorted keys, `?` for None, ndarray summaries), locations, multi-arg header wrapping, nested `^bbN` region labels |
 | `test_builder.py` | Builder contracts: eager arity/attr/region validation, result-type resolution order (explicit → shape_fn → op-specific), attribute normalization (dtype→name string, lists→tuples, nullable-int rule), insertion-point stack, set_terminator rules, per-module id counters |
-| `test_inference.py` | all 23 shape-inference hooks: static + symbolic (`Dim`/`DimExpr`) + `None` dims, numpy dtype promotion/reduction rules, ShapeError/ValueError cases, world-group collectives (group_size=None → None dims) |
+| `test_inference.py` | 23 of the 49 shape-inference hooks (the argsort/tile/diag/random/sparse-era hooks are not exercised here): static + symbolic (`Dim`/`DimExpr`) + `None` dims, numpy dtype promotion/reduction rules, ShapeError/ValueError cases, world-group collectives (group_size=None → None dims) |
 | `test_model.py` | structural attrs of Module/Function/Region/Block/Op/Value/Use/ValueType/Location/effects, use-def chains, RAUW (`replace_all_uses_with`), Dim/DimExpr interop |
 
 ## Known etl bugs
@@ -41,7 +41,7 @@ Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
   in `test_verify.py` need fake ops (`_test_halt`, `_test_no_rule`); they are
   registered by the `test_only_opdefs` fixture, which restores the registry to
   its exact pre-fixture state in a `finally` (pops from `etl.ir.op_defs._REGISTRY`).
-  Import-time registration broke `test_registry.py`'s canonical-75 assertions
+  Import-time registration broke `test_registry.py`'s canonical-set assertions
   when the two files ran in one pytest process.
 - Test modules must NOT import each other's helpers; keep fixtures/helpers local
   to each file (avoids cross-file coupling and ordering hazards).

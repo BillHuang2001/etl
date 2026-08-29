@@ -81,12 +81,14 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./shapes.py` | `evaluate_dim_expr` / `evaluate_shape` — runtime `Dim`/`DimExpr` evaluation (shape-rule reuse) |
 | `./kernels/__init__.py` | `KERNEL_TABLE`, `dispatch(op_name)`, `register_all()` (idempotent) — the kernel contract is documented in this module's docstring and is binding for all category modules |
 | `./kernels/elementwise.py` | add/subtract/multiply/divide/power/remainder/maximum/minimum/abs/negate/square/sqrt/exp/log/log1p/sin/cos/tan/tanh/sigmoid/relu/gelu/erf/sign/bitwise_*/logical_*/cast/equal/not_equal/less/less_equal/greater/greater_equal/select/broadcast/stop_gradient |
-| `./kernels/reductions.py` | reduce_* family (reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod), argmax/argmin (cumsum moved out to indexing.py) |
+| `./kernels/reductions.py` | reduce_* family (reduce_sum/reduce_max/reduce_min/reduce_mean/reduce_prod), argmax/argmin, cumprod (cumsum moved out to indexing.py) |
 | `./kernels/indexing.py` | reshape/transpose/slice/gather/scatter/concatenate/pad/tril/triu/cumsum |
 | `./kernels/linalg.py` | dot/conv/solve |
 | `./kernels/control_flow.py` | if/while/call — recursive region execution (the `return` terminator is special-cased by the interpreter loop, never dispatched) |
 | `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
 | `./kernels/random.py` | the 6 `random_*` kernels (etl.random family): SplitMix64-based, pure/deterministic — same key ⇒ bit-identical values across runs |
+| `./kernels/sorting.py` | sort/argsort — np-exact |
+| `./kernels/structural.py` | tile/flip/roll/diag + nan_to_num — np-exact |
 | `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
 | `./kernels/sparse.py` | the 16 sparse kernels: `sparse_from_dense`/`sparse_to_dense`, coo↔csr / coo↔csc conversions, `sparse_negate`/`add`/`multiply`/`multiply_dense`, `sparse_reduce_sum`, `sparse_transpose`, `sparse_reshape`, `sparse_concatenate`, `sparse_dot_dense`/`dense_dot_sparse` — batched via per-batch loops with lex-max stored-zero padding to a common nnz; shared values-aware canonical validation (see Notes for agents) |
 
@@ -105,7 +107,7 @@ Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from 
 
 ## Notes for agents
 
-- **Kernel dispatch coverage (complete)**: all 90 non-`return` IR op names are registered in `KERNEL_TABLE` (74 pre-sparse ops + the 16 sparse ops — elementwise 40, reductions 7, indexing 10, linalg 3, control_flow 3, collective 8, custom 3; the registry holds 91 op defs incl. `return`); the `return` terminator is special-cased by the interpreter loop and is never dispatched. `register_all()` is idempotent; duplicate keys across category modules ⇒ `BackendError`.
+- **Kernel dispatch coverage (complete)**: all 104 non-`return` IR op names are registered in `KERNEL_TABLE` (88 non-sparse ops + the 16 sparse ops — elementwise 40, reductions 8, indexing 10, linalg 3, sorting 2, structural 5, control_flow 3, collective 8, custom 3, random 6; the registry holds 105 op defs incl. `return`); the `return` terminator is special-cased by the interpreter loop and is never dispatched. `register_all()` is idempotent; duplicate keys across category modules ⇒ `BackendError`.
 - **Sparse kernels (16 ops, `kernels/sparse.py`)** — key contracts for frontends and future agents:
   - **Values-aware canonical validation** (shared `_validate_canonical` + `_check_segment_sorted`): sorted/unique/in-range is enforced, BUT adjacent duplicate rows/segment entries are TOLERATED when at least one of the two values is 0 (stored zeros — this is what makes batched `sparse_from_dense`'s lex-max stored-zero padding legal). Duplicate NONZERO rows always raise `ShapeError`. All consumers handle stored-zero duplicates correctly (add.at / merge collapse / intersect1d first-occurrence).
   - **Batched `sparse_from_dense`** pads each batch element to the common max nnz with lex-max stored-zero rows; consumers see `(B..., nnz_max, ndim)`.

@@ -96,7 +96,8 @@ def arange(start, stop=None, step=1, dtype=None):
     v1: start/stop/step must be concrete Python numbers at trace time (they
     specialize the graph); symbolic bounds raise TraceError and are deferred
     to v2 (see CONTEXT.md). dtype=None → numpy's own inference over the
-    concrete bounds. linspace is deferred to v2.
+    concrete bounds. For evenly spaced values with a given count, use
+    `etl.linspace` (Constant-op composition; float64 default dtype).
     """
     for name, value in (("start", start), ("stop", stop), ("step", step)):
         if isinstance(value, (core.Dim, core.DimExpr)):
