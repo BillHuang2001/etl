@@ -75,6 +75,7 @@ Details: `core` imports nothing from etl (numpy only). `ir` imports `core`. `ops
 - `transforms`: `vectorize`, `vmap`, `grad`, `jvp`, `vjp` — graph→graph.
 - `backends`: `Backend` interface (`lower`/`compile`/`load`/capabilities), registry (lazy activation of optional adapters), numpy interpreter backend (default, CPU), stablehlo exporter (MLIR text — also the shared lowering input for compiler backends), and pluggable compiler adapters `iree` / `xla` (PJRT C API via ctypes — user-provided plugin `.so`, no jax/jaxlib) / `tvm` (jaxlib only for its bundled MLIR bindings — the `jax` package is never imported) in `etl.backends.adapters` — optional, activated by `lower(..., backend="iree"|"xla"|"tvm")`, explicit errors when absent (pip hints for iree/tvm; `ETL_PJRT_PLUGIN`/`plugin_path` guidance for xla).
 - `dist`: `group`, collectives (`all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `collective_permute`), `rank`/`world_size` graph scalars.
+- `sparse`: sparse tensor value model + 16 graph ops + per-op batching/vjp/jvp rules — full surface in `./etl/CONTEXT.md`; numpy-backend-only in v1 (compiler backends defer explicitly).
 - `pipeline`: `LoweredProgram`, `CompiledArtifact`, `lower`, `compile`, `load`, `run`, `bind`, `build`, `evaluate`.
 - `persist`: versioned/self-describing/integrity-checked save-load container, explicit `Cache`.
 
