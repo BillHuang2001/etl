@@ -104,6 +104,7 @@ Planned tests live in `../../tests/backends/numpy/` (sibling — read-only from 
 
 ## Notes for agents
 
+- **Kernel dispatch coverage (complete)**: all 90 non-`return` IR op names are registered in `KERNEL_TABLE` (75 pre-sparse ops + the 16 sparse ops; the registry holds 91 op defs incl. `return`); the `return` terminator is special-cased by the interpreter loop and is never dispatched. `register_all()` is idempotent; duplicate keys across category modules ⇒ `BackendError`.
 - **Sparse kernels (16 ops, `kernels/sparse.py`)** — key contracts for frontends and future agents:
   - **Values-aware canonical validation** (shared `_validate_canonical` + `_check_segment_sorted`): sorted/unique/in-range is enforced, BUT adjacent duplicate rows/segment entries are TOLERATED when at least one of the two values is 0 (stored zeros — this is what makes batched `sparse_from_dense`'s lex-max stored-zero padding legal). Duplicate NONZERO rows always raise `ShapeError`. All consumers handle stored-zero duplicates correctly (add.at / merge collapse / intersect1d first-occurrence).
   - **Batched `sparse_from_dense`** pads each batch element to the common max nnz with lex-max stored-zero rows; consumers see `(B..., nnz_max, ndim)`.
