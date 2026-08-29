@@ -226,7 +226,7 @@ in `printer.py`.
 | `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective, sparse) |
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
-| `./inference.py` | Shape-inference hooks referenced by OpDefs (39 hooks, implemented) |
+| `./inference.py` | Shape-inference hooks referenced by OpDefs (39 hooks, implemented; ~1400 lines — legitimately long, one hook module for all categories; split only if it grows much further) |
 | `./op_defs/sparse.py` | Sparse op defs: 16 ops (from_dense/to_dense, coo/csr/csc conversions, negate, add, multiply, multiply_dense, reduce_sum, transpose, reshape, concatenate, dot variants), all pure |
 | `./builder.py` | Op-construction API (implemented) |
 | `./verify.py` | Structural/type/attribute verification (implemented) |
