@@ -28,8 +28,10 @@ Canonical forms (binding; violations raise ``core.ShapeError`` /
 ``core.DTypeError``, never silent):
 
 - **COO** — ``indices`` is 2-D ``(nnz, ndim)`` with ``ndim ==
-  len(dense_shape)``; rows are lex-sorted (leftmost column first), strictly
-  unique, and in-range ``0 <= idx[d] < dense_shape[d]``.
+  len(dense_shape)``; rows are lex-sorted (leftmost column first), in-range
+  ``0 <= idx[d] < dense_shape[d]``, and unique — VALUES-AWARE: a duplicate
+  row pair is an error only when both of its values are nonzero (duplicate
+  pairs with a stored zero are legal, matching the runtime kernels).
 - **CSR** — rank-2 ``(rows, cols)``; ``indptr`` is ``(rows+1,)`` int64,
   monotone non-decreasing, ``indptr[0] == 0``, ``indptr[-1] == nnz``;
   per-row column indices are sorted and strictly increasing, in-range.
@@ -209,8 +211,11 @@ def _axis_bound(shape_entry, nnz, axis, class_name):
 
 
 def _validate_coo(indices, values, dense_shape, class_name):
-    """Canonical COO validation: ``(nnz, ndim)`` int64 lex-sorted unique
-    in-range rows and ``(nnz,)`` values."""
+    """Canonical COO validation: ``(nnz, ndim)`` int64 lex-sorted in-range
+    rows and ``(nnz,)`` values. Uniqueness is VALUES-AWARE: a duplicate row
+    pair is an error only when both of its values are nonzero; a duplicate
+    pair with a stored zero is legal (stored zeros are semantically inert,
+    matching the values-aware runtime kernels)."""
     indices = _normalize_index_leaf(indices, "indices", class_name)
     values = _validate_values_leaf(values, class_name)
     indices_arr = indices.numpy() if isinstance(indices, core.Tensor) else indices
@@ -250,11 +255,19 @@ def _validate_coo(indices, values, dense_shape, class_name):
             f"{class_name}: COO indices must be lex-sorted in row-major order "
             "(leftmost column first)"
         )
-    # Strictly unique rows (adjacent comparison is valid after the sort check).
-    if nnz > 1 and np.any(np.all(indices_arr[1:] == indices_arr[:-1], axis=1)):
-        raise core.ShapeError(
-            f"{class_name}: COO indices must be unique (no duplicate rows)"
-        )
+    # Values-aware uniqueness (adjacent comparison is valid after the sort
+    # check): a duplicate row raises only when BOTH values of the duplicate
+    # pair are nonzero — a duplicate pair with a stored zero is legal
+    # (stored zeros are semantically inert, matching the values-aware runtime
+    # kernels).
+    if nnz > 1:
+        dup = np.all(indices_arr[1:] == indices_arr[:-1], axis=1)
+        if np.any(dup):
+            both_nonzero = (values_arr[1:] != 0) & (values_arr[:-1] != 0)
+            if np.any(dup & both_nonzero):
+                raise core.ShapeError(
+                    f"{class_name}: COO indices must be unique (no duplicate rows)"
+                )
     return indices, values
 
 
