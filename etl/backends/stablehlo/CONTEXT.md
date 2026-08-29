@@ -24,7 +24,7 @@ Direct mnemonics (etl op → StableHLO, emitted with `stablehlo.` prefix):
 |---|---|---|
 | ELEMENTWISE_MAP | add/subtract/multiply/divide/power/remainder/maximum/minimum | `stablehlo.add/subtract/multiply/divide/power/remainder/maximum/minimum` |
 | ELEMENTWISE_MAP | abs/negate/sqrt/sign | `stablehlo.abs/negate/sqrt/sign` |
-| ELEMENTWISE_MAP | exp/log/log1p/sin/cos/tan/tanh/sigmoid/erf | `stablehlo.exponential/log/log_plus_one/sine/cosine/tan/tanh/logistic/erf` |
+| ELEMENTWISE_MAP | exp/log/log1p/sin/cos/tan/tanh/sigmoid | `stablehlo.exponential/log/log_plus_one/sine/cosine/tan/tanh/logistic` |
 | ELEMENTWISE_MAP | bitwise_and/or/xor; logical_and/or/not | `stablehlo.and/or/xor/not` |
 | ELEMENTWISE_MAP | cast | `stablehlo.convert` |
 | COMPARISON_MAP | equal/not_equal/less/less_equal/greater/greater_equal | `stablehlo.compare` + `comparison_direction` attr (EQ/NE/LT/LE/GT/GE) |
