@@ -85,6 +85,7 @@ def register_all() -> None:
         elementwise,
         indexing,
         linalg,
+        random,
         reductions,
         sparse,
     )
@@ -98,6 +99,7 @@ def register_all() -> None:
         control_flow,
         collective,
         custom,
+        random,
     ):
         staging: dict[str, Callable[..., Any]] = {}
         module.register_kernels(staging)

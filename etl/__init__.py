@@ -202,6 +202,9 @@ from .numpy import arange  # noqa: F401  (GRAPH creation op — same object as
 # enp.arange; top-level etl.zeros/ones/full/empty are the CONCRETE core
 # creators, arange has no concrete counterpart)
 
+# --- Key-based functional RNG (etl.random) ----------------------------------
+from . import random  # noqa: F401  (submodule; the etl.random API surface)
+
 # --- Persistence / cache (etl.persist) -------------------------------------
 from . import persist  # noqa: F401
 from .persist import Cache, FileCache  # noqa: F401

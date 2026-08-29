@@ -1034,6 +1034,146 @@ def infer_scalar_int64(
 
 
 # ---------------------------------------------------------------------------
+# Random hooks (referenced by the random.py OpDefs)
+#
+# Key-based functional RNG (etl.random): every random op is PURE and a
+# deterministic function of its key operand (a rank-0 int64 tensor). The
+# result dtype comes from the ``dtype`` attribute; the result shape is the
+# symbolic broadcast of the ``shape`` attribute with the broadcastable
+# parameter operands (low/high/mean/std), matching the numpy kernels' natural
+# broadcasting (the interpreter validates the runtime output against these
+# declared types). ``random_permutation``'s length is a runtime operand, so
+# its result dim is ``None`` (runtime-dynamic, unchecked). Shape functions
+# validate arity and the key operand type so IR-level construction errors are
+# caught here, not at run time.
+# ---------------------------------------------------------------------------
+def _check_random_key(t: ValueType, name: str) -> None:
+    """Validate one key operand type (rank-0 int64)."""
+    if t.dtype != np.dtype("int64") or t.shape != ():
+        raise ShapeError(
+            f"{name}: key must be a rank-0 int64 tensor, got "
+            f"dtype={t.dtype} shape={t.shape}"
+        )
+
+
+def _random_broadcast_shape(
+    input_types: tuple[ValueType, ...],
+    attributes: dict[str, Any],
+    name: str,
+) -> tuple:
+    """Broadcast of the ``shape`` attribute against the parameter operands.
+
+    ``input_types`` = (key, param_1, ..., param_k) — every non-key operand
+    shape participates (low/high/mean/std are broadcastable against the
+    requested shape, matching the kernel arithmetic).
+    """
+    if len(input_types) < 2:
+        raise ShapeError(
+            f"{name}: expected at least 2 operands (key + parameters), got "
+            f"{len(input_types)}"
+        )
+    _check_random_key(input_types[0], name)
+    shape_attr = attributes["shape"]
+    if not isinstance(shape_attr, (tuple, list)):
+        raise ShapeError(
+            f"{name}: shape attribute must be a tuple of dims, got "
+            f"{shape_attr!r}"
+        )
+    return _broadcast_shapes(
+        tuple(shape_attr), *(t.shape for t in input_types[1:])
+    )
+
+
+def infer_random_key_mix(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_key_mix``: one derived rank-0 int64 key."""
+    if len(input_types) != 1:
+        raise ShapeError(
+            f"random_key_mix: expected 1 operand (the key), got "
+            f"{len(input_types)}"
+        )
+    _check_random_key(input_types[0], "random_key_mix")
+    return (ValueType(np.dtype("int64"), ()),)
+
+
+def infer_random_uniform(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_uniform``: broadcast shape, attr dtype."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"random_uniform: expected 3 operands (key, low, high), got "
+            f"{len(input_types)}"
+        )
+    shape = _random_broadcast_shape(input_types, attributes, "random_uniform")
+    return (ValueType(dtype(attributes["dtype"]), shape),)
+
+
+def infer_random_normal(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_normal``: broadcast shape, attr dtype."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"random_normal: expected 3 operands (key, mean, std), got "
+            f"{len(input_types)}"
+        )
+    shape = _random_broadcast_shape(input_types, attributes, "random_normal")
+    return (ValueType(dtype(attributes["dtype"]), shape),)
+
+
+def infer_random_randint(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_randint``: broadcast shape, attr dtype."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"random_randint: expected 3 operands (key, low, high), got "
+            f"{len(input_types)}"
+        )
+    shape = _random_broadcast_shape(input_types, attributes, "random_randint")
+    return (ValueType(dtype(attributes["dtype"]), shape),)
+
+
+def infer_random_permutation(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_permutation``: 1-D of runtime length (None).
+
+    The length is a runtime operand (static ints and symbolic scalars both
+    arrive as rank-0 int64 operands), so the result dim is ``None`` —
+    runtime-dynamic and unchecked by the interpreter.
+    """
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"random_permutation: expected 2 operands (key, n), got "
+            f"{len(input_types)}"
+        )
+    _check_random_key(input_types[0], "random_permutation")
+    return (ValueType(dtype(attributes["dtype"]), (None,)),)
+
+
+def infer_random_multinomial(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``random_multinomial``: ``(num_samples,)``, attr dtype."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"random_multinomial: expected 2 operands (key, input), got "
+            f"{len(input_types)}"
+        )
+    _check_random_key(input_types[0], "random_multinomial")
+    num_samples = attributes["num_samples"]
+    if not isinstance(num_samples, int) or isinstance(num_samples, bool) or num_samples < 0:
+        raise ShapeError(
+            f"random_multinomial: num_samples must be a non-negative int, "
+            f"got {num_samples!r}"
+        )
+    return (ValueType(dtype(attributes["dtype"]), (num_samples,)),)
+
+
+# ---------------------------------------------------------------------------
 # Sparse hooks (referenced by the sparse.py OpDefs)
 #
 # A sparse value is an (indices, values) pair: ``indices`` is an int64 tensor
