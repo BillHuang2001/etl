@@ -19,6 +19,7 @@ pytest suite asserting the op contracts in `../../etl/ops/CONTEXT.md` and `../..
 | `test_runtime_call.py` | `etl.runtime_call`: effect `callback`, callback attr = registered-id STRING, `result_specs` = tuple of `ir.ValueType`s equal to result types, single/multi-output numpy-backend execution, scalar-operand promotion, TypeError/TraceError paths. Backend-rejection policy lives in `../backends/` |
 | `test_errors.py` | per-op table (all 67 public ops): no-trace → TraceError, concrete-Tensor operand → TraceError (three-option message), wrong dtype → DTypeError, static broadcast mismatch → ShapeError, both-scalars → TraceError, unsupported operand kinds → TypeError |
 | `test_dunders.py` | dunder ≡ op-function transparency: identical `ir.pretty_print` (with `ETL_DISABLE_LOCATIONS=1`) for `+ - * / ** < <= > >= == @`, unary `-`, reflected scalar-left forms; `bool(x)`/`x != y` raise TraceError |
+| `test_sorting.py` | `sort`/`argsort` exact numpy parity (axis variants incl. `axis=None` flatten, descending = flip of ascending, stable vs numpy `kind="stable"` + explicit stability ordering, exact dtype preservation, int64 indices) + error kinds (directing/three-option TraceError, TypeError for bad static params — note axis is TypeError, NOT ShapeError — ShapeError for out-of-range axis and rank-0 operands, no op-name prefix in sort/argsort ShapeError text); topk regression coverage (numpy-exact composition, k validation, symbolic extents, error kinds) |
 
 ## Notes for agents
 
