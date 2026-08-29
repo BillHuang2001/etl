@@ -7,8 +7,8 @@ Design (binding, parent CONTEXT.md "Numpy backend design"):
   kernel callable. Execution order is always BLOCK OP ORDER (the effect
   ordering); the table only maps op -> implementation.
 - Per-category modules split by concern (file-size control, see parent
-  CONTEXT.md): ``elementwise``, ``reductions``, ``indexing``, ``linalg``,
-  ``control_flow``, ``collective``, ``custom``. Each exposes
+  CONTEXT.md): ``elementwise``, ``reductions``, ``sparse``, ``indexing``,
+  ``linalg``, ``control_flow``, ``collective``, ``custom``. Each exposes
   ``register_kernels(table)``; ``register_all()`` merges them (idempotent —
   repeated calls are no-ops).
 - Unknown op at dispatch time => ``core.BackendError`` naming the op — the
@@ -86,11 +86,13 @@ def register_all() -> None:
         indexing,
         linalg,
         reductions,
+        sparse,
     )
 
     for module in (
         elementwise,
         reductions,
+        sparse,
         indexing,
         linalg,
         control_flow,
