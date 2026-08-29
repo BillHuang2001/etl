@@ -1,14 +1,21 @@
-"""Linear-algebra and scan ops: dot, conv, tril, triu, cumsum, solve.
+"""Linear-algebra and scan ops: dot, matmul, conv, tril, triu, cumsum,
+cumprod, solve.
 
 All functions follow the unified semantics documented in this node's
 ``CONTEXT.md`` (operand normalization via ``_utils.as_operand``, active
 builder, call-site ``Location``). Category-specific rules:
 
 - ``dot``: batched matrix multiplication (Nx ``dot`` semantics — last axis of
-  ``a`` against second-to-last of ``b``, numpy ``matmul`` shape rules).
+  ``a`` against second-to-last of ``b``, numpy ``matmul`` shape rules; rank
+  >= 2 only).
+- ``matmul``: numpy ``matmul`` semantics (1-D support) — frontend
+  composition over ``dot`` via rank-1 promote/squeeze reshapes; batch
+  broadcasting falls out of ``dot``. ``SymbolicTensor.__matmul__`` still
+  routes to ``dot``.
 - ``conv``: convolution with static configuration; output spatial dims are
   ``DimExpr`` floor-division formulas.
-- ``tril``/``triu``/``cumsum``/``solve``: numpy semantics; dtypes per numpy.
+- ``tril``/``triu``/``cumsum``/``cumprod``/``solve``: numpy semantics; dtypes
+  per numpy (bool → int64 for the cumulative scans).
 """
 from __future__ import annotations
 
@@ -20,7 +27,7 @@ from etl import core
 
 from . import _utils
 
-__all__ = ["dot", "conv", "tril", "triu", "cumsum", "solve"]
+__all__ = ["dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod", "solve"]
 
 PaddingSpec = Union[str, int, Tuple[Tuple[int, int], ...]]
 
@@ -173,6 +180,72 @@ def dot(a, b) -> "core.SymbolicTensor":
         "dot", operands=(a_sym.value, b_sym.value), location=loc
     )
     return _wrap_result(op, loc)
+
+
+def _reshape_op(builder, x, shape, loc) -> "core.SymbolicTensor":
+    """Build a ``reshape`` op to ``shape`` (compensation helpers)."""
+    op = builder.create(
+        "reshape",
+        operands=(x.value,),
+        attributes={"shape": tuple(shape)},
+        location=loc,
+    )
+    return _wrap_result(op, loc)
+
+
+def matmul(a, b) -> "core.SymbolicTensor":
+    """Matrix product with numpy ``matmul`` semantics (1-D support).
+
+    Frontend composition over :func:`dot` (which keeps its existing
+    rank >= 2 contract — ``SymbolicTensor.__matmul__`` still routes to
+    ``dot``): rank-1 operands are promoted to rank-2 (``(1, k)`` /
+    ``(k, 1)`` via ``reshape``), multiplied, and the result is squeezed back
+    to the numpy rank-1 shape. Batch broadcasting (including a vector
+    against a batched matrix) falls out of ``dot``'s IR ``infer_dot``
+    contract. See the design note in this node's CONTEXT.md.
+
+    Args:
+        a: ``SymbolicTensor`` or Python scalar, shape ``(..., m, k)`` or
+            ``(k,)``.
+        b: ``SymbolicTensor`` or Python scalar, shape ``(..., k, n)`` or
+            ``(k,)``.
+
+    Returns:
+        ``SymbolicTensor`` per numpy matmul: vector@vector → 0-d scalar;
+        vector@matrix / matrix@vector → 1-D; else batched ``dot`` shape.
+        Dtype = ``promote_dtypes(a.dtype, b.dtype)``.
+
+    Raises:
+        core.TraceError: no active trace; concrete ``Tensor`` operand.
+        core.ShapeError: rank-0 operand (numpy raises ``ValueError``);
+            static ``k`` mismatch; incompatible batch dims.
+    """
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    a_sym, b_sym = _as_binary_operands(a, b, loc)
+    rank_a, rank_b = len(a_sym.shape), len(b_sym.shape)
+    if rank_a == 0 or rank_b == 0:
+        raise core.ShapeError(
+            f"matmul: operands must have rank >= 1, got ranks {rank_a} and "
+            f"{rank_b} (numpy matmul does not accept scalars)"
+        )
+    if rank_a == 1:
+        a_sym = _reshape_op(builder, a_sym, (1,) + a_sym.shape, loc)
+    if rank_b == 1:
+        b_sym = _reshape_op(builder, b_sym, b_sym.shape + (1,), loc)
+    result = dot(a_sym, b_sym)
+    # Squeeze the promoted axes back to numpy's rank-1 result shapes. The
+    # promoted axis sits at position len(batch_dims) (vector@matrix) or the
+    # last position (matrix@vector); slicing from both ends is batch-safe.
+    if rank_a == 1 and rank_b == 1:
+        return _reshape_op(builder, result, (), loc)
+    if rank_a == 1:
+        return _reshape_op(
+            builder, result, result.shape[:-2] + (result.shape[-1],), loc
+        )
+    if rank_b == 1:
+        return _reshape_op(builder, result, result.shape[:-1], loc)
+    return result
 
 
 def conv(x, w, strides=1, padding="VALID", input_dilation=1,
@@ -354,6 +427,43 @@ def cumsum(x, axis=0, reverse=False) -> "core.SymbolicTensor":
         x_sym = _cast_op(builder, x_sym, np.dtype("int64"), loc)
     op = builder.create(
         "cumsum",
+        operands=(x_sym.value,),
+        attributes={"axis": axis_norm, "reverse": reverse},
+        location=loc,
+    )
+    return _wrap_result(op, loc)
+
+
+def cumprod(x, axis=0, reverse=False) -> "core.SymbolicTensor":
+    """Cumulative product along an axis (numpy ``cumprod`` semantics plus an
+    optional reverse scan direction, mirroring :func:`cumsum`).
+
+    Args:
+        x: ``SymbolicTensor`` or Python scalar.
+        axis: int; scan axis.
+        reverse: bool; scan from the end toward the start.
+
+    Returns:
+        ``SymbolicTensor`` with the same shape and dtype as ``x`` (numpy
+        ``cumprod`` dtype rule: bool → int64, else preserved).
+    """
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    x_sym = _utils.as_operand(x, location=loc)
+    if not isinstance(reverse, bool):
+        raise TypeError(f"cumprod: reverse must be a bool, got {reverse!r}")
+    rank = len(x_sym.shape)
+    if rank == 0:
+        axis_norm = 0  # scalar cumprod: no axis to validate
+    else:
+        axis_norm = _utils.normalize_axes(axis, rank)[0]
+    # numpy cumprod dtype rule: bool → int64 (mirror of cumsum). The IR
+    # cumprod preserves the operand dtype (infer_identity), so cast bool
+    # inputs to int64 frontend-side.
+    if x_sym.dtype == np.dtype("bool"):
+        x_sym = _cast_op(builder, x_sym, np.dtype("int64"), loc)
+    op = builder.create(
+        "cumprod",
         operands=(x_sym.value,),
         attributes={"axis": axis_norm, "reverse": reverse},
         location=loc,
