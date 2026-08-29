@@ -47,7 +47,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 
 ## Test strategy
 
-Coverage additions (tree/pytree UX contract — written against the pinned contract of the parallel tree-UX implementation in `../etl/`; until that branch merges, the new tests fail as expected, with no skips/xfails):
+Tree/pytree UX coverage (validated green against the tree-UX implementation in `../etl/`, no skips/xfails):
 
 - `core/test_tree_utils.py` — `tree_map` (single/multi-tree, empty containers, leaf-type-changing fns, multi-tree mismatch → `TypeError` with first-mismatch pytree path), `tree_leaves`/`tree_structure`/`tree_flatten`/`tree_unflatten` incl. alias identity with `flatten`/`unflatten`.
 - `core/test_tree.py` — `defaultdict`/`Counter` roundtrips (factory list/None, nested); structured errors: unpersistable lambda factory, mixed-type dict keys, dataclass InitVar/`init=False` rebuild; `register_pytree_node(object, ...)` → `TypeError` (with try/finally registry cleanup so a missing guard can't hijack the MRO dispatch for the session); plain user class stays a leaf; etl value types (`Device`/`Dim`/`TensorSpec`) flatten to exactly 1 leaf.
