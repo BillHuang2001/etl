@@ -467,16 +467,44 @@ def _vjp_deferral(op_name: str, reason: str):
     return rule
 
 
+def _one_hot_rows(idx_col: "core.SymbolicTensor", k: int, dtype, location) -> "core.SymbolicTensor":
+    """One-hot row-selection matrix ``(k, nnz)`` with ``A[k, i] = [idx[i] == k]``.
+
+    Built from ordinary dense ops (``arange`` constant + broadcast ``equal`` +
+    ``cast``) in the cotangent dtype. The sparse vjp rules use it to scatter-
+    ACCUMULATE dense gradients: ``g_dense = A @ U`` is a dense matmul, which
+    accumulates the per-nonzero contributions of rows sharing one target —
+    the numpy backend's single-axis ``scatter`` kernel (``put_along_axis``
+    overwrite semantics) cannot accumulate, so a direct scatter would silently
+    drop all but the last duplicate target.
+    """
+    arange_k = ops.constant(
+        core.tensor(np.arange(k, dtype=np.int64))  # (k,)
+    )
+    rows = _raw_reshape(arange_k.value, (k, 1), location)
+    cols = _raw_reshape(idx_col.value, (1, -1), location)
+    return ops.cast(ops.equal(rows, cols), dtype)  # (k, nnz) in cotangent dtype
+
+
 def _vjp_sparse_dot_dense(op, cotangents, primals):
     """(indices, values, dense) -> dense (M, N), sparse (M, K) x dense (K, N):
     wrt values[i] = sum_n cot[m_i, n] * dense[k_i, n];
-    wrt dense = scatter(cot[m_i, :] * v_i at row k_i into zeros (K, N))."""
+    wrt dense (K, N) = A @ U with A[k, i] = [k_i == k] (one-hot) and
+    U[i, :] = v_i * cot[m_i, :] — the matmul accumulates the contributions of
+    nonzeros sharing a row k (single-axis scatter cannot)."""
     cot = _ok(cotangents[0])
     if cot is None:
         return (ZeroTangent(), ZeroTangent(), ZeroTangent())
     indices, values, dense = primals
     _require_unbatched(indices, op.name, 2)
     dense_shape = tuple(op.attributes["dense_shape"])  # (M, K)
+    k = dense_shape[1]
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise core.TransformError(
+            f"grad/vjp: vjp of 'sparse_dot_dense' needs a static inner dim K "
+            f"(dense_shape[1] = {k!r}) to build the accumulation matrix — "
+            "symbolic inner dims are a v1 gap"
+        )
     idx_m = _col(_sym(indices), 0, op.location)
     idx_k = _col(_sym(indices), 1, op.location)
     g_values = ops.reduce_sum(
@@ -486,16 +514,12 @@ def _vjp_sparse_dot_dense(op, cotangents, primals):
         ),
         axes=(1,),
     )
+    one_hot = _one_hot_rows(idx_k, k, cot.type.dtype, op.location)  # (K, nnz)
     updates = ops.multiply(
-        _raw_reshape(cot, (-1, 1), op.location),  # cot_values (nnz, 1)
-        ops.gather(_sym(cot), idx_m, axis=0),      # (nnz, N)
+        _raw_reshape(values, (-1, 1), op.location),  # (nnz, 1)
+        ops.gather(_sym(cot), idx_m, axis=0),        # (nnz, N)
     )
-    g_dense = ops.scatter(
-        ops.multiply(_sym(dense), 0),  # zeros (K, N) in the dense dtype
-        idx_k,
-        updates,
-        axis=0,
-    )
+    g_dense = ops.dot(one_hot, updates)  # (K, N)
     return (ZeroTangent(), g_values.value, g_dense.value)
 
 
@@ -503,13 +527,22 @@ def _vjp_dense_dot_sparse(op, cotangents, primals):
     """(dense, indices, values) -> dense (M, N), dense (M, K) x sparse
     (K, N): with index rows (k_i, n_i) —
     wrt values[i] = sum_m cot[m, n_i] * dense[m, k_i];
-    wrt dense = scatter(cot[:, n_i] * v_i at column k_i into zeros (M, K))."""
+    wrt dense (M, K) = V @ A^T with A[k, i] = [k_i == k] (one-hot) and
+    V[:, i] = cot[:, n_i] * v_i — the matmul accumulates the contributions of
+    nonzeros sharing a column k (single-axis scatter cannot)."""
     cot = _ok(cotangents[0])
     if cot is None:
         return (ZeroTangent(), ZeroTangent(), ZeroTangent())
     dense, indices, values = primals
     _require_unbatched(indices, op.name, 2)
     dense_shape = tuple(op.attributes["dense_shape"])  # (K, N)
+    k = dense_shape[0]
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise core.TransformError(
+            f"grad/vjp: vjp of 'dense_dot_sparse' needs a static inner dim K "
+            f"(dense_shape[0] = {k!r}) to build the accumulation matrix — "
+            "symbolic inner dims are a v1 gap"
+        )
     idx_k = _col(_sym(indices), 0, op.location)
     idx_n = _col(_sym(indices), 1, op.location)
     g_values = ops.reduce_sum(
@@ -519,16 +552,12 @@ def _vjp_dense_dot_sparse(op, cotangents, primals):
         ),
         axes=(0,),
     )
+    one_hot = _one_hot_rows(idx_k, k, cot.type.dtype, op.location)  # (K, nnz)
     updates = ops.multiply(
         ops.gather(_sym(cot), idx_n, axis=1),        # (M, nnz)
-        _raw_reshape(values, (1, -1), op.location),  # cot_values (1, nnz)
+        _raw_reshape(values, (1, -1), op.location),  # (1, nnz)
     )
-    g_dense = ops.scatter(
-        ops.multiply(_sym(dense), 0),  # zeros (M, K) in the dense dtype
-        idx_k,
-        updates,
-        axis=1,
-    )
+    g_dense = ops.dot(updates, ops.transpose(one_hot))  # (M, K)
     return (g_dense.value, ZeroTangent(), g_values.value)
 
 
