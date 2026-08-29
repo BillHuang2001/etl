@@ -6,7 +6,7 @@ pytest suite validating the `etl` package (sibling — see `../etl/CONTEXT.md` f
 
 ## Structure
 
-Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `tests/trace/`, `tests/block/`, `tests/transforms/`, `tests/backends/`, `tests/dist/`, `tests/persist/`, plus:
+Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `tests/trace/`, `tests/block/`, `tests/transforms/`, `tests/backends/`, `tests/dist/`, `tests/persist/`, `tests/bench/` (`etl.bench` harness — see its own CONTEXT.md), plus:
 
 - `tests/pipeline_test.py` — end-to-end staging pipeline (trace→lower→compile→load→run), bind, build, evaluate
 - `tests/test_spec_compliance.py` — design-principle compliance:
