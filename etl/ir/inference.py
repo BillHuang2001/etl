@@ -1031,3 +1031,401 @@ def infer_scalar_int64(
 ) -> tuple[ValueType, ...]:
     """Result type of ``rank``/``world_size``: scalar (``()`` shape) int64."""
     return (ValueType(np.dtype("int64"), ()),)
+
+
+# ---------------------------------------------------------------------------
+# Sparse hooks (referenced by the sparse.py OpDefs)
+#
+# A sparse value is an (indices, values) pair: ``indices`` is an int64 tensor
+# of shape ``(B..., nnz, ndim)`` (batch dims, runtime-dynamic ``nnz``, one
+# coordinate row per non-zero), ``values`` holds the non-zero values with
+# shape ``(B..., nnz)``. ``nnz`` is always runtime-dynamic (``None``); the
+# unbatched dense shape and the sparse value dtype come from the
+# ``dense_shape`` / ``dtype`` attributes (``dense_shape`` entries may carry a
+# symbolic first dim after vectorize — hooks only use ``len()`` on it and
+# never assume ints). Batch dims always come from INPUT TYPES: for a sparse
+# operand they are the leading dims of its indices type minus the trailing
+# ``(nnz, ndim)`` pair; for dense operands they are the leading dims minus the
+# dense rank. Result indices always end ``(None, ndim)``.
+# ---------------------------------------------------------------------------
+
+
+def _sparse_dense_shape(attributes: dict[str, Any], name: str) -> tuple:
+    """The ``dense_shape`` attribute as a tuple (hooks only use ``len()``)."""
+    dense_shape = attributes["dense_shape"]
+    if not isinstance(dense_shape, (tuple, list)):
+        raise ShapeError(
+            f"{name}: dense_shape must be a tuple of dims, got {dense_shape!r}"
+        )
+    return tuple(dense_shape)
+
+
+def _sparse_rank2_shape(attributes: dict[str, Any], name: str) -> tuple:
+    """The ``dense_shape`` attribute validated to rank 2 — the csr/csc
+    conversions and the dot ops are rank-2-only."""
+    dense_shape = _sparse_dense_shape(attributes, name)
+    if len(dense_shape) != 2:
+        raise ShapeError(
+            f"{name}: sparse operand must be rank-2, got dense_shape "
+            f"{dense_shape!r}"
+        )
+    return dense_shape
+
+
+def _sparse_batch(indices_t: ValueType, name: str) -> tuple:
+    """Batch dims of a COO-form sparse indices operand: the indices type
+    shape minus the trailing ``(nnz, ndim)`` pair."""
+    if len(indices_t.shape) < 2:
+        raise ShapeError(
+            f"{name}: sparse indices must have rank >= 2 (trailing "
+            f"(nnz, ndim)), got rank {len(indices_t.shape)}"
+        )
+    return indices_t.shape[:-2]
+
+
+def _sparse_coo_to_csr_like(
+    input_types: tuple[ValueType, ...],
+    attributes: dict[str, Any],
+    name: str,
+) -> tuple[ValueType, ...]:
+    """Shared result types of ``sparse_coo_to_csr`` / ``sparse_coo_to_csc``
+    (rank-2 only): (indptr, indices, values). indptr = batch + (rows + 1,);
+    indices = batch + (None,); values = batch + (None,) with the input values
+    dtype."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"{name}: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, values_t = input_types
+    dense_shape = _sparse_rank2_shape(attributes, name)
+    batch = _sparse_batch(indices_t, name)
+    return (
+        ValueType(np.dtype("int64"), batch + (dense_shape[0] + 1,)),
+        ValueType(np.dtype("int64"), batch + (None,)),
+        ValueType(values_t.dtype, batch + (None,)),
+    )
+
+
+def _sparse_csr_to_coo_like(
+    input_types: tuple[ValueType, ...],
+    attributes: dict[str, Any],
+    name: str,
+) -> tuple[ValueType, ...]:
+    """Shared result types of ``sparse_csr_to_coo`` / ``sparse_csc_to_coo``
+    (rank-2 only): (indices, values). indices = batch + (None, 2); values =
+    batch + (None,) with the input values dtype. Batch dims come from the
+    indptr operand (``batch + (rows + 1,)``)."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"{name}: expected 3 operands (indptr, indices, values), got "
+            f"{len(input_types)}"
+        )
+    indptr_t, _indices_t, values_t = input_types
+    _sparse_rank2_shape(attributes, name)
+    if len(indptr_t.shape) < 1:
+        raise ShapeError(f"{name}: indptr must have rank >= 1")
+    batch = indptr_t.shape[:-1]
+    return (
+        ValueType(np.dtype("int64"), batch + (None, 2)),
+        ValueType(values_t.dtype, batch + (None,)),
+    )
+
+
+def _sparse_binary_merge(
+    input_types: tuple[ValueType, ...],
+    attributes: dict[str, Any],
+    name: str,
+) -> tuple[ValueType, ...]:
+    """Shared result types of the sparse binary merge ops (``sparse_add``
+    union merge, ``sparse_multiply`` intersection merge): (indices, values).
+    indices = batch of the first sparse operand + (None, ndim); values =
+    batch + (None,) with the first operand's values dtype."""
+    if len(input_types) != 4:
+        raise ShapeError(
+            f"{name}: expected 4 operands (ia, va, ib, vb), got "
+            f"{len(input_types)}"
+        )
+    ia_t, va_t, _ib_t, _vb_t = input_types
+    ndim = len(_sparse_dense_shape(attributes, name))
+    batch = _sparse_batch(ia_t, name)
+    return (
+        ValueType(np.dtype("int64"), batch + (None, ndim)),
+        ValueType(va_t.dtype, batch + (None,)),
+    )
+
+
+def infer_sparse_from_dense(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_from_dense``: (indices i64, values). indices
+    = batch dims of the dense operand + (None, ndim); values = batch +
+    (None,) with the dense operand's dtype."""
+    t = _one(input_types, "sparse_from_dense")
+    rank = len(_sparse_dense_shape(attributes, "sparse_from_dense"))
+    if rank > t.rank:
+        raise ShapeError(
+            f"sparse_from_dense: dense rank {rank} exceeds operand rank "
+            f"{t.rank}"
+        )
+    batch = t.shape[: t.rank - rank]
+    return (
+        ValueType(np.dtype("int64"), batch + (None, rank)),
+        ValueType(t.dtype, batch + (None,)),
+    )
+
+
+def infer_sparse_to_dense(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``sparse_to_dense``: a dense tensor with the batch dims
+    of the indices operand + the ``dense_shape`` attribute; dtype from the
+    ``dtype`` attribute."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_to_dense: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, _values_t = input_types
+    batch = _sparse_batch(indices_t, "sparse_to_dense")
+    dense_shape = _sparse_dense_shape(attributes, "sparse_to_dense")
+    return (ValueType(dtype(attributes["dtype"]), batch + dense_shape),)
+
+
+def infer_sparse_coo_to_csr(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_coo_to_csr`` (rank-2 only): (indptr, indices,
+    values); the COO is lex-sorted, i.e. already row-major, so no reorder."""
+    return _sparse_coo_to_csr_like(input_types, attributes, "sparse_coo_to_csr")
+
+
+def infer_sparse_csr_to_coo(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_csr_to_coo`` (rank-2 only): (indices, values)
+    in COO form."""
+    return _sparse_csr_to_coo_like(input_types, attributes, "sparse_csr_to_coo")
+
+
+def infer_sparse_coo_to_csc(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_coo_to_csc`` (rank-2 only): (indptr, indices,
+    values) — same shapes as ``sparse_coo_to_csr``; the op reorders the COO
+    to column-major at run time."""
+    return _sparse_coo_to_csr_like(input_types, attributes, "sparse_coo_to_csc")
+
+
+def infer_sparse_csc_to_coo(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_csc_to_coo`` (rank-2 only): (indices, values)
+    — same shapes as ``sparse_csr_to_coo``; the op reorders back to
+    row-major at run time."""
+    return _sparse_csr_to_coo_like(input_types, attributes, "sparse_csc_to_coo")
+
+
+def infer_sparse_negate(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_negate``: identical to the input (indices,
+    values) pair — negation preserves the sparsity structure."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_negate: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    return (input_types[0], input_types[1])
+
+
+def infer_sparse_add(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_add`` (union merge): (indices, values)."""
+    return _sparse_binary_merge(input_types, attributes, "sparse_add")
+
+
+def infer_sparse_multiply(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_multiply`` (intersection merge): (indices,
+    values) — same shapes as ``sparse_add``."""
+    return _sparse_binary_merge(input_types, attributes, "sparse_multiply")
+
+
+def infer_sparse_multiply_dense(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_multiply_dense``: (indices, values) with the
+    input shapes; values dtype = promotion of the values and dense dtypes."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"sparse_multiply_dense: expected 3 operands (indices, values, "
+            f"dense), got {len(input_types)}"
+        )
+    indices_t, values_t, dense_t = input_types
+    return (
+        ValueType(indices_t.dtype, indices_t.shape),
+        ValueType(np.result_type(values_t.dtype, dense_t.dtype), values_t.shape),
+    )
+
+
+def infer_sparse_reduce_sum(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``sparse_reduce_sum``: a dense tensor with the batch
+    dims of the indices operand + the ``dense_shape`` dims reduced over
+    ``axes`` (dropped, or kept when ``keepdims``); dtype from the ``dtype``
+    attribute. ``axes`` refer to the unbatched sparse axes."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_reduce_sum: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, _values_t = input_types
+    batch = _sparse_batch(indices_t, "sparse_reduce_sum")
+    dense_shape = _sparse_dense_shape(attributes, "sparse_reduce_sum")
+    rank = len(dense_shape)
+    axes = attributes["axes"]
+    if isinstance(axes, int):
+        axes = (axes,)
+    keepdims = bool(attributes["keepdims"])
+    reduced = sorted(
+        {_normalize_axis(a, rank, "sparse_reduce_sum.axes") for a in axes}
+    )
+    reduced_set = set(reduced)
+    dense_out = tuple(
+        1 if (i in reduced_set and keepdims) else dim
+        for i, dim in enumerate(dense_shape)
+        if (i not in reduced_set) or keepdims
+    )
+    return (ValueType(dtype(attributes["dtype"]), batch + dense_out),)
+
+
+def infer_sparse_transpose(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_transpose``: (indices, values). indices =
+    batch + (None, rank) with rank = len(dense_shape); values = batch +
+    (None,) with the input values dtype. ``perm`` must be a permutation of
+    ``rank`` axes."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_transpose: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, values_t = input_types
+    rank = len(_sparse_dense_shape(attributes, "sparse_transpose"))
+    perm = attributes["perm"]
+    if not isinstance(perm, (tuple, list)) or len(perm) != rank or not all(
+        isinstance(p, int) and not isinstance(p, bool) for p in perm
+    ):
+        raise ShapeError(f"sparse_transpose: invalid perm {perm!r} for rank {rank}")
+    if sorted(perm) != list(range(rank)):
+        raise ShapeError(
+            f"sparse_transpose: {perm} is not a permutation of {rank} axes"
+        )
+    batch = _sparse_batch(indices_t, "sparse_transpose")
+    return (
+        ValueType(np.dtype("int64"), batch + (None, rank)),
+        ValueType(values_t.dtype, batch + (None,)),
+    )
+
+
+def infer_sparse_reshape(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_reshape``: (indices, values). indices = batch
+    + (None, new_rank) with new_rank = len(dense_shape); values = batch +
+    (None,) with the input values dtype. ``old_shape`` must have the same
+    element count as ``dense_shape`` (checked when fully static)."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_reshape: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, values_t = input_types
+    dense_shape = _sparse_dense_shape(attributes, "sparse_reshape")
+    old_shape = _shape_attr(
+        attributes["old_shape"], "sparse_reshape.old_shape", allow_wildcard=False
+    )
+    _check_counts_equal(
+        _count_factors(old_shape), _count_factors(dense_shape), "sparse_reshape"
+    )
+    batch = _sparse_batch(indices_t, "sparse_reshape")
+    return (
+        ValueType(np.dtype("int64"), batch + (None, len(dense_shape))),
+        ValueType(values_t.dtype, batch + (None,)),
+    )
+
+
+def infer_sparse_concatenate(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``sparse_concatenate`` (variadic (indices, values)
+    pairs): (indices, values). indices = batch of the first indices operand +
+    (None, rank); values = batch + (None,) with the promoted values dtype."""
+    if len(input_types) < 4 or len(input_types) % 2 != 0:
+        raise ShapeError(
+            f"sparse_concatenate: expected an even number of operands >= 4 "
+            f"(ia, va, ib, vb, ...), got {len(input_types)}"
+        )
+    ia_t = input_types[0]
+    rank = len(_sparse_dense_shape(attributes, "sparse_concatenate"))
+    batch = _sparse_batch(ia_t, "sparse_concatenate")
+    values_dtype = np.result_type(*[t.dtype for t in input_types[1::2]])
+    return (
+        ValueType(np.dtype("int64"), batch + (None, rank)),
+        ValueType(values_dtype, batch + (None,)),
+    )
+
+
+def infer_sparse_dot_dense(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``sparse_dot_dense`` (rank-2 sparse (M, K) x dense
+    (..., K, N)): a dense tensor with the batch dims of the sparse operand's
+    indices + (M, N); dtype = promotion of the values and dense dtypes."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"sparse_dot_dense: expected 3 operands (indices, values, dense), "
+            f"got {len(input_types)}"
+        )
+    indices_t, values_t, dense_t = input_types
+    m, _k = _sparse_rank2_shape(attributes, "sparse_dot_dense")
+    if len(dense_t.shape) < 2:
+        raise ShapeError(
+            f"sparse_dot_dense: dense operand must have rank >= 2, got rank "
+            f"{len(dense_t.shape)}"
+        )
+    batch = _sparse_batch(indices_t, "sparse_dot_dense")
+    n = dense_t.shape[-1]
+    return (
+        ValueType(np.result_type(values_t.dtype, dense_t.dtype), batch + (m, n)),
+    )
+
+
+def infer_sparse_dense_dot_sparse(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``dense_dot_sparse`` (dense (..., M, K) x rank-2 sparse
+    (K, N)): a dense tensor with the batch dims of the sparse operand's
+    indices + (M, N); dtype = promotion of the values and dense dtypes."""
+    if len(input_types) != 3:
+        raise ShapeError(
+            f"dense_dot_sparse: expected 3 operands (dense, indices, values), "
+            f"got {len(input_types)}"
+        )
+    dense_t, indices_t, values_t = input_types
+    _k, n = _sparse_rank2_shape(attributes, "dense_dot_sparse")
+    if len(dense_t.shape) < 2:
+        raise ShapeError(
+            f"dense_dot_sparse: dense operand must have rank >= 2, got rank "
+            f"{len(dense_t.shape)}"
+        )
+    batch = _sparse_batch(indices_t, "dense_dot_sparse")
+    m = dense_t.shape[-2]
+    return (
+        ValueType(np.result_type(values_t.dtype, dense_t.dtype), batch + (m, n)),
+    )

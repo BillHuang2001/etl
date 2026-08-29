@@ -112,7 +112,7 @@ Module's counters (stable ids for serialization). Parent pointers
 `verify` checks consistency. `Value.uses` is maintained by the Builder and by
 `Value.replace_all_uses_with`.
 
-## Op registry (canonical v1 set — 75 ops, all declared in `op_defs/`)
+## Op registry (canonical v1 set — 91 ops, all declared in `op_defs/`)
 
 | File | Category | Ops | Effect |
 |---|---|---|---|
@@ -125,6 +125,7 @@ Module's counters (stable ids for serialization). Parent pointers
 | control.py | terminator | return | pure |
 | collective.py | collective | all_reduce all_gather reduce_scatter all_to_all broadcast_collective collective_permute | collective |
 | collective.py | collective | rank world_size (scalar int64) | read |
+| sparse.py | sparse | sparse_from_dense sparse_to_dense sparse_coo_to_csr sparse_csr_to_coo sparse_coo_to_csc sparse_csc_to_coo sparse_negate sparse_add sparse_multiply sparse_multiply_dense sparse_reduce_sum sparse_transpose sparse_reshape sparse_concatenate sparse_dot_dense dense_dot_sparse | pure |
 
 Declaring an op here does NOT mean every backend implements it — backends
 reject unsupported ops explicitly via capabilities, never silently. IR name
@@ -222,10 +223,11 @@ in `printer.py`.
 
 | Path | Area |
 |---|---|
-| `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective) |
+| `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective, sparse) |
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
-| `./inference.py` | Shape-inference hooks referenced by OpDefs (23 hooks, implemented) |
+| `./inference.py` | Shape-inference hooks referenced by OpDefs (39 hooks, implemented; ~1400 lines — legitimately long, one hook module for all categories; split only if it grows much further) |
+| `./op_defs/sparse.py` | Sparse op defs: 16 ops (from_dense/to_dense, coo/csr/csc conversions, negate, add, multiply, multiply_dense, reduce_sum, transpose, reshape, concatenate, dot variants), all pure |
 | `./builder.py` | Op-construction API (implemented) |
 | `./verify.py` | Structural/type/attribute verification (implemented) |
 | `./serialize.py` | IR payload serialization: self-describing payload, sha256 integrity, round-trip rebuild with original ids (implemented) |
@@ -271,8 +273,8 @@ terminators). CPU only.
 
 ## Status
 
-Phase 2 complete for this directory: SSA data model, op registry (75 ops),
-shape-inference hooks (`inference.py`, 24 hooks), `pretty_print`, `verify`
+Phase 2 complete for this directory: SSA data model, op registry (91 ops),
+shape-inference hooks (`inference.py`, 40 hooks), `pretty_print`, `verify`
 (the full invariant set — module/function/region/op/value levels, SSA
 dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
 and serialization (`serialize_module`/`deserialize_module` — payload schema,

@@ -110,6 +110,7 @@ class NumpyBackend(Backend):
         runtime_calls=True,  # Python callbacks execute synchronously at the op position
         custom_blocks=True,  # registered numpy block impls
         async_collectives=False,  # simulation is synchronous
+        sparse_ops=True,  # the ONLY backend with sparse-tensor support in v1
     )
 
     def lower(self, graph: "Graph", options: dict | None = None) -> LoweredProgram:

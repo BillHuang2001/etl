@@ -41,6 +41,7 @@ class Capabilities:
         runtime_calls: supports ``runtime_call`` (executing Python callbacks).
         custom_blocks: supports ``block_call`` ops (registered backend impls).
         async_collectives: collective execution may be asynchronous (numpy: False).
+        sparse_ops: supports etl.sparse sparse-tensor ops (numpy: True).
     """
 
     dynamic_shapes: bool = False
@@ -49,6 +50,7 @@ class Capabilities:
     runtime_calls: bool = False
     custom_blocks: bool = False
     async_collectives: bool = False
+    sparse_ops: bool = False
 
     def supports_dtype(self, dtype: Any) -> bool:
         """True iff ``dtype`` is among ``self.dtypes`` (numpy dtype equality)."""

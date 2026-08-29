@@ -27,6 +27,9 @@ stablehlo/dialect/StablehloOps.td):
     erf, so it is deferred together with it (no silent approximation).
   - ``argmax``/``argmin`` — no such ops in the StableHLO opset (see
     openxla/xla issue #33449 requesting them); no trivial decomposition.
+  - sparse ops — the ``sparse_*``/``dense_dot_sparse`` family
+    (``etl.sparse``) is numpy-backend-only in v1; densify via
+    ``etl.sparse.to_dense`` to export.
 * ``collective_broadcast`` IS a specced StableHLO op (present in the
   spec's collective-op list and the status table).
 """
@@ -142,7 +145,9 @@ COLLECTIVE_MAP: dict[str, str] = {
 # are the dist graph scalars; complex-number elementwise beyond cast is
 # additionally deferred (not an op name — enforced by dtype checks in the
 # writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
-# only); `argmax`/`argmin` because StableHLO has no such ops.
+# only); `argmax`/`argmin` because StableHLO has no such ops. The 16
+# `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
+# in v1 — densify via `etl.sparse.to_dense` to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
     {
         "gather",
@@ -156,6 +161,22 @@ DEFERRED_OPS: frozenset[str] = frozenset(
         "argmin",
         "erf",
         "gelu",
+        "sparse_from_dense",
+        "sparse_to_dense",
+        "sparse_coo_to_csr",
+        "sparse_csr_to_coo",
+        "sparse_coo_to_csc",
+        "sparse_csc_to_coo",
+        "sparse_negate",
+        "sparse_add",
+        "sparse_multiply",
+        "sparse_multiply_dense",
+        "sparse_reduce_sum",
+        "sparse_transpose",
+        "sparse_reshape",
+        "sparse_concatenate",
+        "sparse_dot_dense",
+        "dense_dot_sparse",
     }
 )
 

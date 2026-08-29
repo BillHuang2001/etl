@@ -23,7 +23,7 @@ from etl import core
 from etl import ir
 from etl import ops
 from etl.core import TransformError
-from etl.trace import Graph, current_builder, with_builder
+from etl.trace import Graph, StaticValue, current_builder, with_builder
 from etl.transforms._metadata import MappedAxes, UNMAPPED, ValueEnv
 
 # Binding rule signature (see ./CONTEXT.md):
@@ -75,6 +75,76 @@ def require_batching_rule(op_name: str) -> BatchingRule:
             f"Python-loop fallback."
         )
     return rule
+
+
+#: Pytree node type → batched-output aux remap fn. Registered pytree nodes
+#: whose children include STATIC leaves (e.g. a future sparse-tensor node:
+#: children = [tensor leaves..., dense_shape ints, dtype, format]) get their
+#: OUTPUT static leaves remapped at the vectorize boundary — `vectorize_graph`
+#: prepends a batch dim to the tensor outputs, which goes stale for node
+#: metadata derived from tensor shapes (the sparse value's dense_shape must
+#: gain the batch dim as a leading symbolic `Dim`). INPUT-side static values
+#: are never remapped (the batch lives in the flat tensor-leaf specs only).
+_BATCHED_AUX_REMAP: Dict[type, Callable] = {}
+
+
+def register_batched_aux_remap(node_type: type, fn: Callable) -> None:
+    """Register (or replace) the batched-output aux remap fn for `node_type`.
+
+    At the vectorize boundary (`vectorize_graph`, step 6), every registered
+    pytree node in the OUTPUT tree with static-leaf children hands its node
+    spec, its direct static-leaf child values (in child order), and the
+    current pass's fresh batch `Dim` to `fn`, and the returned values become
+    the node's new static leaves (rebuilt as fresh plain-leaf
+    `TreeSpec(type(None))` specs — the canonical normalized leaf; a
+    `type=None` field would classify as a TENSOR position in the pipeline's
+    `_is_tensor_leaf_spec`) appended after the non-static children. Static leaves inside
+    unregistered subtrees and inside nested container children keep their
+    values verbatim (only their flat index/path are recomputed) — they are
+    NOT passed to `fn`.
+
+    Args:
+        node_type: The pytree node class whose output static leaves are
+            remapped (looked up by MRO walk — a registered base class catches
+            subclasses, exact type first).
+        fn: ``fn(node: core.TreeSpec, static_values: tuple, batch_dim:
+            core.Dim) -> tuple`` — returns the REMAPPED static leaf values
+            (the count may change).
+
+    Raises:
+        TypeError: If ``node_type`` is not a type or ``fn`` is not callable;
+            if ``node_type`` is ``object`` itself (every type's MRO ends in
+            ``object``, so registering it would hijack the lookup for all
+            types — the same guard as ``core.register_pytree_node``).
+    """
+    if node_type is object:
+        raise TypeError(
+            "register_batched_aux_remap: cannot register 'object' — it "
+            "would hijack the MRO lookup for all types"
+        )
+    if not isinstance(node_type, type):
+        raise TypeError(f"node_type must be a type, got {node_type!r}")
+    if not callable(fn):
+        raise TypeError("fn must be callable")
+    _BATCHED_AUX_REMAP[node_type] = fn
+
+
+def _lookup_batched_aux_remap(spec) -> Optional[Callable]:
+    """The registered batched-aux remap fn for `spec`, or `None` (never raises).
+
+    MRO walk over ``spec.type.__mro__`` mirroring
+    ``core.tree._flatten_into`` (first match wins, exact type first) so a
+    registered base class catches subclasses. Non-type specs (leaf specs may
+    carry ``type=None``) have no registrations → ``None``.
+    """
+    spec_type = spec.type
+    if not isinstance(spec_type, type):
+        return None
+    for base in spec_type.__mro__:
+        fn = _BATCHED_AUX_REMAP.get(base)
+        if fn is not None:
+            return fn
+    return None
 
 
 def _sym(value: ir.Value) -> "core.SymbolicTensor":
@@ -219,8 +289,12 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
     from the active pass depth — `_batch_dim`: `"batch"` at depth 0,
     `"batch_1"` at depth 1, ...) as the leading dim — a single pass
     introduces exactly one batch axis; `output_tree` and `static_values` are
-    preserved. Region-bearing control-flow ops (`cond`/`while_loop`/`scan`)
-    are not vectorizable in v1 and raise `TransformError`.
+    preserved, except that registered output-tree nodes with static-leaf
+    children (e.g. a future sparse-tensor node) get their OUTPUT static
+    leaves remapped at this boundary via `register_batched_aux_remap`
+    (input-side statics are never remapped). Region-bearing control-flow ops
+    (`cond`/`while_loop`/`scan`) are not vectorizable in v1 and raise
+    `TransformError`.
 
     Args:
         graph: the traced graph to rewrite.
@@ -247,8 +321,12 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
         )
 
     # 2. New input specs: all mapped inputs share ONE fresh leading symbolic
-    #    dim (`batch`); unmapped specs are reused unchanged.
-    new_specs, mapped_input_axes = _batched_input_specs(graph, tensor_axes)
+    #    dim (`batch`); unmapped specs are reused unchanged. The one fresh
+    #    `batch_dim` object is threaded into the output-aux remap (step 6) so
+    #    remapped static leaves share the batch Dim identity with the tensor
+    #    output/input specs.
+    batch_dim = _batch_dim()
+    new_specs, mapped_input_axes = _batched_input_specs(graph, tensor_axes, batch_dim)
 
     # 3. Build the NEW module/function (the input graph is never mutated).
     builder = ir.Builder()
@@ -287,14 +365,18 @@ def vectorize_graph(graph: Graph, axes) -> Graph:
 
     # 6. Wrap the new IR into a NEW Graph: the input/output tree skeletons
     #    and static values are reused unchanged — only the flat tensor specs
-    #    and the module are new.
+    #    and the module are new. Registered output-tree nodes with static-leaf
+    #    children get their OUTPUT static leaves remapped here
+    #    (`_remap_output_aux` — e.g. a sparse node's dense_shape gains the
+    #    batch dim); input statics are never remapped.
+    output_tree, output_static_values = _remap_output_aux(graph, batch_dim)
     return Graph(
         module,
         graph.input_specs,
         new_specs,
-        graph.output_tree,
+        output_tree,
         graph.static_values,
-        graph.output_static_values,
+        output_static_values,
         source_locations,
     )
 
@@ -398,7 +480,9 @@ def _batch_dim() -> core.Dim:
 
 
 def _batched_input_specs(
-    graph: Graph, tensor_axes: Tuple[Optional[int], ...]
+    graph: Graph,
+    tensor_axes: Tuple[Optional[int], ...],
+    batch_dim: Optional[core.Dim] = None,
 ) -> Tuple[Tuple, Tuple[MappedAxes, ...]]:
     """New flat tensor specs + per-input `MappedAxes`.
 
@@ -412,8 +496,13 @@ def _batched_input_specs(
     batch extents WITHIN a level with a clear ShapeError. Level-distinct
     names keep nested vmap levels from colliding at run time (unequal extents
     run; equal extents keep working). Unmapped specs are reused unchanged.
+
+    `batch_dim` may be supplied by the caller (`vectorize_graph` threads the
+    SAME object into the output-aux remap so remapped static leaves share the
+    batch Dim identity with the specs); when omitted it is created here.
     """
-    batch_dim = _batch_dim()
+    if batch_dim is None:
+        batch_dim = _batch_dim()
     new_specs = []
     mapped_axes = []
     for spec, entry in zip(graph.tensor_specs, tensor_axes):
@@ -431,6 +520,192 @@ def _batched_input_specs(
         )
         mapped_axes.append(MappedAxes((0,)))
     return tuple(new_specs), tuple(mapped_axes)
+
+
+def _remap_output_aux(
+    graph: Graph, batch_dim: core.Dim
+) -> Tuple["core.TreeSpec", Tuple[StaticValue, ...]]:
+    """Rebuild the output tree + output static records at the vectorize boundary.
+
+    `vectorize_graph` prepends a leading batch dim to mapped tensor outputs,
+    which goes stale for registered pytree nodes whose children include
+    STATIC leaves (e.g. a future sparse-tensor node: children = [tensor
+    leaves..., dense_shape ints, dtype, format] — the sparse value's
+    dense_shape must gain the batch dim as a leading symbolic `Dim`). For
+    every output-tree container node with a registered remap fn
+    (`_lookup_batched_aux_remap`), the fn receives the node spec, its direct
+    static-leaf child values (in child order), and `batch_dim` — the same
+    object the mapped tensor specs carry — and returns the REMAPPED static
+    leaf values (count may change). INPUT-side static values are never
+    remapped (the batch lives in the flat tensor-leaf specs only).
+
+    Algorithm (two mutable leaf counters — an OLD-tree counter classifying
+    leaves against the recorded static indices, since registered nodes may
+    change leaf counts and old/new indices diverge, and a NEW-tree counter
+    assigning fresh sequential indices to the rebuilt records):
+
+    1. Leaf (`num_leaves == 1`, no children): classified by its OLD index —
+       recorded static leaves keep their value/kind VERBATIM, only
+       index/path recomputed; the leaf spec itself is unchanged. Empty
+       containers (`num_leaves == 0`) consume nothing and pass through
+       unchanged.
+    2. Container with a registered fn: direct static-leaf children are
+       collected (in child order) for the fn call; direct tensor-leaf
+       children keep their specs verbatim at their original positions;
+       non-leaf children recurse normally (they pass through — static leaves
+       inside them keep verbatim values with recomputed indices, and are NOT
+       passed to the fn). The rebuilt children = all non-static children in
+       original order + one fresh plain-leaf `core.TreeSpec` (`type(None)` —
+       the canonical normalized leaf; a `type=None` FIELD would classify as a
+       TENSOR position in the pipeline) per returned static value; the node's
+       `type`/`context`/`node_data` are preserved. One `StaticValue` record is
+       emitted per new static value at its index in the NEW children tuple.
+    3. Unregistered container: recurse into children; `type`/`context`/
+       `node_data` preserved. Path keys mirror `_iter_leaf_paths` (dict
+       nodes use the recorded sorted key from `node_data`, all other
+       container kinds use positional indices).
+
+    When NO registered container node is found, the ORIGINAL
+    `(output_tree, output_static_values)` objects are returned — byte-
+    identical old behavior (zero regression).
+    """
+    old_static = {record.index for record in graph.output_static_values}
+    old_by_index = {record.index: record for record in graph.output_static_values}
+    found = False
+
+    def _child_key(spec, index):
+        # Mirror `trace._iter_leaf_paths`: dict nodes use the recorded sorted
+        # key from `node_data`; all other container kinds use positional
+        # indices.
+        if isinstance(spec.type, type) and issubclass(spec.type, dict):
+            return spec.node_data[index]
+        return index
+
+    def walk(spec, prefix, old_counter, new_counter):
+        """Recursive rebuild; returns ``(new_spec, records)``."""
+        nonlocal found
+        if spec.num_leaves == 0:
+            # Empty container: consumes nothing, passes through unchanged.
+            return spec, []
+        if not spec.children:
+            # Leaf: classify by its OLD index. Static leaves keep their
+            # value/kind verbatim (only index/path recomputed); the leaf spec
+            # itself is unchanged.
+            old_idx = old_counter[0]
+            old_counter[0] += 1
+            new_idx = new_counter[0]
+            new_counter[0] += 1
+            if old_idx not in old_static:
+                return spec, []
+            old_record = old_by_index[old_idx]
+            return spec, [
+                StaticValue(
+                    index=new_idx,
+                    path=prefix,
+                    value=old_record.value,
+                    kind=old_record.kind,
+                )
+            ]
+        fn = _lookup_batched_aux_remap(spec)
+        if fn is None:
+            # Unregistered container: recurse into children.
+            new_children = []
+            records = []
+            for index, child in enumerate(spec.children):
+                rebuilt, child_records = walk(
+                    child,
+                    prefix + (_child_key(spec, index),),
+                    old_counter,
+                    new_counter,
+                )
+                new_children.append(rebuilt)
+                records.extend(child_records)
+            return (
+                core.TreeSpec(
+                    type=spec.type,
+                    children=tuple(new_children),
+                    context=spec.context,
+                    node_data=spec.node_data,
+                ),
+                records,
+            )
+        # Registered container: direct static-leaf children are collected for
+        # the fn; direct tensor-leaf children keep their specs verbatim;
+        # container children recurse normally.
+        found = True
+        static_values = []
+        new_children = []
+        records = []
+        for index, child in enumerate(spec.children):
+            if not child.children:
+                if child.num_leaves == 0:
+                    # Empty container child: consumes nothing, passes through.
+                    new_children.append(child)
+                    continue
+                # Direct leaf child of the registered node.
+                old_idx = old_counter[0]
+                old_counter[0] += 1
+                if old_idx in old_static:
+                    static_values.append(old_by_index[old_idx].value)
+                else:
+                    new_children.append(child)
+                    new_counter[0] += 1  # tensor leaf: one new leaf
+                continue
+            rebuilt, child_records = walk(
+                child,
+                prefix + (_child_key(spec, index),),
+                old_counter,
+                new_counter,
+            )
+            new_children.append(rebuilt)
+            records.extend(child_records)
+        remapped = fn(spec, tuple(static_values), batch_dim)
+        if isinstance(remapped, str):
+            raise TransformError(
+                "vectorize: the batched-aux remap fn registered for node "
+                f"type {spec.type.__qualname__!r} must return a non-str "
+                f"sequence of static leaf values, got a str"
+            )
+        try:
+            remapped = tuple(remapped)
+        except TypeError as exc:
+            raise TransformError(
+                "vectorize: the batched-aux remap fn registered for node "
+                f"type {spec.type.__qualname__!r} must return a sequence of "
+                f"static leaf values, got {remapped!r}"
+            ) from exc
+        for value in remapped:
+            child_pos = len(new_children)
+            records.append(
+                StaticValue(
+                    index=new_counter[0],
+                    path=prefix + (child_pos,),
+                    value=value,
+                    kind=type(value).__qualname__,
+                )
+            )
+            new_counter[0] += 1
+            # Plain-leaf spec for the fresh static: `type(None)` (the
+            # canonical normalized leaf — NOT a `type=None` field, which the
+            # pipeline's `_is_tensor_leaf_spec` treats as a TENSOR marker,
+            # grad/vjp output-tree convention).
+            new_children.append(core.TreeSpec(type=type(None)))
+        return (
+            core.TreeSpec(
+                type=spec.type,
+                children=tuple(new_children),
+                context=spec.context,
+                node_data=spec.node_data,
+            ),
+            records,
+        )
+
+    old_counter = [0]
+    new_counter = [0]
+    new_tree, records = walk(graph.output_tree, (), old_counter, new_counter)
+    if not found:
+        return graph.output_tree, graph.output_static_values
+    return new_tree, tuple(records)
 
 
 def _entry_function(graph: Graph) -> ir.Function:

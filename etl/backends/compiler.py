@@ -7,9 +7,9 @@ the frontend half of the staging pipeline across all compilers:
 - the SAME block-call portable inlining every backend uses
   (``inline.py::inline_portables``);
 - the SAME capability pre-check pattern as the numpy reference backend
-  (``runtime_call`` / ``collective`` effects / ``block_call`` / dtypes /
-  dynamic shapes vs ``Capabilities`` — every rejection names the
-  feature);
+  (``runtime_call`` / ``collective`` effects / ``block_call`` / sparse
+  ops (category "sparse") / dtypes / dynamic shapes vs ``Capabilities``
+  — every rejection names the feature);
 - the SAME ``Signature`` recording as ``NumpyBackend.lower``;
 - a StableHLO-MLIR ``LoweredProgram`` payload — the honest capability gate:
   the exporter raises ``core.BackendError`` naming any op it cannot emit,
@@ -67,8 +67,9 @@ class CompilerBackend(Backend):
       every rejection naming the missing feature:
       ``runtime_call`` requires ``capabilities.runtime_calls``;
       ``collective``-effect ops require ``capabilities.collectives``;
-      ``block_call`` requires ``capabilities.custom_blocks``; every value
-      dtype must be declared in ``capabilities.dtypes``; when
+      ``block_call`` requires ``capabilities.custom_blocks``; ops in the
+      ``"sparse"`` category require ``capabilities.sparse_ops``; every
+      value dtype must be declared in ``capabilities.dtypes``; when
       ``capabilities.dynamic_shapes`` is False, symbolic /
       runtime-dynamic (``None``) dimensions are rejected — all raise
       ``core.BackendError`` naming the feature.
@@ -178,9 +179,11 @@ class CompilerBackend(Backend):
         2. Capability pre-check on the CURRENT module state (live walk via
            ``inline.iter_ops`` — the module is mutated by inlining in
            step 3): ``runtime_call`` / ``collective``-effect ops /
-           ``block_call`` / dtypes / dynamic shapes are checked against
-           ``Capabilities`` here (mirrors the numpy backend's flag
-           pattern). Every rejection names the missing feature.
+           ``block_call`` / sparse ops (category "sparse" vs
+           ``capabilities.sparse_ops``) / dtypes / dynamic shapes are
+           checked against ``Capabilities`` here (mirrors the numpy
+           backend's flag pattern). Every rejection names the missing
+           feature.
         3. ``inline_portables(graph.module, keep_backend_impls=None)`` — for
            adapters declaring ``custom_blocks=True`` every remaining
            ``block_call`` MUST have a portable decomposition, else
@@ -223,6 +226,14 @@ class CompilerBackend(Backend):
                 raise core.BackendError(
                     f"capability drift: the {self.name} backend cannot "
                     "execute custom block ops (block_call)"
+                )
+            if op.opdef.category == "sparse" and not capabilities.sparse_ops:
+                raise core.BackendError(
+                    f"capability drift: the {self.name} backend cannot "
+                    f"execute sparse op '{op.name}' — sparse ops are "
+                    "numpy-backend-only in v1; densify with "
+                    "etl.sparse.to_dense (or convert the sparse computation "
+                    "into dense ops) before lowering to a compiler backend"
                 )
             for result in op.results:
                 self._check_value_dtype(result.type.dtype, f"op '{op.name}'")
