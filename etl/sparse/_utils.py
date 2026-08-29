@@ -260,5 +260,12 @@ def _row_lookup(
     match_int = ops.reduce_sum(ops.cast(eq, np.dtype("int64")), axes=(-1,))
     match = ops.equal(match_int, ndim)  # (nnz_in, nnz_m) bool
     positions = ops.argmax(match, axis=1)  # (nnz_in,) int64
-    mask = ops.greater(ops.reduce_sum(match_int, axes=(1,)), 0)  # (nnz_in,) bool
+    # mask must be based on FULL row matches (the `match` matrix), not the
+    # per-coordinate counts: an input row absent from the merged indices can
+    # still share individual coordinates with different merged rows (e.g. the
+    # intersection merge of sparse_multiply), which would make the sum of
+    # per-coordinate counts positive.
+    mask = ops.greater(
+        ops.reduce_sum(ops.cast(match, np.dtype("int64")), axes=(1,)), 0
+    )  # (nnz_in,) bool
     return positions, mask

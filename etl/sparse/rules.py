@@ -1,4 +1,5 @@
-"""Sparse batching rules + batched-output aux remap + VJP rules.
+"""Sparse batching rules + batched-output aux remap + VJP rules + bilinear
+JVP rules.
 
 **Batching** (vectorize/vmap support): one shared batching rule serves all 16
 sparse ops. Sparse ops are
@@ -25,6 +26,21 @@ rule receives a PROXY op (original attributes/location, transformed
 operand/result values) and builds IR over ``primals`` / ``proxy.results``
 with the frontend ``etl.ops`` / ``etl.sparse.ops`` — never re-traces.
 
+**JVP** (jvp support): explicit rules for the FOUR bilinear sparse ops
+(``sparse_multiply``, ``sparse_multiply_dense``, ``sparse_dot_dense``,
+``dense_dot_sparse`` — the ops whose output depends on TWO differentiable
+operands, so their JVP is a two-term product rule); everything else derives
+its JVP from its VJP rule via the adjoint (double-vjp) trick in
+`etl.transforms.autodiff._jvp_from_vjp`. JVP rules follow the
+``rule(op, tangents) -> output_tangents`` contract (tangents align with
+``op.operands``, returns align with ``op.results``; sparse results return
+``(ZeroTangent, values_tangent)``, dense results ``(dense_tangent,)``).
+``sparse_multiply``'s rule is a GATHER-based product rule: the intersection
+merge (`np.intersect1d`) reorders both inputs' rows into the merged order, so
+each input's tangent and primal values are gathered to the merged rows
+(``_row_lookup``) before multiplying — the naive elementwise
+``add(multiply(ta, vb), multiply(va, tb))`` would pair the WRONG rows.
+
 Sparse vjp semantics (binding): the structure (indices) is never
 differentiated — every rule returns ``ZeroTangent`` for index operands. Value
 cotangents are pulled back with ordinary dense ops:
@@ -36,6 +52,12 @@ cotangents are pulled back with ordinary dense ops:
   ``sparse_transpose``) broadcasts row-equality of the input rows against the
   merged rows + ``argmax`` + ``where`` (``_row_lookup`` in
   ``etl/sparse/_utils.py``) — O(nnz²), acceptable;
+- ``sparse_add``'s values cotangent is the merged cotangent gathered at each
+  input row's merged position (union — every row survives);
+- ``sparse_multiply``'s values cotangent is the merged cotangent WEIGHTED by
+  the other operand's value at the matched row (``d(sum vm)/dv_a = v_b``),
+  then gathered at each input row's merged position and masked where the row
+  is absent from the intersection;
 - ``sparse_coo_to_csr`` / ``sparse_csr_to_coo`` / ``sparse_reshape`` pass the
   values cotangent through 1:1 (no reorder — COO lex-sorted IS row-major);
 - ``sparse_coo_to_csc`` / ``sparse_csc_to_coo`` / ``sparse_concatenate`` are
@@ -63,8 +85,10 @@ Import contract: this module imports `etl.core`, `etl.ir`, `etl.ops`,
 the public `etl.transforms` registration names, the internal
 `MappedAxes`/`UNMAPPED` metadata (exactly like `etl/transforms/rules.py`),
 `ZeroTangent` from `etl.transforms.autodiff`, and `etl.sparse.value` /
-`etl.sparse._utils` (NOT `etl.sparse` — this module is imported BY
-`etl/sparse/__init__.py`). Never backends/pipeline/persist.
+`etl.sparse._utils`. The JVP rules build replacement ops with the
+`etl.sparse.ops` FRONTEND (imported as `sparse_ops` — safe: `etl/sparse/
+__init__.py` imports `ops` before `rules`, so the module is fully loaded
+whenever this file is imported). Never backends/pipeline/persist.
 """
 from __future__ import annotations
 
@@ -77,9 +101,10 @@ from etl import ir
 from etl import ops
 from etl.trace import current_builder
 from etl.transforms import register_batched_aux_remap, register_batching_rule
-from etl.transforms.autodiff import ZeroTangent, register_vjp_rule
+from etl.transforms.autodiff import ZeroTangent, register_jvp_rule, register_vjp_rule
 from etl.transforms._metadata import MappedAxes, UNMAPPED
 
+from etl.sparse import ops as sparse_ops
 from etl.sparse._utils import _raw_reshape, _row_lookup
 from etl.sparse.value import SparseTensor
 
@@ -202,7 +227,7 @@ def _ok(tangent):
 
 
 def _require_unbatched(value: ir.Value, op_name: str, expected_rank: int) -> None:
-    """Reject batched sparse operands in the flat-index/lookup vjp rules.
+    """Reject batched sparse operands in the flat-index/lookup AD rules.
 
     The dense-side gather/scatter construction below flattens the sparse
     dense_shape into one row-major index space; with leading batch dims that
@@ -212,9 +237,9 @@ def _require_unbatched(value: ir.Value, op_name: str, expected_rank: int) -> Non
     rank = value.type.rank
     if rank != expected_rank:
         raise core.TransformError(
-            f"grad/vjp: vjp of '{op_name}' is implemented for unbatched sparse "
-            f"operands only (got rank {rank}, expected {expected_rank}) — "
-            "batched sparse vjp is a v1 gap"
+            f"grad/vjp/jvp: differentiation of '{op_name}' is implemented for "
+            f"unbatched sparse operands only (got rank {rank}, expected "
+            f"{expected_rank}) — batched sparse differentiation is a v1 gap"
         )
 
 
@@ -345,11 +370,11 @@ def _vjp_sparse_negate(op, cotangents, primals):
     return (ZeroTangent(), ops.negate(_sym(cot)).value)
 
 
-def _vjp_sparse_merge(op, cotangents, primals):
-    """sparse_add / sparse_multiply (ia, va, ib, vb) -> (im, vm): each input's
+def _vjp_sparse_add(op, cotangents, primals):
+    """sparse_add (ia, va, ib, vb) -> (im, vm): union merge — each input's
     values cotangent = the merged cotangent gathered at that input's rows'
-    positions in the merged indices, masked where a row is absent from the
-    merge (the intersection case of sparse_multiply). O(nnz^2) row lookup."""
+    positions in the merged indices (every input row survives the union, so
+    the mask is all-true). O(nnz^2) row lookup."""
     cot_merged = _ok(cotangents[1])
     if cot_merged is None:
         return (ZeroTangent(), ZeroTangent(), ZeroTangent(), ZeroTangent())
@@ -360,6 +385,37 @@ def _vjp_sparse_merge(op, cotangents, primals):
     merged = op.results[0]
     g_a = _gather_at_rows(cot_merged, ia, merged, ndim, op.location)
     g_b = _gather_at_rows(cot_merged, ib, merged, ndim, op.location)
+    return (ZeroTangent(), g_a, ZeroTangent(), g_b)
+
+
+def _vjp_sparse_multiply(op, cotangents, primals):
+    """sparse_multiply (ia, va, ib, vb) -> (im, vm): intersection merge — each
+    input's values cotangent is the merged cotangent WEIGHTED by the OTHER
+    operand's value at the matched row (d(sum vm)/dv_a = v_b), gathered at
+    the input row's position in the merged indices and masked where the row
+    is absent from the intersection:
+        g_a[i] = cot[pos_a[i]] * vb[merged_to_b[pos_a[i]]]
+    O(nnz^2) row lookups."""
+    cot_merged = _ok(cotangents[1])
+    if cot_merged is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent(), ZeroTangent())
+    ia, va, ib, vb = primals
+    _require_unbatched(ia, op.name, 2)
+    _require_unbatched(ib, op.name, 2)
+    ndim = len(op.attributes["dense_shape"])
+    merged = op.results[0]
+    # each merged row's position in the inputs' index lists (every merged row
+    # is present in both inputs — the merge is an intersection)
+    merged_to_a, _ = _row_lookup(merged, ia, ndim, op.location)
+    merged_to_b, _ = _row_lookup(merged, ib, ndim, op.location)
+    weighted_a = ops.multiply(
+        _sym(cot_merged), ops.gather(_sym(vb), merged_to_b, axis=0)
+    )
+    weighted_b = ops.multiply(
+        _sym(cot_merged), ops.gather(_sym(va), merged_to_a, axis=0)
+    )
+    g_a = _gather_at_rows(weighted_a.value, ia, merged, ndim, op.location)
+    g_b = _gather_at_rows(weighted_b.value, ib, merged, ndim, op.location)
     return (ZeroTangent(), g_a, ZeroTangent(), g_b)
 
 
@@ -561,9 +617,147 @@ def _vjp_dense_dot_sparse(op, cotangents, primals):
     return (g_dense.value, ZeroTangent(), g_values.value)
 
 
+# --- JVP rules (the four bilinear sparse ops) --------------------------------
+#
+# Contract (etl/transforms/autodiff.py): rule(op, tangents) -> output_tangents;
+# tangents align with op.operands (None/ZeroTangent = zero); returns align
+# with op.results — sparse results return (ZeroTangent, values_tangent)
+# (structure is never differentiated), dense results (dense_tangent,). All
+# four outputs depend on TWO differentiable operands, so the rules are
+# two-term product rules built with the etl.sparse frontend ops (they build
+# IR into the active builder over the proxy's operand/tangent values). Every
+# other sparse op's JVP derives from its VJP rule via the adjoint
+# (double-vjp) trick — sound because the vjp rules are linear in the
+# cotangent and their emitted ops all carry registered vjp rules.
+
+def _sparse_coo_of(indices: ir.Value, values: ir.Value, dense_shape: tuple) -> "SparseTensor":
+    """A symbolic COO sparse over the given ir.Values (no validation — the
+    leaves are graph values; used to feed the etl.sparse frontend ops)."""
+    return SparseTensor.from_parts(
+        _sym(indices), _sym(values), dense_shape=dense_shape, format="coo"
+    )
+
+
+def _jvp_sparse_multiply(op, tangents):
+    """(ia, va, ib, vb) -> (im, vm): the intersection merge
+    (``np.intersect1d``) reorders both inputs' rows into the merged order, so
+    the product rule needs each input's tangent AND primal values gathered to
+    the merged rows:
+        t_vm = gather(ta, pos_a) * gather(vb, pos_b)
+             + gather(va, pos_a) * gather(tb, pos_b)
+    with pos_a/pos_b = the merged rows' positions in the inputs' index lists
+    (`_row_lookup`, the same O(nnz²) machinery as the vjp merge rule). The
+    naive elementwise ``add(multiply(ta, vb), multiply(va, tb))`` would pair
+    the WRONG rows (the merged order matches neither input's order)."""
+    ta, tb = _ok(tangents[1]), _ok(tangents[3])
+    if ta is None and tb is None:
+        return (ZeroTangent(), ZeroTangent())
+    ia, va, ib, vb = op.operands
+    _require_unbatched(ia, op.name, 2)
+    _require_unbatched(ib, op.name, 2)
+    ndim = len(op.attributes["dense_shape"])
+    merged = op.results[0]
+    pos_a, _ = _row_lookup(merged, ia, ndim, op.location)
+    pos_b, _ = _row_lookup(merged, ib, ndim, op.location)
+    terms = []
+    if ta is not None:
+        terms.append(
+            ops.multiply(
+                ops.gather(_sym(ta), pos_a, axis=0),
+                ops.gather(_sym(vb), pos_b, axis=0),
+            )
+        )
+    if tb is not None:
+        terms.append(
+            ops.multiply(
+                ops.gather(_sym(va), pos_a, axis=0),
+                ops.gather(_sym(tb), pos_b, axis=0),
+            )
+        )
+    if len(terms) == 1:
+        return (ZeroTangent(), terms[0].value)
+    return (ZeroTangent(), ops.add(terms[0], terms[1]).value)
+
+
+def _jvp_sparse_multiply_dense(op, tangents):
+    """(indices, values, dense) -> (indices, values): structure preserved and
+    the rows stay aligned, so the product rule is elementwise:
+        t_values = multiply_dense(indices, ta, dense)
+                 + multiply_dense(indices, va, tdense)."""
+    ta, td = _ok(tangents[1]), _ok(tangents[2])
+    if ta is None and td is None:
+        return (ZeroTangent(), ZeroTangent())
+    indices, va, dense = op.operands
+    dense_shape = tuple(op.attributes["dense_shape"])
+    terms = []
+    if ta is not None:
+        terms.append(
+            sparse_ops.multiply_dense(
+                _sparse_coo_of(indices, ta, dense_shape), _sym(dense)
+            )
+        )
+    if td is not None:
+        terms.append(
+            sparse_ops.multiply_dense(
+                _sparse_coo_of(indices, va, dense_shape), _sym(td)
+            )
+        )
+    if len(terms) == 1:
+        return (ZeroTangent(), terms[0].values.value)
+    return (ZeroTangent(), ops.add(terms[0].values, terms[1].values).value)
+
+
+def _jvp_sparse_dot_dense(op, tangents):
+    """(indices, values, dense) -> dense: bilinear in (values, dense):
+        t_out = sparse_dot_dense(indices, ta, dense)
+              + sparse_dot_dense(indices, va, tdense)."""
+    ta, td = _ok(tangents[1]), _ok(tangents[2])
+    if ta is None and td is None:
+        return (ZeroTangent(),)
+    indices, va, dense = op.operands
+    dense_shape = tuple(op.attributes["dense_shape"])
+    terms = []
+    if ta is not None:
+        terms.append(
+            sparse_ops.matmul(_sparse_coo_of(indices, ta, dense_shape), _sym(dense))
+        )
+    if td is not None:
+        terms.append(
+            sparse_ops.matmul(_sparse_coo_of(indices, va, dense_shape), _sym(td))
+        )
+    if len(terms) == 1:
+        return (terms[0].value,)
+    return (ops.add(terms[0], terms[1]).value,)
+
+
+def _jvp_dense_dot_sparse(op, tangents):
+    """(dense, indices, values) -> dense: bilinear in (dense, values):
+        t_out = dense_dot_sparse(dense, indices, ta)
+              + dense_dot_sparse(tdense, indices, va)."""
+    td, tv = _ok(tangents[0]), _ok(tangents[2])
+    if td is None and tv is None:
+        return (ZeroTangent(),)
+    dense, indices, va = op.operands
+    dense_shape = tuple(op.attributes["dense_shape"])
+    terms = []
+    if tv is not None:
+        terms.append(
+            sparse_ops.matmul(_sym(dense), _sparse_coo_of(indices, tv, dense_shape))
+        )
+    if td is not None:
+        terms.append(
+            sparse_ops.matmul(_sym(td), _sparse_coo_of(indices, va, dense_shape))
+        )
+    if len(terms) == 1:
+        return (terms[0].value,)
+    return (ops.add(terms[0], terms[1]).value,)
+
+
 def _register_sparse_rules() -> None:
-    """Install the 16 sparse batching rules, the sparse aux remap, and the 16
-    sparse VJP rules (three of which are explicit deferrals).
+    """Install the 16 sparse batching rules, the sparse aux remap, the 16
+    sparse VJP rules (three of which are explicit deferrals), and the 4
+    explicit bilinear JVP rules (everything else derives its JVP from its VJP
+    rule via the adjoint trick).
 
     Runs at import time (this module is imported at the end of
     `etl/sparse/__init__.py`), so `import etl.sparse` registers everything.
@@ -574,8 +768,8 @@ def _register_sparse_rules() -> None:
     register_vjp_rule("sparse_to_dense", _vjp_sparse_to_dense)
     register_vjp_rule("sparse_from_dense", _vjp_sparse_from_dense)
     register_vjp_rule("sparse_negate", _vjp_sparse_negate)
-    register_vjp_rule("sparse_add", _vjp_sparse_merge)
-    register_vjp_rule("sparse_multiply", _vjp_sparse_merge)
+    register_vjp_rule("sparse_add", _vjp_sparse_add)
+    register_vjp_rule("sparse_multiply", _vjp_sparse_multiply)
     register_vjp_rule("sparse_multiply_dense", _vjp_sparse_multiply_dense)
     register_vjp_rule("sparse_reduce_sum", _vjp_sparse_reduce_sum)
     register_vjp_rule("sparse_transpose", _vjp_sparse_transpose)
@@ -606,6 +800,10 @@ def _register_sparse_rules() -> None:
     )
     register_vjp_rule("sparse_dot_dense", _vjp_sparse_dot_dense)
     register_vjp_rule("dense_dot_sparse", _vjp_dense_dot_sparse)
+    register_jvp_rule("sparse_multiply", _jvp_sparse_multiply)
+    register_jvp_rule("sparse_multiply_dense", _jvp_sparse_multiply_dense)
+    register_jvp_rule("sparse_dot_dense", _jvp_sparse_dot_dense)
+    register_jvp_rule("dense_dot_sparse", _jvp_dense_dot_sparse)
 
 
 _register_sparse_rules()
