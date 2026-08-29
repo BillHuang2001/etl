@@ -34,9 +34,17 @@ Implemented kernels (op name — semantics; shapes follow the ``ir.inference``
    strictly increasing; NO reorder.
 5. ``sparse_coo_to_csc(indices, values) -> (indptr, indices, values)`` —
    rank-2; canonical-validates the COO, then reorders column-major
-   (``np.lexsort((row, col))``); indptr over columns.
+   (``np.lexsort((row, col))``). The indptr runs over COLUMNS but has the
+   inference-declared length rows+1 (``infer_sparse_coo_to_csc`` reuses the
+   CSR shape): the true column pointers occupy ``ip[0:cols+1]`` and the tail
+   ``ip[cols+1:rows+1]`` is a monotone ``nnz`` continuation. When ``cols >
+   rows`` the column pointers cannot fit the declared length => explicit
+   ``ShapeError`` (see ``_coo_to_csc``; the upstream inference hook should
+   declare ``dense_shape[1]+1`` for csc).
 6. ``sparse_csc_to_coo(indptr, indices, values) -> (indices, values)`` —
-   rank-2; validates the CSC triple, expands, then re-sorts back to row-major
+   rank-2; validates the CSC triple (indptr length cols+1 standard OR rows+1
+   padded convention — the tail must equal nnz, strictly; else
+   ``ShapeError``), expands, then re-sorts back to row-major
    (``np.lexsort((col, row))``).
 7. ``sparse_negate(indices, values) -> (indices, -values)`` — structure
    preserved; no canonical assumption.
@@ -56,7 +64,9 @@ Implemented kernels (op name — semantics; shapes follow the ``ir.inference``
 11. ``sparse_reduce_sum(indices, values) -> dense`` — build the dense via
     ``np.add.at`` then ``np.sum(axis=axes, keepdims=keepdims)``; all-axes fast
     path = ``values.sum()``. ``axes`` refer to the unbatched sparse axes
-    (normalized: int -> tuple, list -> tuple; empty = ALL axes). Result dtype
+    (normalized: int -> tuple, list -> tuple; an EMPTY tuple = NO reduction —
+    identity dense, matching ``infer_sparse_reduce_sum``, which keeps every
+    dim for empty ``axes``). Result dtype
     = ``core.dtype(attributes["dtype"])`` — the op DECLARES it, so the
     computed sum is converted to it (accumulation happens in the declared
     dtype via the zeros buffer / final astype; float identity). In-range
@@ -594,17 +604,39 @@ def _csr_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
 
 def _coo_to_csc(ctx: Any, op: Any, operands: tuple) -> tuple:
     """``sparse_coo_to_csc`` (rank-2): canonical-validate, then reorder to
-    column-major (lexsort by (col, row)); indptr over columns."""
+    column-major (lexsort by (col, row)); indptr over columns.
+
+    Shape contract (binding): ``infer_sparse_coo_to_csc`` declares the
+    indptr as batch + (dense_shape[0] + 1,) — the SAME length as
+    ``sparse_coo_to_csr`` (rows+1) — even though the indptr runs over
+    columns (cols+1 meaningful entries). This kernel honors BOTH: the
+    output indptr has the declared length rows+1 with the true column
+    pointers in ``ip[0:cols+1]`` and a monotone ``nnz`` tail in
+    ``ip[cols+1:rows+1]`` (``_csc_to_coo`` validates that tail strictly —
+    never silent garbage). When cols > rows the column pointers do not fit
+    in the declared length and the conversion raises an explicit
+    ``ShapeError`` (the csc representation is inexpressible in the
+    inference-declared shape; note the upstream inference hook must be
+    amended to dense_shape[1]+1 for csc — see the module docstring).
+    """
     name = op.name
     indices, values = operands
     idx, vals = indices.numpy(), values.numpy()
     rows, cols = _rank2_shape(ctx, name, op.attributes["dense_shape"])
     _validate_canonical(ctx, name, idx, vals, (rows, cols))
+    if cols > rows:
+        raise core.ShapeError(
+            f"kernel for op '{name}': dense_shape {(rows, cols)!r} has more "
+            f"columns than rows — the csc column pointers (length cols+1 = "
+            f"{cols + 1}) do not fit the inference-declared indptr length "
+            f"rows+1 = {rows + 1}; the upstream infer_sparse_coo_to_csc shape "
+            "must be amended (dense_shape[1]+1) for this representation"
+        )
     batch = idx.shape[:-2]
     n = _batch_count(batch)
     idx_flat = idx.reshape((n,) + idx.shape[-2:])
     vals_flat = vals.reshape((n,) + vals.shape[-1:])
-    out_indptr = np.zeros((n, cols + 1), _INT64)
+    out_indptr = np.zeros((n, rows + 1), _INT64)
     out_indices = np.empty((n, idx.shape[-2]), _INT64)
     out_vals = np.empty((n, vals.shape[-1]), dtype=vals.dtype)
     for b in range(n):
@@ -612,11 +644,12 @@ def _coo_to_csc(ctx: Any, op: Any, operands: tuple) -> tuple:
         col = idx_flat[b][:, 1]
         order = np.lexsort((row, col))  # primary: col, secondary: row
         counts = np.bincount(col[order], minlength=cols).astype(_INT64)
-        out_indptr[b, 1:] = np.cumsum(counts)
+        out_indptr[b, 1 : cols + 1] = np.cumsum(counts)
+        out_indptr[b, cols + 1 :] = counts.sum()  # monotone nnz tail
         out_indices[b] = row[order]
         out_vals[b] = vals_flat[b][order]
     return (
-        core.Tensor(out_indptr.reshape(batch + (cols + 1,))),
+        core.Tensor(out_indptr.reshape(batch + (rows + 1,))),
         core.Tensor(out_indices.reshape(batch + (idx.shape[-2],))),
         core.Tensor(out_vals.reshape(vals.shape)),
     )
@@ -624,14 +657,20 @@ def _coo_to_csc(ctx: Any, op: Any, operands: tuple) -> tuple:
 
 def _csc_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
     """``sparse_csc_to_coo`` (rank-2): validate the CSC triple, expand, then
-    RE-SORT back to row-major (lexsort by (row, col))."""
+    RE-SORT back to row-major (lexsort by (row, col)).
+
+    The indptr may arrive with length cols+1 (standard column pointers) or
+    rows+1 (the padded convention emitted by ``_coo_to_csc`` — the true
+    column pointers in ``ip[0:cols+1]`` plus a strictly-validated monotone
+    ``nnz`` tail). Anything else => ``ShapeError``.
+    """
     name = op.name
     indptr, indices, values = operands
     ip_a, idx_a, vals = indptr.numpy(), indices.numpy(), values.numpy()
     rows, cols = _rank2_shape(ctx, name, op.attributes["dense_shape"])
     batch = ip_a.shape[:-1]
     n = _batch_count(batch)
-    ip_flat = ip_a.reshape((n, cols + 1))
+    ip_flat = ip_a.reshape((n, ip_a.shape[-1]))
     idx_flat = idx_a.reshape((n,) + idx_a.shape[-1:])
     vals_flat = vals.reshape((n,) + vals.shape[-1:])
     out_idx = np.empty((n, idx_a.shape[-1], 2), _INT64)
@@ -639,10 +678,33 @@ def _csc_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
     for b in range(n):
         ip = ip_flat[b]
         ri = idx_flat[b]
-        _validate_indptr(name, ip, ri.shape[0], cols)
+        nnz = ri.shape[0]
+        if ip.shape[0] == cols + 1:
+            ip_eff = ip
+        elif ip.shape[0] == rows + 1:
+            if cols + 1 > ip.shape[0]:
+                raise core.ShapeError(
+                    f"kernel for op '{name}': indptr length {ip.shape[0]} "
+                    f"(rows+1) cannot hold {cols + 1} column pointers"
+                )
+            _validate_indptr(name, ip, nnz, rows)  # full-length sanity
+            ip_eff = ip[: cols + 1]
+            if not np.all(ip[cols + 1 :] == nnz):
+                raise core.ShapeError(
+                    f"kernel for op '{name}': padded indptr tail "
+                    f"{ip[cols + 1 :].tolist()} must equal nnz={nnz} (the "
+                    "csc column-pointer padding convention)"
+                )
+        else:
+            raise core.ShapeError(
+                f"kernel for op '{name}': indptr length {ip.shape[0]} must be "
+                f"cols+1 = {cols + 1} (standard) or rows+1 = {rows + 1} "
+                "(padded csc convention)"
+            )
+        _validate_indptr(name, ip_eff, nnz, cols)
         for c in range(cols):
-            _check_segment_sorted(name, ri[ip[c]: ip[c + 1]], rows, "row")
-        col_ids = np.repeat(np.arange(cols, dtype=_INT64), np.diff(ip))
+            _check_segment_sorted(name, ri[ip_eff[c]: ip_eff[c + 1]], rows, "row")
+        col_ids = np.repeat(np.arange(cols, dtype=_INT64), np.diff(ip_eff))
         two_d = np.stack([ri, col_ids], axis=-1)  # (col, row) pairs
         order = np.lexsort((col_ids, ri))  # primary: row, secondary: col
         out_idx[b] = two_d[order]
@@ -782,11 +844,14 @@ def _multiply_dense(ctx: Any, op: Any, operands: tuple) -> tuple:
 def _reduce_sum(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     """``sparse_reduce_sum``: dense accumulation + numpy reduction.
 
-    ``axes`` refer to the unbatched sparse axes (int or tuple/list, empty =
-    ALL axes). In-range is checked (sortedness/duplicates are NOT assumed —
-    stored zeros from batched padding are legal). The result dtype is the
-    op-DECLARED ``dtype`` attribute: accumulation happens in that dtype (the
-    zeros buffer) and the final per-element result is converted to it.
+    ``axes`` refer to the unbatched sparse axes (int or tuple/list; an EMPTY
+    tuple = NO reduction — identity dense, matching ``infer_sparse_reduce_sum``
+    which keeps every dim for empty ``axes``; the frontend must emit the full
+    axis tuple for an all-axes reduction). In-range is checked (sortedness/
+    duplicates are NOT assumed — stored zeros from batched padding are
+    legal). The result dtype is the op-DECLARED ``dtype`` attribute:
+    accumulation happens in that dtype (the zeros buffer) and the final
+    per-element result is converted to it.
     """
     name = op.name
     indices, values = operands
@@ -805,8 +870,6 @@ def _reduce_sum(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     if isinstance(axes, int) and not isinstance(axes, bool):
         axes = (axes,)
     axes = tuple(axes)
-    if not axes:
-        axes = tuple(range(rank))
     axes_norm = tuple(sorted({a % rank for a in axes}))
     keepdims = bool(op.attributes.get("keepdims", False))
     reduced_set = set(axes_norm)
@@ -886,10 +949,14 @@ def _reshape(ctx: Any, op: Any, operands: tuple) -> tuple:
     total_new = math.prod(new_shape)
     batch = idx.shape[:-2]
     n = _batch_count(batch)
+    nnz = idx.shape[-2]
     idx_flat = idx.reshape((n,) + idx.shape[-2:])
     vals_flat = vals.reshape((n,) + vals.shape[-1:])
-    out_idx = np.empty_like(idx_flat)
-    out_vals = np.empty_like(vals_flat)
+    # NOTE: the result rank differs from the input rank — allocate from the
+    # NEW shape (np.empty_like(idx_flat) would silently broadcast a rank-1
+    # coordinate row into a rank-2 buffer via numpy's trailing-dim rules).
+    out_idx = np.empty((n, nnz, len(new_shape)), _INT64)
+    out_vals = np.empty((n, nnz), dtype=vals.dtype)
     for b in range(n):
         linear = np.ravel_multi_index(idx_flat[b].T, old_shape)
         if linear.size and (int(linear.min()) < 0 or int(linear.max()) >= total_new):
@@ -903,7 +970,10 @@ def _reshape(ctx: Any, op: Any, operands: tuple) -> tuple:
         order = _lexsort_rows(new)
         out_idx[b] = new[order]
         out_vals[b] = vals_flat[b][order]
-    return core.Tensor(out_idx.reshape(idx.shape)), core.Tensor(out_vals.reshape(vals.shape))
+    return (
+        core.Tensor(out_idx.reshape(batch + (nnz, len(new_shape)))),
+        core.Tensor(out_vals.reshape(vals.shape)),
+    )
 
 
 def _concatenate(ctx: Any, op: Any, operands: tuple) -> tuple:
@@ -973,7 +1043,9 @@ def _concatenate(ctx: Any, op: Any, operands: tuple) -> tuple:
     out_dtype = np.result_type(*[va_t.dtype for _, va_t in pairs])
     nnz_total = sum(int(ia_t.shape[-2]) for ia_t, _ in pairs)
     n = _batch_count(batch)
-    offsets = tuple(np.cumsum(extents[:-1])) if n_operands > 1 else ()
+    # offsets[k] = sum(extents[:k]) — the leading 0 makes the last operand's
+    # offset in range (cumsum(extents[:-1]) alone is one short)
+    offsets = (0,) + tuple(np.cumsum(extents[:-1]))
     out_idx = np.empty((n, nnz_total, rank), _INT64)
     out_vals = np.empty((n, nnz_total), dtype=out_dtype)
     for b in range(n):
