@@ -311,9 +311,20 @@ def _col(indices: "core.SymbolicTensor", index: int, location) -> "core.Symbolic
 
 def _gather_at_rows(cot_merged: ir.Value, input_indices: ir.Value, merged_indices: ir.Value, ndim: int, location) -> ir.Value:
     """Input-values cotangent: the merged cotangent gathered at each input
-    row's position in the merged indices (0 where the row is absent)."""
+    row's position in the merged indices (0 where the row is absent).
+
+    Empty-merge safety: the merged cotangent is padded with one zero row so
+    the gather never indexes an empty axis (the numpy ``take`` kernel raises
+    on a length-0 axis with non-empty indices — the empty intersection of
+    ``sparse_multiply`` or an ``nnz=0`` operand). The padded slot is only
+    ever read where the mask is False (absent rows -> position 0), and
+    ``select`` zeroes those entries — real-row values are unchanged.
+    """
     positions, mask = _row_lookup(input_indices, merged_indices, ndim, location)
-    gathered = ops.gather(_sym(cot_merged), positions, axis=0)
+    cot = _sym(cot_merged)
+    dummy = ops.constant(core.tensor(np.zeros((1,), dtype=cot.dtype)))
+    padded = ops.concatenate([cot, dummy], axis=0)
+    gathered = ops.gather(padded, positions, axis=0)
     return ops.select(mask, gathered, 0).value
 
 

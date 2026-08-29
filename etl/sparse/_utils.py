@@ -239,6 +239,15 @@ def _row_lookup(
     - ``argmax`` over the merged axis -> the position (0 when absent);
     - the mask = ``reduce_sum(match, axes=(1,)) > 0`` (the ``where`` arm).
 
+    Empty-merge / empty-nnz safety: the merged indices are first padded with
+    one dummy row of ``-1`` coordinates so the argmax axis has length
+    ``nnz_m + 1 >= 1`` (numpy ``argmax`` over an empty axis raises). The
+    dummy row never matches a real row (coordinates are ``>= 0``), so
+    real-row positions and the mask are unchanged; when the merge is empty
+    (e.g. the disjoint-support intersection of ``sparse_multiply``, or an
+    ``nnz=0`` operand) the match matrix is ``(nnz_in, 1)`` all-False, argmax
+    returns 0, and the rules' ``where(mask, ...)`` yields zero cotangents.
+
     O(nnz_in * nnz_m) in space — acceptable for the vjp rules (documented).
 
     Args:
@@ -254,8 +263,25 @@ def _row_lookup(
         absent), ``mask`` is bool (True where the input row exists in the
         merged indices).
     """
+    # Empty-merge / empty-nnz safety: pad the merged indices with one dummy
+    # row of -1s so the argmax axis below has length >= 1 (the numpy argmax
+    # kernel raises on an empty axis). The dummy row (all -1) never matches a
+    # real row (coordinates are >= 0), so real-row positions/mask below are
+    # unchanged; when nnz_m == 0 the match matrix is (nnz_in, 1) all-False,
+    # argmax returns 0, and the rules' `where(mask, ..., zeros)` yields zero
+    # cotangents (correct: no intersection -> zero grads). The concatenate is
+    # built directly into the active builder (like `_raw_reshape`): the
+    # merged_indices operand is a raw ir.Value, and the concat axis may be
+    # runtime-dynamic (None) — `infer_concatenate` folds a None axis dim.
+    dummy = ops.constant(core.tensor(np.full((1, ndim), -1, dtype=np.int64)))
+    concat_op = current_builder().create(
+        "concatenate",
+        operands=(merged_indices, dummy.value),
+        attributes={"axis": 0},
+        location=location,
+    )
     a = _raw_reshape(input_indices, (-1, 1, ndim), location)
-    b = _raw_reshape(merged_indices, (1, -1, ndim), location)
+    b = _raw_reshape(concat_op.result, (1, -1, ndim), location)
     eq = ops.equal(a, b)  # (nnz_in, nnz_m, ndim) bool
     match_int = ops.reduce_sum(ops.cast(eq, np.dtype("int64")), axes=(-1,))
     match = ops.equal(match_int, ndim)  # (nnz_in, nnz_m) bool
