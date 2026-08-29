@@ -42,7 +42,7 @@ Must-expose names (re-exported from `etl/backends/__init__.py` and from `etl`):
 
 ## Numpy backend design (reference CPU interpreter)
 
-**Capabilities**: name `"numpy"`; `dynamic_shapes=True`; `dtypes=` all numpy dtypes; `collectives=True` (single-process simulation); `runtime_calls=True`; `custom_blocks=True`; `async_collectives=False` (simulation is synchronous).
+**Capabilities**: name `"numpy"`; `dynamic_shapes=True`; `dtypes=` all numpy dtypes; `collectives=True` (single-process simulation); `runtime_calls=True`; `custom_blocks=True`; `async_collectives=False` (simulation is synchronous); `sparse_ops=True` (the ONLY backend with sparse support in v1 — the 16 `sparse_*`/`dense_dot_sparse` ops are numpy-implemented only).
 
 **Staging flow** (implemented — see `numpy/__init__.py`):
 - `lower(graph, options=None)`: (1) `graph.verify()`; (2) capability pre-check (v1 numpy supports everything — the check pattern stays); (3) inline `block_call` portable decompositions as graph→graph expansion via the SHARED fixpoint `inline.py::inline_portables(module, keep_backend_impls="numpy")` (same machinery compiler backends use; block has neither portable decomposition nor registered numpy impl ⇒ `BackendError` naming the block); (4) record `Signature` from the Graph's LIVE attributes (input/output TreeSpec + per-leaf specs + static values — passed down, not re-derived); (5) `payload` = versioned self-describing `ir.Module` serialization (`ir.serialize_module`).
@@ -116,6 +116,7 @@ All three: `runtime_calls=False` (runtime_call rejected at lower), `custom_block
 - **XLA**: a real CPU PJRT plugin `.so` is REQUIRED and user-provided (no pip package exists — discovery via `plugin_path` option / `ETL_PJRT_PLUGIN` / well-known paths). The adapter is ABI-gated against the vendored `pjrt_c_api.h` translation (recorded header commit; `PJRT_Api.version`/`struct_size` drift ⇒ explicit `BackendError`). ctypes plumbing is validated via a compiled test-plugin (`tests/backends/test_pjrt_ctypes_plugin.py`, gcc); real-XLA numerical parity is pending a real plugin `.so`. collectives off because `collective-broadcast` fails at XLA:CPU run time (5/6 work single-replica — re-probe before flipping).
 - **TVM**: requires jaxlib at adapter runtime — ONLY for its bundled LLVM MLIR python bindings (`jaxlib.mlir`, the same bindings any MLIR tooling uses; the `jax` package is never imported — a `sys.modules` shim satisfies the vendored translator's `jax._src.interpreters.mlir` import). A compatibility shim (`tvm_util.ensure_compat()`) patches the 0.26.0 vendored translator against the new mlir python bindings; control flow / conv / gather / scatter / remainder / multi-function / multi-output modules rejected by the compile-time gate.
 - **pyproject extras** (repo root — escalated): `iree` extra OK (`>=20240410`); `xla` extra REMOVED — the adapter has NO pip dependency (user-provided PJRT plugin `.so`); `tvm` extra `apache-tvm>=0.26` + `jaxlib>=0.10,<0.11` (`from_stablehlo` exists only in 0.26; jaxlib only for the bundled MLIR bindings).
+- **Sparse ops (v1, numpy-backend-only):** the 16 `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are implemented ONLY by the numpy backend; compiler backends (stablehlo export, iree/xla/tvm adapters) defer with an explicit `BackendError` naming the op and suggesting densification via `etl.sparse.to_dense` — never silent.
 
 ## Test strategy
 
@@ -130,7 +131,7 @@ All three: `runtime_calls=False` (runtime_call rejected at lower), `custom_block
 | Path | Area |
 |---|---|
 | `./backend.py` | `Capabilities`, `Backend` ABC, `Executable` protocol |
-| `./compiler.py` | shared pluggable-compiler framework: `CompilerBackend` (shared `lower` with dtype/shape/op capability pre-check; concrete default `check_available`; abstract `compile`/`load`), `CompilerExecutable` (shared save/load; abstract `run`) |
+| `./compiler.py` | shared pluggable-compiler framework: `CompilerBackend` (shared `lower` with dtype/shape/op capability pre-check — incl. sparse ops (category "sparse") vs `Capabilities.sparse_ops`; concrete default `check_available`; abstract `compile`/`load`), `CompilerExecutable` (shared save/load; abstract `run`) |
 | `./inline.py` | SHARED block-inlining machinery: `iter_block_ops`/`iter_ops` (regions-first bottom-up walk), `clone_ops_into`/`drop_op_uses` (portable splicing + use bookkeeping), `inline_portables` (fixpoint driver) |
 | `./program.py` | `Signature`, `LoweredProgram`, `CompiledArtifact` (owned by backends; `text()` renders str / stablehlo-dict (`mlir_text`) / serialized-module payloads) |
 | `./registry.py` | `register`/`get` + `OPTIONAL_ADAPTERS` (first-use auto-activation of optional adapters) |
