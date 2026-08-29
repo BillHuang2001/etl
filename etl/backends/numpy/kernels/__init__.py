@@ -87,7 +87,9 @@ def register_all() -> None:
         linalg,
         random,
         reductions,
+        sorting,
         sparse,
+        structural,
     )
 
     for module in (
@@ -96,6 +98,8 @@ def register_all() -> None:
         sparse,
         indexing,
         linalg,
+        sorting,
+        structural,
         control_flow,
         collective,
         custom,

@@ -48,6 +48,7 @@ _ELEMENTWISE_UNARY = (
     "erf",
     "sign",
     "logical_not",
+    "nan_to_num",
 )
 
 _COMPARISON = ("equal", "not_equal", "less", "less_equal", "greater", "greater_equal")
@@ -62,6 +63,10 @@ _STRUCTURE = (
     "scatter",
     "concatenate",
     "pad",
+    "tile",
+    "flip",
+    "roll",
+    "diag",
 )
 
 _REDUCTION = (
@@ -73,6 +78,7 @@ _REDUCTION = (
     "argmax",
     "argmin",
     "cumsum",
+    "cumprod",
 )
 
 _LINALG = ("dot", "conv", "tril", "triu", "solve")
@@ -128,6 +134,11 @@ _RANDOM = (
     "random_multinomial",
 )
 
+_SORTING = (
+    "sort",
+    "argsort",
+)
+
 CANONICAL_NAMES = (
     _ELEMENTWISE_BINARY
     + ("cast",)
@@ -141,6 +152,7 @@ CANONICAL_NAMES = (
     + _COLLECTIVE
     + _SPARSE
     + _RANDOM
+    + _SORTING
 )
 
 _CATEGORY_EXPECTED = {
@@ -156,6 +168,7 @@ _CATEGORY_EXPECTED = {
     **{name: "collective" for name in _COLLECTIVE},
     **{name: "sparse" for name in _SPARSE},
     **{name: "random" for name in _RANDOM},
+    **{name: "sorting" for name in _SORTING},
 }
 
 _EFFECT_EXPECTED = {name: "pure" for name in CANONICAL_NAMES}
@@ -303,7 +316,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 97
+    assert len(names) == 105
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -393,6 +406,7 @@ _SHAPE_FN_OPS = (
     + _STRUCTURE
     + _REDUCTION
     + _LINALG
+    + _SORTING
 )
 
 _NO_SHAPE_FN_OPS = ("constant", "call", "if", "runtime_call", "block_call")
@@ -473,7 +487,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 97
+    assert len(opdefs) == 105
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )

@@ -158,6 +158,33 @@ def _arg_reduce(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
     return core.Tensor(np.asarray(result))
 
 
+def _cumprod(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``cumprod``: cumulative product along ``axis`` (optionally reversed).
+
+    Mirrors the ``cumsum`` contract in ``indexing.py``: the op preserves the
+    operand dtype (the frontend pre-casts bool inputs to int64), so
+    accumulate with ``dtype=arr.dtype`` (numpy >= 2.0 would upcast integer
+    accumulation). ``reverse`` accumulates from the end toward the start
+    (flip -> cumprod -> flip). A rank-0 tensor is its own cumprod.
+    """
+    del ctx
+    arr = operands[0].numpy()
+    _check_dtype(op.name, arr)
+    axis = op.attributes["axis"]
+    reverse = bool(op.attributes.get("reverse", False))
+    if arr.ndim == 0:
+        return core.Tensor(np.array(arr, copy=True))
+    if reverse:
+        arr = np.flip(arr, axis=axis)
+    try:
+        result = np.cumprod(arr, axis=axis, dtype=arr.dtype)
+    except (ValueError, IndexError) as exc:
+        raise core.ShapeError(f"cumprod: {exc}") from exc
+    if reverse:
+        result = np.flip(result, axis=axis)
+    return core.Tensor(result)
+
+
 def register_kernels(table: dict) -> None:
     """Register this module's reduction kernels into the dispatch table.
 
@@ -168,3 +195,4 @@ def register_kernels(table: dict) -> None:
         table[name] = _reduce
     table["argmax"] = _arg_reduce
     table["argmin"] = _arg_reduce
+    table["cumprod"] = _cumprod

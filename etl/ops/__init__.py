@@ -1,7 +1,7 @@
 """etl.ops — frontend tensor operations.
 
 Every numerical op that can appear in an EvoXIR graph. This module defines
-the full public op surface (67 functions), the unified operand/construction/
+the full public op surface (82 functions), the unified operand/construction/
 inference semantics (see this directory's ``CONTEXT.md`` — binding), and the
 ``SymbolicTensor`` operator handlers registered into ``etl.core`` at import
 time.
@@ -64,7 +64,15 @@ from .reductions import (  # noqa: F401
 )
 
 # Linalg.
-from .linalg import conv, cumsum, dot, solve, tril, triu  # noqa: F401
+from .linalg import conv, cumprod, cumsum, dot, matmul, solve, tril, triu  # noqa: F401
+
+# Sorting.
+from .sorting import argsort, sort, topk  # noqa: F401
+
+# Structural / creation.
+from .structural import (  # noqa: F401
+    clamp, diag, eye, flip, isnan, linspace, nan_to_num, roll, stack, tile,
+)
 
 # Constants / escape hatches.
 from .constant import constant, runtime_call, stop_gradient  # noqa: F401
@@ -88,7 +96,12 @@ __all__ = [
     "reduce_sum", "reduce_max", "reduce_min", "reduce_mean", "reduce_prod",
     "sum", "max", "min", "mean", "prod", "argmax", "argmin",
     # linalg
-    "dot", "conv", "tril", "triu", "cumsum", "solve",
+    "dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod", "solve",
+    # sorting
+    "sort", "argsort", "topk",
+    # structural / creation
+    "tile", "stack", "flip", "roll", "clamp", "diag", "isnan", "nan_to_num",
+    "eye", "linspace",
     # constants / escape hatches
     "constant", "runtime_call", "stop_gradient",
 ]
