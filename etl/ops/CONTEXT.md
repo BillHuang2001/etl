@@ -37,6 +37,20 @@ Reductions: `_utils.normalize_axes` (None=all, negatives shifted, sorted, dedupe
 - `neg`: `(x) -> SymbolicTensor`. `getitem`: `(x, key) -> SymbolicTensor`; `key` is a STATIC int/`builtins.slice`/tuple thereof → `slice`/`gather` ops. Symbolic indices, boolean masks, `None`/newaxis, ellipsis → `TraceError`. Strided slices → `gather`.
 - Mapping: `add→elementwise.add`, `sub→subtract`, `mul→multiply`, `matmul→linalg.dot`, `truediv→divide`, `pow→power`, `neg→negate`, `lt/le/gt/ge/eq→comparison.*`, `getitem→indexing.getitem`.
 
+## 15-op batch (design decisions)
+
+The 15 public names `sort argsort topk tile stack flip roll clamp eye matmul cumprod diag isnan nan_to_num linspace` split into 8 new IR ops (`sort`, `argsort`, `tile`, `flip`, `roll`, `diag`, `cumprod`, `nan_to_num` — declared in `etl.ir` op_defs) and 7 frontend compositions:
+
+- `topk` = composition over sort/argsort + gather (static `k` ≤ extent → `ShapeError`; symbolic extent → runtime error).
+- `stack` = reshape + concatenate composition.
+- `clamp` = maximum/minimum composition; scalar bounds pre-cast to x's dtype when same_kind-castable (float bound on int tensor → float64 promotion — numpy 2.x parity, deviation vs numpy 1.x's TypeError; documented edge: int bound on uint tensor → weak promotion int64).
+- `eye` = Constant-op composition, float32 default.
+- `linspace` = Constant-op composition with float64 default dtype — deliberate deviation from the etl float32 creation convention; explicit `dtype` param; symbolic bounds → `TraceError` (v2 deferral).
+- `matmul` = dot sugar with rank-1 promote/squeeze (`dot`'s rank ≥ 2 contract and `__matmul__` → dot unchanged).
+- `isnan` = comparison composition.
+
+Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Backend coverage: numpy = full reference; compiler backends (stablehlo/iree/xla/tvm) defer the 8 new IR ops with explicit `BackendError` (no exporter entries added); compositions work via their components.
+
 ## IR op definitions (ownership decision — binding)
 
 The generic SSA machinery and the op **registry** live in `etl.ir`, and the canonical op-definition table (which ops exist, their arities/attrs/effects) lives there too — `ir` must not import `ops` (layering `core ← ir ← ops`), and `ops` must NOT maintain a parallel table (`_opdefs.py` was deleted as superseded; `Builder.create` validates against `ir.opdef()`). Any missing arity/attr spec is fixed in `ir`, not duplicated here. **Effect policy:** all frontend ops are `pure` except `runtime_call` (`callback`). Ops are functional SSA dataflow (`scatter`/`constant`/`pad` produce new values, no `write` effect); `write`/`read`/`collective` kinds are reserved for other layers (e.g. `dist`).

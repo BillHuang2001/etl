@@ -13,7 +13,7 @@ golden output, the `Builder`, shape-inference hooks, and the SSA data model.
 
 | File | Covers |
 |---|---|
-| `test_registry.py` | 75-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
+| `test_registry.py` | 105-op canonical set (incl. `return` terminator and `broadcast_collective` distinct from shape-op `broadcast`), per-op category/effect/arity/attr-schema/shape_fn, registry API (opdef/has_opdef/op_names/all_opdefs/register_opdef, KeyError/ValueError paths) |
 | `test_verify.py` | valid modules + one test per violation class from `verify()`'s docstring: module/function/region/op/SSA/use-bookkeeping/shape_fn-agreement/attr-schema violations, location-annotated messages, TypeError on non-Module |
 | `test_serialize.py` | payload schema, multi-feature round-trips (symbolic dims, constants as base64 npy, all effect kinds, if/while regions, multi-function + `call`), original id preservation, fast-forwarded counters, tamper detection (sha256), version/format rejection (PersistenceError) |
 | `test_pretty_print.py` | exact-string goldens: SSA headers, %N renumbering, attribute rendering (sorted keys, `?` for None, ndarray summaries), locations, multi-arg header wrapping, nested `^bbN` region labels |
