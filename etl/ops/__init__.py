@@ -36,6 +36,7 @@ from . import constant
 from . import elementwise
 from . import indexing
 from . import linalg
+from . import random  # noqa: F401  (etl.random frontend — re-exported via etl/random.py)
 from . import reductions
 
 # Elementwise arithmetic / math / bitwise.
