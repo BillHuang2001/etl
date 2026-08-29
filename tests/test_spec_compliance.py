@@ -19,6 +19,10 @@ contract in `../etl/CONTEXT.md`). Groups (one class per group, in file order):
 12. `TestErrorLocations`     — error messages carry `file.py:line` locations.
 13. `TestTreeMapIsComposition` — `tree_map` is transparent sugar over
                                `flatten`/`unflatten` (structure-preserving).
+14. `TestSparseExplicitness` — sparse tensors obey the SAME discipline:
+                               graph-time computation ops (no eager mode),
+                               polymorphic creators, pure symbolic leaves,
+                               static-leaf snapshotting, explicit deferrals.
 
 Conventions: small shapes, CPU only, fast. Tests assert the documented
 contract; a test exposing a contract violation stays failing with a
@@ -109,6 +113,51 @@ def _dot_inputs():
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
     w = np.full((3, 4), 0.5, dtype=np.float32)
     return x, w
+
+
+#: Tiny COO spec: (3, 4) float32 — the shared sparse trace-input spec.
+_SPARSE_SPEC = etl.sparse.SparseTensorSpec(
+    etl.TensorSpec((None, 2), etl.int64),
+    etl.TensorSpec((None,), etl.float32),
+    dense_shape=(3, 4),
+    format="coo",
+)
+
+
+def _sparse_coo():
+    """A tiny concrete COO (3, 4) float32 with two stored entries."""
+    indices = np.array([[0, 1], [2, 3]], dtype=np.int64)
+    values = np.array([1.5, -2.5], dtype=np.float32)
+    return etl.sparse.coo(indices, values, (3, 4))
+
+
+def _sparse_csr():
+    """A tiny concrete CSR (3, 4) float32 storing the same entries as
+    `_sparse_coo` — used for the format static-leaf mismatch."""
+    indptr = np.array([0, 1, 2, 2], dtype=np.int64)
+    indices = np.array([1, 3], dtype=np.int64)
+    values = np.array([1.5, -2.5], dtype=np.float32)
+    return etl.sparse.csr(indptr, indices, values, (3, 4))
+
+
+@etl.defn
+def _sparse_to_dense(x):
+    """`etl.sparse.to_dense(x)` — used by the sparse sugar / static-leaf
+    / vjp-deferral tests."""
+    return etl.sparse.to_dense(x)
+
+
+def _capture_symbolic_sparse():
+    """Trace a tiny defn and return the symbolic sparse it produced."""
+    captured = {}
+
+    @etl.defn
+    def f(x):
+        captured["out"] = etl.sparse.negate(x)
+        return etl.sparse.to_dense(captured["out"])
+
+    etl.trace(f, _SPARSE_SPEC)
+    return captured["out"]
 
 
 # ===========================================================================
@@ -851,3 +900,396 @@ class TestTreeMapIsComposition:
         assert etl.tree_structure(
             etl.tree_map(_double_leaf, _MIXED_TREE)
         ) == etl.tree_structure(_MIXED_TREE)
+
+
+# ===========================================================================
+# 14. Sparse tensors: the same explicitness discipline, in all three phases
+# ===========================================================================
+
+
+class TestSparseExplicitness:
+    """Sparse tensors (etl.sparse) obey the SAME explicit-staging discipline
+    as the dense core (sparse/CONTEXT.md is the authoritative contract):
+    graph-time computation ops with no eager mode, polymorphic creators
+    (concrete -> eager value, symbolic -> in-graph assembly), pure symbolic
+    leaves, dense_shape/dtype/format as static snapshotted leaves, and
+    explicit v1 deferrals — never a silent fallback."""
+
+    def test_ops_raise_outside_any_trace(self):
+        """Sparse computation ops called outside a trace raise TraceError —
+        there is no eager mode to fall back into (same as dense ops)."""
+        s = _sparse_coo()
+        calls = [
+            (etl.sparse.add, (s, s)),
+            (etl.sparse.subtract, (s, s)),
+            (etl.sparse.multiply, (s, s)),
+            (etl.sparse.multiply_dense, (s, s)),  # builder check precedes operands
+            (etl.sparse.negate, (s,)),
+            (etl.sparse.sum, (s,)),
+            (etl.sparse.transpose, (s,)),
+            (etl.sparse.reshape, (s, (12,))),
+            (etl.sparse.concatenate, ([s, s],)),
+        ]
+        for op, args in calls:
+            with pytest.raises(etl.TraceError, match="No active trace"):
+                op(*args)
+
+    def test_matmul_with_concrete_sparse_raises_outside_trace(self):
+        """`sparse.matmul` normalizes its operands before the builder check,
+        so concrete sparse operands outside a trace get the three-option
+        TraceError (explicit input / etl.constant / etl.evaluate)."""
+        s = _sparse_coo()
+        with pytest.raises(
+            etl.TraceError,
+            match=r"explicit input.*etl\.constant.*etl\.evaluate",
+        ):
+            etl.sparse.matmul(s, s)
+
+    def test_converters_need_a_trace_for_symbolic_inputs(self):
+        """Converters are polymorphic: concrete -> eager method; a SYMBOLIC
+        instance outside a trace raises TraceError (graph materialization is
+        trace-time only). The one exception is the documented identity:
+        `to_coo` on an already-COO value is a no-op."""
+        symbolic = _capture_symbolic_sparse()
+        for op in (etl.sparse.to_dense, etl.sparse.to_csr, etl.sparse.to_csc):
+            with pytest.raises(etl.TraceError, match="No active trace"):
+                op(symbolic)
+        # COO -> COO is the documented identity (no op is emitted).
+        assert etl.sparse.to_coo(symbolic) is symbolic
+
+    def test_converters_are_eager_for_concrete_inputs(self):
+        """Converters on CONCRETE instances are pure eager layout
+        conversions — the polymorphic counterpart of the graph ops."""
+        s = _sparse_coo()
+        dense = etl.sparse.to_dense(s)
+        assert isinstance(dense, np.ndarray)
+        np.testing.assert_array_equal(
+            dense,
+            [[0.0, 1.5, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, -2.5]],
+        )
+        csr = etl.sparse.to_csr(s)
+        assert isinstance(csr, etl.sparse.CSRTensor)
+        np.testing.assert_array_equal(etl.sparse.to_dense(csr), dense)
+
+    def test_ops_build_ir_inside_a_trace(self):
+        """Inside a trace the sparse ops build IR ops only — `sparse_add`,
+        `sparse_dot_dense`, `sparse_to_dense`, `sparse_from_dense`, ... —
+        never eager results."""
+
+        @etl.defn
+        def f(a, b, d, x):
+            added = etl.sparse.add(a, etl.sparse.from_dense(x))
+            return etl.add(etl.sparse.to_dense(added), etl.sparse.matmul(a, d))
+
+        graph = etl.trace(
+            f,
+            _SPARSE_SPEC,
+            _SPARSE_SPEC,
+            etl.TensorSpec((4, 4), etl.float32),
+            etl.TensorSpec((3, 4), etl.float32),
+        )
+        names = _op_names(graph)
+        for op_name in (
+            "sparse_from_dense",
+            "sparse_add",
+            "sparse_to_dense",
+            "sparse_dot_dense",
+        ):
+            assert op_name in names, f"expected {op_name!r} in graph ops {names}"
+
+        # Results are graph values, never eager data.
+        out = graph.module.main.entry_block.ops[-2].results[0]
+        assert isinstance(out, etl.ir.Value)
+
+    def test_no_eager_numerical_ops(self):
+        """Feeding CONCRETE sparse values to a computation op inside a trace
+        raises the three-option TraceError — the ops never fall back to
+        eager numerics."""
+        s = _sparse_coo()
+
+        @etl.defn
+        def f(x):
+            return etl.sparse.add(x, s)
+
+        with pytest.raises(
+            etl.TraceError,
+            match=r"explicit input.*etl\.constant.*etl\.evaluate",
+        ):
+            etl.trace(f, _SPARSE_SPEC)
+
+    def test_creators_concrete_components_are_eager(self):
+        """Concrete components build a validated eager sparse value — the
+        `.values` / `.indices` carry concrete data, canonical form is
+        enforced, never silently."""
+        s = _sparse_coo()
+        assert isinstance(s, etl.sparse.SparseTensor)
+        assert isinstance(s.values, np.ndarray)
+        assert isinstance(s.indices, np.ndarray)
+        np.testing.assert_array_equal(s.values, [1.5, -2.5])
+        np.testing.assert_array_equal(s.indices, [[0, 1], [2, 3]])
+        assert s.dtype == np.dtype(np.float32)
+        assert s.dense_shape == (3, 4)
+        assert s.format == "coo"
+
+        # core.Tensor components are equally valid concrete components.
+        t = etl.sparse.coo(
+            etl.tensor(np.array([[0, 1]], dtype=np.int64)),
+            etl.tensor(np.array([7.0], dtype=np.float32)),
+            (3, 4),
+        )
+        assert isinstance(t.values, etl.Tensor)
+        np.testing.assert_array_equal(t.to_dense()[0, 1], 7.0)
+
+        # Canonical-form validation is eager (duplicate rows -> ShapeError).
+        with pytest.raises(etl.ShapeError):
+            etl.sparse.coo(
+                np.array([[0, 1], [0, 1]], dtype=np.int64),
+                np.array([1.0, 2.0]),
+                (3, 4),
+            )
+
+    def test_creators_symbolic_components_are_graph_values(self):
+        """Symbolic components inside a trace assemble the in-graph sparse
+        value via from_parts — the children are SymbolicTensor (no data,
+        no validation)."""
+
+        @etl.defn
+        def f(x):
+            out = etl.sparse.coo(x.indices, x.values, (3, 4))
+            return etl.sparse.to_dense(out)
+
+        etl.trace(f, _SPARSE_SPEC)  # traces fine: in-graph assembly
+
+    def test_creators_reject_tensorspec_components(self):
+        """`core.TensorSpec` creator components raise TypeError directing to
+        `SparseTensorSpec` for trace inputs."""
+        with pytest.raises(TypeError, match="SparseTensorSpec"):
+            etl.sparse.coo(
+                etl.TensorSpec((None, 2), etl.int64),
+                np.array([1.0, 2.0]),
+                (3, 4),
+            )
+
+    def test_creators_reject_mixed_concrete_and_symbolic(self):
+        """Mixed concrete+symbolic creator components raise TypeError — a
+        creator is either eager assembly or in-graph assembly, never both."""
+        with pytest.raises(TypeError, match="mixed kinds"):
+            etl.sparse.coo(
+                np.array([[0, 1]], dtype=np.int64),
+                _capture_symbolic(),
+                (3, 4),
+            )
+
+    def test_symbolic_sparse_leaves_have_no_concrete_escape_hatches(self):
+        """The indices/values leaves of an in-graph sparse value are pure
+        SymbolicTensor — no `.numpy()`, no DLPack, no array protocol
+        (mirror of the dense check)."""
+        symbolic = _capture_symbolic_sparse()
+        assert isinstance(symbolic, etl.sparse.SparseTensor)
+        for leaf in (symbolic.indices, symbolic.values):
+            assert isinstance(leaf, etl.SymbolicTensor)
+            for attr in ("numpy", "data_ptr", "__dlpack__", "__array__", "item"):
+                assert not hasattr(leaf, attr), (
+                    f"symbolic sparse leaf must not expose {attr!r}"
+                )
+
+    def test_no_sparse_constant(self):
+        """`etl.constant` embeds concrete core.Tensor data only — a concrete
+        sparse tensor is rejected (v1: no sparse constant)."""
+
+        @etl.defn
+        def f(x):
+            return etl.sparse.to_dense(etl.constant(_sparse_coo()))
+
+        with pytest.raises(etl.TraceError, match="got SparseTensor"):
+            etl.trace(f, _SPARSE_SPEC)
+
+    def test_closure_captured_sparse_raises(self):
+        """A concrete sparse captured from a closure and fed to a computation
+        op is a TraceError naming the three sanctioned paths — same as the
+        dense closure-capture contract."""
+        s = _sparse_coo()
+
+        @etl.defn
+        def f(x):
+            return etl.sparse.add(x, s)
+
+        with pytest.raises(
+            etl.TraceError,
+            match=r"explicit input.*etl\.constant.*etl\.evaluate",
+        ):
+            etl.trace(f, _SPARSE_SPEC)
+
+    def test_static_leaves_are_snapshotted_and_run_validated(self):
+        """dense_shape/dtype/format are static leaves: tracing with a
+        SparseTensorSpec then RUNNING with a concrete sparse whose
+        dense_shape (or format) differs fails loudly — the graph never
+        silently adapts to a different sparse structure."""
+        exe = etl.build(_sparse_to_dense, _SPARSE_SPEC)
+
+        # dense_shape mismatch (3, 4) vs (3, 5).
+        wrong_shape = etl.sparse.coo(
+            np.array([[0, 1], [2, 3]], dtype=np.int64),
+            np.array([1.5, -2.5], dtype=np.float32),
+            (3, 5),
+        )
+        with pytest.raises(etl.TraceError, match="specialized on"):
+            etl.run(exe, wrong_shape)
+
+        # format mismatch: the coo-vs-csr leaf layouts diverge.
+        with pytest.raises(etl.TraceError, match="structure does not match"):
+            etl.run(exe, _sparse_csr())
+
+    def test_evaluate_derives_sparse_spec_and_returns_concrete(self):
+        """`etl.evaluate` with concrete sparse args derives a
+        SparseTensorSpec via from_concrete and returns concrete sparse
+        results — documented shorthand composition, no new semantics."""
+
+        @etl.defn
+        def f(x):
+            return etl.sparse.negate(x)
+
+        out = etl.evaluate(f, _sparse_coo())
+        assert isinstance(out, etl.sparse.SparseTensor)
+        assert not isinstance(out, etl.sparse.SparseTensorSpec)
+        np.testing.assert_array_equal(out.values.numpy(), [-1.5, 2.5])
+        np.testing.assert_array_equal(out.to_dense(), -_sparse_coo().to_dense())
+
+        # The derived spec mirrors the concrete instance's static leaves.
+        derived = etl.sparse.SparseTensorSpec.from_concrete(_sparse_coo())
+        assert isinstance(derived, etl.sparse.SparseTensorSpec)
+        assert derived.dense_shape == (3, 4)
+        assert derived.format == "coo"
+        assert derived.dtype == np.dtype(np.float32)
+
+    def test_vmap_bare_axes_on_sparse_numerics(self):
+        """`vmap(graph, in_axes=0)` with a bare int axis maps a sparse input
+        (registered pytree node): a batched concrete sparse runs and the
+        dense output matches the per-batch references."""
+        graph = etl.vmap(etl.trace(_sparse_to_dense, _SPARSE_SPEC), in_axes=0)
+        exe = etl.load(etl.compile(etl.lower(graph)))
+
+        # Batched concrete COO: leading batch dim on the tensor leaves
+        # (validation-free assembly — the per-element canonical checks are
+        # the interpreter's job).
+        batched = etl.sparse.SparseTensor.from_parts(
+            np.array([[[0, 1], [2, 3]], [[0, 3], [1, 0]]], dtype=np.int64),
+            np.array([[1.5, -2.5], [3.5, -1.5]], dtype=np.float32),
+            dense_shape=(3, 4),
+            format="coo",
+        )
+        out = etl.run(exe, batched).numpy()
+        expected = np.zeros((2, 3, 4), dtype=np.float32)
+        expected[0, 0, 1] = 1.5
+        expected[0, 2, 3] = -2.5
+        expected[1, 0, 3] = 3.5
+        expected[1, 1, 0] = -1.5
+        np.testing.assert_array_equal(out, expected)
+
+    # BUG(etl): vmap's callable path cannot trace over a sparse input —
+    # etl/transforms/vmap.py::_derive_unvectorized_args strips `shape[1:]`
+    # from every mapped tensor leaf when deriving the unvectorized specs for
+    # tracing, which for a sparse node removes the runtime-dynamic nnz dim
+    # instead of leaving the leaf shape unchanged (the batch dim is prepended
+    # later by vectorize). `etl.vmap(f, in_axes=0)(SparseTensorSpec(...))`
+    # therefore raises ShapeError ("SparseTensorSpec: COO indices spec must
+    # have shape (None, 2), got (2,)"). The transforms CONTEXT.md documents
+    # "callable-path args" support for registered pytree nodes (commit
+    # a176a41); the graph-level path (`etl.vmap(graph, in_axes=0)` /
+    # `etl.vectorize`) works. Do NOT skip/xfail/weaken.
+    def test_vmap_callable_bare_axes_on_sparse(self):
+        """`vmap(f, in_axes=0)(sparse_spec)` — the callable sugar — traces
+        the wrapped defn with the unbatched spec and vectorizes it."""
+        graph = etl.vmap(_sparse_to_dense, in_axes=0)(_SPARSE_SPEC)
+        assert isinstance(graph, etl.Graph)
+
+    def test_sparse_sparse_matmul_is_a_v1_deferral(self):
+        """sparse @ sparse matmul raises TraceError at trace time (densify
+        one operand with etl.sparse.to_dense) — never a silent fallback."""
+
+        @etl.defn
+        def f(a, b):
+            return etl.sparse.matmul(a, b)
+
+        with pytest.raises(etl.TraceError, match="v1 deferral"):
+            etl.trace(f, _SPARSE_SPEC, _SPARSE_SPEC)
+
+    def test_whole_sparse_bind_is_a_v1_deferral(self):
+        """Binding a WHOLE sparse value by name is unsupported in v1 — bind
+        is per-leaf; the error is explicit and lists the leaf names."""
+        spec = etl.sparse.SparseTensorSpec(
+            etl.TensorSpec((None, 2), etl.int64, name="s_indices"),
+            etl.TensorSpec((None,), etl.float32, name="s_values"),
+            dense_shape=(3, 4),
+            format="coo",
+        )
+        exe = etl.build(_sparse_to_dense, spec)
+        with pytest.raises(
+            etl.TraceError, match=r"unknown input name.*s_indices"
+        ):
+            etl.bind(exe, s=_sparse_coo())
+
+    def test_leaf_level_bind_works(self):
+        """Binding individual tensor leaves by name works: bind the indices
+        leaf, run with the remaining values + static leaves, get the right
+        dense output."""
+        spec = etl.sparse.SparseTensorSpec(
+            etl.TensorSpec((None, 2), etl.int64, name="s_indices"),
+            etl.TensorSpec((None,), etl.float32, name="s_values"),
+            dense_shape=(3, 4),
+            format="coo",
+        )
+        exe = etl.build(_sparse_to_dense, spec)
+        bound = etl.bind(
+            exe,
+            s_indices=etl.tensor(np.array([[0, 1], [2, 3]], dtype=np.int64)),
+        )
+        partial = etl.sparse.SparseTensor.from_parts(
+            np.array([1.5, -2.5], dtype=np.float32),
+            dense_shape=(3, 4),
+            format="coo",
+        )
+        out = etl.run(bound, partial)
+        np.testing.assert_array_equal(out.numpy(), _sparse_coo().to_dense())
+
+    def test_vjp_deferrals_are_explicit(self):
+        """`sparse_concatenate`, `sparse_coo_to_csc` and `sparse_csc_to_coo`
+        have no VJP rule in v1 — vjp raises TransformError naming the op,
+        never a silent fallback."""
+        # sparse_concatenate (dense output -> plain dense cotangent spec).
+        @etl.defn
+        def cat(a, b):
+            return etl.sparse.to_dense(etl.sparse.concatenate([a, b], axis=0))
+
+        with pytest.raises(etl.TransformError, match="sparse_concatenate"):
+            etl.vjp(cat, etl.TensorSpec((6, 4), etl.float32))(
+                _SPARSE_SPEC, _SPARSE_SPEC
+            )
+
+        # sparse_coo_to_csc (CSC output -> sparse cotangent spec).
+        @etl.defn
+        def to_csc_fn(x):
+            return etl.sparse.to_csc(x)
+
+        csc_cotangent = etl.sparse.SparseTensorSpec(
+            etl.TensorSpec((5,), etl.int64),
+            etl.TensorSpec((None,), etl.int64),
+            etl.TensorSpec((None,), etl.float32),
+            dense_shape=(3, 4),
+            format="csc",
+        )
+        with pytest.raises(etl.TransformError, match="sparse_coo_to_csc"):
+            etl.vjp(to_csc_fn, csc_cotangent)(_SPARSE_SPEC)
+
+        # sparse_csc_to_coo (csc input auto-converted for to_dense).
+        csc_spec = etl.sparse.SparseTensorSpec(
+            etl.TensorSpec((5,), etl.int64),
+            etl.TensorSpec((None,), etl.int64),
+            etl.TensorSpec((None,), etl.float32),
+            dense_shape=(3, 4),
+            format="csc",
+        )
+        with pytest.raises(etl.TransformError, match="sparse_csc_to_coo"):
+            etl.vjp(_sparse_to_dense, etl.TensorSpec((3, 4), etl.float32))(
+                csc_spec
+            )
