@@ -8,7 +8,11 @@ the op's ``dense_shape`` attribute (int entries; a SYMBOLIC first dim is
 allowed after vectorize — its extent is the batch, see ``_axis_bounds``) and
 the sparse value dtype in ``dtype``. **Canonical COO** = lex-sorted unique
 in-range rows; ops that assume canonical input validate it at run time (see
-"Canonical-form runtime validation" below) — never silently.
+"Canonical-form runtime validation" below) — never silently. The uniqueness
+check is VALUES-AWARE: a duplicate row whose duplicate pair includes a
+stored zero (at least one of the two values is 0) is tolerated — stored
+zeros are semantically inert for every consumer — while duplicate NONZERO
+rows (a genuine double-count hazard) still raise.
 
 Implemented kernels (op name — semantics; shapes follow the ``ir.inference``
 ``infer_sparse_*`` hooks):
@@ -17,9 +21,11 @@ Implemented kernels (op name — semantics; shapes follow the ``ir.inference``
    extraction. Batched: per batch element, padded to the common
    ``nnz_max = max(nnz_e)``; padding rows are the LEX-MAX row
    ``(dense_shape - 1)`` with stored-zero values — sortedness is preserved
-   (uniqueness holds unless the lex-max row is itself a stored entry), and
-   stored zeros are inert for every accumulator (``to_dense``/``reduce_sum``/
-   ``add``/``multiply``). Unbatched: unpadded.
+   (uniqueness holds unless the lex-max row is itself a stored entry, and
+   such a stored-zero duplicate is legal: canonical validation is
+   values-aware, see below), and stored zeros are inert for every
+   accumulator (``to_dense``/``reduce_sum``/``add``/``multiply``).
+   Unbatched: unpadded.
 2. ``sparse_to_dense(indices, values) -> dense`` — zeros +
    ``np.add.at`` scatter (duplicate rows accumulate). Result dtype =
    ``core.dtype(attributes["dtype"])``; shape = batch + evaluated
@@ -112,21 +118,27 @@ dim, so per-batch results with element-varying nnz (``from_dense``,
 ``add``/``multiply`` merges) are padded to the common max nnz with the
 lex-max row and stored-zero values (see the per-op notes; this is the only
 way to represent them in one ndarray — downstream accumulators treat stored
-zeros as inert, and downstream canonical VALIDATION accepts them whenever
-the lex-max row is not itself a stored entry). Rank-2-only ops (the csr/csc
-conversions and the dot variants) enforce ``len(dense_shape) == 2`` with
-``core.ShapeError``; batch dims still pass through.
+zeros as inert, and downstream canonical VALIDATION is values-aware: a
+duplicate row whose duplicate pair includes the stored zero is accepted).
+Rank-2-only ops (the csr/csc conversions and the dot variants) enforce
+``len(dense_shape) == 2`` with ``core.ShapeError``; batch dims still pass
+through.
 
 Canonical-form runtime validation (binding): ops that ASSUME canonical input
 (``add``, ``multiply``, ``multiply_dense``, ``transpose``, ``reshape``,
 ``concatenate``, ``coo_to_csr``, ``coo_to_csc``, ``csr_to_coo``,
 ``csc_to_coo``, the dot variants, ``to_dense``) validate: rows lex-sorted
-and unique, all coordinates in-range wrt the (evaluated) ``dense_shape``,
-and (for the csr/csc conversions) indptr monotone with ``indptr[0] == 0``
-and ``indptr[-1] == nnz`` plus strictly-increasing per-row/per-column
-entries — raising an explicit ``core.ShapeError`` naming the op and the
-violation, NEVER silent. Checks are vectorized numpy. NOTE (vectorize case):
-when ``dense_shape[0]`` is a SYMBOLIC ``core.Dim`` whose extent is the batch,
+and unique — VALUES-AWARE: an adjacent duplicate row (COO) or duplicate
+per-row/per-column segment entry (CSR/CSC) raises ONLY when BOTH values of
+the duplicate pair are nonzero (a genuine double-count hazard); a duplicate
+pair that includes a stored zero is tolerated, which is what makes batched
+``sparse_from_dense``'s documented stored-zero padding (lex-max rows) legal
+— all coordinates in-range wrt the (evaluated) ``dense_shape``, and (for
+the csr/csc conversions) indptr monotone with ``indptr[0] == 0`` and
+``indptr[-1] == nnz`` plus strictly-increasing per-row/per-column entries —
+raising an explicit ``core.ShapeError`` naming the op and the violation,
+NEVER silent. Checks are vectorized numpy. NOTE (vectorize case): when
+``dense_shape[0]`` is a SYMBOLIC ``core.Dim`` whose extent is the batch,
 the in-range bound for sparse axis 0 is the batch extent (the Dim evaluates
 to it when bound; otherwise the batch extent of the indices array is used);
 all other axes evaluate normally.
@@ -251,11 +263,16 @@ def _check_pair(op_name: str, indices: np.ndarray, values: np.ndarray) -> None:
         )
 
 
-def _check_sorted_unique(idx: np.ndarray, op_name: str) -> None:
+def _check_sorted_unique(idx: np.ndarray, vals: np.ndarray, op_name: str) -> None:
     """Validate one element's 2-D indices as lex-sorted with unique rows.
 
-    O(n) vectorized adjacent-row comparison (no full sort). Raises
-    ``ShapeError`` naming the op and the offending rows.
+    O(n) vectorized adjacent-row comparison (no full sort). VALUES-AWARE
+    uniqueness: an adjacent duplicate row raises ``ShapeError`` only when
+    BOTH values of the duplicate pair are nonzero (a genuine double-count
+    hazard); a duplicate pair where at least one value is 0 (a stored zero,
+    e.g. batched ``sparse_from_dense`` padding) is tolerated — stored zeros
+    are semantically inert for every consumer. Raises ``ShapeError`` naming
+    the op and the offending rows.
     """
     nnz, _ndim = idx.shape
     if nnz < 2:
@@ -264,12 +281,15 @@ def _check_sorted_unique(idx: np.ndarray, op_name: str) -> None:
     prv = idx[:-1]
     dup = np.all(nxt == prv, axis=1)
     if np.any(dup):
-        bad = int(np.argmax(dup))
-        raise core.ShapeError(
-            f"kernel for op '{op_name}': indices contain duplicate rows "
-            "(canonical COO requires sorted unique rows) — row "
-            f"{prv[bad].tolist()} appears more than once"
-        )
+        both_nonzero = (vals[1:] != 0) & (vals[:-1] != 0)
+        bad = dup & both_nonzero
+        if np.any(bad):
+            i = int(np.argmax(bad))
+            raise core.ShapeError(
+                f"kernel for op '{op_name}': indices contain duplicate rows "
+                "(canonical COO requires sorted unique rows) — row "
+                f"{prv[i].tolist()} appears more than once"
+            )
     diff = nxt != prv
     first = np.argmax(diff, axis=1)  # first differing coordinate per pair
     rows_nxt = nxt[np.arange(nnz - 1), first]
@@ -312,10 +332,11 @@ def _validate_canonical(
 
     Checks (all ``core.ShapeError`` naming the op, never silent): the pair
     structure, ``indices.shape[-1] == len(dense_shape)``, per batch element
-    lex-sorted unique rows (unless ``check_sorted=False`` — used by
-    ``sparse_reduce_sum``, which only needs in-range), and all coordinates
-    in-range wrt the evaluated ``dense_shape`` bounds (see ``_axis_bounds``
-    for the vectorize symbolic-first-dim rule).
+    lex-sorted values-aware-unique rows (unless ``check_sorted=False`` —
+    used by ``sparse_reduce_sum``, which only needs in-range; see
+    ``_check_sorted_unique`` for the stored-zero tolerance), and all
+    coordinates in-range wrt the evaluated ``dense_shape`` bounds (see
+    ``_axis_bounds`` for the vectorize symbolic-first-dim rule).
     """
     _check_pair(op_name, indices, values)
     rank = len(dense_shape)
@@ -327,11 +348,12 @@ def _validate_canonical(
     batch = indices.shape[:-2]
     n = _batch_count(batch)
     flat = indices.reshape((n,) + indices.shape[-2:])
+    flat_vals = values.reshape((n,) + values.shape[-1:])
     bounds = _axis_bounds(ctx, op_name, tuple(dense_shape), batch)
     for b in range(n):
         idx = flat[b]
         if check_sorted:
-            _check_sorted_unique(idx, op_name)
+            _check_sorted_unique(idx, flat_vals[b], op_name)
         _check_in_range(idx, bounds, op_name)
 
 
@@ -358,9 +380,14 @@ def _validate_indptr(op_name: str, indptr: np.ndarray, nnz: int, n_buckets: int)
         )
 
 
-def _check_segment_sorted(op_name: str, seg: np.ndarray, bound: int, what: str) -> None:
+def _check_segment_sorted(
+    op_name: str, seg: np.ndarray, seg_vals: np.ndarray, bound: int, what: str
+) -> None:
     """Validate one row/column segment of a CSR/CSC indices array: entries
-    in ``[0, bound)`` and strictly increasing."""
+    in ``[0, bound)`` and strictly increasing (VALUES-AWARE: an adjacent
+    equal pair is tolerated when at least one of the two values is 0 — a
+    stored zero, e.g. from batched padding — while an equal pair with both
+    values nonzero and any strictly-decreasing entry still raise)."""
     if seg.size == 0:
         return
     mn = int(seg.min())
@@ -370,12 +397,21 @@ def _check_segment_sorted(op_name: str, seg: np.ndarray, bound: int, what: str) 
             f"kernel for op '{op_name}': {what} index out of range: entries "
             f"span [{mn}, {mx}] but must lie in [0, {bound})"
         )
-    if np.any(seg[1:] <= seg[:-1]):
+    if np.any(seg[1:] < seg[:-1]):
         raise core.ShapeError(
             f"kernel for op '{op_name}': {what} entries are not strictly "
             "increasing within each row/column (CSR/CSC requires sorted "
             "unique entries)"
         )
+    eq = seg[1:] == seg[:-1]
+    if np.any(eq):
+        both_nonzero = (seg_vals[1:] != 0) & (seg_vals[:-1] != 0)
+        if np.any(eq & both_nonzero):
+            raise core.ShapeError(
+                f"kernel for op '{op_name}': {what} entries are not strictly "
+                "increasing within each row/column (CSR/CSC requires sorted "
+                "unique entries)"
+            )
 
 
 def _row_keys(idx2d: np.ndarray, dense_shape: tuple) -> np.ndarray:
@@ -592,7 +628,13 @@ def _csr_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
         ci = idx_flat[b]
         _validate_indptr(name, ip, ci.shape[0], rows)
         for r in range(rows):
-            _check_segment_sorted(name, ci[ip[r]: ip[r + 1]], cols, "column")
+            _check_segment_sorted(
+                name,
+                ci[ip[r]: ip[r + 1]],
+                vals_flat[b][ip[r]: ip[r + 1]],
+                cols,
+                "column",
+            )
         row_ids = np.repeat(np.arange(rows, dtype=_INT64), np.diff(ip))
         out_idx[b] = np.stack([row_ids, ci], axis=-1)
         out_vals[b] = vals_flat[b]
@@ -703,7 +745,13 @@ def _csc_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
             )
         _validate_indptr(name, ip_eff, nnz, cols)
         for c in range(cols):
-            _check_segment_sorted(name, ri[ip_eff[c]: ip_eff[c + 1]], rows, "row")
+            _check_segment_sorted(
+                name,
+                ri[ip_eff[c]: ip_eff[c + 1]],
+                vals_flat[b][ip_eff[c]: ip_eff[c + 1]],
+                rows,
+                "row",
+            )
         col_ids = np.repeat(np.arange(cols, dtype=_INT64), np.diff(ip_eff))
         two_d = np.stack([ri, col_ids], axis=-1)  # (col, row) pairs
         order = np.lexsort((col_ids, ri))  # primary: row, secondary: col
