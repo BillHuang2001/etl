@@ -242,7 +242,7 @@ in `printer.py`.
 
 | Path | Area |
 |---|---|
-| `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, structure, reduction, linalg, control, collective, sparse) |
+| `./op_defs/` | OpDef/AttrSpec, registry, category tables (elementwise, comparison, structure, reduction, sorting, linalg, control, collective, sparse, random) |
 | `./value.py`, `./op.py`, `./block.py`, `./region.py`, `./function.py`, `./module.py` | SSA data model |
 | `./types.py`, `./location.py`, `./effects.py`, `./version.py` | Small shared definitions |
 | `./inference.py` | Shape-inference hooks referenced by OpDefs (49 hooks, implemented; ~1644 lines — legitimately long, one hook module for all categories; split only if it grows much further) |
