@@ -34,7 +34,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
 |---|---|
 | `./core/` | value-model tests |
 | `./ir/` | SSA/verify/serialize tests |
-| `./ops/` | per-op shape/dtype/error tests |
+| `./ops/` | per-op shape/dtype/error tests (incl. `test_random.py` — the `etl.random` key-based RNG suite: cross-run determinism, split/split_n semantics, distribution sanity, symbolic operands, dtype rules, explicitness, while_loop key threading, validation errors, TransformError/vmap, compiler-backend deferrals) |
 | `./numpy/` | enp sugar tests |
 | `./trace/` | defn/trace/control-flow tests |
 | `./block/` | custom op tests |
