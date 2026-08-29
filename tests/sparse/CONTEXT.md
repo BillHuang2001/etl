@@ -23,16 +23,12 @@ pytest suite validating the `etl.sparse` contract (`../../etl/sparse/CONTEXT.md`
 - Siblings (`../../etl/`, other test dirs) are READ-ONLY — never modify etl to make a test pass. A real contract violation stays failing with a `# BUG(etl): <description>` marker + minimal repro and gets reported to the parent.
 - CPU only, small shapes (canonical 3×4, a few ≤ (8, 16) cases). Each file < ~2s (test_backends.py is the slowest, ~1.2s in this env). No network, no GPU.
 - All error tests use tight `pytest.raises(..., match=...)` regexes pinned to the exact wording in `etl/sparse/value.py` / `ops.py` / `rules.py` and the numpy kernel messages (`"kernel for op 'sparse_X': …"`).
-- `python3 -m pytest tests/sparse` is green except the deliberately-kept failing BUG(etl) test (below).
-
-## Known issues
-
-- **BUG(etl) — concrete COO constructor is NOT values-aware for stored-zero duplicates** (`test_value.py::test_stored_zero_duplicate_row_constructs`, kept failing with a `# BUG(etl):` marker): the contract (`etl/sparse/CONTEXT.md`: "duplicate NONZERO rows error; duplicate rows with one stored zero are legal") promises the concrete constructor accepts a duplicate row whose pair includes a stored zero; `etl/sparse/value.py:254` rejects ALL duplicate rows (`"COO indices must be unique (no duplicate rows)"`). The runtime kernels ARE values-aware (pinned passing in `test_errors.py::test_runtime_stored_zero_duplicate_passes`). After an etl fix, delete the marker comment and this entry.
+- `python3 -m pytest tests/sparse` is fully green.
 
 ## Notes for agents
 
 - **Pytree layout gotcha:** flatten children are `[tensor leaves…, *dense_shape, dtype, format]` — static leaves are `[*dense_shape, dtype, format]` (one leaf per dense dim). The FORMAT leaf (last) and dtype leaf (second-to-last) are the ones the pipeline snapshots; coo-vs-csr run mismatches fail at `Graph.flatten_inputs` with a path like `[0]`.
-- **Graph-level vmap is the supported sparse path:** the callable path `etl.vmap(f)(sparse_spec)` fails in v1 (spec stripping produces invalid leaf shapes) — do NOT test it. Trace with an unbatched spec, `etl.vmap(graph, in_axes=0)`, run with a batched concrete built via `SparseTensor.from_parts` (the validating constructors reject batched leaves) with dense_shape UNCHANGED.
+- **Graph-level vmap is the primary supported sparse path:** the callable path `etl.vmap(f, in_axes=0)(sparse_spec)` now works too (pinned by `tests/test_spec_compliance.py::TestSparseExplicitness::test_vmap_callable_bare_axes_on_sparse`). Trace with an unbatched spec, `etl.vmap(graph, in_axes=0)` (or the callable sugar), run with a batched concrete built via `SparseTensor.from_parts` (the validating constructors reject batched leaves) with dense_shape UNCHANGED.
 - **Batch-Dim identity:** the output-side static leaf at the sparse node's dense_shape[0] is the SAME `core.Dim('batch')` object the mapped tensor specs carry; input-side statics never gain the batch.
 - **Batched to_dense:** only the Dim-at-position-0 batched concrete (output convention) materializes; the input-side batched convention (dense_shape unchanged) exists purely as a `run()` input — `to_dense` on it is NOT contracted (do not assert it).
 - **grad argnums:** `etl.grad(f)` on a sparse arg needs `argnums=(1,)` (flat leaf position of the values; the int64 indices leaf at 0 is not differentiable — `argnums=(0,)` raises a pinned TransformError). Run grad graphs with the sparse node passed DIRECTLY (not wrapped in a tuple).

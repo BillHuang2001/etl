@@ -1186,17 +1186,6 @@ class TestSparseExplicitness:
         expected[1, 1, 0] = -1.5
         np.testing.assert_array_equal(out, expected)
 
-    # BUG(etl): vmap's callable path cannot trace over a sparse input —
-    # etl/transforms/vmap.py::_derive_unvectorized_args strips `shape[1:]`
-    # from every mapped tensor leaf when deriving the unvectorized specs for
-    # tracing, which for a sparse node removes the runtime-dynamic nnz dim
-    # instead of leaving the leaf shape unchanged (the batch dim is prepended
-    # later by vectorize). `etl.vmap(f, in_axes=0)(SparseTensorSpec(...))`
-    # therefore raises ShapeError ("SparseTensorSpec: COO indices spec must
-    # have shape (None, 2), got (2,)"). The transforms CONTEXT.md documents
-    # "callable-path args" support for registered pytree nodes (commit
-    # a176a41); the graph-level path (`etl.vmap(graph, in_axes=0)` /
-    # `etl.vectorize`) works. Do NOT skip/xfail/weaken.
     def test_vmap_callable_bare_axes_on_sparse(self):
         """`vmap(f, in_axes=0)(sparse_spec)` — the callable sugar — traces
         the wrapped defn with the unbatched spec and vectorizes it."""

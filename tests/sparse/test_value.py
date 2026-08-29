@@ -46,7 +46,7 @@ def _batched_coo_dim():
     """A batched COO built per the ``to_dense`` contract: ``dense_shape[0]``
     is a ``core.Dim`` whose extent is the batch (value.py's documented
     batched case; ``batched_coo_example()`` from conftest uses the
-    input-side convention — see the BUG(etl) test below)."""
+    input-side convention — see test_stored_zero_duplicate_row_constructs)."""
     idx = np.array([[0, 1], [1, 2], [2, 0], [2, 3]], dtype=np.int64)
     vals = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     return sparse.SparseTensor.from_parts(
@@ -502,14 +502,6 @@ def test_base_class_format_value_errors():
 
 
 def test_stored_zero_duplicate_row_constructs():
-    # BUG(etl): the concrete COO constructor rejects duplicate rows even when
-    # one of the pair is a stored zero, but the contract
-    # (etl/sparse/CONTEXT.md: "duplicate NONZERO rows error; duplicate rows
-    # with one stored zero are legal") requires them to construct fine. The
-    # runtime kernels ARE values-aware (see
-    # tests/sparse/test_errors.py::test_runtime_stored_zero_duplicate_passes);
-    # the concrete constructor is not.
-    # Minimal repro:
     s = sparse.coo(
         np.array([[0, 1], [0, 1], [2, 0]], dtype=np.int64),
         np.array([0.0, 1.0, 3.0], dtype=np.float32),
