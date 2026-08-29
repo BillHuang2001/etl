@@ -72,10 +72,10 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 |---|---|
 | add/subtract/multiply/divide/power/remainder/maximum/minimum | `stablehlo.add/subtract/multiply/divide/power/remainder/maximum/minimum` |
 | abs/negate/sqrt/sign | `stablehlo.abs/negate/sqrt/sign` |
-| exp/log/log1p/sin/cos/tan/tanh/sigmoid/erf | `stablehlo.exponential/log/log_plus_one/sine/cosine/tan/tanh/logistic/erf` |
+| exp/log/log1p/sin/cos/tan/tanh/sigmoid | `stablehlo.exponential/log/log_plus_one/sine/cosine/tan/tanh/logistic` |
 | square | decompose → `multiply(x, x)` |
 | relu | decompose → `maximum(x, 0)` |
-| gelu | decompose → erf-based (`0.5*x*(1+erf(x/√2))`) |
+| erf / gelu | deferred in v1 — `stablehlo.erf` does not exist in the opset (erf is CHLO-only); gelu's erf-based decomposition is deferred with it (see the Deferred list below) |
 | stop_gradient | identity passthrough (emit operand directly) |
 | bitwise_and/or/xor; logical_and/or/not | `stablehlo.and/or/xor/not` |
 | equal/not_equal/less/less_equal/greater/greater_equal | `stablehlo.compare` + `comparison_direction` attr (EQ/NE/LT/LE/GT/GE) |
