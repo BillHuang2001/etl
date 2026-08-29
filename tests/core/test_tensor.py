@@ -4,9 +4,12 @@ Mirrors ``etl/core/tensor.py``. Contract points under test:
 
 - ``Tensor`` wraps an ndarray *by reference*: ``.numpy()`` and ``.data`` are
   the same array (zero-copy; mutations are visible both ways).
-- Creators follow numpy conventions for default dtypes (``zeros``/``ones``/
-  ``empty`` default to float64; ``full`` infers from ``fill_value``;
-  ``tensor`` uses ``np.asarray`` inference) and honor explicit dtype/device.
+- Creators follow etl's default-dtype rule: ``zeros``/``ones``/``empty``
+  default to float32 (the library's documented default dtype — deliberate
+  deviation from numpy's float64, matching ``TensorSpec``); ``full`` and
+  ``tensor`` infer from the data/fill_value with an inferred float64 coerced
+  to float32 for Python data, while existing ndarray inputs keep their own
+  dtype (respected as-is); explicit dtype/device honored everywhere.
 - Structural equality (dtype + shape + device + elementwise values),
   ``!=`` inverts it, and tensors are unhashable.
 - DLPack is zero-copy in both directions. Note (numpy >= 2.0): the
@@ -93,7 +96,7 @@ class TestCreators:
         t = zeros(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float64")  # numpy default
+        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
         assert np.all(t.data == 0)
 
     @pytest.mark.parametrize("shape", CREATOR_SHAPES)
@@ -101,7 +104,7 @@ class TestCreators:
         t = ones(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float64")  # numpy default
+        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
         assert np.all(t.data == 1)
 
     @pytest.mark.parametrize(
@@ -117,27 +120,34 @@ class TestCreators:
 
     @pytest.mark.parametrize(
         "fill_value,expected_dtype",
-        [(7, np.dtype("int64")), (2.5, np.dtype("float64"))],
+        [(7, np.dtype("int64")), (2.5, np.dtype("float32"))],
     )
     def test_full_default_dtype_inferred_from_fill(self, fill_value, expected_dtype):
-        # Contract: defaults to the dtype numpy infers from ``fill_value``.
+        # Contract: defaults to the dtype numpy infers from ``fill_value``,
+        # except an inferred float64 becomes float32 (etl default dtype;
+        # integer fills keep numpy's int64).
         t = full((2, 2), fill_value)
         assert t.dtype == expected_dtype
-        assert t.dtype == np.asarray(fill_value).dtype
 
     @pytest.mark.parametrize("shape", CREATOR_SHAPES)
     def test_empty(self, shape):
         t = empty(shape)
         assert t.shape == shape
         assert t.device == Device("cpu", 0)
-        assert t.dtype == np.dtype("float64")  # numpy default
+        assert t.dtype == np.dtype("float32")  # etl default dtype (not numpy's float64)
         assert t.data.size == int(np.prod(shape, dtype=int))
         t.data.fill(9)  # a real, writable buffer (contents otherwise undefined)
         assert np.all(t.data == 9)
 
-    def test_tensor_default_dtype_follows_asarray(self):
-        assert tensor([[1, 2], [3, 4]]).dtype == np.asarray([[1, 2], [3, 4]]).dtype
-        assert tensor([1.0, 2.0]).dtype == np.asarray([1.0, 2.0]).dtype
+    def test_tensor_default_dtype_rule(self):
+        # Python data: numpy inference with float64 coerced to float32.
+        assert tensor([1.0, 2.0]).dtype == np.dtype("float32")
+        assert tensor([[1, 2], [3, 4]]).dtype == np.dtype("int64")  # ints keep int64
+        assert tensor([True]).dtype == np.dtype("bool")
+        assert tensor(1j).dtype == np.dtype("complex128")  # complex keeps complex128
+        # Existing ndarrays carry an explicit dtype — respected as-is.
+        assert tensor(np.zeros(3, dtype=np.float64)).dtype == np.dtype("float64")
+        assert tensor(np.ones(3, dtype=np.float32)).dtype == np.dtype("float32")
 
     def test_tensor_scalar(self):
         t = tensor(5)
