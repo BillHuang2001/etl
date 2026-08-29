@@ -3,7 +3,7 @@
 The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (91 ops) so any accidental addition/removal/rename/effect change in the
+set (97 ops) so any accidental addition/removal/rename/effect change in the
 ``etl`` package is caught here.
 """
 
@@ -119,6 +119,15 @@ _SPARSE = (
     "dense_dot_sparse",
 )
 
+_RANDOM = (
+    "random_key_mix",
+    "random_uniform",
+    "random_normal",
+    "random_randint",
+    "random_permutation",
+    "random_multinomial",
+)
+
 CANONICAL_NAMES = (
     _ELEMENTWISE_BINARY
     + ("cast",)
@@ -131,6 +140,7 @@ CANONICAL_NAMES = (
     + _TERMINATOR
     + _COLLECTIVE
     + _SPARSE
+    + _RANDOM
 )
 
 _CATEGORY_EXPECTED = {
@@ -145,6 +155,7 @@ _CATEGORY_EXPECTED = {
     **{name: "terminator" for name in _TERMINATOR},
     **{name: "collective" for name in _COLLECTIVE},
     **{name: "sparse" for name in _SPARSE},
+    **{name: "random" for name in _RANDOM},
 }
 
 _EFFECT_EXPECTED = {name: "pure" for name in CANONICAL_NAMES}
@@ -292,7 +303,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 91
+    assert len(names) == 97
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -308,7 +319,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 91) ---------------------------------------
+# --- 3. per-op effect mapping (all 97) ---------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -426,7 +437,7 @@ def test_register_duplicate_name_raises_valueerror_before_mutation():
 
 def test_register_new_name_works_and_is_cleaned_up():
     # Registry is global: use a name no other test depends on and remove it
-    # afterwards so the canonical 91-op set is never polluted.
+    # afterwards so the canonical 97-op set is never polluted.
     name = "__etl_test_ephemeral_op__"
     assert not ir.has_opdef(name)
     fresh = ir.OpDef(
@@ -462,7 +473,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 91
+    assert len(opdefs) == 97
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )
