@@ -132,6 +132,14 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
 - `return` op: terminator-only (operands = yielded values), emitted via
   `builder.set_terminator(block, "return", operands)` — it appends as the
   last op (never via `create`).
+- Registered pytree nodes (types registered via `core.register_pytree_node`,
+  e.g. sparse tensors) are valid carried values / branch outputs /
+  scan carries: `_flatten_tree` consults the registry FIRST (MRO walk over
+  `core.tree._PYTREE_NODE_REGISTRY`), the node's registered `flatten_fn`
+  yields its children (SymbolicTensor leaves + static leaves) which recurse
+  and classify as usual, and reconstruction goes through `core.unflatten`
+  with the registered (polymorphic) `unflatten_fn` — tensor children become
+  region block args / op results, static children pass through unchanged.
 - `scan` desugaring uses these registered op defs (raw, via `ir.opdef`):
   `constant` (int32 0/1/length scalars), `add` (counter increment), `less`
   (counter < length), `gather` (`axes=(0,)` with a 0-d int32 counter — the
