@@ -112,7 +112,7 @@ Module's counters (stable ids for serialization). Parent pointers
 `verify` checks consistency. `Value.uses` is maintained by the Builder and by
 `Value.replace_all_uses_with`.
 
-## Op registry (canonical v1 set — 75 ops, all declared in `op_defs/`)
+## Op registry (canonical v1 set — 91 ops, all declared in `op_defs/`)
 
 | File | Category | Ops | Effect |
 |---|---|---|---|
