@@ -7,7 +7,7 @@ EvoXIR is etl's compiler-neutral, region-based SSA intermediate representation
 `Function`s of `Block`s of `Op`s over typed `Value`s. EvoXIR is *the* frontend
 IR — StableHLO is an important export target, never the definition. This
 directory owns the IR data model, the op-definition registry (full canonical
-v1 op set, 91 ops), the `Builder` (op-construction API), `verify`
+v1 op set, 97 ops), the `Builder` (op-construction API), `verify`
 (structural/type/attribute validation), serialization (the self-describing IR
 payload — core of the `.etlgraph` format; the outer container lives in
 `../persist`), and `pretty_print`.
@@ -112,7 +112,7 @@ Module's counters (stable ids for serialization). Parent pointers
 `verify` checks consistency. `Value.uses` is maintained by the Builder and by
 `Value.replace_all_uses_with`.
 
-## Op registry (canonical v1 set — 91 ops, all declared in `op_defs/`)
+## Op registry (canonical v1 set — 97 ops, all declared in `op_defs/`)
 
 | File | Category | Ops | Effect |
 |---|---|---|---|
@@ -273,7 +273,7 @@ terminators). CPU only.
 
 ## Status
 
-Phase 2 complete for this directory: SSA data model, op registry (91 ops),
+Phase 2 complete for this directory: SSA data model, op registry (97 ops),
 shape-inference hooks (`inference.py`, 40 hooks), `pretty_print`, `verify`
 (the full invariant set — module/function/region/op/value levels, SSA
 dominance, use bookkeeping, shape_fn result-type agreement), the `Builder`,
