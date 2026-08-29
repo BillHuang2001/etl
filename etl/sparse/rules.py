@@ -1,6 +1,7 @@
-"""Sparse batching rules + batched-output aux remap (vectorize/vmap support).
+"""Sparse batching rules + batched-output aux remap + VJP rules.
 
-One shared batching rule serves all 16 sparse ops. Sparse ops are
+**Batching** (vectorize/vmap support): one shared batching rule serves all 16
+sparse ops. Sparse ops are
 **batch-transparent**: their leading batch dims flow from the input operand
 types through the op's inference hook (`etl/ir/inference.py`) into every
 result type, and their attributes (`dense_shape`, `dtype`, `axes`, `perm`,
@@ -15,6 +16,35 @@ operands with the SAME attributes and lets inference produce the batched
 result types; every result is mapped along the full leading batch
 (`MappedAxes(range(mapped_count))`).
 
+**VJP** (grad/vjp support): one rule per sparse op, registered under the exact
+IR op names. All rules follow the `etl.transforms.autodiff` contract —
+``rule(op, cotangents, primals)`` where ``cotangents`` align with
+``op.results``, ``primals`` are the op's operand values, and the return tuple
+aligns with ``op.operands`` (``None`` / ``ZeroTangent`` = zero gradient). The
+rule receives a PROXY op (original attributes/location, transformed
+operand/result values) and builds IR over ``primals`` / ``proxy.results``
+with the frontend ``etl.ops`` / ``etl.sparse.ops`` — never re-traces.
+
+Sparse vjp semantics (binding): the structure (indices) is never
+differentiated — every rule returns ``ZeroTangent`` for index operands. Value
+cotangents are pulled back with ordinary dense ops:
+
+- dense-side gathers/scatters at the index rows use a FLAT row-major index
+  (``indices @ strides``) because the numpy backend's ``gather``/``scatter``
+  kernels are single-axis only;
+- the merged-index row lookup (``sparse_add`` / ``sparse_multiply`` /
+  ``sparse_transpose``) broadcasts row-equality of the input rows against the
+  merged rows + ``argmax`` + ``where`` (``_row_lookup`` in
+  ``etl/sparse/_utils.py``) — O(nnz²), acceptable;
+- ``sparse_coo_to_csr`` / ``sparse_csr_to_coo`` / ``sparse_reshape`` pass the
+  values cotangent through 1:1 (no reorder — COO lex-sorted IS row-major);
+- ``sparse_coo_to_csc`` / ``sparse_csc_to_coo`` / ``sparse_concatenate`` are
+  explicit ``core.TransformError`` deferrals (they reorder / split rows, which
+  needs a sort-based un-permutation / dynamic slicing — never silent);
+- batched sparse operands (indices rank > 2) are a v1 gap in the
+  flat-index/lookup rules → explicit ``core.TransformError`` (the passthrough
+  rules are batch-agnostic).
+
 Guards (never silent):
 
 - If NO operand is mapped the op is rebuilt unchanged and every result is
@@ -28,21 +58,29 @@ Guards (never silent):
   shared weight in `sparse_multiply_dense` / `sparse_dot_dense`) pass through
   as-is — the batch comes from the mapped sparse side.
 
-Import contract: this module imports `etl.core`, `etl.ir`, `etl.trace`
-(active-builder hook — the same hook `etl/sparse/ops.py` uses), the public
-`etl.transforms` registration names, the internal `MappedAxes`/`UNMAPPED`
-metadata (exactly like `etl/transforms/rules.py`), and `etl.sparse.value`
-(NOT `etl.sparse` — this module is imported BY `etl/sparse/__init__.py`).
-Never backends/pipeline/persist.
+Import contract: this module imports `etl.core`, `etl.ir`, `etl.ops`,
+`etl.trace` (active-builder hook — the same hook `etl/sparse/ops.py` uses),
+the public `etl.transforms` registration names, the internal
+`MappedAxes`/`UNMAPPED` metadata (exactly like `etl/transforms/rules.py`),
+`ZeroTangent` from `etl.transforms.autodiff`, and `etl.sparse.value` /
+`etl.sparse._utils` (NOT `etl.sparse` — this module is imported BY
+`etl/sparse/__init__.py`). Never backends/pipeline/persist.
 """
 from __future__ import annotations
 
+import math
+
+import numpy as np
+
 from etl import core
 from etl import ir
+from etl import ops
 from etl.trace import current_builder
 from etl.transforms import register_batched_aux_remap, register_batching_rule
+from etl.transforms.autodiff import ZeroTangent, register_vjp_rule
 from etl.transforms._metadata import MappedAxes, UNMAPPED
 
+from etl.sparse._utils import _raw_reshape, _row_lookup
 from etl.sparse.value import SparseTensor
 
 #: The 16 sparse ops, keyed by their exact IR op name (note the last one
@@ -140,8 +178,363 @@ def _sparse_aux_remap(node, static_values, batch_dim):
     return (batch_dim, *dense_shape, dtype_leaf, format_leaf)
 
 
+# --- VJP rules (all 16 sparse ops) -----------------------------------------
+#
+# Contract (etl/transforms/autodiff.py): rule(op, cotangents, primals) ->
+# tuple aligned with op.operands; cotangents align with op.results; entries
+# are ir.Value | None | ZeroTangent. Every rule short-circuits structurally
+# zero cotangents BEFORE building gather/scatter ops (the `_ok` pattern —
+# mirror of `etl/transforms/rules.py`). The structure (indices) is never
+# differentiated: index operands always get ZeroTangent.
+
+def _sym(value: ir.Value) -> "core.SymbolicTensor":
+    """Wrap an ir.Value as a SymbolicTensor (dtype/shape from its type)."""
+    return core.SymbolicTensor(
+        value=value, dtype=value.type.dtype, shape=value.type.shape
+    )
+
+
+def _ok(tangent):
+    """The tangent as an ir.Value, or None when structurally zero."""
+    if tangent is None or isinstance(tangent, ZeroTangent):
+        return None
+    return tangent
+
+
+def _require_unbatched(value: ir.Value, op_name: str, expected_rank: int) -> None:
+    """Reject batched sparse operands in the flat-index/lookup vjp rules.
+
+    The dense-side gather/scatter construction below flattens the sparse
+    dense_shape into one row-major index space; with leading batch dims that
+    flattening would silently mix batch elements (per-batch offsets are
+    runtime values) — an explicit v1 gap, never a silent wrong gradient.
+    """
+    rank = value.type.rank
+    if rank != expected_rank:
+        raise core.TransformError(
+            f"grad/vjp: vjp of '{op_name}' is implemented for unbatched sparse "
+            f"operands only (got rank {rank}, expected {expected_rank}) — "
+            "batched sparse vjp is a v1 gap"
+        )
+
+
+def _flat_strides(dense_shape: tuple) -> tuple:
+    """Row-major flattening strides of a fully static dense shape.
+
+    Raises:
+        core.TransformError: a symbolic/None dim (the flat-index construction
+            needs static strides — v1 gap).
+    """
+    strides = []
+    acc = 1
+    for dim in reversed(dense_shape):
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            raise core.TransformError(
+                f"grad/vjp: cannot flatten a sparse dense_shape with symbolic "
+                f"dim {dim!r} — the vjp needs fully static dense shapes (v1 "
+                "gap)"
+            )
+        strides.append(acc)
+        acc *= dim
+    return tuple(reversed(strides))
+
+
+def _flat_indices(indices: "core.SymbolicTensor", dense_shape: tuple, location) -> "core.SymbolicTensor":
+    """(nnz,) flat row-major positions of an (nnz, ndim) indices tensor.
+
+    ``flat = sum_k indices[:, k] * stride_k`` with the static row-major
+    strides of `dense_shape` (the numpy backend's ``gather``/``scatter``
+    kernels are single-axis only, so the multi-axis index rows are folded
+    into one flat index space).
+    """
+    strides = _flat_strides(dense_shape)
+    scaled = ops.multiply(
+        indices, ops.constant(core.tensor(np.asarray(strides, dtype=np.int64)))
+    )
+    return ops.reduce_sum(scaled, axes=(1,))
+
+
+def _flat_gather(dense: ir.Value, flat_indices, dense_shape: tuple, location) -> "core.SymbolicTensor":
+    """Gather a dense tensor's entries at the flat index positions (nnz,)."""
+    flat = _raw_reshape(dense, (-1,), location)
+    return ops.gather(flat, flat_indices, axis=0)
+
+
+def _flat_scatter_into_dense(updates, flat_indices, dense_shape: tuple, dtype, location) -> "core.SymbolicTensor":
+    """Scatter (nnz,) updates at (nnz,) flat positions into a dense tensor.
+
+    The result is a dense-shaped zero tensor of `dtype` with the updates
+    accumulated at the flat index positions (reshaped back to `dense_shape`,
+    which is fully static here).
+    """
+    zeros = ops.constant(
+        core.tensor(np.zeros((math.prod(dense_shape),), dtype=dtype))
+    )
+    scattered = ops.scatter(zeros, flat_indices, updates, axis=0)
+    return ops.reshape(scattered, dense_shape)
+
+
+def _col(indices: "core.SymbolicTensor", index: int, location) -> "core.SymbolicTensor":
+    """The `index`-th coordinate column of an (nnz, ndim) indices tensor:
+    (nnz,) — a 0-d constant-index gather drops the coord axis."""
+    return ops.gather(
+        indices,
+        ops.constant(core.tensor(np.asarray(index, dtype=np.int64))),
+        axis=1,
+    )
+
+
+def _gather_at_rows(cot_merged: ir.Value, input_indices: ir.Value, merged_indices: ir.Value, ndim: int, location) -> ir.Value:
+    """Input-values cotangent: the merged cotangent gathered at each input
+    row's position in the merged indices (0 where the row is absent)."""
+    positions, mask = _row_lookup(input_indices, merged_indices, ndim, location)
+    gathered = ops.gather(_sym(cot_merged), positions, axis=0)
+    return ops.select(mask, gathered, 0).value
+
+
+def _expand_reduced(v: ir.Value, dense_shape: tuple, axes: tuple, keepdims: bool, location) -> "core.SymbolicTensor":
+    """Expand a reduced cotangent back to the full (static) dense shape.
+
+    Mirrors `etl/transforms/rules.py._expand_reduced`: insert size-1 dims at
+    the reduced axes (when not kept), then broadcast to the dense shape.
+    """
+    if keepdims:
+        return ops.broadcast(_sym(v), dense_shape)
+    target = tuple(1 if i in axes else d for i, d in enumerate(dense_shape))
+    reshaped = ops.reshape(_sym(v), target)
+    if tuple(reshaped.shape) == tuple(dense_shape):
+        return reshaped
+    return ops.broadcast(reshaped, dense_shape)
+
+
+def _vjp_sparse_to_dense(op, cotangents, primals):
+    """(indices, values) -> dense: wrt values = the dense cotangent gathered
+    at the index rows (flat-index gather); indices non-differentiable."""
+    cot = _ok(cotangents[0])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    _require_unbatched(primals[0], op.name, 2)
+    dense_shape = tuple(op.attributes["dense_shape"])
+    flat = _flat_indices(_sym(primals[0]), dense_shape, op.location)
+    g_values = _flat_gather(cot, flat, dense_shape, op.location)
+    return (ZeroTangent(), g_values.value)
+
+
+def _vjp_sparse_from_dense(op, cotangents, primals):
+    """dense -> (indices, values): wrt dense = the values cotangent scattered
+    at the index rows (flat-index scatter). The indices are the op's FIRST
+    RESULT (``proxy.results[0]``) — the op has a single dense operand."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(),)
+    dense = primals[0]
+    dense_shape = tuple(op.attributes["dense_shape"])
+    _require_unbatched(dense, op.name, len(dense_shape))
+    flat = _flat_indices(_sym(op.results[0]), dense_shape, op.location)
+    g_dense = _flat_scatter_into_dense(
+        _sym(cot), flat, dense_shape, dense.type.dtype, op.location
+    )
+    return (g_dense.value,)
+
+
+def _vjp_sparse_negate(op, cotangents, primals):
+    """(indices, values) -> (indices, -values): wrt values = negate(cot)."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    return (ZeroTangent(), ops.negate(_sym(cot)).value)
+
+
+def _vjp_sparse_merge(op, cotangents, primals):
+    """sparse_add / sparse_multiply (ia, va, ib, vb) -> (im, vm): each input's
+    values cotangent = the merged cotangent gathered at that input's rows'
+    positions in the merged indices, masked where a row is absent from the
+    merge (the intersection case of sparse_multiply). O(nnz^2) row lookup."""
+    cot_merged = _ok(cotangents[1])
+    if cot_merged is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent(), ZeroTangent())
+    ia, _va, ib, _vb = primals
+    _require_unbatched(ia, op.name, 2)
+    _require_unbatched(ib, op.name, 2)
+    ndim = len(op.attributes["dense_shape"])
+    merged = op.results[0]
+    g_a = _gather_at_rows(cot_merged, ia, merged, ndim, op.location)
+    g_b = _gather_at_rows(cot_merged, ib, merged, ndim, op.location)
+    return (ZeroTangent(), g_a, ZeroTangent(), g_b)
+
+
+def _vjp_sparse_multiply_dense(op, cotangents, primals):
+    """(indices, values, dense) -> (indices, values):
+    wrt values = cot_values * gather(dense at the index rows);
+    wrt dense = scatter(cot_values * values at the index rows into zeros)."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent())
+    indices, values, dense = primals
+    dense_shape = tuple(op.attributes["dense_shape"])
+    _require_unbatched(indices, op.name, 2)
+    _require_unbatched(dense, op.name, len(dense_shape))
+    flat = _flat_indices(_sym(indices), dense_shape, op.location)
+    g_values = ops.multiply(_sym(cot), _flat_gather(dense, flat, dense_shape, op.location))
+    g_dense = _flat_scatter_into_dense(
+        ops.multiply(_sym(cot), _sym(values)),
+        flat,
+        dense_shape,
+        dense.type.dtype,
+        op.location,
+    )
+    return (ZeroTangent(), g_values.value, g_dense.value)
+
+
+def _vjp_sparse_reduce_sum(op, cotangents, primals):
+    """(indices, values) -> dense: wrt values = the dense cotangent expanded
+    back to the full dense shape, gathered at the index rows."""
+    cot = _ok(cotangents[0])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    _require_unbatched(primals[0], op.name, 2)
+    dense_shape = tuple(op.attributes["dense_shape"])
+    full = _expand_reduced(
+        cot,
+        dense_shape,
+        tuple(op.attributes["axes"]),
+        bool(op.attributes["keepdims"]),
+        op.location,
+    )
+    flat = _flat_indices(_sym(primals[0]), dense_shape, op.location)
+    g_values = _flat_gather(full.value, flat, dense_shape, op.location)
+    return (ZeroTangent(), g_values.value)
+
+
+def _vjp_sparse_transpose(op, cotangents, primals):
+    """(indices, values) -> (indices, values) with rows permuted by `perm`:
+    each input row's cotangent = the result cotangent at that row's position
+    in the result indices (the permuted-row lookup)."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    _require_unbatched(primals[0], op.name, 2)
+    ndim = len(op.attributes["dense_shape"])
+    perm = tuple(op.attributes["perm"])
+    permuted = ops.gather(
+        _sym(primals[0]),
+        ops.constant(core.tensor(np.asarray(perm, dtype=np.int64))),
+        axis=-1,
+    )
+    g_values = _gather_at_rows(cot, permuted.value, op.results[0], ndim, op.location)
+    return (ZeroTangent(), g_values)
+
+
+def _vjp_sparse_reshape(op, cotangents, primals):
+    """(indices, values) -> (indices, values): 1:1 row mapping — the values
+    cotangent passes through unchanged."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    return (ZeroTangent(), cot)
+
+
+def _vjp_sparse_coo_to_csr(op, cotangents, primals):
+    """(indices, values) -> (indptr, indices, values): no reorder — COO
+    lex-sorted IS row-major, so the values cotangent (the THIRD result)
+    passes through 1:1."""
+    cot = _ok(cotangents[2])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent())
+    return (ZeroTangent(), cot)
+
+
+def _vjp_sparse_csr_to_coo(op, cotangents, primals):
+    """(indptr, indices, values) -> (indices, values): no reorder (CSR
+    expands in row-major order), so the values cotangent passes through 1:1."""
+    cot = _ok(cotangents[1])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent())
+    return (ZeroTangent(), ZeroTangent(), cot)
+
+
+def _vjp_deferral(op_name: str, reason: str):
+    """Explicit v1-deferral rule: raising ``core.TransformError`` naming the
+    op — never a silent fallback (mirrors the conv-vjp precedent)."""
+
+    def rule(op, cotangents, primals):
+        raise core.TransformError(
+            f"grad/vjp: vjp of {op_name} is a v1 deferral ({reason}) — "
+            f"{op_name} cannot be differentiated in v1; densify with "
+            "etl.sparse.to_dense before differentiating"
+        )
+
+    return rule
+
+
+def _vjp_sparse_dot_dense(op, cotangents, primals):
+    """(indices, values, dense) -> dense (M, N), sparse (M, K) x dense (K, N):
+    wrt values[i] = sum_n cot[m_i, n] * dense[k_i, n];
+    wrt dense = scatter(cot[m_i, :] * v_i at row k_i into zeros (K, N))."""
+    cot = _ok(cotangents[0])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent())
+    indices, values, dense = primals
+    _require_unbatched(indices, op.name, 2)
+    dense_shape = tuple(op.attributes["dense_shape"])  # (M, K)
+    idx_m = _col(_sym(indices), 0, op.location)
+    idx_k = _col(_sym(indices), 1, op.location)
+    g_values = ops.reduce_sum(
+        ops.multiply(
+            ops.gather(_sym(cot), idx_m, axis=0),
+            ops.gather(_sym(dense), idx_k, axis=0),
+        ),
+        axes=(1,),
+    )
+    updates = ops.multiply(
+        _raw_reshape(cot, (-1, 1), op.location),  # cot_values (nnz, 1)
+        ops.gather(_sym(cot), idx_m, axis=0),      # (nnz, N)
+    )
+    g_dense = ops.scatter(
+        ops.multiply(_sym(dense), 0),  # zeros (K, N) in the dense dtype
+        idx_k,
+        updates,
+        axis=0,
+    )
+    return (ZeroTangent(), g_values.value, g_dense.value)
+
+
+def _vjp_dense_dot_sparse(op, cotangents, primals):
+    """(dense, indices, values) -> dense (M, N), dense (M, K) x sparse
+    (K, N): with index rows (k_i, n_i) —
+    wrt values[i] = sum_m cot[m, n_i] * dense[m, k_i];
+    wrt dense = scatter(cot[:, n_i] * v_i at column k_i into zeros (M, K))."""
+    cot = _ok(cotangents[0])
+    if cot is None:
+        return (ZeroTangent(), ZeroTangent(), ZeroTangent())
+    dense, indices, values = primals
+    _require_unbatched(indices, op.name, 2)
+    dense_shape = tuple(op.attributes["dense_shape"])  # (K, N)
+    idx_k = _col(_sym(indices), 0, op.location)
+    idx_n = _col(_sym(indices), 1, op.location)
+    g_values = ops.reduce_sum(
+        ops.multiply(
+            ops.gather(_sym(cot), idx_n, axis=1),   # (M, nnz)
+            ops.gather(_sym(dense), idx_k, axis=1),  # (M, nnz)
+        ),
+        axes=(0,),
+    )
+    updates = ops.multiply(
+        ops.gather(_sym(cot), idx_n, axis=1),        # (M, nnz)
+        _raw_reshape(values, (1, -1), op.location),  # cot_values (1, nnz)
+    )
+    g_dense = ops.scatter(
+        ops.multiply(_sym(dense), 0),  # zeros (M, K) in the dense dtype
+        idx_k,
+        updates,
+        axis=1,
+    )
+    return (g_dense.value, ZeroTangent(), g_values.value)
+
+
 def _register_sparse_rules() -> None:
-    """Install the 16 sparse batching rules + the sparse aux remap.
+    """Install the 16 sparse batching rules, the sparse aux remap, and the 16
+    sparse VJP rules (three of which are explicit deferrals).
 
     Runs at import time (this module is imported at the end of
     `etl/sparse/__init__.py`), so `import etl.sparse` registers everything.
@@ -149,6 +542,41 @@ def _register_sparse_rules() -> None:
     for name in _SPARSE_OPS:
         register_batching_rule(name, _sparse_batching)
     register_batched_aux_remap(SparseTensor, _sparse_aux_remap)
+    register_vjp_rule("sparse_to_dense", _vjp_sparse_to_dense)
+    register_vjp_rule("sparse_from_dense", _vjp_sparse_from_dense)
+    register_vjp_rule("sparse_negate", _vjp_sparse_negate)
+    register_vjp_rule("sparse_add", _vjp_sparse_merge)
+    register_vjp_rule("sparse_multiply", _vjp_sparse_merge)
+    register_vjp_rule("sparse_multiply_dense", _vjp_sparse_multiply_dense)
+    register_vjp_rule("sparse_reduce_sum", _vjp_sparse_reduce_sum)
+    register_vjp_rule("sparse_transpose", _vjp_sparse_transpose)
+    register_vjp_rule("sparse_reshape", _vjp_sparse_reshape)
+    register_vjp_rule("sparse_coo_to_csr", _vjp_sparse_coo_to_csr)
+    register_vjp_rule("sparse_csr_to_coo", _vjp_sparse_csr_to_coo)
+    register_vjp_rule(
+        "sparse_coo_to_csc",
+        _vjp_deferral(
+            "sparse_coo_to_csc",
+            "reorders values column-major; needs a sort-based un-permutation",
+        ),
+    )
+    register_vjp_rule(
+        "sparse_csc_to_coo",
+        _vjp_deferral(
+            "sparse_csc_to_coo",
+            "re-sorts values back to row-major; needs a sort-based "
+            "un-permutation",
+        ),
+    )
+    register_vjp_rule(
+        "sparse_concatenate",
+        _vjp_deferral(
+            "sparse_concatenate",
+            "needs dynamic slicing of the merged cotangent per operand",
+        ),
+    )
+    register_vjp_rule("sparse_dot_dense", _vjp_sparse_dot_dense)
+    register_vjp_rule("dense_dot_sparse", _vjp_dense_dot_sparse)
 
 
 _register_sparse_rules()
