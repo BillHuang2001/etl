@@ -22,6 +22,10 @@ pytest suite asserting the op contracts in `../../etl/ops/CONTEXT.md` and `../..
 | `test_dunders.py` | dunder ≡ op-function transparency: identical `ir.pretty_print` (with `ETL_DISABLE_LOCATIONS=1`) for `+ - * / ** < <= > >= == @`, unary `-`, reflected scalar-left forms; `bool(x)`/`x != y` raise TraceError |
 | `test_sorting.py` | `sort`/`argsort` exact numpy parity (axis variants incl. `axis=None` flatten, descending = flip of ascending, stable vs numpy `kind="stable"` + explicit stability ordering, exact dtype preservation, int64 indices) + error kinds (directing/three-option TraceError, TypeError for bad static params — note axis is TypeError, NOT ShapeError — ShapeError for out-of-range axis and rank-0 operands, no op-name prefix in sort/argsort ShapeError text); topk regression coverage (numpy-exact composition, k validation, symbolic extents, error kinds) |
 
+## Known Issues
+
+- `test_errors.py::test_op_table_covers_all_public_ops` FAILS (pre-existing, independent of `test_matmul.py`): the per-op error table lacks rows for the new 15-op batch (`matmul`, `sort`, `argsort`, `topk`, `tile`, `flip`, `roll`, `diag`, `cumprod`, `nan_to_num`, `clamp`, `linspace`, `stack`, …) that landed in the implementation commits (registry 97 → 105). Fix = extend the table with the missing ops (same pattern as existing rows: no-trace TraceError, concrete-Tensor TraceError, dtype/static-shape errors where applicable).
+
 ## Notes for agents
 
 - Keep tests small/fast (CPU only, shapes ≤ ~256×256); `pytest.raises(..., match=...)`, `pytest.warns`/`recwarn`, heavy parametrization.
