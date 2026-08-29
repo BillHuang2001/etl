@@ -201,7 +201,7 @@ in `printer.py`.
 
 - Import rule above; nothing from `ops`/`trace`/`backends`/etc.
 - Implementation status: data structures, registry, shape-inference hooks
-  (`inference.py`, 23 hooks), `pretty_print`, `verify`, the `Builder`, and
+  (`inference.py`, 24 hooks), `pretty_print`, `verify`, the `Builder`, and
   serialization (`serialize_module`/`deserialize_module`) are implemented.
 - Shape-inference conventions (binding for `verify` agreement): broadcasting
   resolves symbolic conflicts as `DimExpr("max", a, b)` (left dim first);

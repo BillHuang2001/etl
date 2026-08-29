@@ -264,3 +264,20 @@ Graph save/load round-trips through the persist container.
   dynamic-index `slice` (scan works around via gather/reshape); `ir.verify`
   does not check `while` body-return types against operand types (checked
   at trace time here instead).
+- **Registered pytree nodes vs control flow (asymmetric flattening):**
+  `trace.py::_flatten_trace_into` and `core.tree._flatten_into` consult
+  `_PYTREE_NODE_REGISTRY` FIRST (MRO walk), so even an etl-module dataclass
+  registered via `register_pytree_node` becomes a container. But
+  `control_flow.py::_flatten_tree` NEVER consults the registry: a registered
+  custom node that is a non-etl dataclass is decomposed by its FIELDS
+  (ignoring the registered flatten/unflatten), and any other registered node
+  (incl. an etl-module dataclass) falls through to being a plain LEAF — which
+  `cond`/`while_loop`/`scan` then reject (`TraceError`: not a
+  `SymbolicTensor`/static). Any future custom container carried through
+  control flow (e.g. sparse tensors) must be added to `_LEAF_TYPES` (and the
+  operand/carried checks) in `control_flow.py`. Note `core.TreeSpec.context`
+  (the registered node's aux) is also invisible to
+  `core.first_mismatch_path` (it compares `type`/`node_data`/children only),
+  so aux-bearing nodes get no automatic run-time aux-equality validation via
+  `Graph.flatten_inputs` — aux equality must be checked explicitly or the aux
+  must live as static leaves.
