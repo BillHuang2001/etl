@@ -87,6 +87,7 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./kernels/control_flow.py` | if/while/call — recursive region execution (the `return` terminator is special-cased by the interpreter loop, never dispatched) |
 | `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
 | `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
+| `./kernels/sparse.py` | the 16 sparse kernels: `sparse_from_dense`/`sparse_to_dense`, coo↔csr / coo↔csc conversions, `sparse_negate`/`add`/`multiply`/`multiply_dense`, `sparse_reduce_sum`, `sparse_transpose`, `sparse_reshape`, `sparse_concatenate`, `sparse_dot_dense`/`dense_dot_sparse` — batched via per-batch loops with lex-max stored-zero padding to a common nnz; shared values-aware canonical validation (see Notes for agents) |
 
 Sibling: `../../tests/` → test suite (read-only from here; escalate test-related writes to root). Parent: `../` → Backend ABC, `LoweredProgram`/`CompiledArtifact`/`Signature` (owned there), registry (optional-adapter auto-activation), StableHLO exporter, shared `inline.py` block-inlining machinery, `compiler.py` (`CompilerBackend`/`CompilerExecutable`), `adapters/` (separate parallel effort).
 
