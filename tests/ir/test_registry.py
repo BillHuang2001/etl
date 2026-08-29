@@ -32,6 +32,7 @@ _ELEMENTWISE_BINARY = (
 
 _ELEMENTWISE_UNARY = (
     "abs",
+    "acos",
     "negate",
     "square",
     "sqrt",
@@ -48,6 +49,9 @@ _ELEMENTWISE_UNARY = (
     "erf",
     "sign",
     "logical_not",
+    "floor",
+    "ceil",
+    "round",
 )
 
 _COMPARISON = ("equal", "not_equal", "less", "less_equal", "greater", "greater_equal")
@@ -204,6 +208,7 @@ _SIGNATURE_EXPECTED = [
     ("conv", 2, 1, 0, False),
     ("solve", 2, 1, 0, False),
     ("tril", 1, 1, 0, False),
+    ("sort", 1, 1, 0, False),
     ("sparse_from_dense", 1, 2, 0, False),
     ("sparse_add", 4, 2, 0, False),
     ("sparse_concatenate", (4, None), 2, 0, False),
@@ -303,7 +308,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 97
+    assert len(names) == 103
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -319,7 +324,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 97) ---------------------------------------
+# --- 3. per-op effect mapping (all 103) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -473,7 +478,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 97
+    assert len(opdefs) == 103
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )
@@ -510,3 +515,4 @@ def test_attr_type_names_contains_all_tags():
     assert len(set(tags)) == 12  # the tags are distinct
     assert set(tags) <= set(ir.ATTR_TYPE_NAMES)
     assert len(ir.ATTR_TYPE_NAMES) == 12
+ert len(ir.ATTR_TYPE_NAMES) == 12

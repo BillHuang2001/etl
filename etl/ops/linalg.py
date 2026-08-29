@@ -513,6 +513,11 @@ def norm(x, axis=None, keepdims=False, ord=2) -> "core.SymbolicTensor":
     Returns:
         ``SymbolicTensor`` — the norm along the given axes. Dtype per numpy:
         integer input → ``float64``, float keeps its dtype.
+        NOTE: ``axis=None`` on a rank > 1 input reduces over ALL elements
+        (flat-vector norm; ``ord=2`` ≡ Frobenius) — numpy's ``linalg.norm``
+        would instead compute MATRIX norms for 2-D input (e.g. spectral for
+        ``ord=2``); those are not in v1 scope. Per-axis calls match numpy
+        ``vector_norm`` exactly.
     Raises:
         core.TraceError: no active trace; concrete ``Tensor`` operand.
         NotImplementedError: unsupported ``ord``.

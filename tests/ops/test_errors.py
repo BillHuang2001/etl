@@ -29,7 +29,7 @@ import etl
 from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
-# Per-op table of MINIMAL VALID call arguments (all 67 public ops).
+# Per-op table of MINIMAL VALID call arguments (all 79 public ops).
 # Each entry: op name -> (args_builder, kwargs). ``args_builder`` receives the
 # dict ``t`` of symbolic tensors below and returns the positional args of a
 # valid call; ``kwargs`` are constant per op.
@@ -54,7 +54,7 @@ _TENSOR_SPECS = (
 )
 
 OP_CALLS = {
-    # --- elementwise arithmetic / math / bitwise (28) ---
+    # --- elementwise arithmetic / math / bitwise (32) ---
     "add": (lambda t: (t["x"], t["x"]), {}),
     "subtract": (lambda t: (t["x"], t["x"]), {}),
     "multiply": (lambda t: (t["x"], t["x"]), {}),
@@ -156,7 +156,7 @@ def _trace_call(op_name, args_builder, kwargs=None):
             "x": x, "y": y, "xi": xi, "xb": xb, "a": a, "b": b,
             "xc": xc, "wc": wc, "idx": idx, "u": u,
         }
-        return getattr(etl, op_name)(*args_builder(t), **kwargs)
+        return _op_ref(op_name)(*args_builder(t), **kwargs)
 
     return etl.trace(fn, *_specs())
 
@@ -196,7 +196,7 @@ def test_op_table_covers_all_public_ops():
 def test_op_outside_trace_raises_directing_trace_error(op_name):
     args_builder, kwargs = OP_CALLS[op_name]
     with pytest.raises(etl.TraceError) as exc:
-        getattr(etl, op_name)(*args_builder(_STANDINS), **kwargs)
+        _op_ref(op_name)(*args_builder(_STANDINS), **kwargs)
     message = str(exc.value)
     assert message.startswith(
         "No active trace: tensor ops can only be called while tracing"
@@ -384,6 +384,16 @@ def test_unsupported_operand_kind_raises_type_error(bad, kind):
         return etl.add(x, bad)
 
     with pytest.raises(TypeError, match=rf"unsupported operand type {kind}"):
+        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+
+
+def test_unary_op_with_ndarray_raises_type_error():
+    def fn(x):
+        return etl.exp(np.array([1.0, 2.0]))
+
+    with pytest.raises(TypeError, match="unsupported operand type ndarray"):
+        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
+ytest.raises(TypeError, match=rf"unsupported operand type {kind}"):
         etl.trace(fn, etl.TensorSpec((4,), etl.float32))
 
 
