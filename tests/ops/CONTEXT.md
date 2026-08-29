@@ -22,6 +22,7 @@ pytest suite asserting the op contracts in `../../etl/ops/CONTEXT.md` and `../..
 
 ## Notes for agents
 
+- `test_errors.py` pins the pre-batch 67-op table — the 15-op batch (sort/argsort/topk/tile/stack/flip/roll/clamp/eye/matmul/cumprod/diag/isnan/nan_to_num/linspace) left it stale, so `test_op_table_covers_all_public_ops` FAILS against the 82-name `etl.ops.__all__`. Extend `OP_CALLS` to the 82 names (escalate to the ops/test owner; do not weaken the test).
 - Keep tests small/fast (CPU only, shapes ≤ ~256×256); `pytest.raises(..., match=...)`, `pytest.warns`/`recwarn`, heavy parametrization.
 - A real etl bug contradicting the documented contract must NOT be papered over: keep the test plain-failing with `# BUG(etl): <one-line description>` and report a minimal repro; the parent delegates etl fixes (this dir is read-only w.r.t. etl).
 - Contract divergences that turned out to be *documented* behavior are tested as such (e.g. `ops.dot` is rank-≥2 only; numpy-scalar and `Dim`-valued getitem keys are non-static → TraceError; float scalar + int tensor → float64 per NEP-50/result_type, NOT float32).

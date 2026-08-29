@@ -41,7 +41,7 @@ Known-Issue behaviors are encoded as tests with `# CURRENT contract` comments:
   in `test_verify.py` need fake ops (`_test_halt`, `_test_no_rule`); they are
   registered by the `test_only_opdefs` fixture, which restores the registry to
   its exact pre-fixture state in a `finally` (pops from `etl.ir.op_defs._REGISTRY`).
-  Import-time registration broke `test_registry.py`'s canonical-75 assertions
+  Import-time registration broke `test_registry.py`'s canonical-set assertions
   when the two files ran in one pytest process.
 - Test modules must NOT import each other's helpers; keep fixtures/helpers local
   to each file (avoids cross-file coupling and ordering hazards).
