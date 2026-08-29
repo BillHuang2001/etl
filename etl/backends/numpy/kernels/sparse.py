@@ -40,18 +40,16 @@ Implemented kernels (op name — semantics; shapes follow the ``ir.inference``
    strictly increasing; NO reorder.
 5. ``sparse_coo_to_csc(indices, values) -> (indptr, indices, values)`` —
    rank-2; canonical-validates the COO, then reorders column-major
-   (``np.lexsort((row, col))``). The indptr runs over COLUMNS but has the
-   inference-declared length rows+1 (``infer_sparse_coo_to_csc`` reuses the
-   CSR shape): the true column pointers occupy ``ip[0:cols+1]`` and the tail
-   ``ip[cols+1:rows+1]`` is a monotone ``nnz`` continuation. When ``cols >
-   rows`` the column pointers cannot fit the declared length => explicit
-   ``ShapeError`` (see ``_coo_to_csc``; the upstream inference hook should
-   declare ``dense_shape[1]+1`` for csc).
+   (``np.lexsort((row, col))``). The indptr is the STANDARD CSC column
+   pointer array of length ``cols+1`` (``infer_sparse_coo_to_csc`` declares
+   batch + (dense_shape[1] + 1,)): ``indptr[0] == 0``, monotone
+   non-decreasing, ``indptr[-1] == nnz``; both unbatched and batched
+   (per-batch element).
 6. ``sparse_csc_to_coo(indptr, indices, values) -> (indices, values)`` —
-   rank-2; validates the CSC triple (indptr length cols+1 standard OR rows+1
-   padded convention — the tail must equal nnz, strictly; else
-   ``ShapeError``), expands, then re-sorts back to row-major
-   (``np.lexsort((col, row))``).
+   rank-2; validates the CSC triple (indptr length ``cols+1`` standard —
+   the legacy padded ``rows+1`` convention is also still accepted
+   defensively; the tail must equal nnz, strictly; else ``ShapeError``),
+   expands, then re-sorts back to row-major (``np.lexsort((col, row))``).
 7. ``sparse_negate(indices, values) -> (indices, -values)`` — structure
    preserved; no canonical assumption.
 8. ``sparse_add(ia, va, ib, vb) -> (indices, values)`` — union merge over
@@ -648,37 +646,22 @@ def _coo_to_csc(ctx: Any, op: Any, operands: tuple) -> tuple:
     """``sparse_coo_to_csc`` (rank-2): canonical-validate, then reorder to
     column-major (lexsort by (col, row)); indptr over columns.
 
-    Shape contract (binding): ``infer_sparse_coo_to_csc`` declares the
-    indptr as batch + (dense_shape[0] + 1,) — the SAME length as
-    ``sparse_coo_to_csr`` (rows+1) — even though the indptr runs over
-    columns (cols+1 meaningful entries). This kernel honors BOTH: the
-    output indptr has the declared length rows+1 with the true column
-    pointers in ``ip[0:cols+1]`` and a monotone ``nnz`` tail in
-    ``ip[cols+1:rows+1]`` (``_csc_to_coo`` validates that tail strictly —
-    never silent garbage). When cols > rows the column pointers do not fit
-    in the declared length and the conversion raises an explicit
-    ``ShapeError`` (the csc representation is inexpressible in the
-    inference-declared shape; note the upstream inference hook must be
-    amended to dense_shape[1]+1 for csc — see the module docstring).
+    Shape contract (binding): the indptr is the STANDARD CSC column-pointer
+    array of length ``cols + 1`` — ``infer_sparse_coo_to_csc`` declares
+    batch + (dense_shape[1] + 1,) — with ``indptr[0] == 0``, monotone
+    non-decreasing, ``indptr[-1] == nnz``. Both the unbatched and the
+    batched paths emit one such indptr per batch element (``(B, cols+1)``).
     """
     name = op.name
     indices, values = operands
     idx, vals = indices.numpy(), values.numpy()
     rows, cols = _rank2_shape(ctx, name, op.attributes["dense_shape"])
     _validate_canonical(ctx, name, idx, vals, (rows, cols))
-    if cols > rows:
-        raise core.ShapeError(
-            f"kernel for op '{name}': dense_shape {(rows, cols)!r} has more "
-            f"columns than rows — the csc column pointers (length cols+1 = "
-            f"{cols + 1}) do not fit the inference-declared indptr length "
-            f"rows+1 = {rows + 1}; the upstream infer_sparse_coo_to_csc shape "
-            "must be amended (dense_shape[1]+1) for this representation"
-        )
     batch = idx.shape[:-2]
     n = _batch_count(batch)
     idx_flat = idx.reshape((n,) + idx.shape[-2:])
     vals_flat = vals.reshape((n,) + vals.shape[-1:])
-    out_indptr = np.zeros((n, rows + 1), _INT64)
+    out_indptr = np.zeros((n, cols + 1), _INT64)
     out_indices = np.empty((n, idx.shape[-2]), _INT64)
     out_vals = np.empty((n, vals.shape[-1]), dtype=vals.dtype)
     for b in range(n):
@@ -686,12 +669,11 @@ def _coo_to_csc(ctx: Any, op: Any, operands: tuple) -> tuple:
         col = idx_flat[b][:, 1]
         order = np.lexsort((row, col))  # primary: col, secondary: row
         counts = np.bincount(col[order], minlength=cols).astype(_INT64)
-        out_indptr[b, 1 : cols + 1] = np.cumsum(counts)
-        out_indptr[b, cols + 1 :] = counts.sum()  # monotone nnz tail
+        out_indptr[b, 1:] = np.cumsum(counts)
         out_indices[b] = row[order]
         out_vals[b] = vals_flat[b][order]
     return (
-        core.Tensor(out_indptr.reshape(batch + (rows + 1,))),
+        core.Tensor(out_indptr.reshape(batch + (cols + 1,))),
         core.Tensor(out_indices.reshape(batch + (idx.shape[-2],))),
         core.Tensor(out_vals.reshape(vals.shape)),
     )
@@ -701,10 +683,12 @@ def _csc_to_coo(ctx: Any, op: Any, operands: tuple) -> tuple:
     """``sparse_csc_to_coo`` (rank-2): validate the CSC triple, expand, then
     RE-SORT back to row-major (lexsort by (row, col)).
 
-    The indptr may arrive with length cols+1 (standard column pointers) or
-    rows+1 (the padded convention emitted by ``_coo_to_csc`` — the true
-    column pointers in ``ip[0:cols+1]`` plus a strictly-validated monotone
-    ``nnz`` tail). Anything else => ``ShapeError``.
+    The indptr is the STANDARD CSC column-pointer convention of length
+    ``cols+1`` (both the concrete ``etl.sparse.csc`` path and the graph
+    ``sparse_coo_to_csc`` op emit it). For backward compatibility the
+    legacy padded ``rows+1`` convention (true column pointers in
+    ``ip[0:cols+1]`` plus a strictly-validated monotone ``nnz`` tail) is
+    still accepted. Anything else => ``ShapeError``.
     """
     name = op.name
     indptr, indices, values = operands
