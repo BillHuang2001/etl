@@ -1296,7 +1296,9 @@ def infer_sparse_reduce_sum(
     )
     reduced_set = set(reduced)
     dense_out = tuple(
-        dim for i, dim in enumerate(dense_shape) if (i not in reduced_set) or keepdims
+        1 if (i in reduced_set and keepdims) else dim
+        for i, dim in enumerate(dense_shape)
+        if (i not in reduced_set) or keepdims
     )
     return (ValueType(dtype(attributes["dtype"]), batch + dense_out),)
 
