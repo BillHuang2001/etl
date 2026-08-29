@@ -29,7 +29,7 @@ import etl
 from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
-# Per-op table of MINIMAL VALID call arguments (all 67 public ops).
+# Per-op table of MINIMAL VALID call arguments (all 82 public ops).
 # Each entry: op name -> (args_builder, kwargs). ``args_builder`` receives the
 # dict ``t`` of symbolic tensors below and returns the positional args of a
 # valid call; ``kwargs`` are constant per op.
@@ -123,6 +123,23 @@ OP_CALLS = {
     "triu": (lambda t: (t["a"],), {}),
     "cumsum": (lambda t: (t["x"],), {}),
     "solve": (lambda t: (t["a"], t["b"]), {}),
+    # --- sorting (3) ---
+    "sort": (lambda t: (t["x"],), {}),
+    "argsort": (lambda t: (t["x"],), {}),
+    "topk": (lambda t: (t["x"], 2), {}),  # returns (values, indices)
+    # --- structural / creation (12) ---
+    "tile": (lambda t: (t["x"],), {"reps": (2,)}),
+    "flip": (lambda t: (t["x"],), {"axes": (0,)}),
+    "roll": (lambda t: (t["x"],), {"shift": 1}),
+    "stack": (lambda t: ([t["x"], t["x"]],), {}),  # list operand, like concatenate
+    "clamp": (lambda t: (t["x"],), {"min": 0.0, "max": 1.0}),
+    "eye": (lambda t: (3,), {}),  # all-static creation op — no tensor operands
+    "matmul": (lambda t: (t["a"], t["b"]), {}),
+    "cumprod": (lambda t: (t["x"],), {}),
+    "diag": (lambda t: (t["a"],), {}),
+    "isnan": (lambda t: (t["x"],), {}),
+    "nan_to_num": (lambda t: (t["x"],), {}),
+    "linspace": (lambda t: (0.0, 1.0, 5), {}),  # all-static creation op
     # --- constants / escape hatches (3) ---
     # ``constant`` takes a concrete Tensor by design — it is excluded from
     # the concrete-Tensor-operand category but present in the no-trace one.
@@ -167,7 +184,7 @@ def _tensor_variant(op_name, args_builder):
 
     def build(t):
         args = list(args_builder(t))
-        if op_name == "concatenate":
+        if op_name in ("concatenate", "stack"):
             args[0] = [t["x"], tensor]  # Tensor inside the container
         elif op_name == "runtime_call":
             args[1] = tensor  # args[0] is the callback, args[1] the 1st operand
@@ -183,9 +200,9 @@ def _tensor_variant(op_name, args_builder):
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 67 public op names."""
+    """The table must exercise exactly the 82 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 67
+    assert len(etl.ops.__all__) == 82
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +236,13 @@ def test_no_trace_message_mentions_defn():
 # (b) concrete Tensor operand INSIDE a trace -> mandated three-option message
 # ---------------------------------------------------------------------------
 
-# ``constant`` is the one op whose documented input IS a concrete Tensor.
-_TENSOR_OPERAND_SKIP = {"constant"}
+# ``constant`` is the one op whose documented input IS a concrete Tensor;
+# ``eye``/``linspace`` are all-static creation ops with NO tensor operand at
+# all (a concrete Tensor passed as a static parameter hits the frontend's
+# TypeError path — e.g. "eye: n must be a Python int" / "linspace: start must
+# be a Python int or float" — never the mandated three-option TraceError), so
+# the concrete-Tensor-operand category does not apply to them.
+_TENSOR_OPERAND_SKIP = {"constant", "eye", "linspace"}
 
 
 @pytest.mark.parametrize("op_name", sorted(set(OP_CALLS) - _TENSOR_OPERAND_SKIP))
