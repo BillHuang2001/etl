@@ -1212,9 +1212,22 @@ def infer_sparse_coo_to_csc(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:
     """Result types of ``sparse_coo_to_csc`` (rank-2 only): (indptr, indices,
-    values) — same shapes as ``sparse_coo_to_csr``; the op reorders the COO
-    to column-major at run time."""
-    return _sparse_coo_to_csr_like(input_types, attributes, "sparse_coo_to_csc")
+    values). CSC indptr runs over COLUMNS, so indptr = batch + (cols + 1,);
+    indices = batch + (None,); values = batch + (None,) with the input values
+    dtype."""
+    if len(input_types) != 2:
+        raise ShapeError(
+            f"sparse_coo_to_csc: expected 2 operands (indices, values), got "
+            f"{len(input_types)}"
+        )
+    indices_t, values_t = input_types
+    dense_shape = _sparse_rank2_shape(attributes, "sparse_coo_to_csc")
+    batch = _sparse_batch(indices_t, "sparse_coo_to_csc")
+    return (
+        ValueType(np.dtype("int64"), batch + (dense_shape[1] + 1,)),
+        ValueType(np.dtype("int64"), batch + (None,)),
+        ValueType(values_t.dtype, batch + (None,)),
+    )
 
 
 def infer_sparse_csc_to_coo(

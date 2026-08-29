@@ -278,6 +278,13 @@ def _register_sparse() -> None:
                     default=0,
                     description="Sparse (unbatched) axis to concatenate along.",
                 ),
+                AttrSpec(
+                    name="operand_extents",
+                    type=ATTR_INTS,
+                    description="dense_shape[axis] per operand, in order (the "
+                    "kernel offsets each operand's coordinate by the prefix "
+                    "sum).",
+                ),
             ),
             shape_fn=infer_sparse_concatenate,
         )
