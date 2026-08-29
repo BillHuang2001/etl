@@ -155,6 +155,53 @@ def _tree_has_registered_node(tree_spec: "core.TreeSpec") -> bool:
     return any(_tree_has_registered_node(child) for child in tree_spec.children)
 
 
+def _registered_node_tensor_positions(
+    tree_spec: "core.TreeSpec", tensor_positions
+) -> set:
+    """The flat leaf indices (pre-order, matching `core.flatten`) of TENSOR
+    leaves that live UNDER a registered pytree node (e.g. a sparse-tensor
+    node's indices/values leaves).
+
+    For such leaves the leading dim is NOT a batch dim — sparse COO indices
+    are ``(None, ndim)`` with dim 0 the runtime-dynamic nnz — so callers must
+    leave their shape unchanged when stripping mapped dims (the vmap callable
+    path: the batch dim is prepended later by `vectorize_graph`, and
+    output-side dense_shape remapping is `register_batched_aux_remap`'s
+    job). `tensor_positions`: the set of flat leaf indices that are tensor
+    leaves (e.g. `TensorSpec` instances); only those are returned. The walk
+    mirrors `_broadcast_registered_axes.fill`'s leaf accounting (registered
+    nodes consume their whole subtree; empty containers consume nothing).
+    """
+    positions = set()
+    leaf_pos = [0]
+
+    def fill(spec):
+        """Mark the tensor leaves in a registered node's subtree."""
+        if spec.children:
+            for child in spec.children:
+                fill(child)
+            return
+        if spec.num_leaves == 0:
+            return  # empty container inside the node: no leaves
+        if leaf_pos[0] in tensor_positions:
+            positions.add(leaf_pos[0])
+        leaf_pos[0] += 1
+
+    def walk(spec):
+        if _is_registered_spec(spec):
+            fill(spec)
+            return
+        if not spec.children:
+            if spec.num_leaves != 0:
+                leaf_pos[0] += 1  # plain leaf
+            return
+        for child in spec.children:
+            walk(child)
+
+    walk(tree_spec)
+    return positions
+
+
 def _broadcast_registered_axes(
     axes_spec: "core.TreeSpec",
     tree_spec: "core.TreeSpec",

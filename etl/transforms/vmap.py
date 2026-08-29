@@ -29,6 +29,7 @@ from etl.transforms.vectorize import (
     _broadcast_registered_axes,
     _is_int,
     _normalize_axis_entries,
+    _registered_node_tensor_positions,
     _tree_has_registered_node,
     vectorize,
 )
@@ -210,9 +211,22 @@ def _derive_unvectorized_args(args, in_axes):
     normalized = _normalize_axis_entries(
         entries, tensor_positions, ranks, "vmap"
     )
+    # Tensor leaves UNDER a registered pytree node (e.g. a sparse-tensor
+    # node's indices/values leaves) keep their shape UNCHANGED when mapped:
+    # their leading dim is NOT a batch dim (sparse COO indices are
+    # (None, ndim) — dim 0 is the runtime-dynamic nnz). The batch dim is
+    # prepended later by vectorize (`_batched_input_specs`), and the
+    # output-side dense_shape remap is `register_batched_aux_remap`'s job.
+    under_registered = _registered_node_tensor_positions(
+        args_spec, tensor_positions
+    )
     unvectorized_leaves = []
     for index, leaf in enumerate(args_leaves):
-        if index in tensor_positions and normalized[index] == 0:
+        if (
+            index in tensor_positions
+            and normalized[index] == 0
+            and index not in under_registered
+        ):
             spec = leaf
             unvectorized_leaves.append(
                 core.TensorSpec(
