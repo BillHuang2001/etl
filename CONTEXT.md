@@ -55,7 +55,8 @@ etl learns from Nx (explicit numerical language, `block`, `vectorize`, `runtime_
 | Path | Area |
 |---|---|
 | `./etl/` | The package. Public API contract lives in `./etl/CONTEXT.md` — read it before touching anything. |
-| `./tests/` | pytest suite mirroring `./etl/` module structure + spec-compliance tests (design principles). |
+| `./etl/sparse/` | Sparse tensor subsystem (value model, ops, transforms rules — see `./etl/sparse/CONTEXT.md`); numpy-backend-only in v1. |
+| `./tests/` | pytest suite mirroring `./etl/` module structure + spec-compliance tests (design principles); sparse suite in `./tests/sparse/`. |
 | `./pyproject.toml` | Packaging, deps (numpy only), pytest config. |
 
 Cross-references: none yet (sibling dirs are read-only — escalate writes to parent).
