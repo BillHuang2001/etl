@@ -796,6 +796,95 @@ class SparseTensorSpec(SparseTensor):
         self.dense_shape = dense_shape
         self.format = format
 
+    @classmethod
+    def from_concrete(cls, sparse) -> "SparseTensorSpec":
+        """Derive the canonical spec from a CONCRETE sparse instance.
+
+        The pending ``etl.evaluate`` pipeline fix calls this to derive trace
+        inputs from concrete sparse arguments. The concrete instance is
+        flattened via ``core.flatten`` and each tensor leaf becomes a
+        ``core.TensorSpec``: the nnz dim (dim 0 of the indices/values
+        leaves) becomes runtime-dynamic (``None``), while the indptr leaf
+        keeps its STATIC ``(rows+1,)`` / ``(cols+1,)`` shape. The static
+        leaves (``dense_shape`` ints/Dims, the values ``np.dtype``, the
+        format string) pass through unchanged, and ``core.unflatten``
+        rebuilds the spec through the polymorphic pytree ``unflatten_fn``
+        (so the result is always a validated :class:`SparseTensorSpec`).
+
+        The result flattens EXACTLY back to the concrete instance's children
+        layout — COO: ``[indices_spec, values_spec, *dense_shape, dtype,
+        "coo"]``; CSR/CSC: ``[indptr_spec, indices_spec, values_spec,
+        *dense_shape, dtype, format]`` — so the spec structure-matches the
+        concrete instance leaf-for-leaf (static leaves
+        ``[*dense_shape, dtype, format]`` identical).
+
+        Args:
+            sparse: A CONCRETE sparse tensor (COO/CSR/CSC with numpy or
+                ``core.Tensor`` leaves).
+
+        Returns:
+            The derived :class:`SparseTensorSpec`.
+
+        Raises:
+            TypeError: ``sparse`` is not a concrete sparse tensor (a spec, a
+                symbolic instance, or a non-sparse value).
+            core.ShapeError: Batched concrete leaves (leaf shapes with more
+                dims than the unbatched spec layout admits — v1 specs are
+                unbatched).
+        """
+        if not is_sparse(sparse):
+            raise TypeError(
+                "SparseTensorSpec.from_concrete expects a concrete sparse "
+                f"tensor (COO/CSR/CSC), got {type(sparse).__name__}"
+            )
+        if isinstance(sparse, cls):
+            raise TypeError(
+                "SparseTensorSpec.from_concrete expects a CONCRETE sparse "
+                "tensor — a SparseTensorSpec is already a spec; pass a "
+                "concrete COO/CSR/CSC instance instead"
+            )
+        if isinstance(sparse.values, core.SymbolicTensor):
+            raise TypeError(
+                "SparseTensorSpec.from_concrete cannot derive a spec from a "
+                "symbolic sparse tensor (no concrete data) — pass a concrete "
+                "COO/CSR/CSC instance"
+            )
+        children, tree = core.flatten(sparse)
+        format = children[-1]
+        n_leaves = 2 if format == "coo" else 3
+        spec_children = []
+        for index, child in enumerate(children):
+            if index >= n_leaves:
+                # Static leaves (dense_shape ints/Dims, values dtype, format)
+                # pass through unchanged — snapshotted and run-validated by
+                # the trace/pipeline machinery like any other static value.
+                spec_children.append(child)
+                continue
+            arr = child.numpy() if isinstance(child, core.Tensor) else child
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(
+                    "SparseTensorSpec.from_concrete: sparse leaf "
+                    f"{index} must be a numpy array or core.Tensor, got "
+                    f"{type(child).__name__}"
+                )
+            if index == 0 and format != "coo":
+                # indptr: STATIC (rows+1,)/(cols+1,) — nnz is not its dim.
+                shape = tuple(arr.shape)
+            else:
+                # indices/values: the nnz dim (dim 0) becomes dynamic.
+                shape = tuple(
+                    None if dim_index == 0 else dim
+                    for dim_index, dim in enumerate(arr.shape)
+                )
+            spec_children.append(core.TensorSpec(shape=shape, dtype=arr.dtype))
+        result = core.unflatten(spec_children, tree)
+        if not isinstance(result, cls):  # pragma: no cover - type-locked
+            raise TypeError(
+                "SparseTensorSpec.from_concrete: internal error — unflatten "
+                f"produced {type(result).__name__}, expected {cls.__name__}"
+            )
+        return result
+
 
 def is_sparse(x) -> bool:
     """True if ``x`` is a sparse tensor in ANY phase or variant.
