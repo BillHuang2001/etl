@@ -3,7 +3,7 @@
 The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (75 ops) so any accidental addition/removal/rename/effect change in the
+set (91 ops) so any accidental addition/removal/rename/effect change in the
 ``etl`` package is caught here.
 """
 
@@ -100,6 +100,25 @@ _COLLECTIVE = (
     "world_size",
 )
 
+_SPARSE = (
+    "sparse_from_dense",
+    "sparse_to_dense",
+    "sparse_coo_to_csr",
+    "sparse_csr_to_coo",
+    "sparse_coo_to_csc",
+    "sparse_csc_to_coo",
+    "sparse_negate",
+    "sparse_add",
+    "sparse_multiply",
+    "sparse_multiply_dense",
+    "sparse_reduce_sum",
+    "sparse_transpose",
+    "sparse_reshape",
+    "sparse_concatenate",
+    "sparse_dot_dense",
+    "dense_dot_sparse",
+)
+
 CANONICAL_NAMES = (
     _ELEMENTWISE_BINARY
     + ("cast",)
@@ -111,6 +130,7 @@ CANONICAL_NAMES = (
     + _CONTROL
     + _TERMINATOR
     + _COLLECTIVE
+    + _SPARSE
 )
 
 _CATEGORY_EXPECTED = {
@@ -124,6 +144,7 @@ _CATEGORY_EXPECTED = {
     **{name: "control" for name in _CONTROL},
     **{name: "terminator" for name in _TERMINATOR},
     **{name: "collective" for name in _COLLECTIVE},
+    **{name: "sparse" for name in _SPARSE},
 }
 
 _EFFECT_EXPECTED = {name: "pure" for name in CANONICAL_NAMES}
@@ -172,6 +193,13 @@ _SIGNATURE_EXPECTED = [
     ("conv", 2, 1, 0, False),
     ("solve", 2, 1, 0, False),
     ("tril", 1, 1, 0, False),
+    ("sparse_from_dense", 1, 2, 0, False),
+    ("sparse_add", 4, 2, 0, False),
+    ("sparse_concatenate", (4, None), 2, 0, False),
+    ("sparse_dot_dense", 3, 1, 0, False),
+    ("dense_dot_sparse", 3, 1, 0, False),
+    ("sparse_negate", 2, 2, 0, False),
+    ("sparse_reduce_sum", 2, 1, 0, False),
 ]
 
 #: (name, attr, tag, required) attribute-schema spot-checks.
@@ -264,7 +292,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 75
+    assert len(names) == 91
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -280,7 +308,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 75) ---------------------------------------
+# --- 3. per-op effect mapping (all 91) ---------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -398,7 +426,7 @@ def test_register_duplicate_name_raises_valueerror_before_mutation():
 
 def test_register_new_name_works_and_is_cleaned_up():
     # Registry is global: use a name no other test depends on and remove it
-    # afterwards so the canonical 75-op set is never polluted.
+    # afterwards so the canonical 91-op set is never polluted.
     name = "__etl_test_ephemeral_op__"
     assert not ir.has_opdef(name)
     fresh = ir.OpDef(
@@ -434,7 +462,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 75
+    assert len(opdefs) == 91
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )
