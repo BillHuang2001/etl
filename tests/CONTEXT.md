@@ -56,8 +56,6 @@ Coverage additions (tree/pytree UX contract — written against the pinned contr
 - `trace/test_static_snapshot.py` — `Device`/`Dim` static args snapshot as ONE static value (no field descent); user dataclasses still descend.
 - `block/test_portable.py` — portable impls returning namedtuple/dataclass structures of symbolics (incl. vmap through them).
 
-Open coordination points until the parallel implementation lands (see the tree-UX work): path granularity for dict-key mismatches (key-level `[1]['w']` vs node-level `[1]` — tests assert both in different files); bind's unbound-portion lead-in wording vs the pinned unified shape (existing `pipeline_test.py:407` asserts the old wording).
-
 ## Notes for agents
 
 - Prefer small focused test files mirroring the module they test; test files may import from `etl` directly.
