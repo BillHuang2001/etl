@@ -15,10 +15,16 @@ CSR/CSC inputs to the computation format, COO).
 
 - Value model (`value.py`): `SparseTensor` (base class AND concrete COO
   representation), `CSRTensor`, `CSCTensor`, `SparseTensorSpec`, `is_sparse`.
-- Creators (CONCRETE, eager numpy — no trace): `coo(indices, values, shape)`,
-  `csr(indptr, indices, values, shape)`, `csc(indptr, indices, values,
-  shape)`, `from_dense(dense, format="coo")` (exact `np.nonzero` extraction;
-  only `format="coo"` in v1 — others raise `ValueError`).
+- Creators (POLYMORPHIC — concrete components (numpy arrays / `core.Tensor`)
+  → validated eager value; symbolic components (`core.SymbolicTensor`) →
+  in-graph assembly, no validation — the numpy kernels validate canonical
+  form at run time): `coo(indices, values, shape)`, `csr(indptr, indices,
+  values, shape)`, `csc(indptr, indices, values, shape)`,
+  `from_dense(dense, format="coo")` (concrete: exact `np.nonzero`
+  extraction; symbolic: emits the `sparse_from_dense` op — the in-graph
+  creator; only `format="coo"` in v1 — others raise `ValueError`). Mixed
+  symbolic/concrete components → `TypeError`; `core.TensorSpec` components →
+  `TypeError` directing to `SparseTensorSpec` for trace inputs.
 - Converters (POLYMORPHIC: concrete instance → eager method; symbolic →
   graph op): `to_dense(x)`, `to_csr(x)`, `to_csc(x)`, `to_coo(x)`.
 - Computation ops (graph-time; symbolic sparse in): `add`, `subtract`
@@ -156,7 +162,7 @@ rule via the adjoint (double-vjp) trick.
 | Path | Area |
 |---|---|
 | `./value.py` | Three-phase value model: `SparseTensor`/`CSRTensor`/`CSCTensor`/`SparseTensorSpec` (+ `from_concrete`), canonical validation, concrete layout helpers, pytree registration |
-| `./ops.py` | Frontend ops: creators (eager), polymorphic converters, computation ops, COO auto-conversion, three-option TraceErrors |
+| `./ops.py` | Frontend ops: creators (polymorphic), polymorphic converters, computation ops, COO auto-conversion, three-option TraceErrors |
 | `./rules.py` | Differentiation: 16 batching rules + `SparseTensor` batched-output aux remap, 16 vjp rules (3 explicit deferrals), explicit jvp rules for the 4 bilinear ops (all other sparse ops auto-derive their jvp via the adjoint trick) |
 | `./_utils.py` | Internal helpers: `_get_location` (etl-frame skip), `_require_symbolic_sparse`/`_require_symbolic_dense`, `_wrap_dense`, `_raw_reshape`, `_row_lookup` (O(nnz²) row-equality lookup for the merge AD rules) |
 

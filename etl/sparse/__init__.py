@@ -69,7 +69,7 @@ __all__ = [
     "CSCTensor",
     "SparseTensorSpec",
     "is_sparse",
-    # creators (concrete, eager)
+    # creators (polymorphic: concrete -> eager value; symbolic -> graph)
     "coo",
     "csr",
     "csc",

@@ -23,10 +23,15 @@ attributes=..., location=...)``, then result wrapping: dtype/shape read from
 the result ``ValueType`` (sparse results via ``SparseTensor.from_parts`` —
 the result ``dense_shape`` is known at trace time).
 
-The creators (``coo`` / ``csr`` / ``csc`` / ``from_dense``) are CONCRETE and
-eager (numpy) — no trace needed. The converters (``to_dense`` / ``to_csr`` /
-``to_csc`` / ``to_coo``) are polymorphic: a concrete instance dispatches to
-its eager ``value.py`` method; a symbolic instance builds the graph op.
+The creators (``coo`` / ``csr`` / ``csc`` / ``from_dense``) are POLYMORPHIC:
+concrete components (numpy arrays / ``core.Tensor``) build the validated
+eager value; symbolic components (``core.SymbolicTensor``) assemble the
+in-graph sparse value — ``from_dense`` emits the ``sparse_from_dense`` op,
+``coo``/``csr``/``csc`` wrap the symbolic leaves via ``from_parts`` with NO
+validation (the numpy kernels validate canonical form at run time). The
+converters (``to_dense`` / ``to_csr`` / ``to_csc`` / ``to_coo``) are
+polymorphic too: a concrete instance dispatches to its eager ``value.py``
+method; a symbolic instance builds the graph op.
 
 Import contract (binding): this module imports ``etl.core``, ``etl.trace``
 (active-builder hook), and the sibling ``etl.sparse`` modules only — never
@@ -168,51 +173,123 @@ def _normalize_axes(seq: Sequence[int], rank: int, what: str) -> Tuple[int, ...]
     return tuple(sorted(set(normalized)))
 
 
-# --- creators (CONCRETE, eager numpy — no trace needed) ----------------------
+# --- creators (polymorphic: concrete -> eager value; symbolic -> graph) ------
+
+
+def _creator_phase(leaves: Tuple[Any, ...], what: str) -> str:
+    """Classify creator components into a single phase.
+
+    Returns:
+        ``"symbolic"`` when every leaf is a ``core.SymbolicTensor``
+        (graph-time assembly via ``from_parts`` — no validation), or
+        ``"concrete"`` when every leaf is a numpy ``ndarray`` /
+        ``core.Tensor`` (eager validated construction).
+
+    Raises:
+        TypeError: Mixed symbolic/concrete leaves, or ``core.TensorSpec``
+            components (directing to ``SparseTensorSpec`` for trace inputs).
+    """
+    if all(isinstance(leaf, core.SymbolicTensor) for leaf in leaves):
+        return "symbolic"
+    if all(isinstance(leaf, (np.ndarray, core.Tensor)) for leaf in leaves):
+        return "concrete"
+    for leaf in leaves:
+        if isinstance(leaf, core.TensorSpec):
+            raise TypeError(
+                f"etl.sparse.{what}: creator components must be concrete "
+                f"(numpy arrays / core.Tensor) or symbolic (SymbolicTensor), "
+                f"got a core.TensorSpec — for trace inputs use a "
+                f"SparseTensorSpec"
+            )
+    kinds = ", ".join(type(leaf).__name__ for leaf in leaves)
+    raise TypeError(
+        f"etl.sparse.{what}: creator components must be ALL concrete (numpy "
+        f"arrays / core.Tensor) or ALL symbolic (SymbolicTensor), got mixed "
+        f"kinds: {kinds}"
+    )
 
 
 def coo(indices, values, shape):
-    """Construct a concrete COO sparse tensor ``(indices, values)``.
+    """Construct a COO sparse tensor from raw components.
 
-    Eager creator: canonical-form validation applies (lex-sorted unique
-    in-range rows). For graph-time assembly use a ``SparseTensorSpec`` trace
-    input (or the converters/computation ops on symbolic operands).
+    Concrete components (numpy arrays / ``core.Tensor``) -> eager
+    construction with canonical-form validation (lex-sorted unique in-range
+    rows). Symbolic components (``core.SymbolicTensor``) -> in-graph assembly
+    via ``SparseTensor.from_parts`` (no validation — the numpy kernels
+    validate canonical form at run time).
     """
+    if _creator_phase((indices, values), "coo") == "symbolic":
+        return SparseTensor.from_parts(
+            indices, values, dense_shape=tuple(shape), format="coo"
+        )
     return SparseTensor(indices, values, tuple(shape), format="coo")
 
 
 def csr(indptr, indices, values, shape):
-    """Construct a concrete CSR sparse tensor ``(indptr, indices, values)``.
+    """Construct a CSR sparse tensor from raw components.
 
-    Eager creator (rank-2); canonical CSR validation applies on construction.
+    Concrete components (numpy arrays / ``core.Tensor``) -> eager
+    construction (rank-2) with canonical CSR validation. Symbolic components
+    (``core.SymbolicTensor``) -> in-graph assembly via
+    ``CSRTensor.from_parts`` (no validation — the numpy kernels validate
+    canonical form at run time).
     """
+    if _creator_phase((indptr, indices, values), "csr") == "symbolic":
+        return CSRTensor.from_parts(
+            indptr, indices, values, dense_shape=tuple(shape), format="csr"
+        )
     return CSRTensor(indptr, indices, values, tuple(shape))
 
 
 def csc(indptr, indices, values, shape):
-    """Construct a concrete CSC sparse tensor ``(indptr, indices, values)``.
+    """Construct a CSC sparse tensor from raw components.
 
-    Eager creator (rank-2); canonical CSC validation applies on construction.
+    Concrete components (numpy arrays / ``core.Tensor``) -> eager
+    construction (rank-2) with canonical CSC validation. Symbolic components
+    (``core.SymbolicTensor``) -> in-graph assembly via
+    ``CSCTensor.from_parts`` (no validation — the numpy kernels validate
+    canonical form at run time).
     """
+    if _creator_phase((indptr, indices, values), "csc") == "symbolic":
+        return CSCTensor.from_parts(
+            indptr, indices, values, dense_shape=tuple(shape), format="csc"
+        )
     return CSCTensor(indptr, indices, values, tuple(shape))
 
 
 def from_dense(dense, format: str = "coo"):
-    """Extract the exact non-zero entries of a dense array into a COO sparse.
+    """Extract the exact non-zero entries of a dense tensor into a COO sparse.
 
     ``dense`` may be a numpy ``ndarray`` or a concrete ``core.Tensor`` (its
-    ``.numpy()`` is used). v1 supports ``format="coo"`` only. The result is
-    a concrete :class:`SparseTensor`: int64 ``indices (nnz, ndim)`` from
-    ``np.nonzero`` and ``values`` in the dense array's dtype.
+    ``.numpy()`` is used) -> eager extraction: int64 ``indices (nnz, ndim)``
+    from ``np.nonzero`` and ``values`` in the dense array's dtype. A
+    ``core.SymbolicTensor`` -> the ``sparse_from_dense`` graph op (the
+    in-graph creator; ``nnz`` is runtime-dynamic, batch dims propagate from
+    the dense operand). v1 supports ``format="coo"`` only.
 
     Raises:
         ValueError: ``format`` is not ``"coo"`` (v1 restriction).
+        TypeError: ``dense`` is neither an array / ``core.Tensor`` nor a
+            ``core.SymbolicTensor``.
     """
     if format != "coo":
         raise ValueError(
             f"etl.sparse.from_dense supports only format='coo' in v1, got "
             f"{format!r}"
         )
+    if isinstance(dense, core.SymbolicTensor):
+        builder = current_builder()
+        loc = _get_location()
+        op = builder.create(
+            "sparse_from_dense",
+            operands=(dense.value,),
+            attributes={
+                "dense_shape": tuple(dense.shape),
+                "dtype": dense.dtype.name,
+            },
+            location=loc,
+        )
+        return _coo_result(op, tuple(dense.shape), loc)
     arr = dense.numpy() if isinstance(dense, core.Tensor) else dense
     if not isinstance(arr, np.ndarray):
         raise TypeError(
