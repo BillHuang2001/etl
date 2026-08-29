@@ -7,7 +7,7 @@ EvoXIR is etl's compiler-neutral, region-based SSA intermediate representation
 `Function`s of `Block`s of `Op`s over typed `Value`s. EvoXIR is *the* frontend
 IR — StableHLO is an important export target, never the definition. This
 directory owns the IR data model, the op-definition registry (full canonical
-v1 op set, ~75 ops), the `Builder` (op-construction API), `verify`
+v1 op set, 91 ops), the `Builder` (op-construction API), `verify`
 (structural/type/attribute validation), serialization (the self-describing IR
 payload — core of the `.etlgraph` format; the outer container lives in
 `../persist`), and `pretty_print`.

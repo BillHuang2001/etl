@@ -29,8 +29,8 @@ CSR/CSC inputs to the computation format, COO).
   `dense_dot_sparse`, sparse@sparse → `TraceError` (v1 deferral), dense@dense
   → `etl.ops.dot` (lazy import, no cycle).
 - `SparseTensorSpec.from_concrete(concrete_sparse) -> SparseTensorSpec` —
-  derives the canonical spec from a CONCRETE sparse instance (used by the
-  pending `etl/pipeline.py` evaluate branch).
+  derives the canonical spec from a CONCRETE sparse instance (used by
+  `etl.pipeline.evaluate` for concrete sparse args).
 
 ## Pytree contract (binding for trace/pipeline/transforms)
 
@@ -61,14 +61,17 @@ instance (canonical validation applies). The format leaf picks the variant.
 
 - **Canonical form enforced in the concrete constructors** (never silent;
   `core.ShapeError`/`core.DTypeError`): COO = int64 `(nnz, ndim)` indices,
-  lex-sorted row-major, strictly unique, in-range per column; CSR/CSC =
-  rank-2, `indptr[0] == 0`, monotone non-decreasing, `indptr[-1] == nnz`,
-  per-row/column indices sorted strictly increasing and in-range. Integer
-  index dtypes normalize to int64. `dense_shape` = positive ints (a
-  `core.Dim` allowed ONLY at position 0 — batched/vmap outputs; its extent
-  is `indices.shape[0]` for in-range checks and `to_dense`).
+  lex-sorted row-major, strictly unique (duplicate NONZERO rows error;
+  duplicate rows with one stored zero are legal), in-range per column;
+  CSR/CSC = rank-2, `indptr[0] == 0`, monotone non-decreasing,
+  `indptr[-1] == nnz`, per-row/column indices sorted strictly increasing and
+  in-range. Integer index dtypes normalize to int64. `dense_shape` = positive
+  ints (a `core.Dim` allowed ONLY at position 0 — batched/vmap outputs; its
+  extent is `indices.shape[0]` for in-range checks and `to_dense`).
 - **`nnz` is runtime-dynamic** in every graph leaf spec (`(None, ndim)` /
-  `(None,)`); indptr specs stay STATIC `(rows+1,)` / `(cols+1,)` i64.
+  `(None,)`); indptr specs stay STATIC `(rows+1,)` / `(cols+1,)` i64 —
+  `sparse_coo_to_csc` emits the STANDARD column-pointer length `cols+1`
+  (matches `infer_sparse_coo_to_csc`).
 - **COO is the computation format**: any CSR/CSC SYMBOLIC input to a
   computation op (add/subtract/multiply/negate/sum/transpose/reshape/
   concatenate/matmul-sparse-side/multiply_dense) or to `to_dense` is first
@@ -81,12 +84,12 @@ instance (canonical validation applies). The format leaf picks the variant.
   `dense_shape` UNCHANGED at the input I/O boundary; vmap OUTPUTS get
   `dense_shape = (batch_dim, *dense_shape)` via the batched-aux-remap
   registry (`rules.py` registers `SparseTensor`'s remap). Public
-  `etl.vmap`/`etl.vectorize` CANNOT take per-leaf in_axes for a registered
-  multi-leaf node — bare `in_axes=0` fails ("got 2 tensor specs") and tuple
-  forms fail structure-match (transforms-level, parent scope); internal
-  `etl.transforms.batching.vectorize_graph(graph, flat_axes)` works (but
-  vectorizing a GRAD graph hits the transforms v1 gap "cannot batch op
-  'gather' with dynamic index dims").
+  `etl.vmap`/`etl.vectorize` accept bare `in_axes=0`/`None` AND pytrees: a
+  LEAF axes entry at a registered-node position broadcasts across the node's
+  tensor leaves (statics → None); a container entry there raises
+  `TransformError`. Vectorizing a GRAD graph over sparse hits the
+  pre-existing transforms gap "cannot batch op 'gather' with dynamic index
+  dims".
 - Batched graph-side `sparse_from_dense`: per-batch stored-zero PADDING rows
   to a common nnz (lex-max row, zero values); duplicate-with-zero rows are
   legal (kernels validate values-aware) — documented, no special handling.
@@ -96,30 +99,21 @@ instance (canonical validation applies). The format leaf picks the variant.
 
 ## Known issues / v1 deferrals (explicit errors, never silent)
 
-- **Sparse values cannot flow through `cond` in v1**: `etl.trace`'s cond
-  machinery requires every branch-output leaf to be a SymbolicTensor and
-  rejects the sparse static leaves ("branches yield tensors only (static
-  output leaves are not supported)"); `while_loop` rejects sparse carries
-  whose op-produced leaf shapes carry `None` for the nnz dim vs the traced
-  input's `Dim`. Both are trace-level constraints
-  (etl/trace/control_flow.py) — parent's scope.
 - sparse @ sparse matmul → `TraceError` (densify one operand with
   `etl.sparse.to_dense`).
 - Whole-sparse `etl.bind` is not supported in v1 (bind's per-leaf
-  spec validation does not cover the sparse static leaves).
+  spec validation does not cover the sparse static leaves); leaf-level bind
+  works.
 - Compiler backends: the 16 sparse ops are numpy-backend-only in v1;
   stablehlo export / iree / xla / tvm defer with an explicit `BackendError`
   suggesting `etl.sparse.to_dense` — see `etl/backends/CONTEXT.md` Known
   Issues.
-- **`sparse_coo_to_csc` non-square dense_shape mismatch (pre-existing)**:
-  the numpy kernel emits an indptr of length `rows+1` (and errors for
-  `cols > rows`) while `infer_sparse_coo_to_csc` declares `cols+1` — square
-  shapes work; kernel (`etl/backends/numpy/kernels/sparse.py`) and
-  inference (`etl/ir/inference.py`) are parent scope.
-- Pending parent-level wiring (out of this node's write scope):
-  `etl/pipeline.py` `evaluate` must derive specs for concrete sparse leaves
-  via `SparseTensorSpec.from_concrete` (currently raises `TypeError` at flat
-  leaf index 2: "argument ... is int").
+- `scan` over sparse `xs` / sparse `y`-stacking is a v1 deferral (explicit
+  `TraceError`); sparse loop CARRIES through `scan`/`cond`/`while_loop` work
+  (trace-level support is generic registered-pytree handling — see
+  `etl/trace/CONTEXT.md`).
+- VJP deferrals (explicit `TransformError`): `sparse_concatenate`,
+  `sparse_coo_to_csc` / `sparse_csc_to_coo` — see the Differentiation section.
 
 ## Differentiation & batching (rules.py — implemented)
 
@@ -190,8 +184,7 @@ rule via the adjoint (double-vjp) trick.
 - **`SparseTensorSpec.from_concrete`**: flatten the concrete instance →
   per-leaf TensorSpecs with the nnz dim (dim 0 of indices/values) → `None`,
   indptr kept STATIC, static leaves passed through → `core.unflatten` (the
-  polymorphic unflatten builds the validated spec). The pending
-  `etl/pipeline.py` evaluate branch calls it for concrete sparse args.
+  polymorphic unflatten builds the validated spec).
 - Ops discipline mirrors `etl.dist`: `current_builder()` first (TraceError
   outside a trace), `_get_location()`, operand normalization (concrete →
   three-option TraceError, spec → TypeError), static checks first
