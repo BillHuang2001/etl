@@ -49,13 +49,15 @@ The generic SSA machinery and the op **registry** live in `etl.ir`, and the cano
 
 | File | Area |
 |---|---|
-| `__init__.py` | Re-exports the 67 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
+| `__init__.py` | Re-exports the 82 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
 | `_utils.py` | Internal: `check_in_trace`, `get_location`, `as_operand`, `weak_scalar_dtype`, `promote_dtypes`, `broadcast_shapes`, `reduced_shape`, `normalize_axes` + `ETL_DISABLE_LOCATIONS_ENV` |
 | `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor` |
 | `comparison.py` | `equal not_equal less less_equal greater greater_equal logical_and logical_or logical_not select` |
 | `indexing.py` | `broadcast reshape transpose slice gather scatter concatenate pad` (+ `getitem`, the operator-handler entry — not in `__all__`) |
 | `reductions.py` | `reduce_sum reduce_max reduce_min reduce_mean reduce_prod sum max min mean prod argmax argmin` |
-| `linalg.py` | `dot conv tril triu cumsum solve` |
+| `linalg.py` | `dot conv tril triu cumsum solve matmul cumprod` |
+| `sorting.py` | `sort argsort topk` |
+| `structural.py` | `tile stack flip roll clamp diag isnan nan_to_num eye linspace` |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `ETL_LARGE_CONSTANT_BYTES`, `constant_like`) |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
 

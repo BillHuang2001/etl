@@ -7,7 +7,7 @@ EvoXIR is etl's compiler-neutral, region-based SSA intermediate representation
 `Function`s of `Block`s of `Op`s over typed `Value`s. EvoXIR is *the* frontend
 IR — StableHLO is an important export target, never the definition. This
 directory owns the IR data model, the op-definition registry (full canonical
-v1 op set, 97 ops), the `Builder` (op-construction API), `verify`
+v1 op set, 105 ops), the `Builder` (op-construction API), `verify`
 (structural/type/attribute validation), serialization (the self-describing IR
 payload — core of the `.etlgraph` format; the outer container lives in
 `../persist`), and `pretty_print`.
@@ -112,14 +112,15 @@ Module's counters (stable ids for serialization). Parent pointers
 `verify` checks consistency. `Value.uses` is maintained by the Builder and by
 `Value.replace_all_uses_with`.
 
-## Op registry (canonical v1 set — 97 ops, all declared in `op_defs/`)
+## Op registry (canonical v1 set — 105 ops, all declared in `op_defs/`)
 
 | File | Category | Ops | Effect |
 |---|---|---|---|
-| elementwise.py | elementwise | add subtract multiply divide power remainder maximum minimum; abs negate square sqrt exp log log1p sin cos tan tanh sigmoid relu gelu erf sign; logical_and logical_or logical_not; bitwise_and bitwise_or bitwise_xor; cast | pure |
+| elementwise.py | elementwise | add subtract multiply divide power remainder maximum minimum; abs negate square sqrt exp log log1p sin cos tan tanh sigmoid relu gelu erf sign; logical_and logical_or logical_not; bitwise_and bitwise_or bitwise_xor; cast nan_to_num | pure |
 | elementwise.py | comparison | equal not_equal less less_equal greater greater_equal (result bool) | pure |
-| structure.py | structure | select broadcast reshape transpose slice gather scatter concatenate pad | pure |
-| reduction.py | reduction | reduce_sum reduce_max reduce_min reduce_mean reduce_prod argmax argmin cumsum | pure |
+| structure.py | structure | select broadcast reshape transpose slice gather scatter concatenate pad tile flip roll diag | pure |
+| reduction.py | reduction | reduce_sum reduce_max reduce_min reduce_mean reduce_prod argmax argmin cumsum cumprod | pure |
+| sorting.py | sorting | sort argsort | pure |
 | linalg.py | linalg | dot conv tril triu solve | pure |
 | control.py | control | constant stop_gradient if while call runtime_call block_call | pure; runtime_call=c**allback**; block_call=read |
 | control.py | terminator | return | pure |
@@ -131,6 +132,24 @@ Declaring an op here does NOT mean every backend implements it — backends
 reject unsupported ops explicitly via capabilities, never silently. IR name
 note: the collective is `broadcast_collective` (the shape op `broadcast`
 already owns that name).
+
+**15-op batch (design notes):** `topk` is a frontend composition over
+sort/argsort + gather (no IR op; static `k` ≤ extent → `ShapeError`, symbolic
+extent → runtime error). `stack` = reshape + concatenate composition. `flip`/
+`roll` are dedicated IR ops with np-exact kernels. `clamp` = maximum/minimum
+composition (scalar bounds pre-cast to x's dtype when same_kind-castable; a
+float bound on an int tensor → float64 promotion — numpy 2.x parity, deviation
+vs numpy 1.x's TypeError; documented edge: int bound on uint tensor falls back
+to weak promotion int64). `eye`/`linspace` = Constant-op compositions
+(`linspace` float64 default — deliberate deviation from the etl float32
+creation convention, explicit dtype param; symbolic bounds → `TraceError`, v2
+deferral). `matmul` = frontend sugar over dot with rank-1 promote/squeeze
+(dot's rank ≥ 2 contract and `__matmul__` → dot unchanged). No vjp/batching
+rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op
+pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules.
+Numpy backend: full reference. Compiler backends (stablehlo/iree/xla/tvm)
+defer the 8 new IR ops with explicit `BackendError` (no exporter entries
+added); compositions work via their components.
 
 ## Builder (op-construction API)
 

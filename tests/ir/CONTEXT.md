@@ -4,10 +4,10 @@
 
 pytest suite validating the `etl.ir` package (sibling — the contract lives in
 `../etl/ir/CONTEXT.md`, read it before touching these tests). These tests are
-the executable spec of the IR layer: the op registry (canonical 75-op v1 set),
+the executable spec of the IR layer: the op registry (canonical 105-op v1 set),
 `verify()` invariants, serialization round-trips/integrity, `pretty_print`
 golden output, the `Builder`, shape-inference hooks, and the SSA data model.
-728 tests, all fast (whole file set runs <2s).
+803 tests, all fast (whole file set runs <2s).
 
 ## Test files
 
