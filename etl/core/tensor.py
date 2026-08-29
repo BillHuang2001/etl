@@ -27,6 +27,23 @@ from .errors import DeviceError
 __all__ = ["Tensor", "from_numpy", "from_dlpack", "tensor", "zeros", "ones", "full", "empty"]
 
 
+def _default_dtype(inferred: Any) -> np.dtype:
+    """The concrete-creator default-dtype rule for Python array-like data.
+
+    When ``dtype=None``, creators follow numpy-style inference EXCEPT for the
+    default floating-point width: the library's documented default dtype is
+    float32 (``TensorSpec`` defaults to float32), so an inferred ``float64``
+    becomes ``float32``. Integer inference (``int64``), bool, and complex
+    (``complex128``) are unchanged — only the floating-point default deviates
+    from numpy. Existing ``ndarray`` inputs are NOT coerced (they carry an
+    explicit dtype; see :func:`tensor`).
+    """
+    dt = _dtype(inferred)
+    if dt == np.dtype("float64"):
+        return np.dtype("float32")
+    return dt
+
+
 class Tensor:
     """A materialized runtime tensor.
 
@@ -133,7 +150,9 @@ def from_numpy(array: np.ndarray) -> Tensor:
     """Wrap a numpy array as a :class:`Tensor` without copying.
 
     The tensor shares memory with ``array`` (no implicit copy); the device is
-    the default CPU device.
+    the default CPU device. This is the dtype-preserving, zero-copy wrap
+    path — unlike :func:`tensor`, the array's dtype is kept exactly as-is
+    (no float64 → float32 default-dtype coercion).
 
     Args:
         array: The numpy array to wrap.
@@ -187,6 +206,15 @@ def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
     the data is converted to it (a copy is made only when necessary, per
     numpy conversion semantics).
 
+    Default dtype rule (``dtype=None``): an existing ``ndarray`` keeps its
+    own dtype (an ndarray always carries an explicit dtype — respected
+    as-is, no copy); Python array-likes (lists, tuples, scalars) follow
+    numpy inference EXCEPT an inferred ``float64`` becomes ``float32`` — the
+    library's documented default dtype (see :func:`_default_dtype`; integer
+    data stays ``int64``, bool stays bool, complex stays ``complex128``).
+    For a zero-copy, dtype-preserving wrap of an existing array use
+    :func:`from_numpy` instead.
+
     Args:
         data: Array-like data (ndarray, list, scalar, ...).
         dtype: Optional target dtype (anything ``etl.dtype`` accepts).
@@ -196,7 +224,12 @@ def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
         The new concrete :class:`Tensor`.
     """
     if dtype is None:
-        array = np.asarray(data)
+        inferred = np.asarray(data).dtype
+        # ndarrays carry an explicit dtype (respected as-is); Python data
+        # goes through the default-dtype rule (float64 → float32).
+        if not isinstance(data, np.ndarray):
+            inferred = _default_dtype(inferred)
+        array = np.asarray(data, dtype=inferred)
     else:
         array = np.asarray(data, dtype=_dtype(dtype))
     return Tensor(array, device=device)
@@ -207,13 +240,17 @@ def zeros(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
 
     Args:
         shape: The concrete shape (tuple/list of ints).
-        dtype: Element dtype; defaults to ``float64`` (numpy convention).
+        dtype: Element dtype; defaults to ``float32`` — the library's
+            documented default dtype (numpy defaults to ``float64``; etl
+            deliberately deviates, matching ``TensorSpec``).
         device: Optional target device (default CPU).
 
     Returns:
         The new concrete :class:`Tensor`.
     """
-    array = np.zeros(shape, dtype=None if dtype is None else _dtype(dtype))
+    if dtype is None:
+        dtype = np.float32
+    array = np.zeros(shape, dtype=_dtype(dtype))
     return Tensor(array, device=device)
 
 
@@ -222,13 +259,17 @@ def ones(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = Non
 
     Args:
         shape: The concrete shape (tuple/list of ints).
-        dtype: Element dtype; defaults to ``float64`` (numpy convention).
+        dtype: Element dtype; defaults to ``float32`` — the library's
+            documented default dtype (numpy defaults to ``float64``; etl
+            deliberately deviates, matching ``TensorSpec``).
         device: Optional target device (default CPU).
 
     Returns:
         The new concrete :class:`Tensor`.
     """
-    array = np.ones(shape, dtype=None if dtype is None else _dtype(dtype))
+    if dtype is None:
+        dtype = np.float32
+    array = np.ones(shape, dtype=_dtype(dtype))
     return Tensor(array, device=device)
 
 
@@ -240,14 +281,18 @@ def full(
     Args:
         shape: The concrete shape (tuple/list of ints).
         fill_value: Scalar value to fill with.
-        dtype: Element dtype; defaults to the dtype numpy would infer from
-            ``fill_value``.
+        dtype: Element dtype; defaults to numpy inference from
+            ``fill_value``, except an inferred ``float64`` becomes ``float32``
+            (the library's documented default dtype; integer fills keep
+            ``int64``).
         device: Optional target device (default CPU).
 
     Returns:
         The new concrete :class:`Tensor`.
     """
-    array = np.full(shape, fill_value, dtype=None if dtype is None else _dtype(dtype))
+    if dtype is None:
+        dtype = _default_dtype(np.asarray(fill_value).dtype)
+    array = np.full(shape, fill_value, dtype=_dtype(dtype))
     return Tensor(array, device=device)
 
 
@@ -259,11 +304,15 @@ def empty(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
 
     Args:
         shape: The concrete shape (tuple/list of ints).
-        dtype: Element dtype; defaults to ``float64`` (numpy convention).
+        dtype: Element dtype; defaults to ``float32`` — the library's
+            documented default dtype (numpy defaults to ``float64``; etl
+            deliberately deviates, matching ``TensorSpec``).
         device: Optional target device (default CPU).
 
     Returns:
         The new (uninitialized) concrete :class:`Tensor`.
     """
-    array = np.empty(shape, dtype=None if dtype is None else _dtype(dtype))
+    if dtype is None:
+        dtype = np.float32
+    array = np.empty(shape, dtype=_dtype(dtype))
     return Tensor(array, device=device)
