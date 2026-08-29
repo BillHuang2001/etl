@@ -68,7 +68,12 @@ so the leaf conventions stay explicit — `SymbolicTensor`, `core.Tensor`,
 mirroring `core.TreeSpec`'s container conventions (tuple/list/dict — keys
 sorted — namedtuple/dataclass), so `core.unflatten` can rebuild the trees.
 Leaf nodes use `TreeSpec(type=None)`, which `core.unflatten` treats as a
-plain leaf.
+plain leaf. `_flatten_tree` consults the core pytree registry FIRST (an MRO
+walk over `core.tree._PYTREE_NODE_REGISTRY`, same as `core.flatten` and the
+tracer), so types registered via `core.register_pytree_node` (e.g. a sparse
+tensor) flatten through their registered `flatten_fn` and their children
+recurse normally; rebuild via `core.unflatten` then uses the registered
+`unflatten_fn` (the recorded `TreeSpec.type` is the registered base type).
 """
 
 from __future__ import annotations
@@ -81,12 +86,18 @@ import numpy as np
 
 from etl import core
 from etl import ir
+from etl.core import tree as _core_tree
 
 from .builder import current_builder, with_builder
 
 __all__ = ["cond", "scan", "while_loop"]
 
 _BOOL = np.dtype("bool")
+
+# The registered-custom-node table of core's pytrees. `register_pytree_node`
+# mutates this dict in place, so the alias stays live. Control-flow trees
+# honor the same registrations as `core.flatten` and the tracer (`trace.py`).
+_PYTREE_NODE_REGISTRY = _core_tree._PYTREE_NODE_REGISTRY
 
 #: Objects that must be treated as LEAVES by the local pytree walk (etl
 #: value types — ir SSA structures and core value objects — are never
@@ -160,10 +171,26 @@ def _check_pred(pred: Any, where: str) -> None:
 def _flatten_tree(obj: Any, leaves: List[Any]) -> "core.TreeSpec":
     """Local pytree walk treating `SymbolicTensor` (and every other
     non-container) as a LEAF; see the module docstring "Local pytree note"."""
+    obj_type = type(obj)
+    # 1. Registered custom types (walk the MRO so registered base classes
+    #    catch subclasses; exact type first) — same registry and order as
+    #    `core.tree._flatten_into` and the tracer (`trace.py`). A registered
+    #    node (e.g. a sparse tensor) flattens via its registered flatten_fn
+    #    and its children recurse; `TreeSpec.type` records the registered
+    #    base type so `core.unflatten` rebuilds via the registered
+    #    unflatten_fn.
+    for base in obj_type.__mro__:
+        registered = _PYTREE_NODE_REGISTRY.get(base)
+        if registered is not None:
+            flatten_fn, _ = registered
+            children, context = flatten_fn(obj)
+            child_specs = tuple(
+                _flatten_tree(child, leaves) for child in children
+            )
+            return core.TreeSpec(type=base, children=child_specs, context=context)
     if isinstance(obj, _LEAF_TYPES):
         leaves.append(obj)
         return core.TreeSpec(type=None)
-    obj_type = type(obj)
     if isinstance(obj, tuple) and hasattr(obj_type, "_fields"):
         # namedtuple (checked before plain tuples, like core.TreeSpec).
         child_specs = tuple(_flatten_tree(child, leaves) for child in obj)
