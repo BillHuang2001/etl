@@ -10,7 +10,11 @@ Read `./CONTEXT.md` for the binding design: rule-call signatures, the
 vmap⇔vectorize equivalence contract, AD semantics, and v1 scope.
 """
 
-from etl.transforms.batching import batching_rules, register_batching_rule
+from etl.transforms.batching import (
+    batching_rules,
+    register_batched_aux_remap,
+    register_batching_rule,
+)
 from etl.transforms.autodiff import (
     jvp_rules,
     vjp_rules,
@@ -36,6 +40,7 @@ __all__ = [
     "TransformCallable",
     "batching_rules",
     "register_batching_rule",
+    "register_batched_aux_remap",
     "jvp_rules",
     "register_jvp_rule",
     "vjp_rules",
