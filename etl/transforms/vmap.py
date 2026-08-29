@@ -26,8 +26,10 @@ from etl.trace.graph import _normalize_leaf_types
 from etl.transforms._wrappers import TransformCallable
 from etl.transforms.batching import with_batch_depth
 from etl.transforms.vectorize import (
+    _broadcast_registered_axes,
     _is_int,
     _normalize_axis_entries,
+    _tree_has_registered_node,
     vectorize,
 )
 
@@ -143,8 +145,10 @@ def _derive_unvectorized_args(args, in_axes):
     unmapped entries pass through; static values stay static.
 
     `in_axes` follows the same normalization rules as
-    `vectorize._normalize_axes` (pytree matching `args`; bare int/None only
-    with exactly one tensor spec; v1 entries {None, 0}; static leaves None).
+    `vectorize._normalize_axes` (pytree matching `args` — with registered
+    pytree-node leaf broadcast, e.g. a sparse-tensor spec node — bare int/None
+    only with exactly one tensor spec or a registered-node-containing
+    argument tree; v1 entries {None, 0}; static leaves None).
     Concrete `core.Tensor` leaves raise `core.TraceError` (transforms never
     execute; `TransformCallable` performs the same check at its boundary).
     """
@@ -169,22 +173,31 @@ def _derive_unvectorized_args(args, in_axes):
         if isinstance(leaf, core.TensorSpec)
     }
     ranks = {position: args_leaves[position].rank for position in tensor_positions}
+    has_registered = _tree_has_registered_node(args_spec)
 
     if in_axes is None or _is_int(in_axes):
-        if len(tensor_positions) != 1:
+        if len(tensor_positions) != 1 and not has_registered:
             raise core.TransformError(
                 "vmap: a bare int/None in_axes applies only when the "
                 "arguments have exactly ONE tensor spec; got "
                 f"{len(tensor_positions)} tensor specs — pass a pytree "
                 "matching the argument structure instead"
             )
-        entries = [None] * len(args_leaves)
-        entries[sorted(tensor_positions)[0]] = in_axes
+        entries = [
+            in_axes if index in tensor_positions else None
+            for index in range(len(args_leaves))
+        ]
     else:
         axes_leaves, axes_spec = core.flatten(in_axes)
-        mismatch = core.first_mismatch_path(
-            axes_spec, args_spec, leaf_vs_empty_is_mismatch=True
-        )
+        if has_registered:
+            entries, mismatch = _broadcast_registered_axes(
+                axes_spec, args_spec, axes_leaves, tensor_positions, "vmap"
+            )
+        else:
+            mismatch = core.first_mismatch_path(
+                axes_spec, args_spec, leaf_vs_empty_is_mismatch=True
+            )
+            entries = list(axes_leaves) if mismatch is None else None
         if mismatch is not None:
             raise core.TransformError(
                 "vmap: the in_axes pytree does not match the argument "
@@ -193,7 +206,6 @@ def _derive_unvectorized_args(args, in_axes):
                 "the same container structure as the arguments (0 maps a "
                 "tensor spec's leading axis, None leaves it unmapped)"
             )
-        entries = list(axes_leaves)
 
     normalized = _normalize_axis_entries(
         entries, tensor_positions, ranks, "vmap"
@@ -317,27 +329,38 @@ def _rearrange_outputs(graph: Graph, out_axes) -> Graph:
             f"{len(outputs)} values but the output tree has "
             f"{len(tensor_positions)} tensor leaves"
         )
+    has_registered = _tree_has_registered_node(graph.output_tree)
 
     if out_axes is None or _is_int(out_axes):
         # A bare entry applies to the single tensor output; with ZERO tensor
         # outputs there is nothing to rearrange and the bare form (e.g. the
         # out_axes=0 default) is a no-op. Multiple tensor outputs need a
-        # pytree (a bare entry would be ambiguous).
-        if len(tensor_positions) > 1:
+        # pytree (a bare entry would be ambiguous) — UNLESS the output tree
+        # contains a registered pytree node (e.g. a sparse-tensor node): the
+        # bare entry then applies to ALL its tensor leaves (statics → None).
+        if len(tensor_positions) > 1 and not has_registered:
             raise core.TransformError(
                 "vmap: a bare int/None out_axes applies only when the graph "
                 f"has at most ONE tensor output; got {len(tensor_positions)} "
                 "tensor outputs — pass a pytree matching the output "
                 "structure instead"
             )
-        entries = [None] * graph.output_tree.num_leaves
-        if tensor_positions:
-            entries[sorted(tensor_positions)[0]] = out_axes
+        entries = [
+            out_axes if index in tensor_positions else None
+            for index in range(graph.output_tree.num_leaves)
+        ]
     else:
         axes_leaves, axes_spec = core.flatten(out_axes)
-        mismatch = core.first_mismatch_path(
-            axes_spec, graph.output_tree, leaf_vs_empty_is_mismatch=True
-        )
+        if has_registered:
+            entries, mismatch = _broadcast_registered_axes(
+                axes_spec, graph.output_tree, axes_leaves, tensor_positions,
+                "vmap",
+            )
+        else:
+            mismatch = core.first_mismatch_path(
+                axes_spec, graph.output_tree, leaf_vs_empty_is_mismatch=True
+            )
+            entries = list(axes_leaves) if mismatch is None else None
         if mismatch is not None:
             raise core.TransformError(
                 "vmap: the out_axes pytree does not match the output "
@@ -347,7 +370,6 @@ def _rearrange_outputs(graph: Graph, out_axes) -> Graph:
                 "mapped axis leading / inserts a size-one axis for an "
                 "unmapped output, None requires the output unmapped)"
             )
-        entries = list(axes_leaves)
     # No rank range-check for outputs: entry 0 on a rank-0 unmapped output is
     # the legal size-one-axis insertion, not an error.
     out_entries = _normalize_axis_entries(
