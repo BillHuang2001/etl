@@ -52,11 +52,10 @@ fail loudly in `Graph.flatten_inputs`, and dense_shape/dtype leaves fail on
 mismatch. The layout is IDENTICAL across phases (structure-match; only the
 leaf kinds differ).
 
-`unflatten` is polymorphic on the first child's kind: `core.TensorSpec` →
-validated `SparseTensorSpec`; `core.SymbolicTensor` → symbolic instance via
-`SparseTensor.from_parts` (NO canonical validation — no data to check);
-`core.Tensor` / `np.ndarray` → concrete instance (canonical validation
-applies). The format leaf selects the variant class.
+`unflatten` dispatches on `children[0]`'s kind: `TensorSpec` → validated
+`SparseTensorSpec`; `SymbolicTensor` → symbolic instance via
+`SparseTensor.from_parts` (no validation); `Tensor`/`ndarray` → concrete
+instance (canonical validation applies). The format leaf picks the variant.
 
 ## Constraints
 
@@ -80,11 +79,14 @@ applies). The format leaf selects the variant class.
   no sort).
 - **Batched sparse** = leading batch dim on the tensor leaves with
   `dense_shape` UNCHANGED at the input I/O boundary; vmap OUTPUTS get
-  `dense_shape = (batch_dim, *dense_shape)` via the transforms
-  batched-aux-remap registry (`transforms.register_batched_aux_remap` —
-  `rules.py` registers `SparseTensor`'s remap). vmap of sparse INPUTS
-  requires an `in_axes` pytree mapping BOTH tensor leaves to 0 and the static
-  leaves to `None` — bare `in_axes=0` fails (the node has two tensor leaves).
+  `dense_shape = (batch_dim, *dense_shape)` via the batched-aux-remap
+  registry (`rules.py` registers `SparseTensor`'s remap). Public
+  `etl.vmap`/`etl.vectorize` CANNOT take per-leaf in_axes for a registered
+  multi-leaf node — bare `in_axes=0` fails ("got 2 tensor specs") and tuple
+  forms fail structure-match (transforms-level, parent scope); internal
+  `etl.transforms.batching.vectorize_graph(graph, flat_axes)` works (but
+  vectorizing a GRAD graph hits the transforms v1 gap "cannot batch op
+  'gather' with dynamic index dims").
 - Batched graph-side `sparse_from_dense`: per-batch stored-zero PADDING rows
   to a common nnz (lex-max row, zero values); duplicate-with-zero rows are
   legal (kernels validate values-aware) — documented, no special handling.
@@ -94,23 +96,13 @@ applies). The format leaf selects the variant class.
 
 ## Known issues / v1 deferrals (explicit errors, never silent)
 
-- **`etl.sparse.concatenate` is BLOCKED at trace time**: the
-  `sparse_concatenate` opdef in `etl/ir/op_defs/sparse.py` does NOT declare
-  `operand_extents`, but the numpy kernel requires it AND `builder.create`
-  hard-rejects unknown attributes → `VerificationError: op
-  'sparse_concatenate': unknown attribute(s) ['operand_extents']; declared:
-  ['axis', 'dense_shape', 'dtype']`. The frontend passes `operand_extents`
-  per spec; a one-line ir opdef amendment (AttrSpec name="operand_extents",
-  type=ATTR_INTS, required) must land in etl/ir (parent's scope). Everything
-  else works end-to-end.
 - **Sparse values cannot flow through `cond` in v1**: `etl.trace`'s cond
   machinery requires every branch-output leaf to be a SymbolicTensor and
   rejects the sparse static leaves ("branches yield tensors only (static
-  output leaves are not supported)"). `while_loop` accepts static leaves but
-  rejects sparse carries whose op-produced leaf shapes carry `None` for the
-  nnz dim vs the traced input's `Dim` ("body_fn output leaf N shape (None,
-  2) differs from the loop-carried shape (Dim(...), 2)"). Both are
-  trace-level constraints (etl/trace/control_flow.py) — parent's scope.
+  output leaves are not supported)"); `while_loop` rejects sparse carries
+  whose op-produced leaf shapes carry `None` for the nnz dim vs the traced
+  input's `Dim`. Both are trace-level constraints
+  (etl/trace/control_flow.py) — parent's scope.
 - sparse @ sparse matmul → `TraceError` (densify one operand with
   `etl.sparse.to_dense`).
 - Whole-sparse `etl.bind` is not supported in v1 (bind's per-leaf
@@ -119,14 +111,51 @@ applies). The format leaf selects the variant class.
   stablehlo export / iree / xla / tvm defer with an explicit `BackendError`
   suggesting `etl.sparse.to_dense` — see `etl/backends/CONTEXT.md` Known
   Issues.
+- **`sparse_coo_to_csc` non-square dense_shape mismatch (pre-existing)**:
+  the numpy kernel emits an indptr of length `rows+1` (and errors for
+  `cols > rows`) while `infer_sparse_coo_to_csc` declares `cols+1` — square
+  shapes work; kernel (`etl/backends/numpy/kernels/sparse.py`) and
+  inference (`etl/ir/inference.py`) are parent scope.
 - Pending parent-level wiring (out of this node's write scope):
-  `etl/__init__.py` must import `etl.sparse`; `etl/pipeline.py` `evaluate`
-  must derive specs for concrete sparse leaves via
-  `SparseTensorSpec.from_concrete` (currently raises `TypeError` at flat leaf
-  index 2: "argument ... is int").
-- Differentiation/batching rules (`rules.py`, pending): jvp/vjp rules,
-  per-op batching rules, and the batched-aux remap are registered by the
-  rules agent — see the `rules.py` section below.
+  `etl/pipeline.py` `evaluate` must derive specs for concrete sparse leaves
+  via `SparseTensorSpec.from_concrete` (currently raises `TypeError` at flat
+  leaf index 2: "argument ... is int").
+
+## Differentiation & batching (rules.py — implemented)
+
+`rules.py` registers at `import etl.sparse` via `register_batching_rule` /
+`register_vjp_rule` / `register_jvp_rule` / `register_batched_aux_remap`
+(etl.transforms): one shared batching rule for all 16 sparse ops, the
+`SparseTensor` batched-output aux remap, VJP rules for all 16 ops (3
+explicit deferrals), and explicit JVP rules for the four BILINEAR ops
+(`sparse_multiply`, `sparse_multiply_dense`, `sparse_dot_dense`,
+`dense_dot_sparse`); all other sparse ops derive their JVP from their VJP
+rule via the adjoint (double-vjp) trick.
+
+- **Batching**: the shared rule rebuilds the op over the batched operands
+  with the SAME attributes — dense_shape attrs stay per-element; result
+  batch dims come from the input types via ir inference. The output TREE's
+  dense_shape gains the batch `Dim` at position 0 via the aux remap — never
+  prepend the batch to attrs.
+- **VJP**: the structure (indices) is never differentiated — index operands
+  get `ZeroTangent`, values a FLAT values cotangent. `sparse_add` gathers
+  the merged cotangent (union); `sparse_multiply` WEIGHTS it by the other
+  operand's value at the matched row (intersection); merge-row lookup is
+  O(nnz²) (`_row_lookup`: row-equality broadcast + argmax + full-row mask).
+  Dot vjp rules accumulate dense gradients via one-hot row selection +
+  dense matmul — the numpy scatter kernel is OVERWRITE, not accumulate.
+- **JVP**: the four bilinear rules are two-term product rules built with the
+  `etl.sparse` frontend ops; `sparse_multiply`'s is gather-based (the
+  intersection merge reorders rows). Zero tangents short-circuit.
+- **Cotangent guidance (binding)**: vjp/grad cotangents for sparse inputs
+  are FLAT tensors per leaf (ZeroTangent for indices, a values cotangent for
+  values) — there is NO sparse cotangent object; callers rebuild the sparse
+  value from the returned leaf cotangents. `etl.grad(f)` on a sparse arg
+  needs `argnums=(1,)` (the int64 indices leaf is not differentiable).
+- **VJP deferrals (explicit `TransformError`)**: `sparse_concatenate`
+  (needs dynamic slicing of the merged cotangent per operand);
+  `sparse_coo_to_csc` / `sparse_csc_to_coo` (reorder values; need a
+  sort-based un-permutation).
 
 ## Routing table
 
@@ -134,8 +163,8 @@ applies). The format leaf selects the variant class.
 |---|---|
 | `./value.py` | Three-phase value model: `SparseTensor`/`CSRTensor`/`CSCTensor`/`SparseTensorSpec` (+ `from_concrete`), canonical validation, concrete layout helpers, pytree registration |
 | `./ops.py` | Frontend ops: creators (eager), polymorphic converters, computation ops, COO auto-conversion, three-option TraceErrors |
-| `./rules.py` | (PENDING — rules agent) vectorize/vmap batching rules, jvp/vjp rules, `register_batched_aux_remap` for `SparseTensor` |
-| `./_utils.py` | Internal helpers: `_get_location` (etl-frame skip), `_require_symbolic_sparse`/`_require_symbolic_dense`, `_wrap_dense` |
+| `./rules.py` | Differentiation: 16 batching rules + `SparseTensor` batched-output aux remap, 16 vjp rules (3 explicit deferrals), explicit jvp rules for the 4 bilinear ops (all other sparse ops auto-derive their jvp via the adjoint trick) |
+| `./_utils.py` | Internal helpers: `_get_location` (etl-frame skip), `_require_symbolic_sparse`/`_require_symbolic_dense`, `_wrap_dense`, `_raw_reshape`, `_row_lookup` (O(nnz²) row-equality lookup for the merge AD rules) |
 
 ## Notes for agents
 
@@ -150,9 +179,10 @@ applies). The format leaf selects the variant class.
   `indices.shape[0]` (in-range checks, `to_dense`). The vectorize output
   remap (rules.py) prepends the batch Dim.
 - **`operand_extents`**: `concatenate` MUST pass
-  `operand_extents=tuple(op.dense_shape[axis] for op in operands)` (kernel
-  requires it; result `dense_shape[axis]` = sum) — blocked until the ir
-  opdef amendment lands (see Known issues).
+  `operand_extents=tuple(op.dense_shape[axis] for op in operands)` (the
+  kernel requires it; result `dense_shape[axis]` = sum) — declared on the
+  `sparse_concatenate` opdef in etl/ir, works end-to-end (only the VJP
+  defers).
 - **Batched stored-zero padding rows**: graph-side `sparse_from_dense` and
   the merge kernels pad per-batch nnz to the common max with lex-max
   stored-zero rows; stored-zero duplicates are legal (values-aware canonical
