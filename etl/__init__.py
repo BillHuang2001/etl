@@ -188,6 +188,9 @@ from .backends import (  # noqa: F401
 # --- Distributed collectives (etl.dist) ------------------------------------
 from . import dist  # noqa: F401
 
+# --- Sparse tensors (etl.sparse) -------------------------------------------
+from . import sparse  # noqa: F401
+
 # --- Custom blocks (etl.block) ---------------------------------------------
 from . import block  # noqa: F401  (submodule)
 from .block import BlockOp, block, get_block  # noqa: F401
