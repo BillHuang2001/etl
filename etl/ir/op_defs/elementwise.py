@@ -34,6 +34,11 @@ _BINARY_OPS = {
     "bitwise_and": "Elementwise bitwise AND (broadcasting).",
     "bitwise_or": "Elementwise bitwise OR (broadcasting).",
     "bitwise_xor": "Elementwise bitwise XOR (broadcasting).",
+    "bitwise_left_shift": "Elementwise bitwise left shift (numpy semantics; "
+    "broadcasting).",
+    "bitwise_right_shift": "Elementwise bitwise right shift — arithmetic "
+    "(sign-filling) on signed integer dtypes, logical (zero-filling) on "
+    "unsigned dtypes, mirroring numpy np.right_shift (broadcasting).",
 }
 
 _UNARY_OPS = {

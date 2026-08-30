@@ -41,10 +41,10 @@ from . import reductions
 
 # Elementwise arithmetic / math / bitwise.
 from .elementwise import (  # noqa: F401
-    abs, acos, add, bitwise_and, bitwise_or, bitwise_xor, cast, ceil, cos,
-    divide, erf, exp, floor, gelu, log, log1p, maximum, minimum, multiply,
-    negate, power, relu, remainder, round, sign, sigmoid, sin, sqrt, square,
-    subtract, tan, tanh,
+    abs, acos, add, bitwise_and, bitwise_left_shift, bitwise_or,
+    bitwise_right_shift, bitwise_xor, cast, ceil, cos, divide, erf, exp,
+    floor, gelu, log, log1p, maximum, minimum, multiply, negate, power, relu,
+    remainder, round, sign, sigmoid, sin, sqrt, square, subtract, tan, tanh,
 )
 
 # Comparison / logical / selection.
@@ -91,7 +91,7 @@ __all__ = [
     "maximum", "minimum", "abs", "negate", "square", "sqrt", "exp", "log",
     "log1p", "sin", "cos", "tan", "acos", "floor", "ceil", "round", "tanh",
     "sigmoid", "relu", "gelu", "erf", "sign", "cast", "bitwise_and",
-    "bitwise_or", "bitwise_xor",
+    "bitwise_or", "bitwise_xor", "bitwise_left_shift", "bitwise_right_shift",
     # comparison / logical / selection
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "logical_and", "logical_or", "logical_not", "select",

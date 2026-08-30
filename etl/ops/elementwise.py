@@ -35,6 +35,7 @@ __all__ = [
     "maximum", "minimum", "abs", "negate", "square", "sqrt", "exp", "log",
     "log1p", "sin", "cos", "tan", "tanh", "sigmoid", "relu", "gelu", "erf",
     "sign", "cast", "bitwise_and", "bitwise_or", "bitwise_xor",
+    "bitwise_left_shift", "bitwise_right_shift",
 ]
 
 # --- private construction helpers -------------------------------------------
@@ -482,3 +483,40 @@ def bitwise_xor(x, y) -> "core.SymbolicTensor":
     xt, yt = _binary_operands("bitwise_xor", x, y, loc)
     _require_kinds("bitwise_xor", (xt, yt), _INTEGRAL_KINDS, "integer or bool")
     return _emit_binary(builder, "bitwise_xor", xt, yt, loc)
+
+
+#: Numpy dtype kinds accepted as shift operands: signed and unsigned
+#: integers only. numpy 2.x shift support for bool is a promotion artifact
+#: (bool arrays shift as ints) and StableHLO defines no shift on i1, so etl
+#: requires explicit integer dtypes for shifts (never silent promotion).
+_INTEGER_KINDS = "iu"
+
+
+def bitwise_left_shift(x, y) -> "core.SymbolicTensor":
+    """Elementwise bitwise left shift (``x << y``). Both operands must have
+    integer dtype (``core.DTypeError`` otherwise — bool is NOT accepted;
+    numpy's bool shift is a promotion artifact and StableHLO has no i1
+    shift). Dtype/shape rules identical to :func:`add` (operands promote
+    per ``np.result_type``; the shift amount broadcasts against ``x``)."""
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    xt, yt = _binary_operands("bitwise_left_shift", x, y, loc)
+    _require_kinds("bitwise_left_shift", (xt, yt), _INTEGER_KINDS, "integer")
+    return _emit_binary(builder, "bitwise_left_shift", xt, yt, loc)
+
+
+def bitwise_right_shift(x, y) -> "core.SymbolicTensor":
+    """Elementwise bitwise right shift (``x >> y``). Both operands must have
+    integer dtype (``core.DTypeError`` otherwise — bool is NOT accepted, see
+    :func:`bitwise_left_shift`). Semantics are numpy dtype-natural: the
+    shift is ARITHMETIC (sign-filling) on signed integer dtypes and LOGICAL
+    (zero-filling) on unsigned dtypes — exactly what ``np.right_shift``
+    does per dtype; the StableHLO writer maps signed →
+    ``stablehlo.shift_right_arithmetic`` and unsigned →
+    ``stablehlo.shift_right_logical`` by the promoted operand dtype.
+    Dtype/shape rules identical to :func:`add`."""
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    xt, yt = _binary_operands("bitwise_right_shift", x, y, loc)
+    _require_kinds("bitwise_right_shift", (xt, yt), _INTEGER_KINDS, "integer")
+    return _emit_binary(builder, "bitwise_right_shift", xt, yt, loc)

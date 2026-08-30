@@ -258,6 +258,8 @@ _BINARY_OPS = {
     "bitwise_and": np.bitwise_and,
     "bitwise_or": np.bitwise_or,
     "bitwise_xor": np.bitwise_xor,
+    "bitwise_left_shift": np.left_shift,
+    "bitwise_right_shift": np.right_shift,
     "equal": np.equal,
     "not_equal": np.not_equal,
     "less": np.less,
