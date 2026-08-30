@@ -90,7 +90,7 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | tile | reshape + `broadcast_in_dim` + reshape decomposition |
 | eigh | unrolled cyclic-Jacobi composition (8 sweeps of (p, q) rotations + pair-sort for the ascending eigenvalue order + gather column reorder of V — StableHLO 1.0 removed `stablehlo.eigh`; fp32-tolerance parity with LAPACK numpy, NOT bit-exact; int/bool → f64, f32/f64 pass, complex/f16 → `BackendError`) |
 | diag | rank-2 → flatten + constant-index gather; rank-1 → iota-EQ + select (dtype preserved incl. complex; EXACT vs numpy) |
-| random_key_mix/uniform/normal/randint/permutation | inline SplitMix64 i64 subgraph expansion (`stablehlo/random_export.py`; bit-exact vs the numpy kernels — uniform/randint/permutation EXACT, normal 1 ulp; never `stablehlo.rng`) |
+| random_key_mix/uniform/normal/randint/permutation | inline SplitMix64 i64 subgraph expansion (`stablehlo/random_export.py`; bit-exact vs the numpy kernels — uniform/randint/permutation EXACT; f32-output normal uses a documented f32 Box–Muller fast path (~1e-6 vs numpy, same-key bit-identical across runs), f64 stays exact; never `stablehlo.rng`) |
 | constant | `stablehlo.constant` |
 | cond / while_loop | `stablehlo.if` / `stablehlo.while` |
 | collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast_collective/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
