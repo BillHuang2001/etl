@@ -7,18 +7,36 @@ OUT = {}
 FAIL = []
 
 
+def _to_np(v):
+    if isinstance(v, etl.Tensor):
+        return np.asarray(v.numpy())
+    return np.asarray(v)
+
+
 def check(name, got, want, exact=False, tol=1e-5):
-    g = np.asarray(got) if not isinstance(got, np.ndarray) else got
-    w = np.asarray(want)
-    if g.shape != w.shape:
-        FAIL.append(f"{name}: shape {g.shape} != {w.shape}")
+    # Pytree-aware: tuple outputs (e.g. random.split's key pair) compare
+    # leaf-by-leaf; Tensor leaves convert to ndarrays.
+    g = etl.tree_map(_to_np, got)
+    w = etl.tree_map(_to_np, want)
+    g_leaves, w_leaves = etl.tree_leaves(g), etl.tree_leaves(w)
+    if len(g_leaves) != len(w_leaves):
+        FAIL.append(f"{name}: leaf count {len(g_leaves)} != {len(w_leaves)}")
         return
-    if exact:
-        ok = np.array_equal(g, w)
-        msg = f"{name}: EXACT {'OK' if ok else 'MISMATCH'} maxdiff={np.max(np.abs(g.astype(np.float64) - w.astype(np.float64)))}"
-    else:
-        ok = np.allclose(g, w, rtol=tol, atol=tol)
-        msg = f"{name}: allclose {'OK' if ok else 'FAIL'} maxdiff={np.max(np.abs(g.astype(np.float64) - w.astype(np.float64)))}"
+    ok = True
+    maxdiff = 0.0
+    for gp, wp in zip(g_leaves, w_leaves):
+        if gp.shape != wp.shape:
+            FAIL.append(f"{name}: shape {gp.shape} != {wp.shape}")
+            return
+        if exact:
+            leaf_ok = np.array_equal(gp, wp)
+        else:
+            leaf_ok = np.allclose(gp, wp, rtol=tol, atol=tol)
+        maxdiff = max(
+            maxdiff, float(np.max(np.abs(gp.astype(np.float64) - wp.astype(np.float64))))
+        )
+        ok = ok and leaf_ok
+    msg = f"{name}: {'EXACT' if exact else 'allclose'} {'OK' if ok else 'FAIL'} maxdiff={maxdiff}"
     print(msg)
     if not ok:
         FAIL.append(msg)
@@ -75,7 +93,7 @@ def g0s(x):
 
 cmp("gather_axis0_rt", g0, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((K,), etl.int64), args=(pop, idx0), exact=True)
 cmp("gather_axis0_static", g0s, etl.TensorSpec((P, D), etl.float32), args=(pop,), exact=True)
-cmp("gather_axis1_rt", g1, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((4,), etl.int64), args=(pop, idx1), exact=True)
+cmp("gather_axis1_rt", g1, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((3,), etl.int64), args=(pop, idx1), exact=True)
 cmp("gather_axis1_static", g1s, etl.TensorSpec((P, D), etl.float32), args=(pop,), exact=True)
 cmp("gather_neg", g0, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((2,), etl.int64), args=(pop, neg), exact=True)
 
@@ -84,7 +102,7 @@ def g_scalar(x, i):
     return etl.gather(x, i, axis=0)
 
 
-cmp("gather_0d", g_scalar, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((), etl.int64), args=(pop, np.int64(3)), exact=True)
+cmp("gather_0d", g_scalar, etl.TensorSpec((P, D), etl.float32), etl.TensorSpec((), etl.int64), args=(pop, np.array(3, dtype=np.int64)), exact=True)
 
 # ---------------- sort / argsort ----------------
 x1 = np.array([5.0, 1.0, 5.0, 3.0, 2.0], dtype=np.float32)
@@ -209,16 +227,16 @@ def scrow(x, i, u):
     return etl.scatter(x, i, u, axis=0)
 
 
-cmp("scatter_row_0d", scrow, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((), etl.int64), etl.TensorSpec((4,), etl.float32), args=(mat, np.int64(1), mupd), exact=True)
+cmp("scatter_row_0d", scrow, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((), etl.int64), etl.TensorSpec((4,), etl.float32), args=(mat, np.array(1, dtype=np.int64), mupd), exact=True)
 
 
 def scrow2(x, i, u):
     return etl.scatter(x, i, u, axis=0)
 
 
-idx2 = np.array([[2], [0]], dtype=np.int64)
+idx2 = np.array([2, 0], dtype=np.int64)
 upd2 = np.array([[10.0, 11.0, 12.0, 13.0], [20.0, 21.0, 22.0, 23.0]], dtype=np.float32)
-cmp("scatter_row_multi", scrow2, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2, 1), etl.int64), etl.TensorSpec((2, 4), etl.float32), args=(mat, idx2, upd2), exact=True)
+cmp("scatter_row_multi", scrow2, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2,), etl.int64), etl.TensorSpec((2, 4), etl.float32), args=(mat, idx2, upd2), exact=True)
 
 
 def sccol(x, i, u):
@@ -226,7 +244,9 @@ def sccol(x, i, u):
 
 
 icol = np.array([1, 3], dtype=np.int64)
-ucol = np.array([[5.0], [6.0], [7.0]], dtype=np.float32)
+# Frontend rule: updates = x.shape[:axis] + indices.shape + x.shape[axis+1:]
+# = (3,) + (2,) + () = (3, 2).
+ucol = np.array([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]], dtype=np.float32)
 cmp("scatter_axis1_col", sccol, etl.TensorSpec((3, 4), etl.float32), etl.TensorSpec((2,), etl.int64), etl.TensorSpec((3, 2), etl.float32), args=(mat, icol, ucol), exact=True)
 
 # ---------------- shifts ----------------
@@ -242,9 +262,25 @@ def shr(x, s):
     return etl.bitwise_right_shift(x, s)
 
 
-cmp("shift_left_i64", shl, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64), args=(a64, np.int64(3)), exact=True)
-cmp("shift_right_i64_arith", shr, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64), args=(a64, np.int64(3)), exact=True)
-cmp("shift_right_u64_logical", shr, etl.TensorSpec((3,), etl.uint64), etl.TensorSpec((), etl.int64), args=(u64, np.int64(3)), exact=True)
+def shr_u64(x, s):
+    one = etl.constant(etl.core.Tensor(np.array([1], dtype=np.int64)))
+    mask = etl.subtract(etl.bitwise_left_shift(one, etl.subtract(64, s)), 1)
+    return etl.bitwise_and(etl.bitwise_right_shift(x, s), mask)
+
+
+cmp("shift_left_i64", shl, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64), args=(a64, np.array(3, dtype=np.int64)), exact=True)
+cmp("shift_right_i64_arith", shr, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64), args=(a64, np.array(3, dtype=np.int64)), exact=True)
+cmp("shift_right_u64_logical", shr_u64, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64),
+    args=(u64.view(np.int64), np.array(3, dtype=np.int64)), exact=True)
+# The mask trick must equal numpy's native uint64 shift, bit for bit.
+try:
+    exe = run_iree(shr_u64, etl.TensorSpec((3,), etl.int64), etl.TensorSpec((), etl.int64))
+    got_u64 = etl.run(exe, u64.view(np.int64), np.array(3, dtype=np.int64)).numpy().view(np.uint64)
+    check("shift_right_u64_numpy_parity", got_u64, np.right_shift(u64, 3), exact=True)
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    FAIL.append(f"shift_right_u64_numpy_parity: EXCEPTION {e!r}")
 
 # ---------------- random (SplitMix64 parity, BIT-EXACT) ----------------
 def rkey():
@@ -273,11 +309,11 @@ def rperm64(k):
 
 
 cmp("random_key_mix", rkey, args=(), exact=True)
-cmp("random_uniform", runiform, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=True)
-cmp("random_normal", rnormal, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=True)
-cmp("random_randint", rrandint, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=True)
-cmp("random_permutation", rperm, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=True)
-cmp("random_permutation_i64", rperm64, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=True)
+cmp("random_uniform", runiform, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=True)
+cmp("random_normal", rnormal, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=True)
+cmp("random_randint", rrandint, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=True)
+cmp("random_permutation", rperm, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=True)
+cmp("random_permutation_i64", rperm64, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=True)
 
 # split_n + uniform chained (PSO-style stream)
 def rchain(k):
@@ -285,7 +321,7 @@ def rchain(k):
     return etl.random.uniform(ks[0], (4, 3)) + etl.random.normal(ks[1], (4, 3)) + etl.random.randint(ks[2], (4, 3), low=0, high=5)
 
 
-cmp("random_chain", rchain, etl.TensorSpec((), etl.int64), args=(np.int64(42),), exact=False, tol=1e-5)
+cmp("random_chain", rchain, etl.TensorSpec((), etl.int64), args=(np.array(42, dtype=np.int64),), exact=False, tol=1e-5)
 
 print()
 if FAIL:

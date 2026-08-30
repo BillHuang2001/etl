@@ -36,9 +36,9 @@ _B_MUL = 0xBF58476D1CE4E5B9
 _C_MUL = 0x94D049BB133111EB
 _SIGN_FLIP = 0x8000000000000000
 # Logical-shift masks: (1 << (64 - shift)) - 1 (all < 2^63 → positive i64).
-_MASK30 = 0x3FFFFFFFFFFFFFFF
-_MASK27 = 0x07FFFFFFFFFFFFFF
-_MASK31 = 0x1FFFFFFFF
+_MASK30 = 0x3FFFFFFFF  # 2^34 - 1 (shift 30)
+_MASK27 = 0x1FFFFFFFFF  # 2^37 - 1 (shift 27)
+_MASK31 = 0x1FFFFFFFF  # 2^33 - 1 (shift 31)
 _MASK11 = 0x1FFFFFFFFFFFFF  # 2^53 - 1
 _INV_2P53 = 1.0 / 2.0**53
 _TWO_PI = 2.0 * np.pi
@@ -56,8 +56,18 @@ _F64 = np.dtype("float64")
 
 def _i64(w, value, shape):
     """Emit a scalar/static i64 constant broadcast to ``shape`` (numpy
-    int → two's-complement i64 via np.asarray) → ``(name, lines)``."""
-    return w._scalar_constant_for(_I64, int(np.asarray(value, dtype=_I64)), shape)
+    int → two's-complement i64) → ``(name, lines)``.
+
+    The value is wrapped mod 2^64 first (bit-preserving uint64 → i64
+    view): the SplitMix64 constants exceed 2^63−1, the frontend's
+    ``split_n`` salts are ``i * GOLDEN`` computed UNWRAPPED (> 2^64 for
+    i ≥ 2), and numpy 2.x raises OverflowError on any of them when
+    converted through ``np.asarray(v, dtype=np.int64)``. Wrapping matches
+    the kernels' uint64 arithmetic exactly (the kernels consume salts and
+    constants mod 2^64)."""
+    return w._scalar_constant_for(
+        _I64, int(np.asarray(value % (1 << 64), dtype=np.uint64).view(np.int64)), shape
+    )
 
 
 def _static_shape(w, op, attr_shape) -> tuple:
@@ -133,10 +143,11 @@ def _emit_words(w, seed_name, count, lines) -> str:
         return name
     base, extra = _i64(w, _GOLDEN, ())
     lines.extend(extra)
+    src = base
     base = w._new_name()
-    lines.append(f"{base} = stablehlo.add {seed_name}, {base} : tensor<i64>")
+    lines.append(f"{base} = stablehlo.add {seed_name}, {src} : tensor<i64>")
     iota = w._new_name()
-    lines.append(f'{iota} = "stablehlo.iota" {{dim = 0 : i64}} : tensor<{count}xi64>')
+    lines.append(f"{iota} = stablehlo.iota dim = 0 : tensor<{count}xi64>")
     gold, extra = _i64(w, _GOLDEN, (count,))
     lines.extend(extra)
     prod = w._new_name()
@@ -145,8 +156,9 @@ def _emit_words(w, seed_name, count, lines) -> str:
     )
     b = w._new_name()
     lines.append(
-        f"{b} = stablehlo.broadcast_in_dim {base} : (tensor<i64>) -> "
-        f"tensor<{count}xi64>"
+        f'{b} = "stablehlo.broadcast_in_dim"({base}) '
+        f"{{broadcast_dimensions = {w._i64_array(())}}} : "
+        f"(tensor<i64>) -> tensor<{count}xi64>"
     )
     states = w._new_name()
     lines.append(
@@ -260,8 +272,9 @@ def _emit_random_key_mix(w, op) -> str:
     seed = _emit_seed(w, op, op.operands[0], op.attributes["salt"], lines)
     z, extra = _i64(w, _GOLDEN, ())
     lines.extend(extra)
+    src = z
     z = w._new_name()
-    lines.append(f"{z} = stablehlo.add {seed}, {z} : tensor<i64>")
+    lines.append(f"{z} = stablehlo.add {seed}, {src} : tensor<i64>")
     out = _emit_mix3(w, z, (), lines)
     w._names[id(op.result)] = out
     return "\n".join(lines)
@@ -469,7 +482,7 @@ def _emit_random_permutation(w, op) -> str:
     lines.extend(extra)
     wf = w._new_name()
     lines.append(f"{wf} = stablehlo.xor {words}, {flip} : tensor<{n}xi64>")
-    si = w._emit_stable_argsort(wf, (n,), 0, lines)
+    si = w._emit_stable_argsort(wf, _I64, (n,), 0, lines)
     out = w._new_name()
     lines.append(
         f"{out} = stablehlo.convert {si} : (tensor<{n}xi64>) -> "

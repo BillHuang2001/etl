@@ -26,7 +26,11 @@ imported at module top level, so ``import etl`` stays light):
   ``llvm-cpu`` is among the requested targets,
   ``--iree-llvmcpu-target-cpu=generic`` (portable generic-CPU codegen; also
   silences IREE's generic-CPU warning — llvm-cpu-specific and meaningless for
-  cuda, so not passed there).
+  cuda, so not passed there) and
+  ``--iree-llvmcpu-link-embedded=false`` (the default embedded
+  ``-nostdlib -static`` link cannot resolve libm symbols — ``log``/``cos``/
+  ``floor`` — that f64 math ops lower to; the dynamically-linked dylib
+  resolves them from the system libc/libm at load time).
 - ``iree.runtime.get_driver("local-task")`` / ``get_driver("cuda")`` →
   ``driver.create_default_device()`` (GPU 0 for cuda) — the RELIABLE
   device-acquisition path. The historical
@@ -307,6 +311,12 @@ class IreeBackend(CompilerBackend):
             # generic-CPU warning) — meaningless for cuda, so only passed when
             # llvm-cpu is among the requested targets.
             extra_args.append("--iree-llvmcpu-target-cpu=generic")
+            # The default embedded link (-nostdlib -static, no system libs)
+            # cannot resolve libm symbols (log/cos/floor) that f64 math ops
+            # lower to — iree-lld fails with "undefined symbol: log". A
+            # dynamically-linked dylib resolves them from the system libc/libm
+            # at load time (standard on Linux; validated on IREE 3.11.0).
+            extra_args.append("--iree-llvmcpu-link-embedded=false")
         try:
             vmfb = iree_compiler.compile_str(
                 mlir_text,

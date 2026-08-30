@@ -1284,9 +1284,10 @@ class Writer:
                 f"{self._type_str(x.type.dtype, tshape)}"
             )
         if idx_was_scalar:
+            src = cur
             cur = self._new_name()
             lines.append(
-                f"{cur} = stablehlo.reshape {cur} : "
+                f"{cur} = stablehlo.reshape {src} : "
                 f"({self._type_str(x.type.dtype, tshape if axis != 0 else gres_shape)}) -> "
                 f"{self._vt(op.result.type)}"
             )
@@ -1350,9 +1351,21 @@ class Writer:
                 )
                 ut_shape = (upd_shape[1], upd_shape[0])
             idx_shape_t = self._transposed_idx_shape(idx_shape)
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, idx_shape, lines)
+            iname = self._emit_index_normalize(iname, idx_shape, x_shape[1], lines)
+            if idx_shape != idx_shape_t:
+                t = self._new_name()
+                lines.append(
+                    f"{t} = stablehlo.reshape {iname} : "
+                    f"({self._type_str(np.dtype('int64'), idx_shape)}) -> "
+                    f"{self._type_str(np.dtype('int64'), idx_shape_t)}"
+                )
+                iname = t
             body = self._emit_scatter_row_impl(
                 op, xt, x.type.dtype, idx, ut, ut_shape, (x_shape[1], x_shape[0]),
                 idx_shape_t, self._type_str(x.type.dtype, (x_shape[1], x_shape[0])),
+                iname=iname, upd_dtype=upd.type.dtype,
             )
             lines.extend(body)
             out = self._new_name()
@@ -1392,9 +1405,10 @@ class Writer:
         if idx_shape == ():
             iname = self._name(idx)
             iname = self._emit_to_i64(iname, idx.type.dtype, (), lines)
+            src = iname
             iname = self._new_name()
             lines.append(
-                f"{iname} = stablehlo.reshape {iname} : (tensor<i64>) -> tensor<1xi64>"
+                f"{iname} = stablehlo.reshape {src} : (tensor<i64>) -> tensor<1xi64>"
             )
             k = 1
         else:
@@ -1429,9 +1443,18 @@ class Writer:
             f"{iv} = stablehlo.reshape {iname} : (tensor<{k}xi64>) -> "
             f"tensor<{k}x1xi64>"
         )
+        elem = self._elem_type(x.type.dtype)
+        upd_arg, cur_v = self._new_name(), self._new_name()
+        region = (
+            "({\n"
+            f"  ^bb0({cur_v}: {elem}, {upd_arg}: {elem}):\n"
+            f"    stablehlo.return {upd_arg} : {elem}\n"
+            "  })"
+        )
         result_name = self._bind_results(op)[0]
         lines.append(
             f'{result_name} = "stablehlo.scatter"({self._name(x)}, {iv}, {uname}) '
+            f"{region} "
             f"{{scatter_dimension_numbers = #stablehlo.scatter<"
             f"update_window_dims = [], inserted_window_dims = [0], "
             f"scatter_dims_to_operand_dims = [0], index_vector_dim = 1>}} : "
@@ -1450,17 +1473,19 @@ class Writer:
         if idx_shape == ():
             iname = self._name(idx)
             iname = self._emit_to_i64(iname, idx.type.dtype, (), lines)
+            src = iname
             iname = self._new_name()
             lines.append(
-                f"{iname} = stablehlo.reshape {iname} : (tensor<i64>) -> tensor<1x1xi64>"
+                f"{iname} = stablehlo.reshape {src} : (tensor<i64>) -> tensor<1x1xi64>"
             )
             k = 1
         elif idx_shape == (1,):
             iname = self._name(idx)
             iname = self._emit_to_i64(iname, idx.type.dtype, (1,), lines)
+            src = iname
             iname = self._new_name()
             lines.append(
-                f"{iname} = stablehlo.reshape {iname} : (tensor<1xi64>) -> tensor<1x1xi64>"
+                f"{iname} = stablehlo.reshape {src} : (tensor<1xi64>) -> tensor<1x1xi64>"
             )
             k = 1
         elif len(idx_shape) == 1:
@@ -1492,7 +1517,7 @@ class Writer:
                 "NSGA2 patterns; use the numpy backend for the general case)"
             )
         body = self._emit_scatter_row_impl(
-            op, x, x.type.dtype, idx, upd, upd_shape, x_shape, (k, 1),
+            op, self._name(x), x.type.dtype, idx, upd, upd_shape, x_shape, (k, 1),
             self._vt(op.result.type), iname=iname
         )
         lines.extend(body)
@@ -1500,14 +1525,21 @@ class Writer:
         return "\n".join(lines)
 
     def _emit_scatter_row_impl(self, op, x_name, x_dtype, idx, upd, upd_shape,
-                               x_shape, idx_shape, result_type, iname=None) -> list:
+                               x_shape, idx_shape, result_type, iname=None,
+                               upd_dtype=None) -> list:
         """Shared row-window scatter body (rank-2 axis=0): indices (K,1)
         [given as ``iname`` or emitted from ``idx``], updates broadcast to
         (K, D), scatter with update_window_dims=[1], inserted=[0],
         scatter_dims_to_operand_dims=[0], index_vector_dim=1. ``x_name`` /
         ``x_dtype`` name the operand (a transpose alias in the axis=1
-        path), ``result_type`` the scatter result's MLIR type. Returns the
-        lines; the result name lands in ``self._scatter_row_result``."""
+        path), ``result_type`` the scatter result's MLIR type. ``upd`` is
+        either the updates Value (its SSA name emitted here) or an
+        already-materialized SSA name (the axis=1 transpose path) — in the
+        latter case ``upd_dtype`` supplies the dtype (``upd.type`` does not
+        exist on a str). The update_computation region implements the
+        frontend's copy-and-assign (``put_along_axis``) semantics: return
+        the updates value (replace, never accumulate). Returns the lines;
+        the result name lands in ``self._scatter_row_result``."""
         lines = []
         i64 = np.dtype("int64")
         k, d = idx_shape[0], x_shape[1]
@@ -1516,29 +1548,39 @@ class Writer:
             iname = self._emit_to_i64(iname, idx.type.dtype, idx_shape, lines)
             iname = self._emit_index_normalize(iname, idx_shape, x_shape[0], lines)
         # updates → (K, D), converted to the operand dtype.
-        uname = self._name(upd)
+        uname = upd if isinstance(upd, str) else self._name(upd)
+        udtype = np.dtype(upd_dtype if upd_dtype is not None else upd.type.dtype)
         ushape = upd_shape
         if upd_shape == (x_shape[0],):
             t = self._new_name()
             lines.append(
-                f"{t} = stablehlo.reshape {uname} : ({self._vt(upd.type)}) -> "
-                f"{self._type_str(upd.type.dtype, (1, x_shape[0]))}"
+                f"{t} = stablehlo.reshape {uname} : ({self._type_str(udtype, upd_shape)}) -> "
+                f"{self._type_str(udtype, (1, x_shape[0]))}"
             )
             uname, ushape = t, (1, x_shape[0])
-        if np.dtype(upd.type.dtype) != np.dtype(x_dtype):
+        if udtype != np.dtype(x_dtype):
             t = self._new_name()
             lines.append(
                 f"{t} = stablehlo.convert {uname} : "
-                f"({self._type_str(upd.type.dtype, ushape)}) -> "
+                f"({self._type_str(udtype, ushape)}) -> "
                 f"{self._type_str(x_dtype, ushape)}"
             )
             uname = t
         uname = self._emit_broadcast_static(
             uname, x_dtype, ushape, (k, d), lines, op
         )
+        elem = self._elem_type(x_dtype)
+        upd_arg, cur_v = self._new_name(), self._new_name()
+        region = (
+            "({\n"
+            f"  ^bb0({cur_v}: {elem}, {upd_arg}: {elem}):\n"
+            f"    stablehlo.return {upd_arg} : {elem}\n"
+            "  })"
+        )
         result_name = self._bind_results(op)[0]
         lines.append(
             f'{result_name} = "stablehlo.scatter"({x_name}, {iname}, {uname}) '
+            f"{region} "
             f"{{scatter_dimension_numbers = #stablehlo.scatter<"
             f"update_window_dims = [1], inserted_window_dims = [0], "
             f"scatter_dims_to_operand_dims = [0], index_vector_dim = 1>}} : "
@@ -1740,6 +1782,7 @@ class Writer:
         key_elem = self._elem_type(keys_dtype)
         a, b, c, d = (self._new_name() for _ in range(4))
         c1, c2, c3, c4, c5 = (self._new_name() for _ in range(5))
+        sel_v, sel_i = self._new_name(), self._new_name()
         region = (
             "({\n"
             f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
@@ -1755,7 +1798,11 @@ class Writer:
             f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
             f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
             f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
-            f"    stablehlo.return {c5} : tensor<i1>\n"
+            f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
+            f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
+            f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
+            f"(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>\n"
+            f"    stablehlo.return {sel_v}, {sel_i} : {key_elem}, tensor<i64>\n"
             "  })"
         )
         red_shape_out = tuple(
@@ -1784,10 +1831,14 @@ class Writer:
 
     def _emit_tile(self, op: Op) -> str:
         """``tile`` → reshape + broadcast_in_dim + reshape decomposition
-        (numpy tile semantics: the operand is promoted with leading size-1
-        dims when len(reps) > rank; each aligned dim d_j is interleaved
-        with a 1, broadcast to (d_j, r_j), and the result is reshaped to
-        the declared output — exact for static shapes)."""
+        matching numpy ``tile`` element-for-element (``out[i] =
+        x[i mod s]``): the operand is promoted with leading size-1 dims
+        when len(reps) > rank (reps right-aligned with leading 1s when
+        shorter — NEVER a mix), then reshaped to interleave a size-1 dim
+        BEFORE each dim, broadcast with the IDENTITY broadcast_dimensions
+        (one entry per operand rank — the size-1 dims expand to the reps;
+        element order then matches numpy's repeat loop exactly), and
+        reshaped to the declared output — exact for static shapes."""
         x = op.operands[0]
         reps = tuple(int(r) for r in op.attributes["reps"])
         x_shape = tuple(x.type.shape)
@@ -1795,36 +1846,33 @@ class Writer:
         if not reps:
             self._names[id(op.result)] = self._name(x)
             return ""
+        k = max(x.type.rank, len(reps))
+        padded_shape = (1,) * (k - x.type.rank) + x_shape
+        reps_k = (1,) * (k - len(reps)) + reps
         lines = []
-        out_rank = max(x.type.rank, len(reps))
-        pad = out_rank - x.type.rank
-        padded_shape = (1,) * pad + x_shape
         cur = self._name(x)
-        cur_shape = x_shape
-        if pad:
+        if k != x.type.rank:
             t = self._new_name()
             lines.append(
                 f"{t} = stablehlo.reshape {cur} : "
                 f"({self._type_str(x.type.dtype, x_shape)}) -> "
                 f"{self._type_str(x.type.dtype, padded_shape)}"
             )
-            cur, cur_shape = t, padded_shape
-        d_dims = padded_shape[-len(reps):]
-        interleaved = tuple(d for dim in d_dims for d in (dim, 1))
+            cur = t
+        interleaved = tuple(d for s_i in padded_shape for d in (1, s_i))
         it = self._new_name()
         lines.append(
             f"{it} = stablehlo.reshape {cur} : "
-            f"({self._type_str(x.type.dtype, cur_shape)}) -> "
+            f"({self._type_str(x.type.dtype, padded_shape)}) -> "
             f"{self._type_str(x.type.dtype, interleaved)}"
         )
         bcast_shape = tuple(
-            dim for d, r in zip(d_dims, reps) for dim in (d, r)
+            dim for r_i, s_i in zip(reps_k, padded_shape) for dim in (r_i, s_i)
         )
         bt = self._new_name()
-        dims = list(range(0, 2 * len(reps), 2))
         lines.append(
             f'{bt} = "stablehlo.broadcast_in_dim"({it}) '
-            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"{{broadcast_dimensions = {self._i64_array(range(2 * k))}}} : "
             f"({self._type_str(x.type.dtype, interleaved)}) -> "
             f"{self._type_str(x.type.dtype, bcast_shape)}"
         )
