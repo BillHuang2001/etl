@@ -482,7 +482,7 @@ def _emit_random_permutation(w, op) -> str:
     lines.extend(extra)
     wf = w._new_name()
     lines.append(f"{wf} = stablehlo.xor {words}, {flip} : tensor<{n}xi64>")
-    si = w._emit_stable_argsort(wf, _I64, (n,), 0, lines)
+    _sv, si = w._emit_stable_argsort(wf, _I64, (n,), 0, lines)
     out = w._new_name()
     lines.append(
         f"{out} = stablehlo.convert {si} : (tensor<{n}xi64>) -> "
