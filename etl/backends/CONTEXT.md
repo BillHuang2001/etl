@@ -88,7 +88,7 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | sort / argsort | `stablehlo.sort` with an LT comparator region (argsort sorts a (value, iota) pair; descending = `stablehlo.reverse` after) |
 | argmax / argmin | two-operand `stablehlo.reduce` over (value, iota) with an index tie-break comparator (first occurrence on ties, matching `np.argmax`/`np.argmin`) |
 | tile | reshape + `broadcast_in_dim` + reshape decomposition |
-| eigh | unrolled cyclic-Jacobi composition (8 sweeps of (p, q) rotations + pair-sort for the ascending eigenvalue order + gather column reorder of V — StableHLO 1.0 removed `stablehlo.eigh`; fp32-tolerance parity with LAPACK numpy, NOT bit-exact; int/bool → f64, f32/f64 pass, complex/f16 → `BackendError`) |
+| eigh | unrolled cyclic-Jacobi composition (adaptive dim-based sweeps — 3–7 f32 by size, 8 f64 — of (p, q) rotations + pair-sort for the ascending eigenvalue order + gather column reorder of V — StableHLO 1.0 removed `stablehlo.eigh`; fp32-tolerance parity with LAPACK numpy, NOT bit-exact; int/bool → f64, f32/f64 pass, complex/f16 → `BackendError`) |
 | diag | rank-2 → flatten + constant-index gather; rank-1 → iota-EQ + select (dtype preserved incl. complex; EXACT vs numpy) |
 | random_key_mix/uniform/normal/randint/permutation | inline SplitMix64 i64 subgraph expansion (`stablehlo/random_export.py`; bit-exact vs the numpy kernels — uniform/randint/permutation EXACT; f32-output normal uses a documented f32 Box–Muller fast path (~1e-6 vs numpy, same-key bit-identical across runs), f64 stays exact; never `stablehlo.rng`) |
 | constant | `stablehlo.constant` |
