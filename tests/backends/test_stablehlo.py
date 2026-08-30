@@ -777,3 +777,101 @@ def test_matching_dtype_graphs_emit_no_convert(fn, specs):
     # families: elementwise / compare / select.
     mlir = _export(fn, *specs)
     assert "stablehlo.convert" not in mlir
+
+
+# --- 15. eigh / diag export compositions --------------------------------------
+
+# eigh/diag have no mnemonic StableHLO op (StableHLO 1.0 removed
+# eigh/qr/svd; there is no diag), so the writer emits multi-op compositions
+# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = 8 unrolled cyclic-Jacobi sweeps
+# (slice/iota/compare/select/elementwise rotations) + a stable pair-sort for
+# the ascending eigenvalue order + a gather column reorder of V; diag =
+# iota-EQ mask + select (rank-1 → diagonal matrix) or flatten +
+# constant-index gather (rank-2 → main diagonal). These tests pin the
+# composition markers, the dtype rules, and the dynamic-dims rejection;
+# iree-llvm-cpu round-trip correctness lives in
+# `test_iree_eigh_diag_parity.py`.
+
+
+def _fn_eigh(x):
+    w, v = etl.eigh(x)
+    return w, v
+
+
+def test_eigh_exports_jacobi_composition():
+    mlir = _export(_fn_eigh, etl.TensorSpec((3, 3), etl.float32))
+    # The ascending-order reorder is a stable pair-sort of the final
+    # diagonal; the diagonal extract + the V column reorder are gathers;
+    # the rotations are slice-based (no while-loops — unrolled sweeps).
+    assert "stablehlo.sort" in mlir
+    assert "stablehlo.gather" in mlir
+    assert "stablehlo.slice" in mlir
+    assert "stablehlo.iota" in mlir
+    # (w, v) result types: w (..., n), v (..., n, n).
+    assert "-> (tensor<3xf32>, tensor<3x3xf32>)" in mlir
+
+
+def test_eigh_int_input_upcasts_to_f64():
+    # numpy linalg upcast rule: int/bool → float64 (mirrors the numpy
+    # kernel). The convert is emitted up front; the composition runs in f64.
+    mlir = _export(_fn_eigh, etl.TensorSpec((3, 3), etl.int32))
+    assert "stablehlo.convert" in mlir
+    assert "-> (tensor<3xf64>, tensor<3x3xf64>)" in mlir
+
+
+@pytest.mark.parametrize(
+    "spec,fragment",
+    [
+        (etl.TensorSpec((3, 3), etl.float16), "float16"),
+        (etl.TensorSpec((3, 3), etl.complex64), "complex"),
+    ],
+    ids=["f16", "complex"],
+)
+def test_eigh_unsupported_dtype_deferred_naming_op(spec, fragment):
+    msg = _export_error(_fn_eigh, spec)
+    assert "op 'eigh'" in msg
+    assert "not supported in v1" in msg
+    assert fragment in msg
+
+
+def test_eigh_dynamic_dims_deferred_naming_op():
+    msg = _export_error(_fn_eigh, etl.TensorSpec((_DYN, 3, 3), etl.float32))
+    assert "op 'eigh'" in msg
+    assert "dynamic" in msg
+    assert "not supported" in msg
+
+
+def test_diag_rank1_exports_iota_select_composition():
+    # rank-1 (n,) → the (n, n) diagonal matrix: iota-EQ mask + select over
+    # a broadcast of the input — no gather.
+    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((3,), etl.float32))
+    assert "stablehlo.select" in mlir
+    assert "stablehlo.iota" in mlir
+    assert "stablehlo.gather" not in mlir
+    assert "-> tensor<3x3xf32>" in mlir
+
+
+def test_diag_rank2_exports_gather_composition():
+    # rank-2 (m, n) → the main diagonal (min(m, n),): flatten reshape +
+    # constant-index gather — no select.
+    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((2, 3), etl.float32))
+    assert "stablehlo.gather" in mlir
+    assert "stablehlo.reshape" in mlir
+    assert "stablehlo.select" not in mlir
+    assert "-> tensor<2xf32>" in mlir
+
+
+def test_diag_complex_dtype_preserved():
+    # diag preserves the input dtype incl. complex in both directions (the
+    # mask compares iotas, never data) — no convert is inserted.
+    mlir = _export(lambda x: etl.diag(x), etl.TensorSpec((3,), etl.complex64))
+    assert "stablehlo.select" in mlir
+    assert "stablehlo.convert" not in mlir
+    assert "-> tensor<3x3xcomplex<f32>>" in mlir
+
+
+def test_diag_dynamic_dims_deferred_naming_op():
+    msg = _export_error(lambda x: etl.diag(x), etl.TensorSpec((_DYN,), etl.float32))
+    assert "op 'diag'" in msg
+    assert "dynamic" in msg
+    assert "not supported" in msg
