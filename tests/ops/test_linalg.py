@@ -1,7 +1,8 @@
 """Contract tests for the linear-algebra / scan ops.
 
 Covers ``etl.ops.linalg`` (``dot``, ``conv``, ``tril``, ``triu``, ``cumsum``,
-``solve``), ``etl.ops.reductions.argmax/argmin`` and
+``solve``, ``eigh``, ``cholesky``, ``qr``, ``matrix_rank``, ``svd``,
+``matrix_exp``), ``etl.ops.reductions.argmax/argmin`` and
 ``etl.ops.constant.stop_gradient``. The etl package (repo-root sibling) is
 fully implemented; these tests assert the per-op contracts documented in the
 ``etl/ops/linalg.py`` docstrings and ``etl/ops/CONTEXT.md``:
@@ -17,6 +18,11 @@ fully implemented; these tests assert the per-op contracts documented in the
 - ``tril``/``triu``: numpy semantics with ``k`` offset; shape/dtype preserved.
 - ``cumsum``: numpy semantics plus a reverse scan ("from the end toward the
   start"); bool → int64; other dtypes preserved (numpy-2-proof).
+- ``eigh``/``cholesky``/``qr``/``matrix_rank``/``svd``: numpy ``linalg``
+  semantics (dtype rule int/bool → float64; eigenvalues/singular values real
+  at the input's precision; batched).
+- ``matrix_exp``: scipy/torch semantics (numpy has no ``linalg.matrix_exp``);
+  reference kernel is pure-numpy scaling-and-squaring Taylor.
 - ``argmax``/``argmin``: result dtype int64; numpy semantics.
 - ``stop_gradient``: identity barrier; effect pure.
 """
@@ -824,3 +830,476 @@ def test_stop_gradient_passes_value_through():
     assert [op.name for op in ops_of(graph)] == ["multiply", "stop_gradient", "return"]
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
     np.testing.assert_array_equal(run_numpy(f, x), x * x)
+
+
+# ---------------------------------------------------------------------------
+# eigh
+# ---------------------------------------------------------------------------
+
+def _symmetric(n, rng, dtype):
+    a = rng.standard_normal((n, n))
+    return ((a + a.T) / 2 + np.eye(n) * n).astype(dtype)
+
+
+EIGH_CASES = [(2, np.float32), (3, np.float64), (2, np.int64), (2, np.complex64)]
+
+
+@pytest.mark.parametrize("n,dtype", EIGH_CASES)
+def test_eigh_numerics_vs_numpy(n, dtype):
+    def f(x):
+        return etl.eigh(x)
+
+    rng = np.random.default_rng(3)
+    x = _symmetric(n, rng, dtype)
+    if dtype == np.complex64:
+        x = x.astype(np.complex64) + 1j * rng.standard_normal((n, n)).astype(
+            np.float32
+        )
+        x = (x + x.conj().T) / 2
+    w, v = run_numpy(f, x)
+    wn, vn = np.linalg.eigh(x)
+    # w ascending — numpy order; v may differ by column sign/phase.
+    np.testing.assert_allclose(w, wn, rtol=1e-5, atol=1e-5)
+    recon = v @ np.diag(w) @ v.conj().T
+    np.testing.assert_allclose(recon, x, rtol=1e-4, atol=1e-4)
+
+
+def test_eigh_dtype_rules():
+    def f(x):
+        return etl.eigh(x)
+
+    w64, v64 = run_numpy(f, np.eye(2, dtype=np.float64))
+    assert w64.dtype == np.float64 and v64.dtype == np.float64
+    w32, v32 = run_numpy(f, np.eye(2, dtype=np.float32))
+    assert w32.dtype == np.float32 and v32.dtype == np.float32
+    wi, vi = run_numpy(f, np.eye(2, dtype=np.int64))
+    assert wi.dtype == np.float64 and vi.dtype == np.float64  # int -> float64
+    wc, vc = run_numpy(f, np.eye(2, dtype=np.complex64))
+    assert wc.dtype == np.float32 and vc.dtype == np.complex64
+
+
+def test_eigh_batched_vs_numpy():
+    def f(x):
+        return etl.eigh(x)
+
+    rng = np.random.default_rng(7)
+    batch = np.stack([_symmetric(2, rng, np.float64) for _ in range(3)])
+    w, v = run_numpy(f, batch)
+    wn, vn = np.linalg.eigh(batch)
+    assert w.shape == (3, 2) and v.shape == (3, 2, 2)
+    np.testing.assert_allclose(w, wn, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(v[0] @ np.diag(w[0]) @ v[0].T, batch[0],
+                               rtol=1e-10, atol=1e-10)
+
+
+def test_eigh_ir_result_types():
+    def f(x):
+        return etl.eigh(x)
+
+    graph, out = _trace_capturing(f, etl.TensorSpec((2, 2), etl.float32))
+    assert isinstance(out, tuple) and len(out) == 2
+    w, v = out
+    assert tuple(w.shape) == (2,) and w.dtype == np.float32
+    assert tuple(v.shape) == (2, 2) and v.dtype == np.float32
+    op = _op(graph, "eigh")
+    assert len(op.results) == 2
+    assert op.results[0].type.shape == (2,)
+    assert op.results[1].type.shape == (2, 2)
+
+
+def test_eigh_non_square_raises_shape_error():
+    with pytest.raises(etl.ShapeError, match="must be square"):
+        etl.trace(lambda x: etl.eigh(x), etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(etl.ShapeError, match="rank >= 2"):
+        etl.trace(lambda x: etl.eigh(x), etl.TensorSpec((2,), etl.float32))
+
+
+def test_eigh_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        w, v = etl.eigh(x)
+        return etl.solve(x, w)
+
+    x = np.array([[4.0, 1.0], [1.0, 3.0]])
+    out = etl.evaluate(f, x)
+    wn, _ = np.linalg.eigh(x)
+    np.testing.assert_allclose(out.numpy(), np.linalg.solve(x, wn),
+                               rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# cholesky
+# ---------------------------------------------------------------------------
+
+CHOLESKY_CASES = [(2, np.float32), (3, np.float64), (2, np.int64)]
+
+
+@pytest.mark.parametrize("n,dtype", CHOLESKY_CASES)
+def test_cholesky_numerics_vs_numpy(n, dtype):
+    def f(x):
+        return etl.cholesky(x)
+
+    rng = np.random.default_rng(11)
+    a = rng.standard_normal((n, n))
+    pd = (a @ a.T + np.eye(n) * n).astype(dtype)
+    c = run_numpy(f, pd)
+    cn = np.linalg.cholesky(pd.astype(np.float64) if dtype == np.int64 else pd)
+    np.testing.assert_allclose(c, cn, rtol=1e-5, atol=1e-5)
+    assert c.dtype == (np.float64 if dtype == np.int64 else np.dtype(dtype))
+
+
+def test_cholesky_lower_triangular_reconstructs():
+    def f(x):
+        return etl.cholesky(x)
+
+    rng = np.random.default_rng(13)
+    a = rng.standard_normal((3, 3))
+    pd = a @ a.T + np.eye(3)
+    c = run_numpy(f, pd)
+    assert np.allclose(c, np.tril(c))  # lower triangular
+    np.testing.assert_allclose(c @ c.T, pd, rtol=1e-12, atol=1e-12)
+
+
+def test_cholesky_batched_vs_numpy():
+    def f(x):
+        return etl.cholesky(x)
+
+    rng = np.random.default_rng(17)
+    batch = np.stack(
+        [a @ a.T + np.eye(2) for a in rng.standard_normal((3, 2, 2))]
+    )
+    c = run_numpy(f, batch)
+    cn = np.linalg.cholesky(batch)
+    assert c.shape == (3, 2, 2)
+    np.testing.assert_allclose(c, cn, rtol=1e-10, atol=1e-10)
+
+
+def test_cholesky_non_pd_raises_linalg_error():
+    def f(x):
+        return etl.cholesky(x)
+
+    with pytest.raises(np.linalg.LinAlgError):
+        run_numpy(f, np.array([[1.0, 2.0], [2.0, 1.0]]))
+
+
+def test_cholesky_non_square_raises_shape_error():
+    with pytest.raises(etl.ShapeError, match="must be square"):
+        etl.trace(lambda x: etl.cholesky(x),
+                  etl.TensorSpec((2, 3), etl.float32))
+
+
+def test_cholesky_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        c = etl.cholesky(x)
+        return etl.dot(c, etl.transpose(c))
+
+    x = np.array([[4.0, 1.0], [1.0, 3.0]])
+    out = etl.evaluate(f, x)
+    np.testing.assert_allclose(out.numpy(), x, rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# qr
+# ---------------------------------------------------------------------------
+
+QR_CASES = [((3, 2), np.float32), ((2, 3), np.float64), ((2, 2), np.int64)]
+
+
+@pytest.mark.parametrize("shape,dtype", QR_CASES)
+def test_qr_numerics_vs_numpy(shape, dtype):
+    def f(x):
+        return etl.qr(x)
+
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal(shape).astype(dtype)
+    q, r = run_numpy(f, x)
+    qn, rn = np.linalg.qr(x)
+    assert q.shape == qn.shape and r.shape == rn.shape
+    np.testing.assert_allclose(q, qn, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(r, rn, rtol=1e-5, atol=1e-5)
+    # reconstruction + orthonormality
+    np.testing.assert_allclose(q @ r, x, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(q.T @ q, np.eye(q.shape[1]), rtol=1e-5,
+                               atol=1e-5)
+
+
+def test_qr_reduced_mode_shapes():
+    def f(x):
+        return etl.qr(x)
+
+    q, r = run_numpy(f, np.ones((4, 2), dtype=np.float64))
+    assert q.shape == (4, 2) and r.shape == (2, 2)
+    q, r = run_numpy(f, np.ones((2, 4), dtype=np.float64))
+    assert q.shape == (2, 2) and r.shape == (2, 4)
+
+
+def test_qr_batched_vs_numpy():
+    def f(x):
+        return etl.qr(x)
+
+    rng = np.random.default_rng(23)
+    batch = rng.standard_normal((3, 2, 2))
+    q, r = run_numpy(f, batch)
+    qn, rn = np.linalg.qr(batch)
+    assert q.shape == (3, 2, 2) and r.shape == (3, 2, 2)
+    np.testing.assert_allclose(q, qn, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(r, rn, rtol=1e-10, atol=1e-10)
+
+
+def test_qr_ir_result_types():
+    def f(x):
+        return etl.qr(x)
+
+    graph, out = _trace_capturing(f, etl.TensorSpec((3, 2), etl.float32))
+    q, r = out
+    assert tuple(q.shape) == (3, 2) and tuple(r.shape) == (2, 2)
+    op = _op(graph, "qr")
+    assert len(op.results) == 2
+
+
+def test_qr_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        q, r = etl.qr(x)
+        return etl.dot(q, r)
+
+    x = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    out = etl.evaluate(f, x)
+    np.testing.assert_allclose(out.numpy(), x, rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# matrix_rank
+# ---------------------------------------------------------------------------
+
+def test_matrix_rank_known_values():
+    def f(x):
+        return etl.matrix_rank(x)
+
+    assert run_numpy(f, np.eye(3, dtype=np.float32)) == 3
+    assert run_numpy(f, np.zeros((3, 3), dtype=np.float32)) == 0
+    low = np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [2.0, 2.0, 3.0]])
+    assert run_numpy(f, low) == 2
+    assert run_numpy(f, np.eye(2, dtype=np.int64)) == 2
+
+
+def test_matrix_rank_dtype_is_int64():
+    def f(x):
+        return etl.matrix_rank(x)
+
+    out = run_numpy(f, np.eye(2, dtype=np.float32))
+    assert out.dtype == np.int64
+    assert out.shape == ()  # scalar for 2-D input
+
+
+def test_matrix_rank_batched():
+    def f(x):
+        return etl.matrix_rank(x)
+
+    x = np.stack([np.eye(2), np.zeros((2, 2)), np.ones((2, 2))])
+    out = run_numpy(f, x)
+    assert out.shape == (3,)
+    np.testing.assert_array_equal(out, [2, 0, 1])
+
+
+def test_matrix_rank_tol():
+    def f(x):
+        return etl.matrix_rank(x, tol=0.9)
+
+    small = np.diag([1.0, 0.5])
+    assert run_numpy(f, small) == 1  # singular value 0.5 < tol
+    def g(x):
+        return etl.matrix_rank(x)
+    assert run_numpy(g, small) == 2  # auto threshold keeps it
+
+
+def test_matrix_rank_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        return etl.matrix_rank(x)
+
+    x = np.eye(2, dtype=np.float32)
+    out = etl.evaluate(f, x)
+    assert int(out.numpy()) == 2
+
+
+# ---------------------------------------------------------------------------
+# svd
+# ---------------------------------------------------------------------------
+
+SVD_CASES = [((3, 2), np.float32), ((2, 3), np.float64), ((2, 2), np.int64),
+             ((2, 2), np.complex64)]
+
+
+@pytest.mark.parametrize("shape,dtype", SVD_CASES)
+def test_svd_numerics_vs_numpy(shape, dtype):
+    def f(x):
+        return etl.svd(x)
+
+    rng = np.random.default_rng(29)
+    x = rng.standard_normal(shape).astype(dtype)
+    if dtype == np.complex64:
+        x = x + 1j * rng.standard_normal(shape).astype(np.float32)
+    u, s, vh = run_numpy(f, x)
+    un, sn, vhn = np.linalg.svd(x, full_matrices=False)
+    assert u.shape == un.shape and s.shape == sn.shape and vh.shape == vhn.shape
+    np.testing.assert_allclose(s, sn, rtol=1e-5, atol=1e-5)
+    recon = u @ (s[..., :, None] * vh) if x.ndim == 2 else \
+        np.matmul(u * s[..., None, :], vh)
+    np.testing.assert_allclose(recon, x, rtol=1e-4, atol=1e-4)
+
+
+def test_svd_dtype_rules():
+    def f(x):
+        return etl.svd(x)
+
+    u32, s32, vh32 = run_numpy(f, np.eye(2, dtype=np.float32))
+    assert u32.dtype == np.float32 and s32.dtype == np.float32
+    uc, sc, vhc = run_numpy(f, np.eye(2, dtype=np.complex64))
+    assert uc.dtype == np.complex64 and sc.dtype == np.float32
+    ui, si, vhi = run_numpy(f, np.eye(2, dtype=np.int64))
+    assert ui.dtype == np.float64 and si.dtype == np.float64
+
+
+def test_svd_batched_vs_numpy():
+    def f(x):
+        return etl.svd(x)
+
+    rng = np.random.default_rng(31)
+    batch = rng.standard_normal((3, 2, 2))
+    u, s, vh = run_numpy(f, batch)
+    un, sn, vhn = np.linalg.svd(batch, full_matrices=False)
+    assert u.shape == (3, 2, 2) and s.shape == (3, 2) and vh.shape == (3, 2, 2)
+    np.testing.assert_allclose(s, sn, rtol=1e-10, atol=1e-10)
+
+
+def test_svd_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        u, s, vh = etl.svd(x)
+        return s
+
+    x = np.array([[3.0, 0.0], [0.0, 1.0]])
+    out = etl.evaluate(f, x)
+    np.testing.assert_allclose(out.numpy(), [3.0, 1.0], rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# matrix_exp
+# ---------------------------------------------------------------------------
+
+def _expm_series_ref(a, terms=60):
+    """Independent pure-numpy reference: Taylor series of exp(A/2^s) with
+    scaling-and-squaring, computed in float64 (different series order and
+    scaling policy than the kernel — an oracle, not an alias)."""
+    work = a.astype(np.float64 if a.dtype.kind != "c" else np.complex128)
+    norm = np.abs(work).sum(axis=-2).max()
+    s = max(int(np.ceil(np.log2(max(norm, 1.0)))), 0)
+    b = work * 0.5 ** s
+    n = b.shape[-1]
+    term = np.eye(n, dtype=b.dtype)
+    result = term
+    for k in range(1, terms):
+        term = term @ b / k
+        result = result + term
+    for _ in range(s):
+        result = result @ result
+    return result.astype(a.dtype)
+
+
+def test_matrix_exp_known_values():
+    def f(x):
+        return etl.matrix_exp(x)
+
+    # exp([[0,1],[1,0]]) = [[cosh(1), sinh(1)], [sinh(1), cosh(1)]]
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    out = run_numpy(f, x)
+    expected = np.array([[np.cosh(1), np.sinh(1)], [np.sinh(1), np.cosh(1)]])
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+    # exp(lambda I) = e^lambda I
+    lam = 2.0
+    out = run_numpy(f, np.eye(2) * lam)
+    np.testing.assert_allclose(out, np.exp(lam) * np.eye(2), rtol=1e-12)
+    # exp(0) = I
+    np.testing.assert_allclose(run_numpy(f, np.zeros((2, 2))), np.eye(2),
+                               rtol=1e-12)
+    # rotation: exp([[0,-t],[t,0]]) = [[cos t, -sin t], [sin t, cos t]]
+    t = 0.7
+    rot = run_numpy(f, np.array([[0.0, -t], [t, 0.0]]))
+    np.testing.assert_allclose(
+        rot, [[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]],
+        rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.complex64])
+def test_matrix_exp_vs_series_reference(dtype):
+    def f(x):
+        return etl.matrix_exp(x)
+
+    rng = np.random.default_rng(37)
+    x = rng.standard_normal((3, 3)).astype(dtype)
+    if dtype == np.complex64:
+        x = x + 1j * rng.standard_normal((3, 3)).astype(np.float32)
+    out = run_numpy(f, x)
+    ref = _expm_series_ref(x)
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+    assert out.dtype == np.dtype(dtype)
+
+
+def test_matrix_exp_dtype_rule():
+    def f(x):
+        return etl.matrix_exp(x)
+
+    out = run_numpy(f, np.eye(2, dtype=np.int64))
+    assert out.dtype == np.float64
+    np.testing.assert_allclose(out, np.exp(1.0) * np.eye(2), rtol=1e-12)
+
+
+def test_matrix_exp_batched():
+    def f(x):
+        return etl.matrix_exp(x)
+
+    x = np.stack([np.array([[0.0, 1.0], [1.0, 0.0]]), np.eye(2) * 2.0])
+    out = run_numpy(f, x)
+    assert out.shape == (2, 2, 2)
+    np.testing.assert_allclose(
+        out[0], [[np.cosh(1), np.sinh(1)], [np.sinh(1), np.cosh(1)]],
+        rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(out[1], np.exp(2.0) * np.eye(2), rtol=1e-12)
+
+
+def test_matrix_exp_symmetric_matches_eigh_composition():
+    """Symmetric matrices: exp(A) = V diag(exp(w)) V^T — the composition
+    consumers rely on (e.g. CMAES-style updates)."""
+    def f(x):
+        return etl.matrix_exp(x)
+
+    rng = np.random.default_rng(41)
+    a = rng.standard_normal((3, 3))
+    sym = a @ a.T
+    out = run_numpy(f, sym)
+    w, v = np.linalg.eigh(sym)
+    expected = v @ np.diag(np.exp(w)) @ v.T
+    np.testing.assert_allclose(out, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_matrix_exp_non_square_raises_shape_error():
+    with pytest.raises(etl.ShapeError, match="must be square"):
+        etl.trace(lambda x: etl.matrix_exp(x),
+                  etl.TensorSpec((2, 3), etl.float32))
+    with pytest.raises(etl.ShapeError, match="rank >= 2"):
+        etl.trace(lambda x: etl.matrix_exp(x),
+                  etl.TensorSpec((2,), etl.float32))
+
+
+def test_matrix_exp_inside_defn_graph():
+    @etl.defn
+    def f(x):
+        return etl.matrix_exp(x)
+
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    out = etl.evaluate(f, x)
+    np.testing.assert_allclose(
+        out.numpy(), [[np.cosh(1), np.sinh(1)], [np.sinh(1), np.cosh(1)]],
+        rtol=1e-12, atol=1e-12)

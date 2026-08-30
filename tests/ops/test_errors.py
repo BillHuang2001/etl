@@ -79,6 +79,10 @@ OP_CALLS = {
     "gelu": (lambda t: (t["x"],), {}),
     "erf": (lambda t: (t["x"],), {}),
     "sign": (lambda t: (t["x"],), {}),
+    "acos": (lambda t: (t["x"],), {}),
+    "ceil": (lambda t: (t["x"],), {}),
+    "floor": (lambda t: (t["x"],), {}),
+    "round": (lambda t: (t["x"],), {}),
     "cast": (lambda t: (t["x"],), {"dtype": etl.float64}),
     "bitwise_and": (lambda t: (t["xi"], t["xi"]), {}),
     "bitwise_or": (lambda t: (t["xi"], t["xi"]), {}),
@@ -116,13 +120,28 @@ OP_CALLS = {
     "prod": (lambda t: (t["x"],), {}),
     "argmax": (lambda t: (t["x"],), {}),
     "argmin": (lambda t: (t["x"],), {}),
-    # --- linalg (6) ---
+    # --- linalg (16) ---
     "dot": (lambda t: (t["a"], t["b"]), {}),
     "conv": (lambda t: (t["xc"], t["wc"]), {}),
     "tril": (lambda t: (t["a"],), {}),
     "triu": (lambda t: (t["a"],), {}),
     "cumsum": (lambda t: (t["x"],), {}),
     "solve": (lambda t: (t["a"], t["b"]), {}),
+    "sort": (lambda t: (t["x"],), {}),
+    "diagonal": (lambda t: (t["a"],), {}),
+    "trace": (lambda t: (t["a"],), {}),
+    "norm": (lambda t: (t["x"],), {}),
+    "eigh": (lambda t: (t["a"],), {}),
+    "cholesky": (lambda t: (t["a"],), {}),
+    "qr": (lambda t: (t["a"],), {}),
+    "matrix_rank": (lambda t: (t["a"],), {}),
+    "svd": (lambda t: (t["a"],), {}),
+    "matrix_exp": (lambda t: (t["a"],), {}),
+    # --- statistics (4) ---
+    "var": (lambda t: (t["x"],), {}),
+    "std": (lambda t: (t["x"],), {}),
+    "median": (lambda t: (t["x"],), {}),
+    "nansum": (lambda t: (t["x"],), {}),
     # --- constants / escape hatches (3) ---
     # ``constant`` takes a concrete Tensor by design — it is excluded from
     # the concrete-Tensor-operand category but present in the no-trace one.
@@ -178,14 +197,25 @@ def _tensor_variant(op_name, args_builder):
     return build
 
 
+def _op_ref(op_name):
+    """Map an op name to the callable.
+
+    ``etl.trace`` is the TRACING function (foundational API) — the
+    matrix-trace op is fetched from ``etl.ops`` instead.
+    """
+    if op_name == "trace":
+        return etl.ops.trace
+    return getattr(etl, op_name)
+
+
 # ---------------------------------------------------------------------------
 # Table integrity
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 67 public op names."""
+    """The table must exercise exactly the 85 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 67
+    assert len(etl.ops.__all__) == 85
 
 
 # ---------------------------------------------------------------------------
@@ -384,16 +414,6 @@ def test_unsupported_operand_kind_raises_type_error(bad, kind):
         return etl.add(x, bad)
 
     with pytest.raises(TypeError, match=rf"unsupported operand type {kind}"):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
-
-
-def test_unary_op_with_ndarray_raises_type_error():
-    def fn(x):
-        return etl.exp(np.array([1.0, 2.0]))
-
-    with pytest.raises(TypeError, match="unsupported operand type ndarray"):
-        etl.trace(fn, etl.TensorSpec((4,), etl.float32))
-ytest.raises(TypeError, match=rf"unsupported operand type {kind}"):
         etl.trace(fn, etl.TensorSpec((4,), etl.float32))
 
 

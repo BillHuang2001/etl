@@ -82,10 +82,14 @@ def test_surface_members_are_callable(name):
 
 
 def test_linalg_submodule():
-    """`linalg` is a module whose v1 surface is exactly `solve`."""
+    """`linalg` is a module whose v1 surface is the factorizations: solve,
+    eigh, cholesky, qr, matrix_rank, svd, matrix_exp."""
     assert isinstance(enp.linalg, types.ModuleType)
-    assert enp.linalg.__all__ == ["solve"]
+    assert enp.linalg.__all__ == [
+        "solve", "eigh", "cholesky", "qr", "matrix_rank", "svd", "matrix_exp",
+    ]
     assert callable(enp.linalg.solve)
+    assert callable(enp.linalg.eigh)
 
 
 @pytest.mark.parametrize("name", DEFERRED_NAMES)

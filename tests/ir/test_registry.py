@@ -79,7 +79,10 @@ _REDUCTION = (
     "cumsum",
 )
 
-_LINALG = ("dot", "conv", "tril", "triu", "solve")
+_LINALG = (
+    "dot", "conv", "tril", "triu", "solve", "sort", "diagonal",
+    "eigh", "cholesky", "qr", "matrix_rank", "svd", "matrix_exp",
+)
 
 _CONTROL = (
     "constant",
@@ -308,7 +311,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 103
+    assert len(names) == 109
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -324,7 +327,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 103) --------------------------------------
+# --- 3. per-op effect mapping (all 109) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -478,7 +481,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 103
+    assert len(opdefs) == 109
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )
@@ -515,4 +518,3 @@ def test_attr_type_names_contains_all_tags():
     assert len(set(tags)) == 12  # the tags are distinct
     assert set(tags) <= set(ir.ATTR_TYPE_NAMES)
     assert len(ir.ATTR_TYPE_NAMES) == 12
-ert len(ir.ATTR_TYPE_NAMES) == 12

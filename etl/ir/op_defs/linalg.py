@@ -1,14 +1,21 @@
-"""Linear-algebra op defs: dot, conv, tril, triu, solve — all ``pure``."""
+"""Linear-algebra op defs: dot, conv, tril, triu, solve, sort, diagonal,
+eigh, cholesky, qr, matrix_rank, svd, matrix_exp — all ``pure``."""
 
 from __future__ import annotations
 
 from ..effects import EFFECT_PURE
 from ..inference import (
+    infer_cholesky,
     infer_conv,
     infer_diagonal,
     infer_dot,
+    infer_eigh,
     infer_identity,
+    infer_matrix_exp,
+    infer_matrix_rank,
+    infer_qr,
     infer_solve,
+    infer_svd,
 )
 from . import (
     ATTR_ANY,
@@ -191,6 +198,90 @@ def _register_linalg() -> None:
                 ),
             ),
             shape_fn=infer_solve,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="eigh",
+            category=_CATEGORY,
+            description="Hermitian/symmetric eigendecomposition (numpy "
+            "linalg.eigh): ascending real eigenvalues w and eigenvectors v.",
+            arity=1,
+            result_count=2,
+            effect=EFFECT_PURE,
+            shape_fn=infer_eigh,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="cholesky",
+            category=_CATEGORY,
+            description="Lower-triangular Cholesky factor (numpy "
+            "linalg.cholesky); non-PD input is a runtime error.",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            shape_fn=infer_cholesky,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="qr",
+            category=_CATEGORY,
+            description="QR factorization, numpy reduced mode "
+            "(full_matrices=False): q (m, k), r (k, n) with k = min(m, n).",
+            arity=1,
+            result_count=2,
+            effect=EFFECT_PURE,
+            shape_fn=infer_qr,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="matrix_rank",
+            category=_CATEGORY,
+            description="Numerical rank via SVD (numpy linalg.matrix_rank): "
+            "int64 count per batch element; tol is the static threshold "
+            "(None = numpy auto).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            attributes=(
+                AttrSpec(
+                    name="tol",
+                    type=ATTR_ANY,
+                    default=None,
+                    description="Rank threshold; None = numpy's automatic "
+                    "max(m, n) * eps * largest-singular-value cutoff.",
+                ),
+            ),
+            shape_fn=infer_matrix_rank,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="svd",
+            category=_CATEGORY,
+            description="Singular value decomposition, numpy "
+            "full_matrices=False: u (m, k), s (k,), vh (k, n), k = min(m, n); "
+            "s is real at the input's precision.",
+            arity=1,
+            result_count=3,
+            effect=EFFECT_PURE,
+            shape_fn=infer_svd,
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="matrix_exp",
+            category=_CATEGORY,
+            description="Matrix exponential (scipy/torch linalg semantics — "
+            "numpy has no matrix_exp): square matrices over the last two "
+            "dims, batch supported, dtype preserved (int/bool -> float64).",
+            arity=1,
+            result_count=1,
+            effect=EFFECT_PURE,
+            shape_fn=infer_matrix_exp,
         )
     )
 

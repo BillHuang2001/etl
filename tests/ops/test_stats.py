@@ -293,7 +293,7 @@ def test_stats_ops_in_defn_graph():
             etl.std(x, axes=1),
             etl.median(x, axis=1),
             etl.nansum(x, axes=1),
-            etl.norm(x, axes=1),
+            etl.norm(x, axis=1),
         )
 
     x = np.array([[1.0, 2.0, np.nan], [4.0, 5.0, 6.0]], np.float32)

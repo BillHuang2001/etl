@@ -488,6 +488,120 @@ def _diagonal(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
         np.diagonal(x_arr, offset=attrs["offset"], axis1=attrs["axis1"],
                     axis2=attrs["axis2"])
     )
+
+
+# ---------------------------------------------------------------------------
+# factorizations: eigh / cholesky / qr / matrix_rank / svd / matrix_exp
+# (numpy linalg semantics; declared IR dtypes are authoritative — the
+# interpreters re-validate per-result dtype/shape exactly).
+# ---------------------------------------------------------------------------
+
+
+def _upcast_linalg(x: np.ndarray) -> np.ndarray:
+    """numpy linalg dtype rule: int/bool operands compute in float64."""
+    if x.dtype.kind in "biu":
+        return x.astype(np.float64, copy=False)
+    return x
+
+
+def _eigh(ctx: Any, op: Any, operands: tuple) -> tuple:
+    """``eigh``: Hermitian/symmetric eigendecomposition per numpy
+    ``linalg.eigh`` (ascending real ``w``; batched natively). numpy already
+    returns the declared dtypes (int/bool upcast to float64; complex64 → w
+    float32, v complex64), so no recast is needed."""
+    (x,) = operands
+    x_arr = _upcast_linalg(x.numpy())
+    _check_dtypes("eigh", x_arr)
+    w, v = np.linalg.eigh(x_arr)
+    return core.Tensor(w), core.Tensor(v)
+
+
+def _cholesky(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``cholesky``: lower-triangular factor per numpy ``linalg.cholesky``
+    (batched; non-PD input surfaces numpy's ``LinAlgError``)."""
+    (x,) = operands
+    x_arr = _upcast_linalg(x.numpy())
+    _check_dtypes("cholesky", x_arr)
+    return core.Tensor(np.linalg.cholesky(x_arr))
+
+
+def _qr(ctx: Any, op: Any, operands: tuple) -> tuple:
+    """``qr``: reduced QR per numpy ``linalg.qr`` (``full_matrices=False``
+    default; batched; rectangular inputs allowed)."""
+    (x,) = operands
+    x_arr = _upcast_linalg(x.numpy())
+    _check_dtypes("qr", x_arr)
+    q, r = np.linalg.qr(x_arr)
+    return core.Tensor(q), core.Tensor(r)
+
+
+def _matrix_rank(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``matrix_rank``: SVD-based numerical rank per numpy
+    ``linalg.matrix_rank`` — int64 count per batch element. The static
+    ``tol`` attribute (None = numpy auto) is forwarded as-is; numpy's output
+    is already int64 (declared dtype)."""
+    (x,) = operands
+    x_arr = x.numpy()
+    _check_dtypes("matrix_rank", x_arr)
+    tol = op.attributes.get("tol")
+    if tol is None:
+        result = np.linalg.matrix_rank(x_arr)
+    else:
+        result = np.linalg.matrix_rank(x_arr, tol=tol)
+    return core.Tensor(np.asarray(result, dtype=np.int64))
+
+
+def _svd(ctx: Any, op: Any, operands: tuple) -> tuple:
+    """``svd``: singular value decomposition per numpy ``linalg.svd`` with
+    ``full_matrices=False`` (batched; rectangular inputs allowed; ``s`` is
+    real at the input's precision — matches the declared result dtypes)."""
+    (x,) = operands
+    x_arr = _upcast_linalg(x.numpy())
+    _check_dtypes("svd", x_arr)
+    u, s, vh = np.linalg.svd(x_arr, full_matrices=False)
+    return core.Tensor(u), core.Tensor(s), core.Tensor(vh)
+
+
+def _matrix_exp_impl(a: np.ndarray) -> np.ndarray:
+    """Matrix exponential via scaling-and-squaring + Taylor series (Higham
+    2005 family, the scipy ``expm`` algorithm): scale ``A`` to 1-norm <= 1,
+    sum ``exp(B) = sum B^k / k!`` to term 25 (truncation < 1e-25), then
+    square ``s`` times. Pure numpy — numpy has no ``linalg.matrix_exp``.
+
+    Computed in float64/complex128 and cast back to the input dtype for
+    single precision (max accuracy; deviation from scipy's in-dtype
+    computation is far below fp32 epsilon)."""
+    work = a.astype(
+        np.complex128 if a.dtype.kind == "c" else np.float64, copy=False
+    )
+    n = work.shape[-1]
+    eye = np.broadcast_to(np.eye(n, dtype=work.dtype), work.shape)
+    # 1-norm per batch element; uniform scaling over the whole batch.
+    norms = np.abs(work).sum(axis=-2).max(axis=-1)
+    s = int(np.ceil(np.log2(max(float(norms.max(initial=0.0)), 1.0)))) if work.size else 0
+    b = work * (0.5 ** s)
+    # Horner-style series: exp(B) = sum_{k=0}^{25} B^k / k!.
+    term = eye.copy()
+    result = term
+    for k in range(1, 26):
+        term = term @ b / k
+        result = result + term
+    for _ in range(s):
+        result = result @ result
+    return result.astype(a.dtype, copy=False)
+
+
+def _matrix_exp(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
+    """``matrix_exp``: matrix exponential (scipy/torch semantics — numpy has
+    no ``linalg.matrix_exp``). Square last two dims (validated at trace
+    time); batch supported; dtype preserved with int/bool → float64."""
+    (x,) = operands
+    x_arr = x.numpy()
+    _check_dtypes("matrix_exp", x_arr)
+    work = _upcast_linalg(x_arr)
+    return core.Tensor(_matrix_exp_impl(work))
+
+
 def register_kernels(table: dict) -> None:
     """Register this module's linalg kernels into the dispatch table.
 
@@ -499,3 +613,9 @@ def register_kernels(table: dict) -> None:
     table["solve"] = _solve
     table["sort"] = _sort
     table["diagonal"] = _diagonal
+    table["eigh"] = _eigh
+    table["cholesky"] = _cholesky
+    table["qr"] = _qr
+    table["matrix_rank"] = _matrix_rank
+    table["svd"] = _svd
+    table["matrix_exp"] = _matrix_exp

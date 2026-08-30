@@ -988,6 +988,169 @@ def infer_solve(
     return (ValueType(result_dtype, batch + b_tail),)
 
 
+# ---------------------------------------------------------------------------
+# linalg factorizations (eigh / cholesky / qr / matrix_rank / svd /
+# matrix_exp) — numpy linalg dtype rule shared with solve: int/bool inputs
+# upcast to float64; float32/complex64 stay at single precision; eigenvalue
+# and singular-value arrays are REAL at the input's precision.
+# ---------------------------------------------------------------------------
+
+
+def _linalg_float_dtype(dtype: np.dtype) -> np.dtype:
+    """Result dtype of a matrix-factorization result: int/bool → float64
+    (numpy linalg ``_commonType`` rule), float/complex preserved."""
+    if dtype.kind in "biu":
+        return np.dtype("float64")
+    return dtype
+
+
+def _linalg_real_dtype(dtype: np.dtype) -> np.dtype:
+    """Real dtype at the input's precision: eigenvalues/singular values are
+    real even for complex inputs (numpy: c64 → f32, c128 → f64)."""
+    if dtype.kind in "biu":
+        return np.dtype("float64")
+    if dtype.kind == "c":
+        return np.dtype("float32" if dtype.itemsize <= 8 else "float64")
+    return dtype
+
+
+def _min_dim(a: Any, b: Any) -> Any:
+    """``min(a, b)`` as an int when both are static, else a DimExpr node."""
+    if isinstance(a, int) and isinstance(b, int):
+        return min(a, b)
+    if isinstance(a, int):
+        return b.min(a)
+    return a.min(b)
+
+
+def _check_square_last_two(s: tuple, name: str) -> None:
+    """Rank >= 2 + static squareness of the last two dims (numpy linalg
+    raises at runtime for non-square; etl rejects statically when known)."""
+    if len(s) < 2:
+        raise ShapeError(f"{name}: input must have rank >= 2, got rank {len(s)}")
+    n1, n2 = s[-2], s[-1]
+    if isinstance(n1, int) and isinstance(n2, int) and n1 != n2:
+        raise ShapeError(f"{name}: matrix must be square, got {n1} vs {n2}")
+
+
+def infer_eigh(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``eigh``: (w, v) per numpy ``linalg.eigh`` — ``w`` is
+    the ascending eigenvalue array (REAL, at the input's precision) and ``v``
+    the eigenvector matrix; both keep the input's batch dims. Dtype rule:
+    int/bool → float64 (numpy linalg); complex input keeps complex ``v`` with
+    real ``w`` (c64 → w f32 / v c64)."""
+    if len(input_types) != 1:
+        raise ShapeError(f"eigh: expected 1 operand, got {len(input_types)}")
+    (x,) = input_types
+    sx = x.shape
+    _check_square_last_two(sx, "eigh")
+    batch, n = sx[:-2], sx[-1]
+    w_dtype = _linalg_real_dtype(x.dtype)
+    v_dtype = _linalg_float_dtype(x.dtype)
+    return (
+        ValueType(w_dtype, batch + (n,)),
+        ValueType(v_dtype, batch + (n, n)),
+    )
+
+
+def infer_cholesky(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``cholesky``: the lower-triangular factor, same shape
+    as the input (numpy ``linalg.cholesky``); dtype int/bool → float64, else
+    preserved."""
+    if len(input_types) != 1:
+        raise ShapeError(f"cholesky: expected 1 operand, got {len(input_types)}")
+    (x,) = input_types
+    _check_square_last_two(x.shape, "cholesky")
+    return (ValueType(_linalg_float_dtype(x.dtype), x.shape),)
+
+
+def infer_qr(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``qr`` (numpy reduced mode, ``full_matrices=False``):
+    ``(m, n)`` input → ``q (m, k)``, ``r (k, n)`` with ``k = min(m, n)``
+    (symbolic via DimExpr); batch dims preserved; dtype int/bool → float64,
+    else preserved."""
+    if len(input_types) != 1:
+        raise ShapeError(f"qr: expected 1 operand, got {len(input_types)}")
+    (x,) = input_types
+    sx = x.shape
+    if len(sx) < 2:
+        raise ShapeError(f"qr: input must have rank >= 2, got rank {len(sx)}")
+    m, n = sx[-2], sx[-1]
+    k = _min_dim(m, n)
+    batch = sx[:-2]
+    dtype = _linalg_float_dtype(x.dtype)
+    return (
+        ValueType(dtype, batch + (m, k)),
+        ValueType(dtype, batch + (k, n)),
+    )
+
+
+def infer_matrix_rank(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``matrix_rank``: an INT64 count per batch element
+    (scalar for 2-D input, ``(...,)`` when batched — numpy
+    ``linalg.matrix_rank`` semantics). The ``tol`` attribute does not affect
+    the shape."""
+    if len(input_types) != 1:
+        raise ShapeError(
+            f"matrix_rank: expected 1 operand, got {len(input_types)}"
+        )
+    (x,) = input_types
+    sx = x.shape
+    if len(sx) < 2:
+        raise ShapeError(
+            f"matrix_rank: input must have rank >= 2, got rank {len(sx)}"
+        )
+    return (ValueType(np.dtype("int64"), sx[:-2]),)
+
+
+def infer_svd(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result types of ``svd`` (``full_matrices=False``): ``(m, n)`` input →
+    ``u (m, k)``, ``s (k,)``, ``vh (k, n)`` with ``k = min(m, n)`` (symbolic
+    via DimExpr); batch dims preserved. ``u``/``vh`` keep the input dtype
+    (int/bool → float64); ``s`` is REAL at the input's precision (c64 → f32,
+    c128 → f64 — numpy semantics)."""
+    if len(input_types) != 1:
+        raise ShapeError(f"svd: expected 1 operand, got {len(input_types)}")
+    (x,) = input_types
+    sx = x.shape
+    if len(sx) < 2:
+        raise ShapeError(f"svd: input must have rank >= 2, got rank {len(sx)}")
+    m, n = sx[-2], sx[-1]
+    k = _min_dim(m, n)
+    batch = sx[:-2]
+    return (
+        ValueType(_linalg_float_dtype(x.dtype), batch + (m, k)),
+        ValueType(_linalg_real_dtype(x.dtype), batch + (k,)),
+        ValueType(_linalg_float_dtype(x.dtype), batch + (k, n)),
+    )
+
+
+def infer_matrix_exp(
+    input_types: tuple[ValueType, ...], attributes: dict[str, Any]
+) -> tuple[ValueType, ...]:
+    """Result type of ``matrix_exp``: same shape/dtype as the input (numpy
+    has no ``linalg.matrix_exp`` — semantics follow scipy/torch: square
+    matrices over the last two dims, batch supported, dtype preserved with
+    int/bool → float64)."""
+    if len(input_types) != 1:
+        raise ShapeError(
+            f"matrix_exp: expected 1 operand, got {len(input_types)}"
+        )
+    (x,) = input_types
+    _check_square_last_two(x.shape, "matrix_exp")
+    return (ValueType(_linalg_float_dtype(x.dtype), x.shape),)
+
+
 def infer_all_gather(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:
