@@ -55,10 +55,15 @@ imported at module top level, so ``import etl`` stays light):
   ``rt.load_vm_module(vm_module, config)``, which binds the module to a
   SPECIFIC acquired device.
 - ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
-  array into a HAL device buffer for function input.
-- ``np.asarray(result)`` — converts a returned ``DeviceArray`` back to a
-  host numpy array; wrapped into ``core.Tensor`` exactly like the numpy
-  interpreter's kernels (``core.Tensor(np.asarray(...))``).
+  array into a HAL device buffer for function input (used only for host
+  inputs — device-resident inputs pass through without a copy, see
+  ``IreeExecutable.run``).
+- ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
+  handle, already resident on the device. Run outputs are wrapped into
+  ``core.Tensor(_IreeDevicePayload(...))`` — device-resident tensors whose
+  ``.numpy()`` materializes a LAZY host copy (``DeviceArray.to_host()``) on
+  demand, so the hot run() path performs no host round-trip. Same-device
+  DeviceArray inputs are handed to the invoke directly (no copy).
 
 Staging is explicit and honest: ``compile`` NEVER loads, ``load`` NEVER
 re-lowers/re-compiles. Compiler failures surface as
@@ -541,12 +546,21 @@ class IreeExecutable(CompilerExecutable):
        per-input shape — rank and STATIC dims must match
        (``core.ShapeError``); symbolic dims pass through (IREE executes
        runtime-dynamic shapes — validated).
-    2. Copy each input into a HAL buffer via ``rt.asdevicearray``.
+    2. Per input: a device-resident tensor whose payload is an IREE
+       ``DeviceArray`` on THIS executable's device (kind+index) is passed
+       to the invoke directly — no host round-trip, no copy. Any other
+       input (numpy-backed host tensor, payload on a different device) is
+       copied into a HAL buffer via ``rt.asdevicearray`` exactly as before.
     3. Invoke the entry function; handle single/multiple results (the
        invoker returns the value or a tuple).
-    4. Convert each result via ``np.asarray`` and wrap it in a
-       ``core.Tensor`` — the same construction pattern the numpy
-       interpreter kernels use (``core.Tensor(np.asarray(...))``).
+    4. Wrap each result in ``core.Tensor(_IreeDevicePayload(...))`` — a
+       DEVICE-RESIDENT tensor: ``.data`` is the payload (the DeviceArray
+       already on the device), ``.device`` is this executable's
+       ``core.Device`` (``Device("cpu", 0)`` for the default CPU device),
+       and ``.numpy()`` performs a LAZY host copy (``DeviceArray.to_host()``)
+       on demand — the run() hot path never touches host memory. This holds
+       for both cuda AND llvm-cpu executables (on ``local-task`` the to_host
+       mapping is zero-copy for mappable buffers).
     5. Validate output count + dtype against the signature output specs.
 
     ``save`` / ``load`` are inherited from ``CompilerExecutable``: ``save``
@@ -575,6 +589,22 @@ class IreeExecutable(CompilerExecutable):
             entry_functions=entry_functions,
         )
         self.runtime_device = runtime_device
+        # Per-call invariants cached at load time (never re-derived per run):
+        # the core.Device label of this executable (output tensors + the
+        # same-device pass-through rule), the flat spec tuples, and the
+        # resolved entry function (resolution constructs a new
+        # ``FunctionInvoker`` — ABI JSON parse + argument packer — on every
+        # BoundModule attribute access, so it must happen once).
+        self._core_device: Device = (
+            device if device is not None else Device("cpu", 0)
+        )
+        self._input_specs = (
+            tuple(signature.input_specs) if signature is not None else ()
+        )
+        self._output_specs = (
+            tuple(signature.output_specs) if signature is not None else ()
+        )
+        self._entry: Any = None
 
     # ------------------------------------------------------------------ run
 
@@ -589,13 +619,8 @@ class IreeExecutable(CompilerExecutable):
         import iree.runtime as rt
         import numpy as np
 
-        signature = self.signature
-        if signature is not None:
-            input_specs = tuple(signature.input_specs)
-            output_specs = tuple(signature.output_specs)
-        else:
-            input_specs = ()
-            output_specs = ()
+        input_specs = self._input_specs
+        output_specs = self._output_specs
         if len(flat_input_tensors) != len(input_specs):
             raise core.BackendError(
                 f"program expects {len(input_specs)} input tensor(s), got "
@@ -615,19 +640,50 @@ class IreeExecutable(CompilerExecutable):
                 )
             _validate_input_shape(i, spec.shape, tensor.shape)
 
-        buffers = [
-            rt.asdevicearray(self.runtime_device, tensor.numpy())
-            for tensor in flat_input_tensors
-        ]
+        buffers = []
+        for tensor in flat_input_tensors:
+            data = tensor.data
+            # Device-resident pass-through: an input tensor already living on
+            # THIS executable's device (payload-backed with a matching
+            # core.Device) is handed to the invoke as-is — no host
+            # round-trip, no re-upload. Two payload kinds qualify: our own
+            # _IreeDevicePayload (run outputs of this or another iree
+            # executable — unwrapped to the underlying DeviceArray) and a
+            # raw iree DeviceArray (e.g. a user-constructed payload). The
+            # validation loop above already proved dtype/shape against the
+            # signature, so the payload is guaranteed correct. Anything else
+            # (numpy-backed host input, payload on a different device) takes
+            # the classic asdevicearray H2D copy path.
+            if isinstance(data, _IreeDevicePayload) and (
+                tensor.device == self._core_device
+            ):
+                buffers.append(data.device_array)
+            elif (
+                not isinstance(data, np.ndarray)
+                and isinstance(data, rt.DeviceArray)
+                and tensor.device == self._core_device
+            ):
+                buffers.append(data)
+            else:
+                buffers.append(
+                    rt.asdevicearray(self.runtime_device, tensor.numpy())
+                )
         entry = self._entry_function()
         results = entry(*buffers)
         if results is None:
             results = ()
         elif not isinstance(results, tuple):
             results = (results,)
-        outputs = [core.Tensor(np.asarray(result)) for result in results]
+        # Device-resident outputs: wrap the returned DeviceArrays (already on
+        # the device) in core.Tensor with the lazy _IreeDevicePayload — the
+        # D2H copy happens only if/when .numpy() is called.
+        core_device = self._core_device
+        outputs = [
+            core.Tensor(_IreeDevicePayload(result, core_device))
+            for result in results
+        ]
 
-        if signature is not None:
+        if self.signature is not None:
             if len(outputs) != len(output_specs):
                 raise core.BackendError(
                     f"program produced {len(outputs)} output tensor(s), "
@@ -646,19 +702,29 @@ class IreeExecutable(CompilerExecutable):
     def _entry_function(self) -> Any:
         """Resolve the v1 entry function: ``"main"``, else the single one.
 
+        Resolved ONCE and cached: resolution is a ``BoundModule`` attribute
+        access that constructs a fresh ``FunctionInvoker`` (ABI JSON parse +
+        argument packer) every time — per-call re-resolution would redo that
+        work on every run.
+
         Raises:
             core.BackendError: no ``"main"`` function and not exactly one
                 recorded entry function.
         """
+        if self._entry is not None:
+            return self._entry
         if "main" in self._entry_functions:
-            return getattr(self.native_module, "main")
-        if len(self._entry_functions) == 1:
-            return getattr(self.native_module, self._entry_functions[0])
-        raise core.BackendError(
-            f"the {self.backend_name} executable has "
-            f"{len(self._entry_functions)} entry functions and no 'main' "
-            "entry function"
-        )
+            entry = getattr(self.native_module, "main")
+        elif len(self._entry_functions) == 1:
+            entry = getattr(self.native_module, self._entry_functions[0])
+        else:
+            raise core.BackendError(
+                f"the {self.backend_name} executable has "
+                f"{len(self._entry_functions)} entry functions and no 'main' "
+                "entry function"
+            )
+        self._entry = entry
+        return entry
 
 
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
@@ -683,6 +749,62 @@ def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[i
                 f"input {index}: shape mismatch at dim {dim} — expected "
                 f"{want}, got runtime size {got}"
             )
+
+
+class _IreeDevicePayload:
+    """Duck-typed device payload for ``core.Tensor`` (the payload protocol).
+
+    Wraps an IREE runtime ``DeviceArray`` — a HAL buffer-view handle that is
+    ALREADY resident on the executable's device — plus the ``core.Device`` it
+    lives on. Host materialization (``to_host``) is LAZY: the D2H copy happens
+    only when the wrapping tensor's ``.numpy()`` is called, so the hot
+    ``IreeExecutable.run`` path never touches host memory.
+
+    Payload protocol (see ``etl/core/tensor.py``): ``.shape`` (tuple of
+    ints), ``.dtype`` (numpy-normalizable — DeviceArray is override-aware,
+    e.g. bool results), optional ``.device`` (the core.Device), and
+    ``to_host() -> np.ndarray`` tried first by ``Tensor.numpy()`` (with
+    ``np.asarray`` as the fallback, via ``__array__``). On ``local-task``
+    (llvm-cpu) buffers the to_host mapping is zero-copy for mappable memory;
+    on cuda it is a fresh D2H copy per call.
+    """
+
+    __slots__ = ("_array", "device")
+
+    def __init__(self, array: Any, device: Device) -> None:
+        self._array = array
+        self.device = device
+
+    @property
+    def device_array(self) -> Any:
+        """The wrapped IREE runtime ``DeviceArray`` (the HAL buffer handle).
+
+        Used by ``IreeExecutable.run`` for the same-device pass-through rule:
+        an input tensor produced by an iree executable can be handed to the
+        next invoke without a host round-trip.
+        """
+        return self._array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self._array.shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._array.dtype
+
+    def to_host(self) -> np.ndarray:
+        """Materialize a host copy of the device buffer (lazy D2H)."""
+        return self._array.to_host()
+
+    def __array__(self, dtype: Any = None) -> np.ndarray:
+        """``np.asarray`` fallback for host materialization.
+
+        ``core.Tensor`` prefers ``to_host()``; this keeps
+        ``np.asarray(payload)`` correct for direct payload users too (a
+        fresh host copy per call, like ``to_host``).
+        """
+        return self._array.to_host().__array__(dtype)
 
 
 # ---------------------------------------------------------------------------
