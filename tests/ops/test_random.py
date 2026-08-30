@@ -314,6 +314,30 @@ def test_permutation_dtype_and_zero():
     assert empty.shape == (0,)
 
 
+def test_permutation_static_n_traced_shape_is_static():
+    """A static Python int n traces to a STATIC (n,) output shape — so
+    etl.cond branch unification works for static-size populations; a
+    symbolic rank-0 n input stays runtime-dynamic (None,)."""
+
+    @etl.defn
+    def f_static(key):
+        return etl.random.permutation(key, 7)
+
+    static_spec = etl.lower(
+        etl.trace(f_static, etl.TensorSpec((), "int64"))
+    ).signature.output_specs[0]
+    assert static_spec.shape == (7,)
+
+    @etl.defn
+    def f_symbolic(key, n):
+        return etl.random.permutation(key, n)
+
+    dynamic_spec = etl.lower(
+        etl.trace(f_symbolic, etl.TensorSpec((), "int64"), etl.TensorSpec((), "int64"))
+    ).signature.output_specs[0]
+    assert dynamic_spec.shape == (None,)
+
+
 # --- 5. symbolic operands ----------------------------------------------------
 
 

@@ -1402,11 +1402,14 @@ def infer_random_randint(
 def infer_random_permutation(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:
-    """Result type of ``random_permutation``: 1-D of runtime length (None).
+    """Result type of ``random_permutation``: 1-D of length ``n``.
 
-    The length is a runtime operand (static ints and symbolic scalars both
-    arrive as rank-0 int64 operands), so the result dim is ``None`` —
-    runtime-dynamic and unchecked by the interpreter.
+    A static Python int ``n`` is recorded in the ``n`` attribute at trace
+    time, so the result dim is the STATIC ``n`` — this keeps ``etl.cond`` /
+    ``etl.while_loop`` branch unification working for static-size
+    populations. A symbolic rank-0 n operand leaves the attribute ``None``
+    (its default): the result dim is then ``None`` — runtime-dynamic and
+    unchecked by the interpreter.
     """
     if len(input_types) != 2:
         raise ShapeError(
@@ -1414,7 +1417,15 @@ def infer_random_permutation(
             f"{len(input_types)}"
         )
     _check_random_key(input_types[0], "random_permutation")
-    return (ValueType(dtype(attributes["dtype"]), (None,)),)
+    n = attributes.get("n")
+    if n is None:
+        return (ValueType(dtype(attributes["dtype"]), (None,)),)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ShapeError(
+            f"random_permutation: n attribute must be a non-negative int or "
+            f"None, got {n!r}"
+        )
+    return (ValueType(dtype(attributes["dtype"]), (n,)),)
 
 
 def infer_random_multinomial(

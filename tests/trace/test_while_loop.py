@@ -13,6 +13,8 @@ Runtime semantics are checked on the numpy backend via `run_graph`; IR layout
 is inspected on the traced module.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -133,6 +135,42 @@ def test_nested_tuple_state(run_graph, as_numpy):
     assert counter == 2
     np.testing.assert_allclose(a, 2 * x)
     np.testing.assert_allclose(b, 2 * x)
+
+
+def test_dataclass_carry(run_graph):
+    """A plain user-defined dataclass is a first-class loop-carried pytree:
+    its tensor leaves are carried, its static leaves specialize the loop."""
+
+    @dataclasses.dataclass
+    class State:
+        i: object
+        acc: object
+        tag: str
+
+    def f(x):
+        def cond_fn(s):
+            return etl.less(s.i, _const(3, etl.int32))
+
+        def body_fn(s):
+            return State(
+                etl.add(s.i, _const(1, etl.int32)),
+                etl.add(s.acc, x),
+                s.tag,
+            )
+
+        init = State(
+            _const(0, etl.int32),
+            etl.constant(etl.zeros((2,), etl.float32)),
+            "static-tag",
+        )
+        return etl.while_loop(cond_fn, body_fn, init)
+
+    x = np.array([1.0, 2.0], dtype=np.float32)
+    graph = etl.trace(f, etl.TensorSpec((2,), etl.float32))
+    result = run_graph(graph, x)
+    assert isinstance(result, State)
+    assert result.tag == "static-tag"
+    np.testing.assert_allclose(result.acc.numpy(), 3 * x)
 
 
 def test_zero_iterations_returns_init_unchanged(run_graph, as_numpy):

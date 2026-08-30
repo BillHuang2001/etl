@@ -293,11 +293,14 @@ Graph save/load round-trips through the persist container.
   Registered-node support in `control_flow.py` (generic — it NEVER imports
   the registering module, e.g. `etl.sparse`; `_is_registered_node` /
   `_leaf_registered_flags` walk the registry only):
-  (a) **cond registered-node rule** — a registered-node operand is flattened
-  via `_flatten`; its tensor leaves are captured as `if`-op operands (bound
-  to region entry args) and rebuilt per the node's tree inside `_run_branch`,
-  its static leaves pass through unchanged; every operand leaf must be a
-  `SymbolicTensor` or a static value (else `TraceError`). Branch outputs may
+  (a) **cond pytree-operand rule** — a pytree CONTAINER operand (a
+  registered node — e.g. a sparse tensor — OR a plain container:
+  tuple/namedtuple/list/dict/plain user dataclass) is flattened via
+  `_flatten`; its tensor leaves are captured as `if`-op operands (bound
+  to region entry args) and rebuilt per the container's tree inside
+  `_run_branch`, its static leaves pass through unchanged; every operand
+  leaf must be a `SymbolicTensor` or a static value (else `TraceError`).
+  Branch outputs may
   carry static leaves ONLY inside registered nodes; such leaves must be
   equal across branches (mirroring `while_loop`'s static-leaf semantics) —
   bare static output leaves (top-level or in plain containers) still raise

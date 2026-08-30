@@ -173,6 +173,19 @@ def _is_registered_node(obj: Any) -> bool:
     return _registered_pytree_base(type(obj)) is not None
 
 
+def _is_flattenable_operand(obj: Any) -> bool:
+    """True iff `obj` is a pytree CONTAINER operand — a registered pytree
+    node (e.g. a symbolic sparse tensor) or a plain container
+    (tuple/namedtuple/list/dict/plain user dataclass) — i.e. `_flatten`
+    expands it into leaves. Leaves (`SymbolicTensor`, static Python values,
+    concrete `Tensor`s, ir structures) return False; the callers handle
+    those separately. Mirrors `_flatten_tree`'s container conventions, so
+    any operand `core.flatten`/the tracer accept is accepted here too."""
+    if isinstance(obj, _LEAF_TYPES) or _is_static_value(obj):
+        return False
+    return len(_flatten(obj)[1].children) > 0
+
+
 def _to_symbolic(value: "ir.Value") -> "core.SymbolicTensor":
     """Wrap an `ir.Value` (op result or region block arg) as a SymbolicTensor."""
     return core.SymbolicTensor(
@@ -319,10 +332,11 @@ def _run_branch(
     The region's entry args bind to ALL if operands (predicate at index 0 —
     the v1 verify convention); the branch callable receives the
     captured-operand entry args (wrapped as SymbolicTensor) at the symbolic
-    positions, with static operands passed unchanged. A REGISTERED pytree
-    node operand (e.g. a symbolic sparse tensor) is flattened via `_flatten`:
-    its tensor leaves are captured as if-operands (each bound to one entry
-    arg) and rebuilt per the node's tree, its static leaves passed through
+    positions, with static operands passed unchanged. A pytree CONTAINER
+    operand (a registered node — e.g. a symbolic sparse tensor — or a plain
+    tuple/namedtuple/dict/dataclass) is flattened via `_flatten`: its tensor
+    leaves are captured as if-operands (each bound to one entry arg) and
+    rebuilt per the container's tree, its static leaves passed through
     unchanged.
 
     Output leaves must be `SymbolicTensor`s; a static leaf is allowed only
@@ -338,7 +352,7 @@ def _run_branch(
     for operand in operands:
         if isinstance(operand, core.SymbolicTensor):
             call_args.append(_to_symbolic(next(arg_iter)))
-        elif _is_registered_node(operand):
+        elif _is_flattenable_operand(operand):
             op_leaves, op_tree = _flatten(operand)
             rebuilt = []
             for leaf in op_leaves:
@@ -385,12 +399,14 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
     2. `static_kwargs` must be static Python values (else `core.TraceError`);
        they specialize the regions and are passed to both branches as kwargs.
        `*operands` may be `SymbolicTensor`s (captured SSA values), static
-       values (specialization), or REGISTERED pytree nodes (e.g. a symbolic
-       sparse tensor): the node is flattened via `_flatten`, its tensor
-       leaves are captured as if-operands, its static leaves are passed
-       through unchanged; every leaf must be a `SymbolicTensor` or a static
-       value (else `core.TraceError`). Operands are passed positionally to
-       both branches.
+       values (specialization), or pytree CONTAINERS — REGISTERED pytree
+       nodes (e.g. a symbolic sparse tensor) AND plain containers
+       (tuple/namedtuple/list/dict/plain user dataclass): the container is
+       flattened via `_flatten`, its tensor leaves are captured as
+       if-operands, its static leaves are passed through unchanged; every
+       leaf must be a `SymbolicTensor` or a static value (else
+       `core.TraceError`). Operands are passed positionally to both
+       branches.
     3. Build the `if` op via `ir.opdef("if")` with two regions per the
        conventions above. Run `true_fn(*operands, **static_kwargs)` inside
        the then-region under `with_builder(...)`, `false_fn` likewise in the
@@ -425,8 +441,9 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
     for i, operand in enumerate(operands):
         if isinstance(operand, core.SymbolicTensor) or _is_static_value(operand):
             continue
-        if _is_registered_node(operand):
-            # Registered pytree node (e.g. a sparse tensor): flatten it; the
+        if _is_flattenable_operand(operand):
+            # Pytree container (registered node — e.g. a sparse tensor — or
+            # a plain tuple/namedtuple/dict/dataclass): flatten it; the
             # tensor leaves are captured, the static leaves pass through.
             op_leaves, _ = _flatten(operand)
             for j, leaf in enumerate(op_leaves):
@@ -434,7 +451,7 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
                     leaf
                 ):
                     raise core.TraceError(
-                        f"etl.cond: operand {i} (a registered pytree node) "
+                        f"etl.cond: operand {i} (a pytree node) "
                         f"leaf {j} must be a core.SymbolicTensor or a static "
                         f"Python value, got {type(leaf).__name__}"
                     )
@@ -449,7 +466,7 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
     for operand in operands:
         if isinstance(operand, core.SymbolicTensor):
             if_values.append(operand.value)
-        elif _is_registered_node(operand):
+        elif _is_flattenable_operand(operand):
             op_leaves, _ = _flatten(operand)
             if_values.extend(
                 leaf.value

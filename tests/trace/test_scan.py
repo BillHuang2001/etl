@@ -8,6 +8,8 @@ lengths are reserved and raise `TraceError`. These tests pin the semantics,
 the desugared IR structure, and the error surface.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -158,6 +160,40 @@ def test_scan_structured_xs_and_init(run_graph, as_numpy):
     np.testing.assert_allclose(carry[0], np.sum(xa), rtol=0, atol=0)
     np.testing.assert_allclose(carry[1], 1.0 + np.sum(xb), rtol=0, atol=0)
     assert carry[2] == 7
+
+
+def test_scan_dataclass_xs_and_carry(run_graph):
+    """Plain user-defined dataclasses flow through scan as BOTH the xs and
+    the carry (first-class pytrees, like while_loop/cond)."""
+
+    @dataclasses.dataclass
+    class Pair:
+        a: object
+        b: object
+
+    def step(carry, x):
+        return Pair(etl.add(carry.a, x.a), etl.add(carry.b, x.b)), x
+
+    def f(xs_a, xs_b):
+        init = Pair(
+            etl.constant(etl.tensor(0.0, dtype=etl.float32)),
+            etl.constant(etl.tensor(0.0, dtype=etl.float32)),
+        )
+        final, stacked = etl.scan(step, init, Pair(xs_a, xs_b))
+        return final.a, stacked.a, stacked.b
+
+    xa = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    xb = np.array([10.0, 20.0, 30.0], dtype=np.float32)
+    graph = etl.trace(
+        f,
+        etl.TensorSpec((3,), etl.float32),
+        etl.TensorSpec((3,), etl.float32),
+    )
+    final_a, stacked_a, stacked_b = run_graph(graph, xa, xb)
+    np.testing.assert_allclose(final_a.numpy(), 6.0, rtol=0, atol=0)
+    # The step yields x unchanged: the stacked outputs are the raw steps.
+    np.testing.assert_allclose(stacked_a.numpy(), xa, rtol=0, atol=0)
+    np.testing.assert_allclose(stacked_b.numpy(), xb, rtol=0, atol=0)
 
 
 # --- IR structure -------------------------------------------------------------

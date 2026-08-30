@@ -133,6 +133,14 @@ def _register_random() -> None:
             effect=EFFECT_PURE,
             attributes=(
                 AttrSpec(
+                    name="n",
+                    type=ATTR_INT,
+                    default=None,
+                    description="Static population size when n was a Python "
+                    "int at trace time (None when n is a runtime rank-0 "
+                    "operand → runtime-dynamic result length).",
+                ),
+                AttrSpec(
                     name="dtype",
                     type=ATTR_DTYPE,
                     description="Output dtype (integer).",

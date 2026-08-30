@@ -11,6 +11,8 @@ checked on the numpy backend via the explicit staging pipeline (`run_graph`);
 IR layout is inspected on the traced module.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -100,6 +102,66 @@ def test_runtime_semantics_tuple_branches(run_graph, as_numpy):
     neg = as_numpy(run_graph(graph, np.array(-3.0, dtype=np.float32)))
     np.testing.assert_allclose(neg[0], 3.0)
     np.testing.assert_allclose(neg[1], -10.0)
+
+
+def test_dataclass_operand_and_output(run_graph):
+    """A plain user-defined dataclass is a first-class pytree operand AND
+    output for etl.cond: its tensor leaves are captured as if-operands
+    (bound to the region entry args), and the branches receive the rebuilt
+    dataclass with block-arg-backed tensors."""
+
+    @dataclasses.dataclass
+    class Pair:
+        a: object
+        b: object
+
+    def f(x):
+        pred = etl.greater(x, _const(0.0, etl.float32))
+        return etl.cond(
+            pred,
+            lambda p: Pair(etl.multiply(p.a, p.b), p.a),
+            lambda p: Pair(etl.negate(etl.add(p.a, p.b)), p.a),
+            Pair(x, x),
+        )
+
+    graph = etl.trace(f, etl.TensorSpec((), etl.float32))
+
+    pos = run_graph(graph, np.array(3.0, dtype=np.float32))
+    assert isinstance(pos, Pair)
+    np.testing.assert_allclose(pos.a.numpy(), 9.0)
+    np.testing.assert_allclose(pos.b.numpy(), 3.0)
+
+    neg = run_graph(graph, np.array(-3.0, dtype=np.float32))
+    assert isinstance(neg, Pair)
+    np.testing.assert_allclose(neg.a.numpy(), 6.0)
+    np.testing.assert_allclose(neg.b.numpy(), -3.0)
+
+
+def test_dataclass_operand_ir_structure():
+    """A dataclass operand's TENSOR leaves are captured as if-operands (one
+    entry arg each); static leaves are NOT captured."""
+
+    @dataclasses.dataclass
+    class Wrapped:
+        tensor: object
+        scale: int
+
+    def f(x):
+        pred = etl.greater(x, _const(0.0, etl.float32))
+        return etl.cond(
+            pred,
+            lambda w: etl.multiply(w.tensor, _const(float(w.scale), etl.float32)),
+            lambda w: etl.negate(w.tensor),
+            Wrapped(x, 2),
+        )
+
+    graph = etl.trace(f, etl.TensorSpec((), etl.float32))
+    function = graph.module.main
+    if_op = [op for op in _all_ops(function) if op.name == "if"][0]
+    # pred + ONE tensor leaf (the static `scale` leaf is not captured).
+    assert len(if_op.operands) == 2
+    for region in if_op.regions:
+        assert len(region.entry.arguments) == len(if_op.operands)
 
 
 # ---------------------------------------------------------------------------

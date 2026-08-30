@@ -318,6 +318,9 @@ def permutation(key, n, dtype=core.int32):
     Graph op. ``n`` may be a static Python int (>= 0) or a SYMBOLIC rank-0
     integer tensor scalar (the result length is then runtime-dynamic). The
     result is a 1-D tensor whose values are exactly ``0..n-1`` shuffled.
+    A static Python int traces to a STATIC ``(n,)`` result shape (so
+    ``etl.cond``/``etl.while_loop`` branch unification works for
+    static-size populations); a symbolic rank-0 ``n`` traces to ``(None,)``.
     ``dtype``: integer (default int32). Deterministic.
     """
     builder = _utils.check_in_trace()
@@ -340,10 +343,16 @@ def permutation(key, n, dtype=core.int32):
             f"random.permutation: n must be a Python int or a rank-0 "
             f"integer SymbolicTensor, got {type(n).__name__}"
         )
+    attributes = {"dtype": out_dtype}
+    if type(n) is int:
+        # Record the static population size so the traced result shape is
+        # (n,) — keeps cond/while branch unification working for static-size
+        # populations. A symbolic n keeps the shape runtime-dynamic (None,).
+        attributes["n"] = n
     op = builder.create(
         "random_permutation",
         operands=(key_t.value, n_t.value),
-        attributes={"dtype": out_dtype},
+        attributes=attributes,
         location=loc,
     )
     return _wrap(op, loc)

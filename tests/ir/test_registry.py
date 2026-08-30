@@ -289,6 +289,7 @@ _ATTR_DEFAULT_EXPECTED = [
     ("conv", "batch_group_count", 1),
     ("block_call", "static_args", ()),
     ("all_gather", "group_size", None),
+    ("random_permutation", "n", None),
 ]
 
 #: (name, operand_count, expected) — ``OpDef.check_arity`` behavior.
