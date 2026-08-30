@@ -325,7 +325,8 @@ class Writer:
     def _emit_special(self, op: Op) -> str:
         """Dispatch ops that need dedicated multi-op emitters (see
         ``mapping.SPECIAL_EMITTERS``): gather/scatter/sort/argsort/argmax/
-        argmin/tile and the SplitMix64 random expansions."""
+        argmin/tile, the ``eigh`` Jacobi composition, the ``diag``
+        compositions, and the SplitMix64 random expansions."""
         family = mapping.SPECIAL_EMITTERS[op.name]
         if family == "gather":
             return self._emit_gather(op)
@@ -339,6 +340,10 @@ class Writer:
             return self._emit_arg_reduce(op)
         if family == "tile":
             return self._emit_tile(op)
+        if family == "eigh":
+            return self._emit_eigh(op)
+        if family == "diag":
+            return self._emit_diag(op)
         if family == "random":
             return random_export.emit_random_op(self, op)
         raise self._unsupported(op)
@@ -1675,7 +1680,7 @@ class Writer:
                 f"{self._type_str(np.dtype('int8'), x_shape)}"
             )
             key_name, keys_dtype = t, np.dtype("int8")
-        si = self._emit_stable_argsort(key_name, keys_dtype, x_shape, axis, lines)
+        sv, si = self._emit_stable_argsort(key_name, keys_dtype, x_shape, axis, lines)
         cur = si
         if descending:
             t = self._new_name()
@@ -1690,11 +1695,12 @@ class Writer:
         return "\n".join(lines)
 
     def _emit_stable_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
-                             axis: int, lines: list) -> str:
+                             axis: int, lines: list) -> tuple[str, str]:
         """Pair-sort (keys, iota) ascending with the stable tie-break
         comparator (iota order on equal keys — numpy stable semantics);
-        returns the iota-column name (int64, ``keys_shape``). Shared by the
-        ``argsort`` op and the permutation expansion."""
+        returns the sorted-keys column name AND the iota-column name (both
+        ``keys_shape``; the iota column is int64). Shared by the ``argsort``
+        op, the permutation expansion, and the ``eigh`` eigenvalue sort."""
         key_elem = self._elem_type(keys_dtype)
         i64_type = self._type_str(np.dtype("int64"), keys_shape)
         iota = self._emit_iota(keys_shape, axis, lines)
@@ -1725,7 +1731,526 @@ class Writer:
             f"{{dimension = {axis} : i64}} : ({key_type}, {i64_type}) -> "
             f"({key_type}, {i64_type})"
         )
-        return si
+        return sv, si
+
+    # --- eigh (unrolled cyclic-Jacobi) ---
+
+    #: Number of cyclic-Jacobi sweeps for the ``eigh`` composition. Each
+    #: sweep zeroes every off-diagonal (p, q) once; the off-diagonal norm
+    #: converges quadratically. Measured on the numpy spike (10x10 fp32):
+    #: sweep 4 → 1.1e-5, sweep 6 → 3.7e-7 (fp32 floor). 8 gives margin for
+    #: compiler-reordered fp32 arithmetic and small batch variance; the
+    #: sweep loop is unrolled in the emitted MLIR (no while-loops — iree
+    #: cuda HAL crashes on while-loops with certain shapes, see the bench
+    #: Known Issues).
+    _EIGH_SWEEPS = 8
+
+    def _emit_eigh(self, op: Op) -> str:
+        """``eigh`` → unrolled cyclic-Jacobi symmetric eigensolver.
+
+        StableHLO 1.0 removed ``stablehlo.eigh``/``qr``/``svd`` (iree 3.11
+        ships only ``cholesky`` of the factorizations), so the symmetric
+        eigendecomposition is composed from v1 ops: 8 sweeps of the cyclic
+        (p, q) rotation pairs — each zeroing the (p, q) off-diagonal with
+        the textbook rotation ``J = [[c, s], [-s, c]]`` via
+        ``B = A·J`` (column updates), ``A' = J^T·B`` (row updates),
+        ``V = V·J`` (column updates; V starts as the identity) — then a
+        stable pair-sort of the final diagonal for the ASCENDING
+        eigenvalue order (numpy ``linalg.eigh`` contract) and a column
+        reorder of V by the sorted permutation. Every rotation is applied
+        with full-matrix selects (mask = ``iota == index``), never scatter
+        regions.
+
+        Dtype rule mirrors the numpy kernel: int/bool → float64 (converted
+        first); float32/float64 pass through; complex and float16 defer
+        with an explicit BackendError (complex beyond cast is not in v1;
+        f16 has no defined parity). Dynamic dims → explicit BackendError.
+
+        Parity note: LAPACK-based numpy vs the Jacobi composition agree to
+        fp32 tolerance, NOT bit-exact. Jacobi converges off-diagonals to
+        the fp32 floor (measured ~4e-7 for 10x10 in 8 sweeps), eigenvalue
+        ordering among (near-)degenerate values is fixed by the sort, and
+        the eigenvectors of degenerate eigenspaces are basis-dependent —
+        tests compare reconstruction ``A ≈ v diag(w) v^T`` and column
+        orthogonality, never elementwise v.
+        """
+        x = op.operands[0]
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        rank = len(x_shape)
+        if rank < 2:
+            raise BackendError(
+                f"stablehlo export: op 'eigh'{self._loc(op)} requires "
+                f"rank >= 2, got rank {rank}"
+            )
+        n = x_shape[-1]
+        if x_shape[-2] != n:
+            raise BackendError(
+                f"stablehlo export: op 'eigh'{self._loc(op)} requires a "
+                f"square matrix, got {x_shape[-2]} vs {n}"
+            )
+        in_dtype = np.dtype(x.type.dtype)
+        if in_dtype.kind == "c":
+            raise BackendError(
+                f"stablehlo export: op 'eigh'{self._loc(op)} over complex "
+                "dtype is not supported in v1 — complex-number computation "
+                "beyond cast is deferred"
+            )
+        if in_dtype.kind in "biu":
+            dtype = np.dtype("float64")
+        elif in_dtype in (np.dtype("float32"), np.dtype("float64")):
+            dtype = in_dtype
+        else:
+            raise BackendError(
+                f"stablehlo export: op 'eigh'{self._loc(op)} over dtype "
+                f"{in_dtype!r} is not supported in v1 (float32/float64 "
+                "inputs; int/bool upcast to float64)"
+            )
+        batch = x_shape[:-2]
+        lines = []
+        # int/bool → float64 (numpy linalg upcast rule).
+        a = self._name(x)
+        if dtype != in_dtype:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {a} : "
+                f"({self._type_str(in_dtype, x_shape)}) -> "
+                f"{self._type_str(dtype, x_shape)}"
+            )
+            a = t
+        # Hoisted index masks: iota along the matrix axes, compared against
+        # the (p, q) constants per rotation (shape-independent of the sweep
+        # state, so emitted once).
+        iota_row = self._emit_iota(x_shape, rank - 2, lines)
+        iota_col = self._emit_iota(x_shape, rank - 1, lines)
+        # V starts as the identity (..., n, n).
+        eye = np.eye(n, dtype=dtype)
+        v = self._new_name()
+        lines.append(
+            f"{v} = stablehlo.constant {self._constant_text(eye)} : "
+            f"{self._type_str(dtype, (n, n))}"
+        )
+        if batch:
+            v = self._emit_broadcast_static(v, dtype, (n, n), x_shape, lines, op)
+        for _ in range(self._EIGH_SWEEPS):
+            for p in range(n):
+                for q in range(p + 1, n):
+                    a, v = self._emit_jacobi_rotation(
+                        a, v, p, q, n, batch, dtype, x_shape,
+                        iota_row, iota_col, lines, op,
+                    )
+        # The diagonal now holds the (unsorted) eigenvalues.
+        w = self._emit_diagonal_extract(a, dtype, x_shape, n, lines)
+        # Ascending order + the permutation, then the V column reorder.
+        w_shape = batch + (n,)
+        sv, si = self._emit_stable_argsort(w, dtype, w_shape, len(w_shape) - 1, lines)
+        vs = self._emit_reorder_columns(v, si, dtype, x_shape, n, lines)
+        self._names[id(op.results[0])] = sv
+        self._names[id(op.results[1])] = vs
+        return "\n".join(lines)
+
+    def _emit_jacobi_rotation(self, a_name, v_name, p, q, n, batch, dtype,
+                              x_shape, iota_row, iota_col, lines, op):
+        """One cyclic-Jacobi rotation zeroing ``A[p, q]`` (``p < q``) with
+        ``J = [[c, s], [-s, c]]``: ``B = A·J`` (column updates),
+        ``A' = J^T·B`` (row updates), ``V = V·J`` (column updates). Each
+        updated column/row is applied with a full-matrix select against the
+        hoisted iota masks. Per-batch-element scalars ``c``/``s`` come from
+        the textbook formulas ``tau = (a_qq - a_pp)/(2 a_pq)``,
+        ``t = sign(tau)/(|tau| + sqrt(1 + tau^2))`` (``sign(0) = +1`` —
+        the equal-diagonal case needs the 45° rotation, not no-op),
+        ``c = 1/sqrt(1 + t^2)``, ``s = t c``, guarded by ``a_pq == 0``
+        (``c = 1, s = 0``; also shields the ``0/0 -> NaN`` degenerate case
+        — the guard select happens AFTER the formulas, so the NaN is never
+        propagated). Returns ``(new_a, new_v)`` SSA names."""
+        i64 = np.dtype("int64")
+        rank = len(x_shape)
+        # --- per-batch-element scalars: apq, app, aqq ---------------------
+        apq = self._slice_matrix_scalar(a_name, p, q, batch, dtype, x_shape, lines)
+        app = self._slice_matrix_scalar(a_name, p, p, batch, dtype, x_shape, lines)
+        aqq = self._slice_matrix_scalar(a_name, q, q, batch, dtype, x_shape, lines)
+        # --- c, s from the textbook formulas ------------------------------
+        two, extra = self._scalar_constant_for(dtype, 2.0, batch)
+        lines.extend(extra)
+        one, extra = self._scalar_constant_for(dtype, 1.0, batch)
+        lines.extend(extra)
+        neg_one, extra = self._scalar_constant_for(dtype, -1.0, batch)
+        lines.extend(extra)
+        zero, extra = self._scalar_constant_for(dtype, 0.0, batch)
+        lines.extend(extra)
+        t1 = self._ew("subtract", aqq, app, dtype, batch, lines)
+        t2 = self._ew("multiply", two, apq, dtype, batch, lines)
+        tau = self._ew("divide", t1, t2, dtype, batch, lines)
+        tau2 = self._ew("multiply", tau, tau, dtype, batch, lines)
+        oneptau2 = self._ew("add", one, tau2, dtype, batch, lines)
+        sq = self._ew("sqrt", oneptau2, None, dtype, batch, lines)
+        abst = self._ew("abs", tau, None, dtype, batch, lines)
+        denom = self._ew("add", abst, sq, dtype, batch, lines)
+        ge0 = self._cmp(tau, zero, "GE", dtype, batch, lines)
+        sgn = self._sel(ge0, one, neg_one, dtype, batch, lines)
+        t = self._ew("divide", sgn, denom, dtype, batch, lines)
+        t2 = self._ew("multiply", t, t, dtype, batch, lines)
+        onept2 = self._ew("add", one, t2, dtype, batch, lines)
+        sqt = self._ew("sqrt", onept2, None, dtype, batch, lines)
+        c_calc = self._ew("divide", one, sqt, dtype, batch, lines)
+        s_calc = self._ew("multiply", t, c_calc, dtype, batch, lines)
+        apq_ne0 = self._cmp(apq, zero, "NE", dtype, batch, lines)
+        c = self._sel(apq_ne0, c_calc, one, dtype, batch, lines)
+        s = self._sel(apq_ne0, s_calc, zero, dtype, batch, lines)
+        # Broadcasts with EXPLICIT dimension mappings (numpy trailing
+        # alignment does not apply here — the batch dims stay leading):
+        #   c/s (batch,) → (batch..., n):     batch dims → leading dims
+        #   column vec (..., n) → (..., n, n): n dim → ROW dim (rank-2)
+        #   row vec (..., n) → (..., n, n):   n dim → COLUMN dim (rank-1)
+        c_b = self._bcast(c, dtype, batch, batch + (n,), list(range(len(batch))), lines)
+        s_b = self._bcast(s, dtype, batch, batch + (n,), list(range(len(batch))), lines)
+        col_dims = list(range(rank - 1))
+        row_dims = list(range(rank - 2)) + [rank - 1]
+        # --- rotation masks (iota vs the pair constants) -------------------
+        p_const, extra = self._scalar_constant_for(i64, p, x_shape)
+        lines.extend(extra)
+        q_const, extra = self._scalar_constant_for(i64, q, x_shape)
+        lines.extend(extra)
+        row_p = self._cmp(iota_row, p_const, "EQ", i64, x_shape, lines)
+        row_q = self._cmp(iota_row, q_const, "EQ", i64, x_shape, lines)
+        col_p = self._cmp(iota_col, p_const, "EQ", i64, x_shape, lines)
+        col_q = self._cmp(iota_col, q_const, "EQ", i64, x_shape, lines)
+        # --- B = A·J: column updates ---------------------------------------
+        acp = self._slice_matrix_vec(a_name, "col", p, batch, dtype, x_shape, lines)
+        acq = self._slice_matrix_vec(a_name, "col", q, batch, dtype, x_shape, lines)
+        ncp = self._ew("subtract", self._ew("multiply", c_b, acp, dtype, batch + (n,), lines),
+                       self._ew("multiply", s_b, acq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        ncq = self._ew("add", self._ew("multiply", s_b, acp, dtype, batch + (n,), lines),
+                       self._ew("multiply", c_b, acq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        b = self._sel(col_p, self._bcast(ncp, dtype, batch + (n,), x_shape, col_dims, lines), a_name, dtype, x_shape, lines)
+        b = self._sel(col_q, self._bcast(ncq, dtype, batch + (n,), x_shape, col_dims, lines), b, dtype, x_shape, lines)
+        # --- A' = J^T·B: row updates (slices from the updated B) ------------
+        brp = self._slice_matrix_vec(b, "row", p, batch, dtype, x_shape, lines)
+        brq = self._slice_matrix_vec(b, "row", q, batch, dtype, x_shape, lines)
+        nrp = self._ew("subtract", self._ew("multiply", c_b, brp, dtype, batch + (n,), lines),
+                       self._ew("multiply", s_b, brq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        nrq = self._ew("add", self._ew("multiply", s_b, brp, dtype, batch + (n,), lines),
+                       self._ew("multiply", c_b, brq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        a2 = self._sel(row_p, self._bcast(nrp, dtype, batch + (n,), x_shape, row_dims, lines), b, dtype, x_shape, lines)
+        a2 = self._sel(row_q, self._bcast(nrq, dtype, batch + (n,), x_shape, row_dims, lines), a2, dtype, x_shape, lines)
+        # --- V = V·J: column updates ----------------------------------------
+        vcp = self._slice_matrix_vec(v_name, "col", p, batch, dtype, x_shape, lines)
+        vcq = self._slice_matrix_vec(v_name, "col", q, batch, dtype, x_shape, lines)
+        nvp = self._ew("subtract", self._ew("multiply", c_b, vcp, dtype, batch + (n,), lines),
+                       self._ew("multiply", s_b, vcq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        nvq = self._ew("add", self._ew("multiply", s_b, vcp, dtype, batch + (n,), lines),
+                       self._ew("multiply", c_b, vcq, dtype, batch + (n,), lines),
+                       dtype, batch + (n,), lines)
+        v2 = self._sel(col_p, self._bcast(nvp, dtype, batch + (n,), x_shape, col_dims, lines), v_name, dtype, x_shape, lines)
+        v2 = self._sel(col_q, self._bcast(nvq, dtype, batch + (n,), x_shape, col_dims, lines), v2, dtype, x_shape, lines)
+        return a2, v2
+
+    def _bcast(self, name, dtype, src_shape, target_shape, dims, lines) -> str:
+        """``stablehlo.broadcast_in_dim`` with an explicit dimension mapping
+        (the numpy-trailing-alignment helper ``_emit_broadcast_static`` does
+        NOT apply to the Jacobi updates, whose batch dims stay leading)."""
+        b = self._new_name()
+        lines.append(
+            f'{b} = "stablehlo.broadcast_in_dim"({name}) '
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(dtype, src_shape)}) -> "
+            f"{self._type_str(dtype, target_shape)}"
+        )
+        return b
+
+    def _ew(self, mnemonic, a, b, dtype, shape, lines) -> str:
+        """Elementwise op line on ``shape`` (unary when ``b is None``)."""
+        name = self._new_name()
+        if b is None:
+            lines.append(f"{name} = stablehlo.{mnemonic} {a} : {self._type_str(dtype, shape)}")
+        else:
+            lines.append(f"{name} = stablehlo.{mnemonic} {a}, {b} : {self._type_str(dtype, shape)}")
+        return name
+
+    def _cmp(self, a, b, direction, dtype, shape, lines) -> str:
+        """``stablehlo.compare`` with an explicit direction; result i1."""
+        name = self._new_name()
+        lines.append(
+            f'{name} = "stablehlo.compare"({a}, {b}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
+            f" : ({self._type_str(dtype, shape)}, "
+            f"{self._type_str(dtype, shape)}) -> "
+            f"{self._type_str(np.dtype('bool'), shape)}"
+        )
+        return name
+
+    def _sel(self, pred, on_true, on_false, dtype, shape, lines) -> str:
+        """``stablehlo.select`` on ``shape`` (pred is the i1 mask)."""
+        name = self._new_name()
+        lines.append(
+            f"{name} = stablehlo.select {pred}, {on_true}, {on_false} : "
+            f"({self._type_str(np.dtype('bool'), shape)}, "
+            f"{self._type_str(dtype, shape)}, "
+            f"{self._type_str(dtype, shape)}) -> {self._type_str(dtype, shape)}"
+        )
+        return name
+
+    def _slice_matrix_scalar(self, src, i, j, batch, dtype, x_shape, lines) -> str:
+        """``A[..., i, j]`` (batch...,) — slice of the matrix axes + reshape."""
+        rank = len(x_shape)
+        s = self._new_name()
+        r = self._new_name()
+        lines.append(
+            f'{s} = "stablehlo.slice"({src}) '
+            f"{{start_indices = {self._i64_array([0] * len(batch) + [i, j])}, "
+            f"limit_indices = {self._i64_array(batch + (i + 1, j + 1))}, "
+            f"strides = {self._i64_array([1] * rank)}}} : "
+            f"({self._type_str(dtype, x_shape)}) -> "
+            f"{self._type_str(dtype, batch + (1, 1))}"
+        )
+        lines.append(
+            f"{r} = stablehlo.reshape {s} : "
+            f"({self._type_str(dtype, batch + (1, 1))}) -> "
+            f"{self._type_str(dtype, batch)}"
+        )
+        return r
+
+    def _slice_matrix_vec(self, src, which, idx, batch, dtype, x_shape, lines) -> str:
+        """``A[..., idx, :]`` (``which="row"``) or ``A[..., :, idx]``
+        (``which="col"``) → (batch..., n) — slice + reshape."""
+        rank = len(x_shape)
+        n = x_shape[-1]
+        s = self._new_name()
+        r = self._new_name()
+        if which == "row":
+            starts = [0] * len(batch) + [idx, 0]
+            limits = batch + (idx + 1, n)
+            inter = batch + (1, n)
+        else:
+            starts = [0] * len(batch) + [0, idx]
+            limits = batch + (n, idx + 1)
+            inter = batch + (n, 1)
+        lines.append(
+            f'{s} = "stablehlo.slice"({src}) '
+            f"{{start_indices = {self._i64_array(starts)}, "
+            f"limit_indices = {self._i64_array(limits)}, "
+            f"strides = {self._i64_array([1] * rank)}}} : "
+            f"({self._type_str(dtype, x_shape)}) -> {self._type_str(dtype, inter)}"
+        )
+        lines.append(
+            f"{r} = stablehlo.reshape {s} : "
+            f"({self._type_str(dtype, inter)}) -> "
+            f"{self._type_str(dtype, batch + (n,))}"
+        )
+        return r
+
+    def _emit_diagonal_extract(self, a_name, dtype, x_shape, n, lines) -> str:
+        """Main diagonal of a square matrix (batch..., n, n) → (batch..., n):
+        transpose so the matrix dims are at the front, a 2-index gather with
+        the constant indices ``[[0,0],[1,1],...]`` (all slice dims
+        collapsed; batch dims come back as offset dims), then transpose the
+        batch dims to the front again. For rank 2 the two transposes are
+        the identity and are skipped."""
+        rank = len(x_shape)
+        batch = x_shape[:-2]
+        i64 = np.dtype("int64")
+        idx2 = np.stack([np.arange(n, dtype=np.int64)] * 2, axis=1)
+        iname = self._new_name()
+        lines.append(
+            f"{iname} = stablehlo.constant {self._constant_text(idx2)} : "
+            f"{self._type_str(i64, (n, 2))}"
+        )
+        if rank == 2:
+            src, src_shape = a_name, x_shape
+            offset_dims: list = []
+        else:
+            src = self._new_name()
+            src_shape = (n, n) + batch
+            perm = [rank - 2, rank - 1] + list(range(rank - 2))
+            lines.append(
+                f'{src} = "stablehlo.transpose"({a_name}) '
+                f"{{permutation = {self._i64_array(perm)}}} : "
+                f"({self._type_str(dtype, x_shape)}) -> "
+                f"{self._type_str(dtype, src_shape)}"
+            )
+            # The gather result is (index batch dims ++ offset dims): the
+            # single index batch dim (the matrix index) occupies result
+            # position 0, so the operand's batch offset dims land at result
+            # positions 1..rank-2.
+            offset_dims = list(range(1, rank - 1))
+        g = self._new_name()
+        lines.append(
+            f'{g} = "stablehlo.gather"({src}, {iname}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = "
+            f"[{self._int_list(offset_dims)}], collapsed_slice_dims = [0, 1], "
+            f"start_index_map = [0, 1], index_vector_dim = 1>, "
+            f"slice_sizes = {self._i64_array([1, 1] + list(batch))}}} : "
+            f"({self._type_str(dtype, src_shape)}, {self._type_str(i64, (n, 2))})"
+            f" -> {self._type_str(dtype, (n,) + batch)}"
+        )
+        if rank == 2:
+            return g
+        out = self._new_name()
+        lines.append(
+            f'{out} = "stablehlo.transpose"({g}) '
+            f"{{permutation = {self._i64_array(list(range(1, rank - 1)) + [0])}}} : "
+            f"({self._type_str(dtype, (n,) + batch)}) -> "
+            f"{self._type_str(dtype, batch + (n,))}"
+        )
+        return out
+
+    def _emit_reorder_columns(self, v_name, perm_name, dtype, x_shape, n, lines) -> str:
+        """``V[..., perm, :]`` (numpy advanced indexing on the second-to-last
+        axis): the operand is transposed so the gathered axis is 0 and its
+        rows are the V columns (``(n, batch..., n)``), then gathered with
+        the ``(batch..., n)`` permutation indices (offset dim = the trailing
+        ``n``), and transposed back (the gather places the sorted column at
+        result row i; swapping the last two dims restores the column layout)
+        → ``(batch..., n, n)``."""
+        rank = len(x_shape)
+        batch = x_shape[:-2]
+        i64 = np.dtype("int64")
+        pshape = batch + (n,)
+        iv_shape = pshape + (1,)
+        iv = self._new_name()
+        lines.append(
+            f"{iv} = stablehlo.reshape {perm_name} : "
+            f"({self._type_str(i64, pshape)}) -> {self._type_str(i64, iv_shape)}"
+        )
+        if rank == 2:
+            src = self._new_name()
+            lines.append(
+                f'{src} = "stablehlo.transpose"({v_name}) '
+                f"{{permutation = {self._i64_array([1, 0])}}} : "
+                f"({self._type_str(dtype, x_shape)}) -> "
+                f"{self._type_str(dtype, x_shape)}"
+            )
+            g = self._new_name()
+            lines.append(
+                f'{g} = "stablehlo.gather"({src}, {iv}) '
+                f"{{dimension_numbers = #stablehlo.gather<offset_dims = [1], "
+                f"collapsed_slice_dims = [0], start_index_map = [0], "
+                f"index_vector_dim = 1>, "
+                f"slice_sizes = {self._i64_array([1, n])}}} : "
+                f"({self._type_str(dtype, x_shape)}, "
+                f"{self._type_str(i64, iv_shape)}) -> "
+                f"{self._type_str(dtype, x_shape)}"
+            )
+            out = self._new_name()
+            lines.append(
+                f'{out} = "stablehlo.transpose"({g}) '
+                f"{{permutation = {self._i64_array([1, 0])}}} : "
+                f"({self._type_str(dtype, x_shape)}) -> "
+                f"{self._type_str(dtype, x_shape)}"
+            )
+            return out
+        src = self._new_name()
+        src_shape = (n,) + batch + (n,)
+        perm = [rank - 1] + list(range(rank - 2)) + [rank - 2]
+        lines.append(
+            f'{src} = "stablehlo.transpose"({v_name}) '
+            f"{{permutation = {self._i64_array(perm)}}} : "
+            f"({self._type_str(dtype, x_shape)}) -> "
+            f"{self._type_str(dtype, src_shape)}"
+        )
+        g = self._new_name()
+        # Batched indices: the operand's batch dims (1..rank-2) pair with the
+        # index batch dims via operand_batching_dims / start_indices_batching_dims
+        # (iree 3.11 gather); the offset dim is the trailing n, the gathered
+        # axis is dim 0 (collapsed). Result = index batch dims + offset dims =
+        # (batch..., n, n) with the sorted column at result row i — the last
+        # transpose restores the column layout.
+        batching = list(range(1, rank - 1))
+        lines.append(
+            f'{g} = "stablehlo.gather"({src}, {iv}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = "
+            f"[{rank - 1}], collapsed_slice_dims = [0], "
+            f"operand_batching_dims = [{self._int_list(batching)}], "
+            f"start_indices_batching_dims = "
+            f"[{self._int_list(list(range(len(batch))))}], "
+            f"start_index_map = [0], index_vector_dim = {rank - 1}>, "
+            f"slice_sizes = {self._i64_array([1] + [1] * len(batch) + [n])}}} : "
+            f"({self._type_str(dtype, src_shape)}, "
+            f"{self._type_str(i64, iv_shape)}) -> "
+            f"{self._type_str(dtype, pshape + (n,))}"
+        )
+        out = self._new_name()
+        lines.append(
+            f'{out} = "stablehlo.transpose"({g}) '
+            f"{{permutation = "
+            f"{self._i64_array(list(range(rank - 2)) + [rank - 1, rank - 2])}}} : "
+            f"({self._type_str(dtype, pshape + (n,))}) -> "
+            f"{self._type_str(dtype, x_shape)}"
+        )
+        return out
+
+    def _emit_diag(self, op: Op) -> str:
+        """``diag`` → numpy ``diag`` semantics composed from v1 ops (no
+        StableHLO diag op exists): rank-1 ``(n,)`` → the ``(n, n)``
+        diagonal matrix via an iota-EQ mask + select over a broadcast of
+        the input (dtype preserved, incl. complex — the mask compares
+        iotas, never data); rank-2 ``(m, n)`` → the main diagonal
+        ``(min(m, n),)`` via a flatten reshape + a constant-index
+        single-axis gather (indices ``i*(n+1)``). Dynamic dims → explicit
+        BackendError (the constant index offsets need static shapes)."""
+        x = op.operands[0]
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        dtype = np.dtype(x.type.dtype)
+        lines = []
+        result_name = self._bind_results(op)[0]
+        if len(x_shape) == 1:
+            (n,) = x_shape
+            i0 = self._emit_iota((n, n), 0, lines)
+            i1 = self._emit_iota((n, n), 1, lines)
+            eq = self._cmp(i0, i1, "EQ", np.dtype("int64"), (n, n), lines)
+            xb = self._new_name()
+            lines.append(
+                f'{xb} = "stablehlo.broadcast_in_dim"({self._name(x)}) '
+                f"{{broadcast_dimensions = {self._i64_array([1])}}} : "
+                f"({self._type_str(dtype, (n,))}) -> "
+                f"{self._type_str(dtype, (n, n))}"
+            )
+            zero, extra = self._scalar_constant_for(dtype, 0, (n, n))
+            lines.extend(extra)
+            lines.append(
+                f"{result_name} = stablehlo.select {eq}, {xb}, {zero} : "
+                f"({self._type_str(np.dtype('bool'), (n, n))}, "
+                f"{self._type_str(dtype, (n, n))}, "
+                f"{self._type_str(dtype, (n, n))}) -> "
+                f"{self._type_str(dtype, (n, n))}"
+            )
+            return "\n".join(lines)
+        m, n = x_shape
+        k = min(m, n)
+        i64 = np.dtype("int64")
+        flat = self._new_name()
+        lines.append(
+            f"{flat} = stablehlo.reshape {self._name(x)} : "
+            f"({self._type_str(dtype, (m, n))}) -> "
+            f"{self._type_str(dtype, (m * n,))}"
+        )
+        idx = np.arange(k, dtype=np.int64) * (n + 1)
+        iname = self._new_name()
+        lines.append(
+            f"{iname} = stablehlo.constant {self._constant_text(idx)} : "
+            f"{self._type_str(i64, (k,))}"
+        )
+        iv = self._new_name()
+        lines.append(
+            f"{iv} = stablehlo.reshape {iname} : "
+            f"({self._type_str(i64, (k,))}) -> {self._type_str(i64, (k, 1))}"
+        )
+        lines.append(
+            f'{result_name} = "stablehlo.gather"({flat}, {iv}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = [], "
+            f"collapsed_slice_dims = [0], start_index_map = [0], "
+            f"index_vector_dim = 1>, "
+            f"slice_sizes = {self._i64_array([1])}}} : "
+            f"({self._type_str(dtype, (m * n,))}, "
+            f"{self._type_str(i64, (k, 1))}) -> {self._type_str(dtype, (k,))}"
+        )
+        return "\n".join(lines)
 
     def _emit_arg_reduce(self, op: Op) -> str:
         """``argmax``/``argmin`` → a two-operand ``stablehlo.reduce`` over

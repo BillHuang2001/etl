@@ -38,6 +38,17 @@ stablehlo/dialect/StablehloOps.td):
     two's-complement equivalence; NOT ``stablehlo.rng`` (implementation-
     defined algorithm would break the same-key⇒same-values determinism
     contract).
+  - ``eigh`` → an unrolled cyclic-Jacobi eigensolver (8 sweeps of the
+    (p, q) rotation pairs) built from v1 ops (slice/iota/compare/select/
+    elementwise) + a pair-sort for the ascending eigenvalue order and a
+    column reorder of the eigenvector matrix — StableHLO 1.0 removed
+    ``stablehlo.eigh``/``qr``/``svd`` (iree 3.11: only ``cholesky``
+    survives), so the LAPACK-based numpy kernel has no mnemonic
+    counterpart; parity is fp32-tolerance, NOT bit-exact (see the writer's
+    ``_emit_eigh`` docstring).
+  - ``diag`` → rank-2: flatten + constant-index gather (the main
+    diagonal); rank-1: iota-EQ mask + select (the diagonal matrix). No
+    StableHLO diag op exists.
 * NOT in StableHLO (moved to DEFERRED_OPS here):
   - ``erf`` — only ``chlo.erf`` exists (CHLO: "an intermediate value in
     decompositions, never constructed directly"), and there is no trivial
@@ -106,8 +117,10 @@ ELEMENTWISE_MAP: dict[str, str] = {
 # argmax/argmin/tile use multi-op StableHLO compositions; the random_* ops
 # are expanded as inline SplitMix64 i64 subgraphs in `./random_export.py` —
 # never `stablehlo.rng`, whose implementation-defined algorithm would break
-# the same-key⇒same-values determinism contract). The values are emitter
-# family keys; `status()` reports these as supported ("v1").
+# the same-key⇒same-values determinism contract; `eigh` is an unrolled
+# cyclic-Jacobi composition (see the module docstring); `diag` is a
+# flatten+gather / iota+select composition per direction). The values are
+# emitter family keys; `status()` reports these as supported ("v1").
 SPECIAL_EMITTERS: dict[str, str] = {
     "gather": "gather",
     "scatter": "scatter",
@@ -116,6 +129,8 @@ SPECIAL_EMITTERS: dict[str, str] = {
     "argmax": "arg_reduce",
     "argmin": "arg_reduce",
     "tile": "tile",
+    "eigh": "eigh",
+    "diag": "diag",
     "random_key_mix": "random",
     "random_uniform": "random",
     "random_normal": "random",
@@ -197,9 +212,10 @@ COLLECTIVE_MAP: dict[str, str] = {
 # writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
 # only); `diagonal` because its StableHLO emission is not wired in v1
 # (defer explicitly, never silently). The linalg factorizations
-# (`eigh`/`cholesky`/`qr`/`svd`) have StableHLO counterparts but are not
-# wired in v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff /
-# Padé) — all six defer explicitly. `random_multinomial` defers because its
+# (`cholesky`/`qr`/`svd`) have StableHLO counterparts but are not wired in
+# v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff / Padé) —
+# all five defer explicitly (`eigh` is v1 via the unrolled cyclic-Jacobi
+# composition in `_emit_eigh`). `random_multinomial` defers because its
 # cumulative-search decomposition is not wired in v1. The 16
 # `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
 # in v1 — densify via `etl.sparse.to_dense` to export.
@@ -212,7 +228,6 @@ DEFERRED_OPS: frozenset[str] = frozenset(
         "erf",
         "gelu",
         "diagonal",
-        "eigh",
         "cholesky",
         "qr",
         "matrix_rank",
