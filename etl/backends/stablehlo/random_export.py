@@ -9,14 +9,29 @@ the same-key ⇒ same-values determinism contract.
 
 Bit-identity argument: the kernels compute in uint64 with wrapping
 arithmetic. Two's-complement i64 xor/mul/add/and are bit-identical to the
-uint64 versions (mod-2^64 wrap is the same), and a LOGICAL right shift
-equals ``shift_right_arithmetic`` + ``and`` with a low-bits mask — so the
-i64 graph below produces exactly the numpy kernel's uint64 words. The
-f64 stages (uniform scaling, Box–Muller, randint floor-scaling) use the
-same IEEE ops (add/sub/mul/floor are exact per-op; sqrt/log/cos may differ
-in the last ulp across libm implementations — uniform/randint/permutation/
-key_mix are bit-identical by construction, normal is expected identical or
-within 1 ulp, reported separately).
+uint64 versions (mod-2^64 wrap is the same), and the uint64 LOGICAL right
+shift is emitted directly as ``stablehlo.shift_right_logical`` (bit-exact
+on the i64 bit pattern) — so the i64 graph below produces exactly the
+numpy kernel's uint64 words. The f64 stages (uniform scaling, Box–Muller
+for non-f32 outputs, randint floor-scaling) use the same IEEE ops as the
+kernels: uniform/randint/permutation/key_mix are bit-identical by
+construction, f64-output normal is identical or within 1 ulp (libm noise).
+
+``random_normal`` f32 fast path — DOCUMENTED v1 deviation (compiler
+backends only): for float32 outputs (the default dtype and the hot path —
+e.g. the new-evox DE crossover masks), the Box–Muller tail runs in
+float32: ``(word >> 11)`` converts i64→f32, the ``2^-53`` scaling and the
+``log``/``sqrt``/``cos`` are f32 ops. The numpy backend and the
+``etl.random`` Python API are UNCHANGED (they keep the float64 math).
+Same key + operands ⇒ still BIT-IDENTICAL values across compiler runs
+(the same-key determinism contract is the hard guarantee); the values
+differ from the numpy backend by ~1e-6 relative (f32 mantissa rounding of
+the 53-bit fraction + f32 transcendental ulps) instead of being
+bit-identical/1-ulp. Rationale: GPUs like the A6000 run f64
+transcendentals in software at ~1/64 the f32 SFU rate — the f64
+Box–Muller kernel was the dominant random cost (measured ≈ +0.75–1.24 ms
+device per (4096, 50) normal draw vs ≈ +0.05–0.15 ms for the f32 path).
+f64 and f16 outputs keep the exact f64 math.
 
 The writer calls ``emit_random_op(writer, op)``; all emission goes through
 the Writer's SSA/type helpers (this module is writer-private, not part of
@@ -35,11 +50,6 @@ _GOLDEN = 0x9E3779B97F4A7C15
 _B_MUL = 0xBF58476D1CE4E5B9
 _C_MUL = 0x94D049BB133111EB
 _SIGN_FLIP = 0x8000000000000000
-# Logical-shift masks: (1 << (64 - shift)) - 1 (all < 2^63 → positive i64).
-_MASK30 = 0x3FFFFFFFF  # 2^34 - 1 (shift 30)
-_MASK27 = 0x1FFFFFFFFF  # 2^37 - 1 (shift 27)
-_MASK31 = 0x1FFFFFFFF  # 2^33 - 1 (shift 31)
-_MASK11 = 0x1FFFFFFFFFFFFF  # 2^53 - 1
 _INV_2P53 = 1.0 / 2.0**53
 _TWO_PI = 2.0 * np.pi
 # Per-op stream salts (must match kernels/random.py `_SALTS` EXACTLY).
@@ -51,6 +61,7 @@ _SALTS = {
 }
 
 _I64 = np.dtype("int64")
+_F32 = np.dtype("float32")
 _F64 = np.dtype("float64")
 
 
@@ -93,24 +104,21 @@ def _emit_mix3(w, z_name, z_shape, lines) -> str:
     """The three SplitMix64 mixing steps over an i64 tensor ``z_name`` of
     static shape ``z_shape``; appends lines, returns the result name.
 
-    Each step ``z ^ ((z >> s) & mask)`` computes a LOGICAL right shift in
-    two's-complement (arithmetic shift + low-bits mask) — bit-identical to
-    the numpy kernel's uint64 ``>>``.
+    Each step ``z ^ (z >> s)`` emits ``stablehlo.shift_right_logical`` —
+    the uint64 logical right shift, bit-exact on the two's-complement i64
+    bit pattern (the former arithmetic-shift + low-bits-mask form computed
+    exactly the same bits; the direct op drops the mask constants).
     """
     for shift, mul in ((30, _B_MUL), (27, _C_MUL)):
         amt, extra = _i64(w, shift, z_shape)
         lines.extend(extra)
         s = w._new_name()
         lines.append(
-            f"{s} = stablehlo.shift_right_arithmetic {z_name}, {amt} : "
+            f"{s} = stablehlo.shift_right_logical {z_name}, {amt} : "
             f"{w._type_str(_I64, z_shape)}"
         )
-        mask, extra = _i64(w, {30: _MASK30, 27: _MASK27}[shift], z_shape)
-        lines.extend(extra)
-        m = w._new_name()
-        lines.append(f"{m} = stablehlo.and {s}, {mask} : {w._type_str(_I64, z_shape)}")
         x = w._new_name()
-        lines.append(f"{x} = stablehlo.xor {z_name}, {m} : {w._type_str(_I64, z_shape)}")
+        lines.append(f"{x} = stablehlo.xor {z_name}, {s} : {w._type_str(_I64, z_shape)}")
         c, extra = _i64(w, mul, z_shape)
         lines.extend(extra)
         z_name = w._new_name()
@@ -121,15 +129,11 @@ def _emit_mix3(w, z_name, z_shape, lines) -> str:
     lines.extend(extra)
     s = w._new_name()
     lines.append(
-        f"{s} = stablehlo.shift_right_arithmetic {z_name}, {amt} : "
+        f"{s} = stablehlo.shift_right_logical {z_name}, {amt} : "
         f"{w._type_str(_I64, z_shape)}"
     )
-    mask, extra = _i64(w, _MASK31, z_shape)
-    lines.extend(extra)
-    m = w._new_name()
-    lines.append(f"{m} = stablehlo.and {s}, {mask} : {w._type_str(_I64, z_shape)}")
     x = w._new_name()
-    lines.append(f"{x} = stablehlo.xor {z_name}, {m} : {w._type_str(_I64, z_shape)}")
+    lines.append(f"{x} = stablehlo.xor {z_name}, {s} : {w._type_str(_I64, z_shape)}")
     return x
 
 
@@ -167,6 +171,84 @@ def _emit_words(w, seed_name, count, lines) -> str:
     return _emit_mix3(w, states, (count,), lines)
 
 
+def _emit_word_pairs(w, seed_name, count, lines) -> tuple:
+    """The two SplitMix64 word chains behind one Box–Muller pair: chain A
+    element i = mix3(seed + (2i + 1) * GOLDEN), chain B element i =
+    mix3(seed + (2i + 2) * GOLDEN). These are exactly the even/odd words of
+    ``_emit_words(seed, 2 * count)`` (each element mixes its own derived
+    state — no sequential chain), so the VALUES are bit-identical to the
+    kernel's ``w[0::2]`` / ``w[1::2]``, while the emission stays pure
+    elementwise (no ``(2*count,)`` tensor + reshape + slice column
+    extraction — the whole normal expansion fuses into ONE dispatch).
+    Returns ``(chain_a, chain_b)`` names.
+    """
+    if count == 0:
+        z = w._new_name()
+        lines.append(f"{z} = stablehlo.constant dense<> : tensor<0xi64>")
+        return z, z
+    two_gold = (2 * _GOLDEN) % (1 << 64)  # mod 2^64 (matches uint64 wrap)
+    # prod = iota * 2G (shared by both chains).
+    iota = w._new_name()
+    lines.append(f"{iota} = stablehlo.iota dim = 0 : tensor<{count}xi64>")
+    gold2, extra = _i64(w, two_gold, (count,))
+    lines.extend(extra)
+    prod = w._new_name()
+    lines.append(
+        f"{prod} = stablehlo.multiply {iota}, {gold2} : tensor<{count}xi64>"
+    )
+    # base_a = seed + G, base_b = seed + 2G (scalar adds, mod-2^64 wrap).
+    g, extra = _i64(w, _GOLDEN, ())
+    lines.extend(extra)
+    base_a = w._new_name()
+    lines.append(f"{base_a} = stablehlo.add {seed_name}, {g} : tensor<i64>")
+    g2, extra = _i64(w, two_gold, ())
+    lines.extend(extra)
+    base_b = w._new_name()
+    lines.append(f"{base_b} = stablehlo.add {seed_name}, {g2} : tensor<i64>")
+    out = []
+    for base in (base_a, base_b):
+        b = w._new_name()
+        lines.append(
+            f'{b} = "stablehlo.broadcast_in_dim"({base}) '
+            f"{{broadcast_dimensions = {w._i64_array(())}}} : "
+            f"(tensor<i64>) -> tensor<{count}xi64>"
+        )
+        states = w._new_name()
+        lines.append(
+            f"{states} = stablehlo.add {prod}, {b} : tensor<{count}xi64>"
+        )
+        out.append(_emit_mix3(w, states, (count,), lines))
+    return tuple(out)
+
+
+def _emit_u_scaled(w, words_name, count, dtype, lines) -> str:
+    """``u = (word >> 11) * 2^-53`` in ``dtype`` (f64: bit-exact vs the
+    kernel; f32: the documented f32 fast-path rounding — the 53-bit
+    fraction converts to f32's 24-bit mantissa)."""
+    amt, extra = _i64(w, 11, (count,))
+    lines.extend(extra)
+    s = w._new_name()
+    lines.append(
+        f"{s} = stablehlo.shift_right_logical {words_name}, {amt} : "
+        f"tensor<{count}xi64>"
+    )
+    cv = w._new_name()
+    lines.append(
+        f"{cv} = stablehlo.convert {s} : (tensor<{count}xi64>) -> "
+        f"{w._type_str(dtype, (count,))}"
+    )
+    if dtype == _F32:
+        inv, extra = _scalar_f32(w, _INV_2P53, (count,))
+    else:
+        inv, extra = _scalar_f64(w, _INV_2P53, (count,))
+    lines.extend(extra)
+    u = w._new_name()
+    lines.append(
+        f"{u} = stablehlo.multiply {cv}, {inv} : {w._type_str(dtype, (count,))}"
+    )
+    return u
+
+
 def _emit_uniforms(w, seed_name, shape, lines) -> str:
     """float64 uniform draws ``u_i = (words_i >> 11) * 2^-53`` reshaped to
     ``shape`` (matches ``kernels/random.py`` ``_uniforms``)."""
@@ -177,29 +259,7 @@ def _emit_uniforms(w, seed_name, shape, lines) -> str:
         cur = name
     else:
         words = _emit_words(w, seed_name, count, lines)
-        amt, extra = _i64(w, 11, (count,))
-        lines.extend(extra)
-        s = w._new_name()
-        lines.append(
-            f"{s} = stablehlo.shift_right_arithmetic {words}, {amt} : "
-            f"tensor<{count}xi64>"
-        )
-        mask, extra = _i64(w, _MASK11, (count,))
-        lines.extend(extra)
-        m = w._new_name()
-        lines.append(f"{m} = stablehlo.and {s}, {mask} : tensor<{count}xi64>")
-        c = w._new_name()
-        lines.append(
-            f"{c} = stablehlo.convert {m} : (tensor<{count}xi64>) -> "
-            f"tensor<{count}xf64>"
-        )
-        inv, extra = _scalar_f64(w, _INV_2P53, (count,))
-        lines.extend(extra)
-        u = w._new_name()
-        lines.append(
-            f"{u} = stablehlo.multiply {c}, {inv} : tensor<{count}xf64>"
-        )
-        cur = u
+        cur = _emit_u_scaled(w, words, count, _F64, lines)
     if tuple(shape) != (count,):
         r = w._new_name()
         lines.append(
@@ -208,6 +268,10 @@ def _emit_uniforms(w, seed_name, shape, lines) -> str:
         )
         cur = r
     return cur
+
+
+def _scalar_f32(w, value, shape):
+    return w._scalar_constant_for(_F32, value, shape)
 
 
 def _scalar_f64(w, value, shape):
@@ -306,108 +370,93 @@ def _emit_random_uniform(w, op) -> str:
 
 
 def _emit_random_normal(w, op) -> str:
-    """``random_normal`` → Box–Muller over 2*count words (matches the
-    kernel: u1 = max(word>>11 * 2^-53, 2^-53), u2 = ..., z =
-    sqrt(-2 log u1) cos(2π u2); vals = (mean + z * std).astype(dtype))."""
+    """``random_normal`` → Box–Muller over count pairs (matches the kernel:
+    u1 = max(word>>11 * 2^-53, 2^-53), u2 = ..., z =
+    sqrt(-2 log u1) cos(2π u2); vals = (mean + z * std).astype(dtype)).
+
+    float32 outputs (the default dtype — the hot path, e.g. the new-evox DE
+    crossover masks) take the f32 fast path (DOCUMENTED deviation, see the
+    module docstring): the u1/u2 extraction and the log/sqrt/cos tail run
+    in f32, so the compiler backends avoid the f64 transcendental software
+    routines (the dominant random cost on GPU and CPU). f64/f16 outputs
+    keep the exact f64 math. Both paths draw their two words from two
+    parallel ``(count,)`` elementwise chains (``_emit_word_pairs``) so the
+    whole expansion fuses into one dispatch (no reshape/slice column
+    extraction)."""
     shape = _static_shape(w, op, op.attributes["shape"])
     out_dtype = np.dtype(op.attributes["dtype"])
     count = _count_of(shape)
+    fast = out_dtype == _F32
+    comp = _F32 if fast else _F64
     lines = []
     seed = _emit_seed(w, op, op.operands[0], _SALTS["normal"], lines)
     if count == 0:
         z = w._new_name()
-        lines.append(f"{z} = stablehlo.constant dense<> : tensor<0xf64>")
+        lines.append(f"{z} = stablehlo.constant dense<> : {w._type_str(comp, (0,))}")
         cur = z
     else:
-        words = _emit_words(w, seed, 2 * count, lines)
-        wr = w._new_name()
-        lines.append(
-            f"{wr} = stablehlo.reshape {words} : (tensor<{2 * count}xi64>) -> "
-            f"tensor<{count}x2xi64>"
-        )
-        # u1 = words[:, 0] >> 11, u2 = words[:, 1] >> 11 (logical), × 2^-53.
-        u1, u2 = [], []
-        for col, out in ((0, u1), (1, u2)):
-            sl = w._new_name()
-            lines.append(
-                f'{sl} = "stablehlo.slice"({wr}) {{start_indices = '
-                f"array<i64: 0, {col}>, limit_indices = "
-                f"array<i64: {count}, {col + 1}>, strides = array<i64: 1, 1>}}"
-                f" : (tensor<{count}x2xi64>) -> tensor<{count}x1xi64>"
-            )
-            sv = w._new_name()
-            lines.append(
-                f"{sv} = stablehlo.reshape {sl} : (tensor<{count}x1xi64>) -> "
-                f"tensor<{count}xi64>"
-            )
-            amt, extra = _i64(w, 11, (count,))
-            lines.extend(extra)
-            sh = w._new_name()
-            lines.append(
-                f"{sh} = stablehlo.shift_right_arithmetic {sv}, {amt} : "
-                f"tensor<{count}xi64>"
-            )
-            mask, extra = _i64(w, _MASK11, (count,))
-            lines.extend(extra)
-            m = w._new_name()
-            lines.append(f"{m} = stablehlo.and {sh}, {mask} : tensor<{count}xi64>")
-            cv = w._new_name()
-            lines.append(
-                f"{cv} = stablehlo.convert {m} : (tensor<{count}xi64>) -> "
-                f"tensor<{count}xf64>"
-            )
-            inv, extra = _scalar_f64(w, _INV_2P53, (count,))
-            lines.extend(extra)
-            u = w._new_name()
-            lines.append(
-                f"{u} = stablehlo.multiply {cv}, {inv} : tensor<{count}xf64>"
-            )
-            out.append(u)
-        # u1 = maximum(u1, 2^-53) (kernel's log(0) guard).
-        eps, extra = _scalar_f64(w, _INV_2P53, (count,))
+        words_a, words_b = _emit_word_pairs(w, seed, count, lines)
+        # u1 = maximum(u1, 2^-53) (kernel's log(0) guard); u2 unscaled.
+        u1 = _emit_u_scaled(w, words_a, count, comp, lines)
+        u2 = _emit_u_scaled(w, words_b, count, comp, lines)
+        if fast:
+            eps, extra = _scalar_f32(w, _INV_2P53, (count,))
+        else:
+            eps, extra = _scalar_f64(w, _INV_2P53, (count,))
         lines.extend(extra)
         u1m = w._new_name()
         lines.append(
-            f"{u1m} = stablehlo.maximum {u1[0]}, {eps} : tensor<{count}xf64>"
+            f"{u1m} = stablehlo.maximum {u1}, {eps} : {w._type_str(comp, (count,))}"
         )
         # z = sqrt(-2 log u1) * cos(2π u2)
-        two, extra = _scalar_f64(w, -2.0, (count,))
+        if fast:
+            two, extra = _scalar_f32(w, -2.0, (count,))
+        else:
+            two, extra = _scalar_f64(w, -2.0, (count,))
         lines.extend(extra)
         lg = w._new_name()
-        lines.append(f"{lg} = stablehlo.log {u1m} : tensor<{count}xf64>")
+        lines.append(f"{lg} = stablehlo.log {u1m} : {w._type_str(comp, (count,))}")
         prod = w._new_name()
-        lines.append(f"{prod} = stablehlo.multiply {two}, {lg} : tensor<{count}xf64>")
+        lines.append(
+            f"{prod} = stablehlo.multiply {two}, {lg} : {w._type_str(comp, (count,))}"
+        )
         rt = w._new_name()
-        lines.append(f"{rt} = stablehlo.sqrt {prod} : tensor<{count}xf64>")
-        twopi, extra = _scalar_f64(w, _TWO_PI, (count,))
+        lines.append(f"{rt} = stablehlo.sqrt {prod} : {w._type_str(comp, (count,))}")
+        if fast:
+            twopi, extra = _scalar_f32(w, _TWO_PI, (count,))
+        else:
+            twopi, extra = _scalar_f64(w, _TWO_PI, (count,))
         lines.extend(extra)
         ang = w._new_name()
         lines.append(
-            f"{ang} = stablehlo.multiply {twopi}, {u2[0]} : tensor<{count}xf64>"
+            f"{ang} = stablehlo.multiply {twopi}, {u2} : {w._type_str(comp, (count,))}"
         )
         cs = w._new_name()
-        lines.append(f"{cs} = stablehlo.cosine {ang} : tensor<{count}xf64>")
+        lines.append(f"{cs} = stablehlo.cosine {ang} : {w._type_str(comp, (count,))}")
         z = w._new_name()
-        lines.append(f"{z} = stablehlo.multiply {rt}, {cs} : tensor<{count}xf64>")
+        lines.append(f"{z} = stablehlo.multiply {rt}, {cs} : {w._type_str(comp, (count,))}")
         cur = z
     if tuple(shape) != (count,):
         r = w._new_name()
         lines.append(
-            f"{r} = stablehlo.reshape {cur} : (tensor<{count}xf64>) -> "
-            f"{w._type_str(_F64, shape)}"
+            f"{r} = stablehlo.reshape {cur} : ({w._type_str(comp, (count,))}) -> "
+            f"{w._type_str(comp, shape)}"
         )
         cur = r
-    mean = _emit_to_dtype_broadcast(w, op.operands[1], _F64, shape, lines, op)
-    std = _emit_to_dtype_broadcast(w, op.operands[2], _F64, shape, lines, op)
+    mean = _emit_to_dtype_broadcast(w, op.operands[1], comp, shape, lines, op)
+    std = _emit_to_dtype_broadcast(w, op.operands[2], comp, shape, lines, op)
     zp = w._new_name()
-    lines.append(f"{zp} = stablehlo.multiply {cur}, {std} : {w._type_str(_F64, shape)}")
+    lines.append(f"{zp} = stablehlo.multiply {cur}, {std} : {w._type_str(comp, shape)}")
     s = w._new_name()
-    lines.append(f"{s} = stablehlo.add {mean}, {zp} : {w._type_str(_F64, shape)}")
-    out = w._new_name()
-    lines.append(
-        f"{out} = stablehlo.convert {s} : ({w._type_str(_F64, shape)}) -> "
-        f"{w._type_str(out_dtype, shape)}"
-    )
+    lines.append(f"{s} = stablehlo.add {mean}, {zp} : {w._type_str(comp, shape)}")
+    if fast:
+        out = s
+    else:
+        out = w._new_name()
+        lines.append(
+            f"{out} = stablehlo.convert {s} : ({w._type_str(comp, shape)}) -> "
+            f"{w._type_str(out_dtype, shape)}"
+        )
     w._names[id(op.result)] = out
     return "\n".join(lines)
 

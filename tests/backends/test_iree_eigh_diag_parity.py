@@ -4,10 +4,12 @@ Both are multi-op compositions — no mnemonic StableHLO op exists (StableHLO
 1.0 removed ``eigh``/``qr``/``svd``, and there is no diag op), see
 ``etl/backends/stablehlo/ops.py``:
 
-* ``eigh`` — an unrolled cyclic-Jacobi symmetric eigensolver (8 sweeps of
-  the (p, q) rotation pairs built from slice/iota/compare/select/elementwise,
-  NO while-loops) + a stable pair-sort for the ASCENDING eigenvalue order +
-  a gather column reorder of V.
+* ``eigh`` — an unrolled cyclic-Jacobi symmetric eigensolver (an ADAPTIVE
+  sweep count: dim-based for fp32 — n ≤ 5 → 3, n = 6 → 4, 7 ≤ n ≤ 15 → 5,
+  16 ≤ n ≤ 30 → 6, 31 ≤ n ≤ 50 → 7; f64 always 8 — of the (p, q) rotation
+  pairs built from slice/iota/compare/select/elementwise, NO while-loops) +
+  a stable pair-sort for the ASCENDING eigenvalue order + a gather column
+  reorder of V.
 * ``diag`` — rank-1 → iota-EQ mask + select (the diagonal matrix); rank-2 →
   flatten reshape + constant-index single-axis gather (the main diagonal).
 

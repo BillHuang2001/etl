@@ -38,7 +38,7 @@ stablehlo/dialect/StablehloOps.td):
     two's-complement equivalence; NOT ``stablehlo.rng`` (implementation-
     defined algorithm would break the same-key⇒same-values determinism
     contract).
-  - ``eigh`` → an unrolled cyclic-Jacobi eigensolver (8 sweeps of the
+  - ``eigh`` → an unrolled cyclic-Jacobi eigensolver (adaptive dim-based sweeps — 3–7 f32 by size, 8 f64 — of the
     (p, q) rotation pairs) built from v1 ops (slice/iota/compare/select/
     elementwise) + a pair-sort for the ascending eigenvalue order and a
     column reorder of the eigenvector matrix — StableHLO 1.0 removed

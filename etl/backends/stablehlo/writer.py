@@ -1735,22 +1735,53 @@ class Writer:
 
     # --- eigh (unrolled cyclic-Jacobi) ---
 
-    #: Number of cyclic-Jacobi sweeps for the ``eigh`` composition. Each
-    #: sweep zeroes every off-diagonal (p, q) once; the off-diagonal norm
-    #: converges quadratically. Measured on the numpy spike (10x10 fp32):
-    #: sweep 4 → 1.1e-5, sweep 6 → 3.7e-7 (fp32 floor). 8 gives margin for
-    #: compiler-reordered fp32 arithmetic and small batch variance; the
-    #: sweep loop is unrolled in the emitted MLIR (no while-loops — iree
-    #: cuda HAL crashes on while-loops with certain shapes, see the bench
-    #: Known Issues).
-    _EIGH_SWEEPS = 8
+    #: Adaptive cyclic-Jacobi sweep count for the ``eigh`` composition (see
+    #: ``_eigh_sweeps``). Each sweep zeroes every off-diagonal (p, q) once;
+    #: the off-diagonal norm converges quadratically with a sharp knee
+    #: (measured on the numpy spike, 10x10 fp32: sweep 4 → 1.1e-5, sweep 6 →
+    #: 3.7e-7). The sweep loop is unrolled in the emitted MLIR (no
+    #: while-loops — iree cuda HAL crashes on while-loops with certain
+    #: shapes, see the bench Known Issues), so each sweep is ~40.5·n·(n−1)
+    #: MLIR lines of composition — the count directly trades compile time
+    #: against accuracy.
+    _EIGH_SWEEPS_F64 = 8
+
+    @staticmethod
+    def _eigh_sweeps(n: int, dtype) -> int:
+        """Cyclic-Jacobi sweep count for the unrolled ``eigh`` composition.
+
+        fp32: dim-based schedule (n ≤ 5 → 3, n = 6 → 4, 7 ≤ n ≤ 15 → 5,
+        16 ≤ n ≤ 30 → 6, 31 ≤ n ≤ 50 → 7, n > 50 → 8), validated by a
+        bit-exact numpy simulation of the emission's rotation scheme
+        (worst-over-20-matrices reconstruction AND eigenvalue error
+        ≤ 1e-3 with ≥ 2× margin on CMAES-like PD / rank-deficient /
+        ill-conditioned families; the fp32 knee is flat above the minimum —
+        e.g. dim 10: rec 1.18e-5 at 5 sweeps, identical to 8). The existing
+        parity tests pass with margin at every size (3×3/10×10/batched f32,
+        int32→f64). f64 keeps 8: it needs ≥ the fp32 counts for its tighter
+        (1e-12) targets (3×3 needs 4, dim 10 needs 7, dim ≥ 20 needs 8).
+        """
+        if np.dtype(dtype) != np.dtype("float32"):
+            return Writer._EIGH_SWEEPS_F64
+        if n <= 5:
+            return 3
+        if n == 6:
+            return 4
+        if n <= 15:
+            return 5
+        if n <= 30:
+            return 6
+        if n <= 50:
+            return 7
+        return 8
 
     def _emit_eigh(self, op: Op) -> str:
         """``eigh`` → unrolled cyclic-Jacobi symmetric eigensolver.
 
         StableHLO 1.0 removed ``stablehlo.eigh``/``qr``/``svd`` (iree 3.11
         ships only ``cholesky`` of the factorizations), so the symmetric
-        eigendecomposition is composed from v1 ops: 8 sweeps of the cyclic
+        eigendecomposition is composed from v1 ops: ``_eigh_sweeps(n, dtype)``
+        unrolled sweeps of the cyclic
         (p, q) rotation pairs — each zeroing the (p, q) off-diagonal with
         the textbook rotation ``J = [[c, s], [-s, c]]`` via
         ``B = A·J`` (column updates), ``A' = J^T·B`` (row updates),
@@ -1832,7 +1863,7 @@ class Writer:
         )
         if batch:
             v = self._emit_broadcast_static(v, dtype, (n, n), x_shape, lines, op)
-        for _ in range(self._EIGH_SWEEPS):
+        for _ in range(self._eigh_sweeps(n, dtype)):
             for p in range(n):
                 for q in range(p + 1, n):
                     a, v = self._emit_jacobi_rotation(
