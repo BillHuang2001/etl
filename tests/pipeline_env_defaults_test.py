@@ -152,20 +152,27 @@ class _RecordingIreeStub(etl.backends.Backend):
 @pytest.fixture
 def iree_stub_registered():
     """Register the functional ``"iree"`` stub for a full-path test and
-    restore the registry afterwards (skips if a real iree backend is already
-    registered in this process — e.g. with the compiler extra installed)."""
+    restore the registry afterwards.
+
+    The stub is installed by direct registry assignment (save/restore of the
+    previous entry) so these tests also run when a real ``"iree"`` backend is
+    already registered in this process (e.g. the compiler extra installed):
+    the stub replaces it for the duration of the test and is never visible to
+    other tests. Tests run sequentially, so no cross-test interference.
+    """
     from etl.backends import registry as _registry
 
-    previous = _registry._registry.get("iree")
-    if previous is not None:
-        pytest.skip("a real 'iree' backend is already registered in this process")
     stub = _RecordingIreeStub()
     _RecordingIreeStub.recorded_compile_options = []
-    etl.backends.register(stub)
+    previous = _registry._registry.get("iree")
+    _registry._registry["iree"] = stub
     try:
         yield stub
     finally:
-        _registry._registry.pop("iree", None)
+        if previous is None:
+            _registry._registry.pop("iree", None)
+        else:
+            _registry._registry["iree"] = previous
         _RecordingIreeStub.recorded_compile_options = []
 
 
