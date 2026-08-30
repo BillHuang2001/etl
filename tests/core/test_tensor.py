@@ -297,6 +297,161 @@ class TestDLPack:
 
 
 # ---------------------------------------------------------------------------
+# Device-payload-backed Tensors (duck-typed payload protocol)
+# ---------------------------------------------------------------------------
+
+
+class _DummyDevicePayload:
+    """Minimal duck-typed device payload (the ``core.Tensor`` payload protocol).
+
+    Mirrors the protocol contract (``etl/core/tensor.py``): ``.shape`` (tuple),
+    ``.dtype`` (numpy-normalizable), optional ``.device`` (a ``core.Device``),
+    and a ``to_host()`` host-copy path returning a FRESH ndarray per call.
+    Counts ``to_host`` calls so tests can prove the lazy-copy semantics.
+    """
+
+    def __init__(self, shape, dtype, device=None, values=None):
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+        self.device = device
+        self._values = (
+            np.zeros(shape, dtype=self.dtype)
+            if values is None
+            else np.asarray(values, dtype=self.dtype)
+        )
+        self.to_host_calls = 0
+
+    def to_host(self):
+        self.to_host_calls += 1
+        return self._values.copy()  # a fresh host copy per call
+
+    def __array__(self, dtype=None):
+        # np.asarray fallback path: a fresh host copy per call, like to_host.
+        return np.asarray(self._values, dtype=dtype)
+
+
+class _AsarrayOnlyPayload:
+    """A payload WITHOUT ``to_host`` — ``np.asarray`` is the only host path."""
+
+    def __init__(self, shape, dtype, device=None, values=None):
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+        self.device = device
+        self._values = (
+            np.zeros(shape, dtype=self.dtype)
+            if values is None
+            else np.asarray(values, dtype=self.dtype)
+        )
+
+    def __array__(self, dtype=None):
+        return np.asarray(self._values, dtype=dtype)
+
+
+class TestDevicePayload:
+    """Device-payload-backed ``Tensor`` semantics (no GPU / no backend code)."""
+
+    def test_explicit_device_wins_over_payload_device(self):
+        payload = _DummyDevicePayload((2, 3), "float32", device=Device("cuda", 1))
+        t = Tensor(payload, device=Device("cpu", 2))
+        assert t.device == Device("cpu", 2)  # explicit device= argument wins
+
+    def test_device_derived_from_payload_device(self):
+        payload = _DummyDevicePayload((2, 3), "float32", device=Device("cuda", 1))
+        t = Tensor(payload)
+        assert t.device == Device("cuda", 1)
+
+    def test_no_device_anywhere_raises(self):
+        payload = _DummyDevicePayload((2, 3), "float32", device=None)
+        with pytest.raises(DeviceError, match="requires a device"):
+            Tensor(payload)
+
+    def test_numpy_fresh_host_copy_per_call(self):
+        payload = _DummyDevicePayload(
+            (2, 2), "float32", device=Device("cpu", 0),
+            values=[[1.0, 2.0], [3.0, 4.0]],
+        )
+        t = Tensor(payload)
+        assert payload.to_host_calls == 0  # lazy: no host copy at construction
+        first = t.numpy()
+        second = t.numpy()
+        assert payload.to_host_calls == 2  # one fresh host copy per call
+        assert first is not second
+        first[0, 0] = 999.0
+        assert t.numpy()[0, 0] == 1.0  # mutation never leaks into later copies
+        assert payload.to_host_calls == 3
+
+    def test_data_is_the_payload_object(self):
+        payload = _DummyDevicePayload((3,), "int64", device=Device("cpu", 0))
+        t = Tensor(payload)
+        assert t.data is payload
+
+    def test_shape_dtype_from_payload(self):
+        # dtype via a name string and via an np.dtype payload
+        t1 = Tensor(_DummyDevicePayload((2, 3), "float32", device=Device("cpu", 0)))
+        assert t1.shape == (2, 3)
+        assert t1.dtype == np.dtype("float32")
+        t2 = Tensor(_DummyDevicePayload((4,), np.dtype("int64"), device=Device("cpu", 0)))
+        assert t2.shape == (4,)
+        assert t2.dtype == np.dtype("int64")
+
+    def test_eq_metadata_only_no_host_copy(self):
+        a = _DummyDevicePayload(
+            (2, 2), "float32", device=Device("cpu", 0),
+            values=[[1.0, 2.0], [3.0, 4.0]],
+        )
+        b = _DummyDevicePayload(
+            (2, 2), "float32", device=Device("cpu", 0),
+            values=[[99.0, 98.0], [97.0, 96.0]],
+        )
+        ta, tb = Tensor(a), Tensor(b)
+        assert ta == tb  # metadata-only: differing to_host values are EQUAL
+        assert not (ta != tb)
+        assert a.to_host_calls == 0 and b.to_host_calls == 0  # no hidden copies
+
+    def test_eq_metadata_mismatch_not_equal(self):
+        t1 = Tensor(_DummyDevicePayload((2, 2), "float32", device=Device("cpu", 0)))
+        t2 = Tensor(_DummyDevicePayload((2, 2), "float64", device=Device("cpu", 0)))
+        assert t1 != t2
+        t3 = Tensor(_DummyDevicePayload((2, 2), "float32", device=Device("cpu", 1)))
+        assert t1 != t3
+
+    def test_dlpack_raises_device_error_mentioning_numpy(self):
+        t = Tensor(_DummyDevicePayload((2, 2), "float32", device=Device("cpu", 0)))
+        with pytest.raises(DeviceError, match="numpy"):
+            t.__dlpack__()
+        with pytest.raises(DeviceError, match="numpy"):
+            t.__dlpack_device__()
+
+    def test_asarray_fallback_payload(self):
+        payload = _AsarrayOnlyPayload(
+            (2, 2), "float32", device=Device("cpu", 0),
+            values=[[1.0, 2.0], [3.0, 4.0]],
+        )
+        t = Tensor(payload)
+        np.testing.assert_array_equal(
+            t.numpy(), np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        )
+
+    def test_broken_payload_clear_error(self):
+        class _NoShape:
+            dtype = np.dtype("float32")
+
+        with pytest.raises(TypeError, match="device payload"):
+            Tensor(_NoShape())
+
+    def test_ndarray_backed_behavior_unchanged(self, arr, t):
+        # same-reference .numpy() (zero-copy)
+        assert t.numpy() is t.data is arr
+        # __eq__ is elementwise (array_equal): same values equal, others not
+        assert t == Tensor(arr.copy())
+        assert t != Tensor(np.zeros_like(arr))
+        # dlpack roundtrip still works
+        rt = from_dlpack(t)
+        np.testing.assert_array_equal(rt.data, arr)
+        assert np.shares_memory(rt.data, arr)
+
+
+# ---------------------------------------------------------------------------
 # Torch interop (optional dependency — skipped when torch is missing)
 # ---------------------------------------------------------------------------
 
