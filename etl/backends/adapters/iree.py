@@ -107,6 +107,7 @@ to stdlib + ``etl.core`` + the sibling modules ``compiler`` / ``registry`` /
 from __future__ import annotations
 
 import base64
+import os
 from typing import TYPE_CHECKING, Any
 
 from etl import core
@@ -116,6 +117,50 @@ from ..backend import Capabilities
 from ..compiler import CompilerBackend, CompilerExecutable
 from ..program import CompiledArtifact, LoweredProgram, Signature
 from ..registry import register as _registry_register
+
+# ---------------------------------------------------------------------------
+# CUDA per-call fast-path configuration (measured on IREE 3.11.0, RTX A6000)
+# ---------------------------------------------------------------------------
+# Host inputs on cuda executables are uploaded through PERSISTENT pinned
+# (host-visible) HAL buffers cached per (input index, shape, dtype): each run
+# re-copies the current host values into the mapped view and the dispatches
+# read the pinned memory directly. This removes the two dominant per-call
+# costs of the classic rt.asdevicearray path — a fresh device allocation and
+# the staging queue_copy + fence wait (~0.3-0.7 ms per call, measured).
+# Two invariants keep that path fast:
+#   * the CUDA driver's ASYNC (stream-ordered) allocator is disabled via the
+#     process-global runtime flag --cuda_async_allocations=false: with it
+#     enabled the pool re-trims to empty whenever invoke results are freed,
+#     making every subsequent invocation ~1.1 ms (vs ~0.04 ms warm);
+#   * each cuda executable retains a small DEVICE-LOCAL anchor buffer
+#     (_pool_anchor) that keeps the classic allocator's pool from emptying,
+#     so per-call result allocation/free stays ~0.04 ms (measured: 4 KB
+#     anchor suffices, independent of the result size class).
+# Both are pure performance configuration — correctness-neutral (identical
+# buffers, copies, and synchronization as the default paths).
+_CUDA_FLAGS_CONFIGURED = False
+_PINNED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
+_PINNED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
+
+
+def _configure_cuda_runtime_flags() -> None:
+    """Parse the process-global CUDA allocator flag ONCE (idempotent).
+
+    The user's explicit ``IREE_PY_RUNTIME_FLAGS`` setting wins; parse errors
+    are ignored (best-effort performance tuning, never correctness).
+    """
+    global _CUDA_FLAGS_CONFIGURED
+    if _CUDA_FLAGS_CONFIGURED:
+        return
+    _CUDA_FLAGS_CONFIGURED = True
+    if "cuda_async_allocations" in os.environ.get("IREE_PY_RUNTIME_FLAGS", ""):
+        return
+    try:
+        import iree.runtime as rt
+
+        rt.flags.parse_flags("--cuda_async_allocations=false")
+    except Exception:
+        pass  # flag unavailable — the anchor alone still helps
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from etl.ir import Module  # noqa: F401
@@ -477,6 +522,7 @@ class IreeBackend(CompilerBackend):
             # maps to device_id = index + 1 (verified empirically on 3.11.0:
             # device_id=4 -> physical GPU 3; device_id=0 raises ValueError
             # "Device id 0 not found" — never pass 0).
+            _configure_cuda_runtime_flags()
             driver = rt.get_driver("cuda")
             device_id = device.index + 1
             try:
@@ -605,6 +651,22 @@ class IreeExecutable(CompilerExecutable):
             tuple(signature.output_specs) if signature is not None else ()
         )
         self._entry: Any = None
+        # CUDA per-call fast path (see module-level notes): a retained
+        # device-local anchor buffer keeps the allocator pool warm so per-call
+        # result allocation/free stays ~0.04 ms; the pinned-input cache holds
+        # persistent host-visible input buffers per (index, shape, dtype).
+        self._pool_anchor: Any = None
+        self._pinned_inputs: dict | None = None
+        if device is not None and device.kind == "cuda":
+            import iree.runtime as rt
+
+            self._pinned_inputs = {}
+            try:
+                self._pool_anchor = runtime_device.allocator.allocate_buffer(
+                    rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
+                )
+            except Exception:
+                self._pool_anchor = None  # best-effort perf anchor, never fatal
 
     # ------------------------------------------------------------------ run
 
@@ -641,7 +703,7 @@ class IreeExecutable(CompilerExecutable):
             _validate_input_shape(i, spec.shape, tensor.shape)
 
         buffers = []
-        for tensor in flat_input_tensors:
+        for i, tensor in enumerate(flat_input_tensors):
             data = tensor.data
             # Device-resident pass-through: an input tensor already living on
             # THIS executable's device (payload-backed with a matching
@@ -653,6 +715,7 @@ class IreeExecutable(CompilerExecutable):
             # validation loop above already proved dtype/shape against the
             # signature, so the payload is guaranteed correct. Anything else
             # (numpy-backed host input, payload on a different device) takes
+            # the pinned persistent upload on cuda (see _pinned_input), else
             # the classic asdevicearray H2D copy path.
             if isinstance(data, _IreeDevicePayload) and (
                 tensor.device == self._core_device
@@ -665,9 +728,13 @@ class IreeExecutable(CompilerExecutable):
             ):
                 buffers.append(data)
             else:
-                buffers.append(
-                    rt.asdevicearray(self.runtime_device, tensor.numpy())
-                )
+                pinned = self._pinned_input(i, tensor)
+                if pinned is not None:
+                    buffers.append(pinned)
+                else:
+                    buffers.append(
+                        rt.asdevicearray(self.runtime_device, tensor.numpy())
+                    )
         entry = self._entry_function()
         results = entry(*buffers)
         if results is None:
@@ -725,6 +792,58 @@ class IreeExecutable(CompilerExecutable):
             )
         self._entry = entry
         return entry
+
+    def _pinned_input(self, index: int, tensor: core.Tensor) -> Any | None:
+        """Upload a host tensor through a persistent pinned HAL buffer.
+
+        CUDA fast path replacing ``rt.asdevicearray`` for host inputs: the
+        values are copied (memcpy) into the mapped view of a persistent
+        host-visible (pinned) buffer that the dispatches read directly — no
+        per-call device allocation, no staging ``queue_copy`` + fence wait.
+        The ``DeviceArray`` is built ONCE per (input index, shape, dtype)
+        and cached; every call re-copies the current host values into the
+        same mapped view (runs are synchronous, so reuse cannot race).
+        Falls back to ``None`` (caller uses ``asdevicearray``) for
+        non-cuda executables, oversized inputs, unmappable dtypes, and a
+        full cache — semantics identical either way.
+        """
+        if self._pinned_inputs is None:
+            return None
+        import numpy as np
+        import iree.runtime as rt
+        from iree.runtime.array_interop import map_dtype_to_element_type
+
+        dtype = tensor.dtype
+        shape = tuple(tensor.shape)
+        nbytes = int(np.prod(shape)) * dtype.itemsize
+        if nbytes > _PINNED_INPUT_MAX_BYTES:
+            return None
+        key = (index, shape, dtype)
+        cached = self._pinned_inputs.get(key)
+        if cached is not None:
+            da, view = cached
+        else:
+            element_type = map_dtype_to_element_type(dtype)
+            if element_type is None:
+                return None
+            if len(self._pinned_inputs) >= _PINNED_INPUT_CACHE_MAX:
+                self._pinned_inputs.clear()  # bounded cache; correctness unaffected
+            buf = self.runtime_device.allocator.allocate_buffer(
+                rt.MemoryType.HOST_VISIBLE | rt.MemoryType.DEVICE_LOCAL,
+                rt.BufferUsage.DEFAULT | rt.BufferUsage.MAPPING,
+                nbytes,
+            )
+            view = buf.map().asarray(shape, np.dtype(dtype))
+            buffer_view = rt.HalBufferView(buf, shape, element_type)
+            da = rt.DeviceArray(
+                self.runtime_device,
+                buffer_view,
+                implicit_host_transfer=False,
+                override_dtype=dtype,
+            )
+            self._pinned_inputs[key] = (da, view)
+        np.copyto(view, tensor.numpy())
+        return da
 
 
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
