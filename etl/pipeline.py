@@ -41,6 +41,17 @@ Implementation notes (binding):
 - ``caution``: ``etl.trace`` (the function) shadows the submodule attribute
   in ``etl``; this module imports trace pieces via ``from etl.trace import
   ...`` (import-system resolution) and ``etl.trace.trace`` directly.
+- Fast-path caching (internal, no observable behavior): ``Executable`` (and
+  ``BoundExecutable``) cache a lazily built input plan
+  (``_build_input_plan``: expected tree + per-leaf ``(is_tensor, path, spec,
+  recorded, leaf_index)`` layout) and an output plan (``_build_output_plan``:
+  once-normalized output tree + per-leaf flags). ``run`` validates structure
+  and leaves in one pass over the raw arguments (``_fast_structure_walk`` —
+  mirrors ``core.flatten``'s node precedence and ``first_mismatch_path``
+  semantics with ``leaf_vs_empty_is_mismatch=False``); any structural
+  divergence falls back to the slow path (``_prepare_flat_inputs_slow``),
+  which rebuilds the runtime TreeSpec and raises the canonical
+  structure-mismatch error, so messages stay byte-identical.
 """
 
 from __future__ import annotations
@@ -82,6 +93,28 @@ class Executable:
     def __init__(self, backend_executable, signature):
         self.backend_executable = backend_executable
         self.signature = signature
+        # Lazy fast-path caches (built on the first ``run``): the input plan
+        # precomputes the per-leaf validation layout, the output plan the
+        # normalized output tree + per-leaf classification. Pure derivations
+        # from the signature — no observable behavior change.
+        self._input_plan = None
+        self._output_plan = None
+
+    def _get_input_plan(self):
+        """Fast-path input plan (structure + per-leaf layout), built once."""
+        plan = self._input_plan
+        if plan is None:
+            plan = _build_input_plan(self.signature, {})
+            self._input_plan = plan
+        return plan
+
+    def _get_output_plan(self):
+        """Fast-path output plan (normalized tree + leaf flags), built once."""
+        plan = self._output_plan
+        if plan is None:
+            plan = _build_output_plan(self.signature)
+            self._output_plan = plan
+        return plan
 
     @property
     def functions(self):
@@ -183,6 +216,23 @@ class BoundExecutable:
         self.executable = executable
         self.bindings = dict(bindings)
         self.bound_names = dict(bound_names) if bound_names else {}
+        self._input_plan = None  # lazy fast-path plan (reduced tree layout)
+
+    def _get_input_plan(self):
+        """Fast-path input plan over the *reduced* (unbound) input tree.
+
+        Rebuilt when the bindings dict changes size (defensive: ``bindings``
+        is fixed after ``bind``; any mutation that changes the leaf layout
+        must not reuse a stale reduced tree)."""
+        plan = self._input_plan
+        if plan is None or plan[3] != len(self.bindings):
+            plan = _build_input_plan(self.signature, self.bindings)
+            self._input_plan = plan
+        return plan
+
+    def _get_output_plan(self):
+        """The wrapped executable's output plan (shared cache)."""
+        return self.executable._get_output_plan()
 
     @property
     def signature(self):
@@ -407,6 +457,157 @@ def _structure_matches(spec_a: "core.TreeSpec", spec_b: "core.TreeSpec") -> bool
     return first_mismatch_path(spec_a, spec_b) is None
 
 
+def _fast_structure_walk(exp: "core.TreeSpec", x, leaves: list) -> bool:
+    """Single-pass structure check + leaf collection for the run fast path.
+
+    Mirrors ``core.flatten``'s node precedence (registered pytree nodes via
+    MRO, namedtuple, dataclass, tuple, list, dict, leaf) and
+    ``first_mismatch_path``'s container semantics with
+    ``leaf_vs_empty_is_mismatch=False``: container nodes must match exactly
+    (node type, ``node_data``, child count); leaves match any leaf; a leaf
+    vs an empty container is NOT a mismatch; leaf *types* are ignored.
+
+    Runtime leaves are appended to ``leaves`` in pre-order (flatten order).
+    Errors ``core.flatten`` itself raises on malformed values (e.g.
+    unorderable dict keys) propagate identically and at the same point of
+    the traversal. Returns ``False`` at the first structural divergence —
+    the caller then falls back to the slow path, which rebuilds the runtime
+    TreeSpec and raises the canonical structure-mismatch error, so error
+    messages stay byte-identical.
+    """
+    obj_type = type(x)
+    for base in obj_type.__mro__:
+        registered = _core_tree._PYTREE_NODE_REGISTRY.get(base)
+        if registered is not None:
+            flatten_fn, _ = registered
+            children, _context = flatten_fn(x)
+            if not isinstance(children, (list, tuple)):
+                children = tuple(children)
+            base, node_data = base, None  # context is deliberately not compared
+            break
+    else:
+        if isinstance(x, tuple) and hasattr(obj_type, "_fields"):
+            base, children, node_data = obj_type, x, obj_type._fields
+        elif (
+            dataclasses.is_dataclass(x)
+            and not isinstance(x, type)
+            and not obj_type.__module__.split(".")[0] == "etl"
+        ):
+            fields = dataclasses.fields(x)
+            children = [getattr(x, field.name) for field in fields]
+            base, node_data = obj_type, [field.name for field in fields]
+        elif isinstance(x, tuple):
+            base, children, node_data = obj_type, x, None
+        elif isinstance(x, list):
+            base, children, node_data = obj_type, x, None
+        elif isinstance(x, dict):
+            try:
+                keys = sorted(x)
+            except TypeError:
+                # The raw sort TypeError must never leak: wrap it with the
+                # same guidance core.flatten gives.
+                type_names = []
+                for key in x:
+                    name = type(key).__name__
+                    if name not in type_names:
+                        type_names.append(name)
+                raise TypeError(
+                    f"flatten: cannot sort dict keys of mixed types (types: {type_names}); "
+                    "dict keys are sorted for deterministic tree structure — use keys of one "
+                    "type or register_pytree_node"
+                ) from None
+            children = [x[key] for key in keys]
+            if isinstance(x, collections.defaultdict):
+                node_data = (x.default_factory, keys)
+            else:
+                node_data = keys
+            base = obj_type
+        else:
+            # Leaf.
+            if not exp.children:
+                leaves.append(x)
+                return True
+            return False
+    # Container (possibly empty).
+    if not exp.children:
+        return not children
+    if (
+        exp.type != base
+        or exp.node_data != node_data
+        or len(exp.children) != len(children)
+    ):
+        return False
+    for child_exp, child_x in zip(exp.children, children):
+        if not _fast_structure_walk(child_exp, child_x, leaves):
+            return False
+    return True
+
+
+def _build_input_plan(signature, bound: dict):
+    """Precompute the run-time input validation layout for one signature.
+
+    Returns ``(expected_tree, entries, total, n_bound, bound_keys)``:
+
+    - ``expected_tree`` — the structure run-time arguments must match: the
+      full ``signature.input_tree`` for a plain executable, the bound-leaf-
+      reduced tree for a ``BoundExecutable``.
+    - ``entries`` — one ``(is_tensor, path, spec, recorded, leaf_index)``
+      tuple per leaf of the FULL input tree in pre-order (``path`` is the
+      pre-rendered pytree path string, ``spec`` the tensor spec or ``None``,
+      ``recorded`` the recorded static value or ``None``, ``leaf_index`` the
+      flat leaf index — bound lookups stay live via the ``bound`` dict, so
+      the plan is independent of the bound values).
+    - ``total`` / ``n_bound`` — feed the leaf-count error message.
+    - ``bound_keys`` — the sorted bound leaf indices (freshness guard for
+      ``BoundExecutable`` plans).
+    """
+    input_tree = signature.input_tree
+    total = input_tree.num_leaves
+    n_bound = len(bound)
+    bound_keys = tuple(sorted(bound))
+    if bound:
+        expected_tree = _reduce_tree(input_tree, set(bound), [0])
+    else:
+        expected_tree = input_tree
+    entries = []
+    tensor_specs = iter(signature.input_specs)
+    static_values = iter(signature.static_values)
+    for leaf_spec, leaf_index, path in _walk_leaves(input_tree):
+        if _is_tensor_leaf_spec(leaf_spec):
+            entries.append((True, _format_path(path), next(tensor_specs), None, leaf_index))
+        else:
+            entries.append((False, _format_path(path), None, next(static_values), leaf_index))
+    return (expected_tree, tuple(entries), total, n_bound, bound_keys)
+
+
+def _build_output_plan(signature):
+    """Precompute the run-time output reconstruction layout.
+
+    Returns ``(normalized_tree, flags, tensor_count, static_count)``: the
+    once-normalized output tree (``_normalize_leaf_types`` — a full
+    recursive copy, previously rebuilt on every run), the per-leaf
+    tensor/static flags in pre-order, and the two leaf-kind counts feeding
+    the signature/output checks.
+    """
+    output_tree = signature.output_tree
+    flags = []
+    tensor_count = 0
+    static_count = 0
+    for leaf_spec, _, _ in _walk_leaves(output_tree):
+        if _is_tensor_leaf_spec(leaf_spec):
+            flags.append(True)
+            tensor_count += 1
+        else:
+            flags.append(False)
+            static_count += 1
+    return (
+        _normalize_leaf_types(output_tree),
+        tuple(flags),
+        tensor_count,
+        static_count,
+    )
+
+
 def _subspec(spec: "core.TreeSpec", path: Tuple[Any, ...]) -> "core.TreeSpec":
     """The subtree ``core.TreeSpec`` of ``spec`` at ``path`` (keys as
     produced by ``first_mismatch_path``: positional indices for non-dict
@@ -602,7 +803,7 @@ def _validate_tensor(spec: "core.TensorSpec", leaf: Any, path) -> "core.Tensor":
     return tensor
 
 
-def _prepare_flat_inputs(signature, bound: dict, args) -> list:
+def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
     """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
     in block-arg (tensor-leaf) order.
 
@@ -612,6 +813,12 @@ def _prepare_flat_inputs(signature, bound: dict, args) -> list:
     removed) — anything else raises ``core.TraceError`` with both specs in
     the message. Static leaves are compared by type qualname + ``==`` value
     (``core.TraceError`` naming the pytree path and values).
+
+    This is the fallback path: it rebuilds the runtime TreeSpec via
+    ``core.flatten`` and is therefore also the source of the canonical
+    structure-mismatch errors. The fast path (``_prepare_flat_inputs`` with
+    a cached plan) delegates here on any structural divergence, keeping
+    error messages byte-identical.
     """
     input_tree = signature.input_tree
     total = input_tree.num_leaves
@@ -680,6 +887,70 @@ def _prepare_flat_inputs(signature, bound: dict, args) -> list:
     return tensors
 
 
+def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
+    """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
+    in block-arg (tensor-leaf) order.
+
+    ``bound`` maps flat leaf indices to already-validated ``core.Tensor``\s
+    (empty dict for a plain ``Executable``). For bound executables the user
+    arguments must match the *reduced* input tree (bound leaf positions
+    removed) — anything else raises ``core.TraceError`` with both specs in
+    the message. Static leaves are compared by type qualname + ``==`` value
+    (``core.TraceError`` naming the pytree path and values).
+
+    Fast path: ``plan`` (from ``_build_input_plan``, cached on the
+    executable) precomputes the per-leaf layout, so structure checking and
+    leaf collection run in ONE pass over the raw arguments
+    (``_fast_structure_walk``) with no runtime TreeSpec built and no
+    per-leaf path re-rendering. All checks and error messages are identical
+    to the slow path: flatten-style errors (unorderable dict keys) raise at
+    the same traversal point, and any structural divergence falls back to
+    ``_prepare_flat_inputs_slow``, which rebuilds the runtime tree and
+    raises the canonical structure-mismatch error.
+    """
+    if plan is None:
+        plan = _build_input_plan(signature, bound)
+    expected_tree, entries, total, n_bound, _bound_keys = plan
+    user_leaves = []
+    if not _fast_structure_walk(expected_tree, args, user_leaves):
+        return _prepare_flat_inputs_slow(signature, bound, args)
+    expected_user = total - n_bound
+    if len(user_leaves) != expected_user:
+        raise core.TraceError(
+            f"input leaf count mismatch: {len(user_leaves)} run-time leaves "
+            f"for {expected_user} unbound leaf positions ({total} total, "
+            f"{n_bound} bound)"
+        )
+    expected_total = len(signature.input_specs) + len(signature.static_values)
+    if expected_total != total:
+        raise core.TraceError(
+            f"signature mismatch: the input tree has {total} leaves but the "
+            f"signature records {len(signature.input_specs)} tensor specs and "
+            f"{len(signature.static_values)} static values ({expected_total} "
+            f"leaves)"
+        )
+    tensors = []
+    user_iter = iter(user_leaves)
+    for is_tensor, path, spec, recorded, leaf_index in entries:
+        if is_tensor:
+            bound_tensor = bound.get(leaf_index)
+            if bound_tensor is not None:
+                tensors.append(bound_tensor)
+            else:
+                tensors.append(_validate_tensor(spec, next(user_iter), path))
+        else:
+            leaf = next(user_iter)
+            kind = type(leaf).__qualname__
+            if kind != type(recorded).__qualname__ or leaf != recorded:
+                raise core.TraceError(
+                    f"graph was specialized on {recorded!r} (a "
+                    f"{type(recorded).__qualname__}); run-time argument "
+                    f"{leaf!r} (a {kind}) at path {path} does "
+                    f"not match"
+                )
+    return tensors
+
+
 def _normalize_leaf_types(spec: "core.TreeSpec") -> "core.TreeSpec":
     """Copy of ``spec`` with dataclass-typed *leaf* specs normalized to plain
     leaves (``type(None)``).
@@ -708,7 +979,7 @@ def _normalize_leaf_types(spec: "core.TreeSpec") -> "core.TreeSpec":
     )
 
 
-def _unflatten_outputs(signature, flat_outputs) -> Any:
+def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
     """Wrap flat backend results as ``core.Tensor``\s and rebuild the
     structured output per ``signature.output_tree``.
 
@@ -718,8 +989,15 @@ def _unflatten_outputs(signature, flat_outputs) -> Any:
     naming the flat index. Static leaves consume
     ``signature.output_static_values`` in order. The tree is normalized via
     ``_normalize_leaf_types`` before ``core.unflatten``.
+
+    Fast path: ``plan`` (from ``_build_output_plan``, cached on the
+    executable) carries the once-normalized output tree and the per-leaf
+    tensor/static flags, so the per-call normalization copy and leaf-kind
+    counting walks are skipped. All checks and error messages are identical.
     """
-    output_tree = signature.output_tree
+    if plan is None:
+        plan = _build_output_plan(signature)
+    normalized_tree, flags, tensor_count, static_count = plan
     wrapped = []
     for i, element in enumerate(flat_outputs):
         if isinstance(element, core.Tensor):
@@ -732,36 +1010,29 @@ def _unflatten_outputs(signature, flat_outputs) -> Any:
                 f"expected core.Tensor or numpy ndarray, got "
                 f"{type(element).__qualname__}"
             )
-    # Pre-count leaf kinds so iterator exhaustion is a clear signature error.
-    static_count = 0
-    tensor_count = 0
-    for leaf_spec, _, _ in _walk_leaves(output_tree):
-        if _is_tensor_leaf_spec(leaf_spec):
-            tensor_count += 1
-        else:
-            static_count += 1
     if tensor_count != len(wrapped):
         raise core.BackendError(
             f"signature/output mismatch: the output tree has {tensor_count} "
             f"tensor leaves but the backend produced {len(wrapped)} outputs"
         )
-    if static_count != len(signature.output_static_values):
+    output_static_values = signature.output_static_values
+    if static_count != len(output_static_values):
         raise core.TraceError(
             f"signature mismatch: the output tree records {static_count} "
             f"static output leaves but the signature carries "
-            f"{len(signature.output_static_values)} output static values"
+            f"{len(output_static_values)} output static values"
         )
 
     leaves = []
     tensor_iter = iter(wrapped)
-    static_iter = iter(signature.output_static_values)
-    for leaf_spec, _, _ in _walk_leaves(output_tree):
-        if _is_tensor_leaf_spec(leaf_spec):
+    static_iter = iter(output_static_values)
+    for flag in flags:
+        if flag:
             leaves.append(next(tensor_iter))
         else:
             leaves.append(next(static_iter))
     try:
-        return core.unflatten(leaves, _normalize_leaf_types(output_tree))
+        return core.unflatten(leaves, normalized_tree)
     except ValueError as exc:
         raise core.TraceError(
             f"output tree does not match the recorded outputs: {exc}"
@@ -782,6 +1053,13 @@ def run(executable, *args):
     (DTypeError/ShapeError/DeviceError/TraceError), calls the backend
     executable with flat tensors, and reconstructs the structured outputs
     (including recorded static output leaves).
+
+    Internally, the executable caches the input/output leaf layouts built
+    lazily on the first call (see ``_build_input_plan`` /
+    ``_build_output_plan``): repeated runs validate structure and leaves in
+    a single pass with no runtime TreeSpec construction, while every error
+    path (structure mismatch, leaf count, static values, per-leaf tensor
+    validation) raises exactly the same errors as before.
     """
     if isinstance(executable, BoundExecutable):
         bound = executable.bindings
@@ -793,9 +1071,13 @@ def run(executable, *args):
             f"BoundExecutable (from etl.bind), got {type(executable).__name__}"
         )
     signature = executable.signature
-    flat_tensors = _prepare_flat_inputs(signature, bound, args)
+    flat_tensors = _prepare_flat_inputs(
+        signature, bound, args, executable._get_input_plan()
+    )
     flat_outputs = executable.backend_executable.run(flat_tensors)
-    return _unflatten_outputs(signature, flat_outputs)
+    return _unflatten_outputs(
+        signature, flat_outputs, executable._get_output_plan()
+    )
 
 
 def bind(executable, **bindings):
