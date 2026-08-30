@@ -3,7 +3,7 @@
 The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (116 ops) so any accidental addition/removal/rename/effect change in the
+set (118 ops) so any accidental addition/removal/rename/effect change in the
 ``etl`` package is caught here.
 """
 
@@ -26,7 +26,9 @@ _ELEMENTWISE_BINARY = (
     "logical_and",
     "logical_or",
     "bitwise_and",
+    "bitwise_left_shift",
     "bitwise_or",
+    "bitwise_right_shift",
     "bitwise_xor",
 )
 
@@ -326,7 +328,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 116
+    assert len(names) == 118
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -342,7 +344,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 109) --------------------------------------
+# --- 3. per-op effect mapping (all 118) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -497,7 +499,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 116
+    assert len(opdefs) == 118
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )

@@ -205,7 +205,6 @@ COLLECTIVE_MAP: dict[str, str] = {
 # in v1 — densify via `etl.sparse.to_dense` to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
     {
-        "scan",
         "runtime_call",
         "block_call",
         "rank",

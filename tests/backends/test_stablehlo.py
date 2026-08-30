@@ -202,21 +202,6 @@ def test_none_dim_renders_as_unknown():
 
 # --- 7. deferred ops → BackendError naming the op -----------------------------
 
-def _fn_gather(x, idx):
-    return etl.gather(x, idx, axis=0)
-
-
-def _fn_scatter(x, idx, updates):
-    return etl.scatter(x, idx, updates, axis=0)
-
-
-def _fn_scan(x):
-    def step(carry, elem):
-        return etl.add(carry, elem), etl.multiply(carry, elem)
-
-    return etl.scan(step, 0.0, x)[1]
-
-
 def _fn_runtime_call(x):
     return etl.runtime_call(np.add, x, x, result=etl.TensorSpec((2,), etl.float32))
 
@@ -239,14 +224,6 @@ def _fn_rank(x):
 
 def _fn_world_size(x):
     return etl.dist.world_size()
-
-
-def _fn_argmax(x):
-    return etl.argmax(x)
-
-
-def _fn_argmin(x):
-    return etl.argmin(x)
 
 
 def _fn_erf(x):
@@ -274,17 +251,6 @@ def _fn_solve(a, b):
 
 
 DEFERRED_CASES = [
-    ("gather", _fn_gather,
-     (etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((2,), etl.int32)),
-     "gather"),
-    ("scatter", _fn_scatter,
-     (etl.TensorSpec((4, 3), etl.float32), etl.TensorSpec((2,), etl.int32),
-      etl.TensorSpec((2, 3), etl.float32)),
-     "scatter"),
-    # scan desugars at trace time into while + gather + scatter (see
-    # etl/trace/control_flow.py); the writer walks op order and hits the
-    # enclosing-level gather before the while op — hence 'gather' is named.
-    ("scan", _fn_scan, (etl.TensorSpec((4,), etl.float32),), "gather"),
     ("runtime_call", _fn_runtime_call, (etl.TensorSpec((2,), etl.float32),),
      "runtime_call"),
     ("block_call", _fn_block_call, (etl.TensorSpec((2,), etl.float32),),
@@ -292,8 +258,6 @@ DEFERRED_CASES = [
     ("rank", _fn_rank, (etl.TensorSpec((2,), etl.float32),), "rank"),
     ("world_size", _fn_world_size, (etl.TensorSpec((2,), etl.float32),),
      "world_size"),
-    ("argmax", _fn_argmax, (SPEC_2X3,), "argmax"),
-    ("argmin", _fn_argmin, (SPEC_2X3,), "argmin"),
     ("erf", _fn_erf, (SPEC_2X3,), "erf"),
     ("gelu", _fn_gelu, (SPEC_2X3,), "gelu"),
     ("tril", _fn_tril, (etl.TensorSpec((3, 3), etl.float32),), "tril"),

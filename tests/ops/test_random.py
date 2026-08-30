@@ -16,8 +16,10 @@ The contract under test (binding — see ``etl/ops/random.py`` and
 - ``key()`` is a polymorphic creator (concrete Tensor outside a trace,
   Constant op inside); every other function is a graph op (TraceError
   outside a trace; concrete Tensor operands raise TraceError).
-- Backends: numpy interpreter only in v1 (compiler backends reject every
-  random op with an explicit BackendError); transforms have no rules for
+- Backends: numpy interpreter (all ops); StableHLO export is v1 for every
+  random op EXCEPT ``multinomial`` (the cumulative-search decomposition is
+  not wired in v1 — compiler backends reject it with an explicit
+  BackendError naming ``random_multinomial``); transforms have no rules for
   random ops → TransformError.
 """
 import numpy as np
@@ -781,28 +783,37 @@ def test_vmap_of_random_op_raises_transformerror():
 def test_stablehlo_export_rejects_random_op():
     """The StableHLO exporter names the offending random op in its explicit
     v1 BackendError (no compiler installation needed — the check is in the
-    exporter)."""
+    exporter). ``random_multinomial`` is the only random op still deferred
+    in v1 — the other five export (see tests/backends/
+    test_iree_emitters_parity.py for their iree parity)."""
 
     @etl.defn
     def f(key):
-        return etl.random.uniform(key, (3,))
+        probs = etl.constant(
+            etl.tensor(np.array([0.25, 0.25, 0.5], dtype=np.float32))
+        )
+        return etl.random.multinomial(key, probs, 5)
 
     graph = etl.trace(f, etl.TensorSpec((), etl.int64))
     with pytest.raises(core.BackendError) as excinfo:
         etl.backends.stablehlo.export(graph)
     msg = str(excinfo.value)
-    assert "op 'random_uniform'" in msg
+    assert "op 'random_multinomial'" in msg
     assert "not supported in v1" in msg
 
 
 def test_compiler_backend_lower_rejects_random_op():
-    """Adapter lowering rejects random ops via the shared stablehlo export
-    path before any compiler runs (pure capability pre-check)."""
+    """Adapter lowering rejects the one still-deferred random op
+    (``random_multinomial``) via the shared stablehlo export path before
+    any compiler runs (pure capability pre-check)."""
 
     @etl.defn
     def f(key):
-        return etl.random.normal(key, (3,))
+        probs = etl.constant(
+            etl.tensor(np.array([0.25, 0.25, 0.5], dtype=np.float32))
+        )
+        return etl.random.multinomial(key, probs, 5)
 
     graph = etl.trace(f, etl.TensorSpec((), etl.int64))
-    with pytest.raises(core.BackendError, match="random_normal"):
+    with pytest.raises(core.BackendError, match="random_multinomial"):
         etl.lower(graph, backend="iree")

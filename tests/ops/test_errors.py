@@ -1,6 +1,6 @@
 """Error semantics of the full public op surface (contract: ``etl/ops/CONTEXT.md``).
 
-Every public op in ``etl.ops.__all__`` (67 names) is exercised in three
+Every public op in ``etl.ops.__all__`` (101 names) is exercised in three
 parametrized error categories:
 
 (a) called OUTSIDE a trace -> ``TraceError`` with the directing message
@@ -29,7 +29,7 @@ import etl
 from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
-# Per-op table of MINIMAL VALID call arguments (all 93 public ops).
+# Per-op table of MINIMAL VALID call arguments (all 101 public ops).
 # Each entry: op name -> (args_builder, kwargs). ``args_builder`` receives the
 # dict ``t`` of symbolic tensors below and returns the positional args of a
 # valid call; ``kwargs`` are constant per op.
@@ -54,7 +54,7 @@ _TENSOR_SPECS = (
 )
 
 OP_CALLS = {
-    # --- elementwise arithmetic / math / bitwise (32) ---
+    # --- elementwise arithmetic / math / bitwise (34) ---
     "add": (lambda t: (t["x"], t["x"]), {}),
     "subtract": (lambda t: (t["x"], t["x"]), {}),
     "multiply": (lambda t: (t["x"], t["x"]), {}),
@@ -91,6 +91,8 @@ OP_CALLS = {
     "bitwise_and": (lambda t: (t["xi"], t["xi"]), {}),
     "bitwise_or": (lambda t: (t["xi"], t["xi"]), {}),
     "bitwise_xor": (lambda t: (t["xi"], t["xi"]), {}),
+    "bitwise_left_shift": (lambda t: (t["xi"], t["xi"]), {}),
+    "bitwise_right_shift": (lambda t: (t["xi"], t["xi"]), {}),
     # --- comparison / logical / selection (10) ---
     "equal": (lambda t: (t["x"], t["x"]), {}),
     "not_equal": (lambda t: (t["x"], t["x"]), {}),
@@ -244,9 +246,9 @@ def _op_ref(op_name):
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 99 public op names."""
+    """The table must exercise exactly the 101 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 99
+    assert len(etl.ops.__all__) == 101
 
 
 # ---------------------------------------------------------------------------

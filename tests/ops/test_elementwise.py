@@ -635,6 +635,25 @@ def test_bitwise_ops_require_integer_or_bool(op_name, bad_dtype):
         )
 
 
+@pytest.mark.parametrize("op_name", ["bitwise_left_shift", "bitwise_right_shift"])
+@pytest.mark.parametrize("bad_dtype", [etl.bool_, etl.float32], ids=str)
+def test_shift_ops_require_integer_dtype(op_name, bad_dtype):
+    """Shifts accept integer dtypes ONLY — bool is rejected with an explicit
+    DTypeError (numpy's bool shift is a promotion artifact and StableHLO
+    defines no shift on i1), never silently promoted."""
+    fn = getattr(etl, op_name)
+
+    def traced(x, y):
+        return fn(x, y)
+
+    with pytest.raises(etl.DTypeError, match="must have integer dtype"):
+        trace_fn(
+            traced,
+            etl.TensorSpec((2,), bad_dtype),
+            etl.TensorSpec((2,), etl.int32),
+        )
+
+
 # ---------------------------------------------------------------------------
 # 8. error semantics: TraceError / TypeError
 # ---------------------------------------------------------------------------
@@ -1002,6 +1021,92 @@ def test_comparison_with_python_scalar():
     got = run_numpy(traced, x)
     assert got.dtype == np.dtype("bool")
     assert np.array_equal(got, np.less(x, 3))
+
+
+# ---------------------------------------------------------------------------
+# 9b. shift semantics: numpy dtype-natural (arithmetic on signed, logical on
+# unsigned — exactly np.left_shift / np.right_shift per dtype; bit-exact)
+# ---------------------------------------------------------------------------
+
+_SHIFT_NUMERIC_CASES = [
+    ("left_i32", etl.bitwise_left_shift, np.left_shift,
+     np.array([1, -8, 255], np.int32), np.array([1, 3, 4], np.int32)),
+    ("left_i64", etl.bitwise_left_shift, np.left_shift,
+     np.array([1, 2, 3], np.int64), np.array([1, 40, 8], np.int64)),
+    ("left_u32", etl.bitwise_left_shift, np.left_shift,
+     np.array([1, 2, 3], np.uint32), np.array([1, 3, 8], np.uint32)),
+    ("right_i32_arith", etl.bitwise_right_shift, np.right_shift,
+     np.array([1, -8, 255, -1], np.int32), np.array([3, 2, 4, 1], np.int32)),
+    ("right_i64_arith", etl.bitwise_right_shift, np.right_shift,
+     np.array([1, -8, 255], np.int64), np.array([3, 3, 3], np.int64)),
+    # sign-filling on signed: -8 >> 2 == -2 (arithmetic), never 0x3FFFFFFE
+    ("right_i32_arith_sign", etl.bitwise_right_shift, np.right_shift,
+     np.array([-8], np.int32), np.array([2], np.int32)),
+    ("right_u64_logical", etl.bitwise_right_shift, np.right_shift,
+     np.array([2 ** 63, 0xFFFFFFFFFFFFFFFF, 0], np.uint64),
+     np.array([3, 3, 3], np.uint64)),
+    ("right_u32_logical", etl.bitwise_right_shift, np.right_shift,
+     np.array([0x80000000, 0xFFFFFFFF, 1], np.uint32),
+     np.array([1, 4, 1], np.uint32)),
+]
+
+
+@pytest.mark.parametrize(
+    "op_name,fn,np_fn,a,shift", _SHIFT_NUMERIC_CASES,
+    ids=[c[0] for c in _SHIFT_NUMERIC_CASES],
+)
+def test_shift_numerics_follow_numpy(op_name, fn, np_fn, a, shift):
+    def traced(x, s):
+        return fn(x, s)
+
+    got = run_numpy(traced, a, shift)
+    assert got.dtype == a.dtype  # result dtype follows the (promoted) input
+    # shifts are bit-exact operations — numpy parity must be exact
+    assert np.array_equal(got, np_fn(a, shift))
+
+
+def test_shift_scalar_promotes_via_result_type():
+    """A Python-int shift amount is wrapped as an int64 0-d constant (NEP-50
+    weak-scalar convention, same as ``add(x, 3)`` over i32 → i64 — pinned in
+    tests/backends/test_stablehlo.py); the result dtype is
+    ``np.result_type(input, int64)``. Arithmetic/logical semantics are still
+    numpy-dtype-natural in the promoted dtype."""
+    for dtype in [np.int32, np.int64, np.uint32]:
+        x = np.array([1, 2, 255], dtype=dtype)
+
+        def traced(t):
+            return etl.bitwise_right_shift(t, 3)
+
+        got = run_numpy(traced, x)
+        promoted = np.result_type(dtype, np.int64)
+        assert got.dtype == promoted
+        assert np.array_equal(got, np.right_shift(x.astype(promoted), 3))
+
+
+def test_shift_scalar_on_uint64_promotes_to_float_and_is_rejected():
+    """``np.result_type(uint64, int64)`` is float64 — the frontend's
+    integer-kind guard then rejects the shift with an explicit DTypeError
+    (never a silent float shift)."""
+    x = np.array([1, 2 ** 63], np.uint64)
+
+    def traced(t):
+        return etl.bitwise_right_shift(t, 3)
+
+    with pytest.raises(etl.DTypeError, match="must have integer dtype"):
+        trace_fn(traced, etl.TensorSpec((2,), etl.uint64))
+
+
+def test_shift_amount_tensor_promotes_dtype():
+    """A tensor shift amount promotes per np.result_type (i64 >> i32 → i64)."""
+    x = np.array([1, 2, 3], np.int64)
+    s = np.array([1, 3, 8], np.int32)
+
+    def traced(t, sh):
+        return etl.bitwise_left_shift(t, sh)
+
+    got = run_numpy(traced, x, s)
+    assert got.dtype == np.dtype("int64")
+    assert np.array_equal(got, np.left_shift(x, s))
 
 
 # ---------------------------------------------------------------------------
