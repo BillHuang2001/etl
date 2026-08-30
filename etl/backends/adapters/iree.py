@@ -55,9 +55,10 @@ imported at module top level, so ``import etl`` stays light):
   ``rt.load_vm_module(vm_module, config)``, which binds the module to a
   SPECIFIC acquired device.
 - ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
-  array into a HAL device buffer for function input (used only for host
-  inputs — device-resident inputs pass through without a copy, see
-  ``IreeExecutable.run``).
+  array into a HAL device buffer for function input (used only for the host
+  input FALLBACKS — oversized inputs, unmappable dtypes, non-cuda devices;
+  the cuda fast path stages host inputs through persistent host-local +
+  device buffers, see ``IreeExecutable.run`` / ``_staged_input``).
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
   handle, already resident on the device. Run outputs are wrapped into
   ``core.Tensor(_IreeDevicePayload(...))`` — device-resident tensors whose
@@ -121,12 +122,16 @@ from ..registry import register as _registry_register
 # ---------------------------------------------------------------------------
 # CUDA per-call fast-path configuration (measured on IREE 3.11.0, RTX A6000)
 # ---------------------------------------------------------------------------
-# Host inputs on cuda executables are uploaded through PERSISTENT pinned
-# (host-visible) HAL buffers cached per (input index, shape, dtype): each run
-# re-copies the current host values into the mapped view and the dispatches
-# read the pinned memory directly. This removes the two dominant per-call
-# costs of the classic rt.asdevicearray path — a fresh device allocation and
-# the staging queue_copy + fence wait (~0.3-0.7 ms per call, measured).
+# Host inputs on cuda executables are uploaded through PERSISTENT staging
+# buffers cached per (input index, shape, dtype): each run memcpy's the
+# current host values into the mapped view of a HOST_LOCAL (plain host
+# memory) buffer, then issues a per-call async queue_copy (DMA) into a
+# persistent DEVICE_LOCAL staging buffer that the dispatches read, waiting
+# on a fresh semaphore the copy signals (the invoke does not synchronize
+# with an un-fenced queue_copy — see _staged_input). No per-call device
+# allocation. This removes the two dominant per-call costs of the classic
+# rt.asdevicearray path — a fresh device allocation and the staging
+# queue_copy + fence wait (~0.3-0.7 ms per call, measured).
 # Two invariants keep that path fast:
 #   * the CUDA driver's ASYNC (stream-ordered) allocator is disabled via the
 #     process-global runtime flag --cuda_async_allocations=false: with it
@@ -136,11 +141,24 @@ from ..registry import register as _registry_register
 #     (_pool_anchor) that keeps the classic allocator's pool from emptying,
 #     so per-call result allocation/free stays ~0.04 ms (measured: 4 KB
 #     anchor suffices, independent of the result size class).
-# Both are pure performance configuration — correctness-neutral (identical
-# buffers, copies, and synchronization as the default paths).
+# DESIGN NOTE (measured, do not "simplify" back): the earlier fast path had
+# dispatches read the host values directly from a persistent DEVICE_LOCAL |
+# HOST_VISIBLE ("pinned", host-mapped DEVICE memory) buffer, memcpy'd from
+# host every call. That pattern measured ~0.5-1.2 ms/call on cuda while the
+# pure invoke was 0.04-0.08 ms: host writes into the host-mapped DEVICE
+# memory go over PCIe write-through AND the driver serializes a host write
+# against any outstanding device read of that memory (~0.3-0.6 ms stall),
+# so the "pinned direct-read" idea is inherently slow. Writing into
+# HOST_LOCAL memory is a plain cached memcpy (~0.01 ms for 160 KB) and the
+# DMA queue_copy is ~0.01 ms, so the staged path tracks the pure invoke
+# cost (measured 0.08-0.13 ms/call quiet, ~0.3 ms under PCIe contention on
+# this busy 8-GPU box).
+# Both invariants and the staging are pure performance configuration —
+# correctness-neutral (identical buffers, copies, and synchronization as
+# the default paths).
 _CUDA_FLAGS_CONFIGURED = False
-_PINNED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
-_PINNED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
+_STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
+_STAGED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
 
 
 def _configure_cuda_runtime_flags() -> None:
@@ -596,7 +614,10 @@ class IreeExecutable(CompilerExecutable):
        ``DeviceArray`` on THIS executable's device (kind+index) is passed
        to the invoke directly — no host round-trip, no copy. Any other
        input (numpy-backed host tensor, payload on a different device) is
-       copied into a HAL buffer via ``rt.asdevicearray`` exactly as before.
+       staged on cuda via ``_staged_input`` (persistent host-local source +
+       per-call DMA queue_copy into a persistent device staging buffer) or
+       copied into a HAL buffer via ``rt.asdevicearray`` (fallbacks) exactly
+       as before.
     3. Invoke the entry function; handle single/multiple results (the
        invoker returns the value or a tuple).
     4. Wrap each result in ``core.Tensor(_IreeDevicePayload(...))`` — a
@@ -653,14 +674,15 @@ class IreeExecutable(CompilerExecutable):
         self._entry: Any = None
         # CUDA per-call fast path (see module-level notes): a retained
         # device-local anchor buffer keeps the allocator pool warm so per-call
-        # result allocation/free stays ~0.04 ms; the pinned-input cache holds
-        # persistent host-visible input buffers per (index, shape, dtype).
+        # result allocation/free stays ~0.04 ms; the staged-input cache holds
+        # persistent host-local source + device staging buffers per
+        # (index, shape, dtype).
         self._pool_anchor: Any = None
-        self._pinned_inputs: dict | None = None
+        self._staged_inputs: dict | None = None
         if device is not None and device.kind == "cuda":
             import iree.runtime as rt
 
-            self._pinned_inputs = {}
+            self._staged_inputs = {}
             try:
                 self._pool_anchor = runtime_device.allocator.allocate_buffer(
                     rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
@@ -715,8 +737,8 @@ class IreeExecutable(CompilerExecutable):
             # validation loop above already proved dtype/shape against the
             # signature, so the payload is guaranteed correct. Anything else
             # (numpy-backed host input, payload on a different device) takes
-            # the pinned persistent upload on cuda (see _pinned_input), else
-            # the classic asdevicearray H2D copy path.
+            # the staged upload on cuda (see _staged_input), else the classic
+            # asdevicearray H2D copy path.
             if isinstance(data, _IreeDevicePayload) and (
                 tensor.device == self._core_device
             ):
@@ -728,9 +750,9 @@ class IreeExecutable(CompilerExecutable):
             ):
                 buffers.append(data)
             else:
-                pinned = self._pinned_input(i, tensor)
-                if pinned is not None:
-                    buffers.append(pinned)
+                staged = self._staged_input(i, tensor)
+                if staged is not None:
+                    buffers.append(staged)
                 else:
                     buffers.append(
                         rt.asdevicearray(self.runtime_device, tensor.numpy())
@@ -793,21 +815,41 @@ class IreeExecutable(CompilerExecutable):
         self._entry = entry
         return entry
 
-    def _pinned_input(self, index: int, tensor: core.Tensor) -> Any | None:
-        """Upload a host tensor through a persistent pinned HAL buffer.
+    def _staged_input(self, index: int, tensor: core.Tensor) -> Any | None:
+        """Upload a host tensor through persistent staging buffers.
 
         CUDA fast path replacing ``rt.asdevicearray`` for host inputs: the
-        values are copied (memcpy) into the mapped view of a persistent
-        host-visible (pinned) buffer that the dispatches read directly — no
-        per-call device allocation, no staging ``queue_copy`` + fence wait.
-        The ``DeviceArray`` is built ONCE per (input index, shape, dtype)
-        and cached; every call re-copies the current host values into the
-        same mapped view (runs are synchronous, so reuse cannot race).
+        values are memcpy'd (``np.copyto``) into the mapped view of a
+        persistent HOST_LOCAL (plain host memory) source buffer, then a
+        per-call async ``queue_copy`` (DMA) transfers them into a persistent
+        DEVICE_LOCAL staging buffer that the dispatches read — no per-call
+        device allocation. The DeviceArray over the staging buffer is built
+        ONCE per (input index, shape, dtype) and cached; every call re-copies
+        the current host values into the same mapped view (runs are
+        synchronous, so reuse cannot race).
+
+        The queue_copy is a fire-and-forget queue op — the subsequent invoke
+        does NOT synchronize with it (measured: clobbering the source right
+        after queue_copy corrupts 44/50 results), so each call waits on a
+        fresh semaphore signaled by the copy before returning (~0.04 ms;
+        the copy itself is a ~0.01 ms DMA). A fresh semaphore per call is
+        required: reusing a semaphore whose event was already waited aborts
+        the CUDA event semaphore inside the next invoke.
+
+        Why not write the host values straight into a DEVICE_LOCAL |
+        HOST_VISIBLE ("pinned") buffer and let the dispatches read that
+        memory? Measured on IREE 3.11.0 / RTX A6000: host writes into
+        host-mapped DEVICE memory go over PCIe write-through AND the driver
+        serializes a host write against outstanding device reads of that
+        memory (~0.3-0.6 ms stall per call), while HOST_LOCAL writes are a
+        plain cached memcpy (~0.01 ms for 160 KB) and the DMA queue_copy is
+        ~0.01 ms — the staged path tracks the pure invoke cost.
+
         Falls back to ``None`` (caller uses ``asdevicearray``) for
         non-cuda executables, oversized inputs, unmappable dtypes, and a
         full cache — semantics identical either way.
         """
-        if self._pinned_inputs is None:
+        if self._staged_inputs is None:
             return None
         import numpy as np
         import iree.runtime as rt
@@ -816,34 +858,46 @@ class IreeExecutable(CompilerExecutable):
         dtype = tensor.dtype
         shape = tuple(tensor.shape)
         nbytes = int(np.prod(shape)) * dtype.itemsize
-        if nbytes > _PINNED_INPUT_MAX_BYTES:
+        if nbytes > _STAGED_INPUT_MAX_BYTES:
             return None
         key = (index, shape, dtype)
-        cached = self._pinned_inputs.get(key)
+        cached = self._staged_inputs.get(key)
         if cached is not None:
-            da, view = cached
+            hl_buf, hl_view, staging_da = cached
         else:
             element_type = map_dtype_to_element_type(dtype)
             if element_type is None:
                 return None
-            if len(self._pinned_inputs) >= _PINNED_INPUT_CACHE_MAX:
-                self._pinned_inputs.clear()  # bounded cache; correctness unaffected
-            buf = self.runtime_device.allocator.allocate_buffer(
-                rt.MemoryType.HOST_VISIBLE | rt.MemoryType.DEVICE_LOCAL,
-                rt.BufferUsage.DEFAULT | rt.BufferUsage.MAPPING,
+            if len(self._staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+                self._staged_inputs.clear()  # bounded cache; correctness unaffected
+            # Host-local source (plain host memory — cached writes) +
+            # persistent device staging buffer (dispatch storage).
+            hl_buf = self.runtime_device.allocator.allocate_buffer(
+                rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
+                rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
                 nbytes,
             )
-            view = buf.map().asarray(shape, np.dtype(dtype))
-            buffer_view = rt.HalBufferView(buf, shape, element_type)
-            da = rt.DeviceArray(
+            hl_view = hl_buf.map().asarray(shape, np.dtype(dtype))
+            stg_buf = self.runtime_device.allocator.allocate_buffer(
+                rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+            )
+            staging_da = rt.DeviceArray(
                 self.runtime_device,
-                buffer_view,
+                rt.HalBufferView(stg_buf, shape, element_type),
                 implicit_host_transfer=False,
                 override_dtype=dtype,
             )
-            self._pinned_inputs[key] = (da, view)
-        np.copyto(view, tensor.numpy())
-        return da
+            self._staged_inputs[key] = (hl_buf, hl_view, staging_da)
+        np.copyto(hl_view, tensor.numpy())
+        sem = self.runtime_device.create_semaphore(0)
+        self.runtime_device.queue_copy(
+            hl_buf,
+            staging_da._buffer_view.get_buffer(),
+            rt.HalFence.create_at(sem, 0),
+            rt.HalFence.create_at(sem, 1),
+        )
+        rt.HalFence.create_at(sem, 1).wait()
+        return staging_da
 
 
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
