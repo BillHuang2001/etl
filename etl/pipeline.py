@@ -221,11 +221,11 @@ class BoundExecutable:
     def _get_input_plan(self):
         """Fast-path input plan over the *reduced* (unbound) input tree.
 
-        Rebuilt when the bindings dict changes size (defensive: ``bindings``
-        is fixed after ``bind``; any mutation that changes the leaf layout
-        must not reuse a stale reduced tree)."""
+        Rebuilt when the bindings dict changes (defensive: ``bindings`` is
+        fixed after ``bind``; any mutation must not reuse a stale reduced
+        tree)."""
         plan = self._input_plan
-        if plan is None or plan[3] != len(self.bindings):
+        if plan is None or plan[4] != tuple(sorted(self.bindings)):
             plan = _build_input_plan(self.signature, self.bindings)
             self._input_plan = plan
         return plan
