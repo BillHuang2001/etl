@@ -78,17 +78,25 @@ Export utility ONLY: `stablehlo.export(graph_or_module) -> str` produces StableH
 | erf / gelu | deferred in v1 — `stablehlo.erf` does not exist in the opset (erf is CHLO-only); gelu's erf-based decomposition is deferred with it (see the Deferred list below) |
 | stop_gradient | identity passthrough (emit operand directly) |
 | bitwise_and/or/xor; logical_and/or/not | `stablehlo.and/or/xor/not` |
+| bitwise_left_shift / bitwise_right_shift | `stablehlo.shift_left` / `shift_right_arithmetic` (writer picks `shift_right_logical` for unsigned results) |
 | equal/not_equal/less/less_equal/greater/greater_equal | `stablehlo.compare` + `comparison_direction` attr (EQ/NE/LT/LE/GT/GE) |
 | cast | `stablehlo.convert` |
 | select / broadcast / reshape / transpose / slice / concatenate / pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
 | reduce_sum/max/min/mean/prod | `stablehlo.reduce` (mean: reduce-sum then divide) |
 | dot / conv | `stablehlo.dot_general` (each operand's batch dims are pre-aligned to the matmul-broadcast target batch — `broadcast_in_dim` / `dynamic_broadcast_in_dim` / size-1 squeeze and non-batched plain-matrix forms, both gated on fully-static shapes because iree cannot legalize the dynamic_reshape its import inserts for non-batched dot_general with dynamic dims; see `stablehlo/CONTEXT.md`) / `stablehlo.convolution` |
+| gather / scatter | dedicated writer compositions: `stablehlo.gather` / `stablehlo.scatter` (single-axis numpy `take` / `put_along_axis` semantics; scatter carries an `update_computation` region — replacement, not accumulation) |
+| sort / argsort | `stablehlo.sort` with an LT comparator region (argsort sorts a (value, iota) pair; descending = `stablehlo.reverse` after) |
+| argmax / argmin | two-operand `stablehlo.reduce` over (value, iota) with an index tie-break comparator (first occurrence on ties, matching `np.argmax`/`np.argmin`) |
+| tile | reshape + `broadcast_in_dim` + reshape decomposition |
+| random_key_mix/uniform/normal/randint/permutation | inline SplitMix64 i64 subgraph expansion (`stablehlo/random_export.py`; bit-exact vs the numpy kernels — uniform/randint/permutation EXACT, normal 1 ulp; never `stablehlo.rng`) |
 | constant | `stablehlo.constant` |
 | cond / while_loop | `stablehlo.if` / `stablehlo.while` |
 | collectives (all_reduce/all_gather/reduce_scatter/all_to_all/broadcast_collective/collective_permute) | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
 | symbolic dims | `?` dynamic dims in tensor types, e.g. `tensor<?xNxf32>` |
 
-**Deferred in v1** (⇒ `core.BackendError` naming the op, message suggests decomposition or a future adapter): `gather`, `scatter`, `scan`, `runtime_call`, `block_call` (blocks with no portable decomposition), `dist.rank()`/`dist.world_size()` graph scalars, `erf`, `gelu`, `argmax`, `argmin`, `call`, `tril`/`triu`/`cumsum`/`solve`, complex-number elementwise beyond cast. Mnemonics were verified against the official StableHLO spec at implementation time: `stablehlo.erf` and `stablehlo.argmax/argmin` do NOT exist in the StableHLO opset (erf is a CHLO op; ArgMax/ArgMin are open feature requests), so those ops are deferred rather than emitted with invented mnemonics. The unlisted data-movement ops (tril/triu/cumsum/solve/call) have no v1 mapping and fail explicitly.
+**Deferred in v1** (⇒ `core.BackendError` naming the op, message suggests decomposition or a future adapter): `runtime_call`, `block_call` (blocks with no portable decomposition), `dist.rank()`/`dist.world_size()` graph scalars, `erf`, `gelu` (no `stablehlo.erf` in the StableHLO opset — CHLO only; gelu's erf-based decomposition defers with it, no silent approximation), `diagonal`, `cumsum`, `solve`, the linalg factorizations `eigh`/`cholesky`/`qr`/`svd` (StableHLO counterparts exist but are not wired in v1) and `matrix_rank`/`matrix_exp` (need SVD-cutoff / Padé decompositions), `random_multinomial` (cumulative-search decomposition not wired), `call`, `tril`/`triu`, complex-number elementwise beyond cast. Mnemonics were verified against the official StableHLO spec at implementation time (e.g. `stablehlo.erf` does NOT exist — erf is a CHLO op), so those ops are deferred rather than emitted with invented mnemonics; `argmax`/`argmin` have no single StableHLO op either and are COMPOSED as a two-operand `reduce` (see the table), not deferred. The unlisted data-movement ops (tril/triu/cumsum/solve/call) have no v1 mapping and fail explicitly.
+
+**`scan` has no IR OpDef**: `etl.scan` desugars at trace time into `while` + `gather` + `scatter` (all v1) — scan graphs compile and run on iree-llvm-cpu.
 
 **Dynamic dims — v1 per-op policy (validated through iree; see `stablehlo/CONTEXT.md` for the full allow/reject lists):** `reshape` with any dynamic dim (incl. the keepdims reshapes inside the reduce/reduce_mean emitters), `conv` with dynamic dims, `slice`/`pad` with dynamic dims (iree parses but the RUNTIME aborts), `reduce_mean` reducing over a dynamic dim, and `dot` batch merges that cannot be emitted (no shape source / unprovable symbolic merge) all raise `core.BackendError` at export/`lower()` time — naming the op, the shape, the offending dims, containing "dynamic" — NEVER invalid MLIR reaching a compiler. Elementwise dynamic shapes, dynamic broadcasts with a shape source, reductions over dynamic dims, and dot_general with matched batch structure ARE exported and run on iree/tvm (pinned by the adapter `test_symbolic_dims`).
 
@@ -123,7 +131,7 @@ All three: `runtime_calls=False` (runtime_call rejected at lower), `custom_block
 `../../tests/backends/` (sibling — read-only from here; test-related writes escalate to root):
 - `registry.py`: register/get/duplicate/unknown-name behavior.
 - numpy interpreter: per-op coverage per kernel category; symbolic-dim binding at run time; dynamic control flow; `runtime_call` sync execution; block impl dispatch (impl vs portable decomposition vs missing ⇒ BackendError); collectives — single-rank identity AND multi-rank in-process simulation via the `CollectiveExecutor` hook; persistence round-trips (artifact save/load, backend mismatch ⇒ PersistenceError).
-- stablehlo: golden-text exports for the v1 table (elementwise, reduce, dot, if/while, symbolic-dims rendering), deferred ops ⇒ BackendError naming the op.
+- stablehlo: golden-text exports for the v1 table (elementwise, reduce, dot, if/while, symbolic-dims rendering), deferred ops ⇒ BackendError naming the op; new-emitter parity — gather/sort/argsort/argmin/argmax/tile/scatter, bit-exact random, scan-through-while graphs, and shifts vs numpy via iree-llvm-cpu (`test_iree_emitters_parity.py`, 41 tests + 5 iree-cuda smoke tests on `Device("cuda", 5)`, GPU-guarded).
 - CPU only, pytest, numpy-only deps.
 
 ## Routing table

@@ -26,6 +26,7 @@ Direct mnemonics (etl op → StableHLO, emitted with `stablehlo.` prefix):
 | ELEMENTWISE_MAP | abs/negate/sqrt/sign | `stablehlo.abs/negate/sqrt/sign` |
 | ELEMENTWISE_MAP | exp/log/log1p/sin/cos/tan/tanh/sigmoid | `stablehlo.exponential/log/log_plus_one/sine/cosine/tan/tanh/logistic` |
 | ELEMENTWISE_MAP | bitwise_and/or/xor; logical_and/or/not | `stablehlo.and/or/xor/not` |
+| ELEMENTWISE_MAP | bitwise_left_shift / bitwise_right_shift | `stablehlo.shift_left` / `shift_right_arithmetic` (the writer picks `shift_right_logical` for unsigned results) |
 | ELEMENTWISE_MAP | cast | `stablehlo.convert` |
 | COMPARISON_MAP | equal/not_equal/less/less_equal/greater/greater_equal | `stablehlo.compare` + `comparison_direction` attr (EQ/NE/LT/LE/GT/GE) |
 | SHAPE_MAP | select/broadcast/reshape/transpose/slice/concatenate/pad | `stablehlo.select/broadcast_in_dim/reshape/transpose/slice/concatenate/pad` |
@@ -35,13 +36,22 @@ Direct mnemonics (etl op → StableHLO, emitted with `stablehlo.` prefix):
 | CONTROL_FLOW_MAP | cond/while_loop | `stablehlo.if` / `stablehlo.while` |
 | COLLECTIVE_MAP | all_reduce/all_gather/reduce_scatter/all_to_all/broadcast/collective_permute | `stablehlo.all_reduce/all_gather/reduce_scatter/all_to_all/collective_broadcast/collective_permute` |
 
+Dedicated emitters (`SPECIAL_EMITTERS` — multi-op StableHLO compositions with dedicated writer routines; `status()` reports "v1"):
+- `gather` → `stablehlo.gather` (single-axis, exact numpy `take` semantics; full-rank index reshaping)
+- `scatter` → `stablehlo.scatter` with an `update_computation` region (numpy `put_along_axis` semantics; replacement, not accumulation)
+- `sort`/`argsort` → `stablehlo.sort` with an LT comparator region (argsort sorts a (value, iota) pair; descending = `stablehlo.reverse` after — the numpy composition)
+- `argmin`/`argmax` → two-operand `stablehlo.reduce` over (value, iota) with an index tie-break comparator (first occurrence on ties, matching `np.argmax`/`np.argmin`)
+- `tile` → reshape + `broadcast_in_dim` + reshape decomposition
+- `random_key_mix`/`random_uniform`/`random_normal`/`random_randint`/`random_permutation` → inline SplitMix64 i64 subgraph expansion (`./random_export.py`; bit-exact vs the numpy kernels by two's-complement equivalence — uniform/randint/permutation EXACT, normal 1 ulp; NEVER `stablehlo.rng`, whose implementation-defined algorithm would break the same-key ⇒ same-values determinism contract)
+- **`scan` has no IR OpDef**: `etl.scan` desugars at trace time into while + gather + scatter (all v1 now), so scan graphs compile and run on iree-llvm-cpu.
+
 Decompositions (`DECOMPOSITIONS` — writer emits ordinary sub-ops, no direct mnemonic):
 - `square` → `multiply(x, x)`
 - `relu` → `maximum(x, 0)`
 - `stop_gradient` → identity passthrough (emit operand directly)
 - `reduce_mean` → reduce-sum then divide by element count
 
-Deferred in v1 (`DEFERRED_OPS` ⇒ `core.BackendError` naming the op): `gather`, `scatter`, `scan`, `runtime_call`, `block_call`, `rank`, `world_size` (dist graph scalars), `argmax`/`argmin` (no such ops in the StableHLO opset — ArgMax/ArgMin are open feature requests), `erf`/`gelu` (no `stablehlo.erf` exists — CHLO only; gelu's erf-based decomposition needs erf, so it is deferred together with it, no silent approximation), the 16 `sparse_*`/`dense_dot_sparse` ops (numpy-backend-only; densify via `etl.sparse.to_dense`), complex-number elementwise beyond cast. Unmapped op names (`call`, `tril`, `triu`, `cumsum`, `solve`, …) also count as deferred via `status()`.
+Deferred in v1 (`DEFERRED_OPS` ⇒ `core.BackendError` naming the op): `runtime_call`, `block_call`, `rank`, `world_size` (dist graph scalars), `erf`/`gelu` (no `stablehlo.erf` exists — CHLO only; gelu's erf-based decomposition needs erf, so it is deferred together with it, no silent approximation), `diagonal`, `cumsum`, `solve`, the linalg factorizations `eigh`/`cholesky`/`qr`/`svd` (StableHLO counterparts exist but are not wired in v1) and `matrix_rank`/`matrix_exp` (need SVD-cutoff / Padé decompositions), `random_multinomial` (cumulative-search decomposition not wired), the 16 `sparse_*`/`dense_dot_sparse` ops (numpy-backend-only; densify via `etl.sparse.to_dense`), complex-number elementwise beyond cast. Unmapped op names (`call`, `tril`, `triu`, …) also count as deferred via `status()`.
 
 **Dynamic-dim deferrals (v1, validated through iree):** every rejection names the op, the shape, the offending dims, and contains "dynamic" — raised at export/`lower()` time, never invalid MLIR: `reshape` with ANY dynamic dim (incl. the keepdims reshapes inside the reduce/reduce_mean emitters), `conv` with any dynamic dim in x/w/result, `slice` / `pad` with dynamic dims (iree-compile ACCEPTS the MLIR but the runtime ABORTs at every concrete size), `reduce_mean` reducing over a dynamic dim (element count not statically known), and `dot` batch structure that cannot be emitted (no shape source for the required dynamic broadcast / unprovable symbolic batch merge).
 
@@ -64,7 +74,7 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 
 - Top-level imports restricted to `etl.core` and `etl.ir`; NEVER import `etl.pipeline` (cycle). `trace.Graph` is duck-typed via `.module` (no `etl.trace` import). numpy is allowed (DTYPE_MAP keys). `writer.py` uses TYPE_CHECKING imports for `etl.ir` annotations.
 - Export-only: never registers with the backend registry; no lower/compile/load/run.
-- Files < ~1000 lines (`writer.py` is the known exception — the single emission file, ~1800 lines; splitting is deferred, see Notes for agents); `ops.py` is data-only.
+- Files < ~1000 lines (`writer.py` is the known exception — the single emission file, ~2700 lines; splitting is deferred, see Notes for agents); `ops.py` is data-only.
 - CPU-neutral: MLIR text only, no device interaction.
 
 ## Test strategy
@@ -73,7 +83,8 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 - Golden-text exports for the v1 table: elementwise, comparisons (direction attr), reduce, dot/conv, if/while, collectives.
 - Symbolic-dims rendering: `tensor<?xNxf32>` etc.
 - Decomposition emission: square/relu/stop_gradient/reduce_mean.
-- Deferred ops (gather/scatter/scan/runtime_call/block_call/rank/world_size/erf/gelu + the 16 sparse ops) ⇒ `BackendError` naming the op; unknown op ⇒ same.
+- Deferred ops (runtime_call/block_call/rank/world_size/erf/gelu/diagonal/cumsum/solve/eigh/cholesky/qr/matrix_rank/svd/matrix_exp/random_multinomial + the 16 sparse ops) ⇒ `BackendError` naming the op; unknown op ⇒ same.
+- `../../../tests/backends/test_iree_emitters_parity.py` (41 tests, iree-llvm-cpu): parity vs numpy for gather/sort/argsort/argmin/argmax/tile/scatter, bit-exact random draws (uniform/randint/permutation EXACT, normal 1 ulp), scan-through-while graphs (scan desugars to while+gather+scatter at trace time), and the shift primitives (4 parity cases incl. u64-logical via i64-bits+masking); plus 5 iree-cuda smoke tests on `Device("cuda", 5)` (gather/sort/random_uniform/tile/scatter) — GPU-guarded (`pytest.skip` without the cuda HAL driver/GPU).
 - Dynamic-dims rejection contract (pending — to be added by root): symbolic reshape/conv/slice/pad and dynamic-reduced-axis reduce_mean ⇒ `BackendError` naming op/dims/"dynamic"; positive: reduce_mean over a static axis with dynamic non-reduced dims exports; batched-dot goldens for rank-3@rank-2 (aligned batching dims after broadcast), rhs-higher-rank, size-1 batch squeeze, matched multi-batch (byte-identical), symbolic-batch dynamic-broadcast emission, and unprovable symbolic merge ⇒ `BackendError`; adapter-level: softmax-style symbolic reshape graph must raise from `etl.lower(..., backend='iree'|'tvm')` before any compiler invocation.
 - `verify()` failure surfaces `VerificationError`; non-Graph/non-Module input ⇒ `TypeError`.
 - CPU only, pytest, numpy-only deps.
@@ -83,8 +94,9 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 | Path | Area |
 |---|---|
 | `./ops.py` | v1 mapping tables (data) + lookup/status helpers — the auditable mapping source of truth |
-| `./writer.py` | StableHLO MLIR text emission (`Writer`, ~1800 lines incl. the dynamic-broadcast emission path, batched-dot batch alignment, and the per-op dynamic-dims validation; consumes `ops.py` data only) |
+| `./writer.py` | StableHLO MLIR text emission (`Writer`, ~2700 lines incl. the dynamic-broadcast emission path, batched-dot batch alignment, the per-op dynamic-dims validation, and the gather/scatter/sort/argsort/arg_reduce/tile emitter routines; consumes `ops.py` data only) |
 | `./__init__.py` | `export()` — the only public entry point |
+| `./random_export.py` | SplitMix64 random-op expansion (inline i64 subgraphs for the 5 v1 random ops) |
 
 ## Notes for agents
 
@@ -92,4 +104,7 @@ Helpers (trivial, implemented): `lookup_mapping(op_name)` (first hit across tabl
 - `../../` = `etl/backends/`, `../../../` = repo root (the tests path above is correct from this node).
 - `_emit_dot`'s 5-path dispatch (rank-1 operands / matched batch / non-batched fast paths — plain-matrix rhs AND the size-1-batch squeeze — each gated on FULLY static shapes: iree 3.11 cannot legalize the `dynamic_reshape` its import inserts for non-batched dynamic dot_general, so dynamic shapes fall through to the batched dynamic-broadcast path, which legalizes fine / static or dynamic batch broadcast / unprovable symbolic merge ⇒ BackendError). All `_dot*` helpers live between `_emit_dot` and `_emit_conv`.
 - Dynamic-dims rejection helper: `Writer._reject_dynamic_dims(op, shape, what, op_name=None)` (~line 652) — used by the reshape/conv/slice/pad emitters and the reduce keepdims paths; message template always contains "dynamic" and the offending dims. `slice`/`pad` were added to the reject list EMPIRICALLY: iree-compile accepts the MLIR but the runtime ABORTs (hal.fence.await) at every concrete size.
-- `writer.py` is ~1800 lines and legitimately long: it is the single emission file (mapping data lives in `ops.py`; splitting the writer itself is a possible future refactor, not a correctness issue).
+- `writer.py` is ~2700 lines and legitimately long: it is the single emission file (mapping data lives in `ops.py`; splitting the writer itself is a possible future refactor, not a correctness issue).
+- **`stablehlo.sort` tie order is NOT guaranteed to match numpy's stable argsort**: the (value, iota) comparator matches numpy for ascending order, but the descending path (`stablehlo.reverse` after sorting) reverses ties too — the parity tests pin the descending-argsort tie-break as `np.argsort(x)[::-1]`.
+- **iree's declared dtypes exclude uint64** (the function-signature capability check): u64 values must be constructed INSIDE the graph via i64 bits + masking (as the shift u64-logical parity test does) — u64 tensors cannot be graph inputs/outputs on iree.
+- **iree-cuda while-loop fragility is shape-specific (upstream compiler/runtime)**: `while_fib` segfaults and `while_cond_combo` hits a `hal.device.queue.dealloca` ABORT on iree-cuda (both pass on llvm-cpu), but an NSGA2-`non_dominate_rank`-shaped while_loop (3 carries incl. an input-derived vector carry, `etl.select` on carried vectors) COMPILES and RUNS bit-exact on BOTH llvm-cpu and iree-cuda (maxdiff 0 / 1.1e-16) — NSGA2 GPU is not blocked.
