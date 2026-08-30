@@ -5,8 +5,11 @@ Covered here (all newly v1 — see ``etl/backends/stablehlo/ops.py``):
 * gather / sort / argsort / argmax / argmin / tile / scatter,
 * the SplitMix64 random family (``random_key_mix`` / ``random_uniform`` /
   ``random_normal`` / ``random_randint`` / ``random_permutation`` —
-  bit-exact vs the numpy kernels; ``random_normal`` is the one fp32
-  libm-sensitive draw → tight allclose, probe maxdiff was 0.0),
+  uniform/randint/permutation/key_mix are bit-exact vs the numpy kernels;
+  ``random_normal`` (f32 out) takes the DOCUMENTED f32 Box–Muller fast path
+  on compiler backends — deterministic (same key ⇒ bit-identical across
+  runs, asserted below) but ~1e-6 vs the numpy f64 math, so the parity
+  checks are tolerance-based for normal and the split_n chain),
 * the shift primitives (``bitwise_left_shift`` / ``bitwise_right_shift``),
 * ``etl.scan`` (desugars at trace time into while + gather + scatter — all
   v1, so scan graphs compile and run on iree-llvm-cpu).
@@ -475,9 +478,12 @@ def _rchain(k):
 SEED = np.array(42, dtype=np.int64)
 KEY_SPEC = etl.TensorSpec((), etl.int64)
 
-# (id, fn, specs, args, exact) — the numpy kernel IS the reference; the
-# emitter must reproduce it bit-for-bit (normal: fp32 Box-Muller libm noise,
-# probe maxdiff 0.0 → tight allclose as belt-and-braces)
+# (id, fn, specs, args, exact) — the numpy kernel IS the reference for
+# uniform/randint/permutation/key_mix (the emitter must reproduce them
+# bit-for-bit); normal is the documented f32 fast-path deviation (see
+# etl/backends/stablehlo/random_export.py) → explicit tolerance, and its
+# determinism (same key ⇒ bit-identical draws) is asserted in
+# test_random_iree_determinism.
 RANDOM_CASES = [
     ("random_key_mix_split", _rkey, (), (), True),
     ("random_uniform", _runiform, (KEY_SPEC,), (SEED,), True),
@@ -488,6 +494,10 @@ RANDOM_CASES = [
     ("random_split_n_chain", _rchain, (KEY_SPEC,), (SEED,), False),
 ]
 
+#: Documented tolerance for the f32 normal fast path (measured ~1e-6; 10x
+#: headroom over the f32 rounding budget).
+RANDOM_NORMAL_TOL = dict(rtol=1e-4, atol=1e-5)
+
 
 @pytest.mark.parametrize(
     "case_id,fn,specs,args,exact",
@@ -495,10 +505,32 @@ RANDOM_CASES = [
     ids=[c[0] for c in RANDOM_CASES],
 )
 def test_random_iree_parity(case_id, fn, specs, args, exact):
-    _parity(fn, *specs, args=args, exact=exact)
+    want = etl.evaluate(fn, *args)
+    exe = etl.build(fn, *specs, backend="iree")
+    got = etl.run(exe, *args)
+    if exact:
+        _assert_exact(got, want)
+    else:
+        _assert_close(got, want, **RANDOM_NORMAL_TOL)
     if "permutation" in case_id:
         got = _np(etl.evaluate(fn, *args))
         assert sorted(got.tolist()) == list(range(12))  # a real permutation
+
+
+@pytest.mark.parametrize(
+    "case_id,fn,specs,args",
+    [(c[0], c[1], c[2], c[3]) for c in RANDOM_CASES],
+    ids=[c[0] for c in RANDOM_CASES],
+)
+def test_random_iree_determinism(case_id, fn, specs, args):
+    """The hard etl.random contract on compiler backends: same key +
+    operands ⇒ BIT-IDENTICAL draws across runs (the values may deviate from
+    the numpy reference for the f32 normal fast path, but never across
+    iree runs)."""
+    exe = etl.build(fn, *specs, backend="iree")
+    g1 = etl.run(exe, *args)
+    g2 = etl.run(exe, *args)
+    _assert_exact(g1, g2)
 
 
 # ---------------------------------------------------------------------------

@@ -783,7 +783,8 @@ def test_matching_dtype_graphs_emit_no_convert(fn, specs):
 
 # eigh/diag have no mnemonic StableHLO op (StableHLO 1.0 removed
 # eigh/qr/svd; there is no diag), so the writer emits multi-op compositions
-# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = 8 unrolled cyclic-Jacobi sweeps
+# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = adaptive unrolled cyclic-Jacobi
+# sweeps (fp32: dim-based 3-7; f64: 8 — see writer.py `_eigh_sweeps`)
 # (slice/iota/compare/select/elementwise rotations) + a stable pair-sort for
 # the ascending eigenvalue order + a gather column reorder of V; diag =
 # iota-EQ mask + select (rank-1 → diagonal matrix) or flatten +
