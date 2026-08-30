@@ -16,8 +16,28 @@ stablehlo/dialect/StablehloOps.td):
   and/or/xor/not, convert (cast), compare (+ ``comparison_direction``),
   select, broadcast_in_dim, reshape, transpose, slice, concatenate, pad,
   reduce (with a reducer region + init value), dot_general, convolution,
-  constant, if/while, all_gather/all_reduce/all_to_all/
+  constant, if/while, shift_left/shift_right (arithmetic+logical),
+  gather, scatter, sort (with a comparator region + ``dimension``),
+  reverse, iota (multi-rank ``dim`` form), all_gather/all_reduce/all_to_all/
   collective_broadcast/collective_permute/reduce_scatter.
+* Emitted via dedicated writer routines (``SPECIAL_EMITTERS``), not a
+  single mnemonic:
+  - ``gather``/``scatter`` → ``stablehlo.gather``/``stablehlo.scatter``
+    with the exact numpy ``take``/``put_along_axis`` semantics (single-axis
+    gather; full-rank index reshaping + numpy broadcast for scatter).
+  - ``sort``/``argsort`` → ``stablehlo.sort`` with an LT comparator region
+    (argsort sorts a (value, iota) pair; iota tie-break gives numpy stable
+    semantics; descending = ``stablehlo.reverse`` after — the numpy
+    composition).
+  - ``argmax``/``argmin`` → a two-operand ``stablehlo.reduce`` over
+    (value, iota) with an index tie-break comparator (first occurrence on
+    ties, matching ``np.argmax``/``np.argmin``).
+  - ``tile`` → reshape + ``broadcast_in_dim`` + reshape decomposition.
+  - the ``random_*`` ops → inline SplitMix64 subgraph expansion (see
+    ``./random_export.py``): bit-identical to the numpy kernels by
+    two's-complement equivalence; NOT ``stablehlo.rng`` (implementation-
+    defined algorithm would break the same-key⇒same-values determinism
+    contract).
 * NOT in StableHLO (moved to DEFERRED_OPS here):
   - ``erf`` — only ``chlo.erf`` exists (CHLO: "an intermediate value in
     decompositions, never constructed directly"), and there is no trivial
@@ -25,8 +45,6 @@ stablehlo/dialect/StablehloOps.td):
     ``stablehlo.erf`` would produce invalid MLIR.
   - ``gelu`` — the binding decomposition (0.5*x*(1+erf(x/sqrt(2)))) needs
     erf, so it is deferred together with it (no silent approximation).
-  - ``argmax``/``argmin`` — no such ops in the StableHLO opset (see
-    openxla/xla issue #33449 requesting them); no trivial decomposition.
   - sparse ops — the ``sparse_*``/``dense_dot_sparse`` family
     (``etl.sparse``) is numpy-backend-only in v1; densify via
     ``etl.sparse.to_dense`` to export.
@@ -77,6 +95,34 @@ ELEMENTWISE_MAP: dict[str, str] = {
     "logical_or": "stablehlo.or",
     "logical_not": "stablehlo.not",
     "cast": "stablehlo.convert",
+    "bitwise_left_shift": "stablehlo.shift_left",
+    # bitwise_right_shift maps to shift_right_arithmetic (signed operands)
+    # or shift_right_logical (unsigned) — the writer picks by result dtype
+    # at emission time (the entry documents the signed default).
+    "bitwise_right_shift": "stablehlo.shift_right_arithmetic",
+}
+
+# Ops emitted by dedicated writer routines (gather/scatter/sort/argsort/
+# argmax/argmin/tile use multi-op StableHLO compositions; the random_* ops
+# are expanded as inline SplitMix64 i64 subgraphs in `./random_export.py` —
+# never `stablehlo.rng`, whose implementation-defined algorithm would break
+# the same-key⇒same-values determinism contract). The values are emitter
+# family keys; `status()` reports these as supported ("v1").
+SPECIAL_EMITTERS: dict[str, str] = {
+    "gather": "gather",
+    "scatter": "scatter",
+    "sort": "sort",
+    "argsort": "argsort",
+    "argmax": "arg_reduce",
+    "argmin": "arg_reduce",
+    "tile": "tile",
+    "random_key_mix": "random",
+    "random_uniform": "random",
+    "random_normal": "random",
+    "random_randint": "random",
+    "random_permutation": "random",
+    # random_multinomial stays deferred (cumulative-search decomposition is
+    # not wired in v1; not needed by the benchmark suite).
 }
 
 # Ops emitted by expansion into other ops rather than a direct mnemonic.
@@ -149,28 +195,23 @@ COLLECTIVE_MAP: dict[str, str] = {
 # are the dist graph scalars; complex-number elementwise beyond cast is
 # additionally deferred (not an op name — enforced by dtype checks in the
 # writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
-# only); `argmax`/`argmin` because StableHLO has no such ops; `sort`/
-# `diagonal` because their StableHLO emission is not wired in v1 (defer
-# explicitly, never silently). The linalg factorizations
+# only); `diagonal` because its StableHLO emission is not wired in v1
+# (defer explicitly, never silently). The linalg factorizations
 # (`eigh`/`cholesky`/`qr`/`svd`) have StableHLO counterparts but are not
 # wired in v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff /
-# Padé) — all six defer explicitly. The 16
+# Padé) — all six defer explicitly. `random_multinomial` defers because its
+# cumulative-search decomposition is not wired in v1. The 16
 # `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
 # in v1 — densify via `etl.sparse.to_dense` to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
     {
-        "gather",
-        "scatter",
         "scan",
         "runtime_call",
         "block_call",
         "rank",
         "world_size",
-        "argmax",
-        "argmin",
         "erf",
         "gelu",
-        "sort",
         "diagonal",
         "eigh",
         "cholesky",
@@ -178,6 +219,7 @@ DEFERRED_OPS: frozenset[str] = frozenset(
         "matrix_rank",
         "svd",
         "matrix_exp",
+        "random_multinomial",
         "sparse_from_dense",
         "sparse_to_dense",
         "sparse_coo_to_csr",
@@ -265,7 +307,8 @@ def lookup_mapping(op_name: str) -> str:
 def status(op_name: str) -> Literal["v1", "decompose", "deferred"]:
     """Export status of an etl op name.
 
-    - ``"v1"``: has a direct mnemonic (or comparison direction).
+    - ``"v1"``: has a direct mnemonic (or comparison direction) or a
+      dedicated emitter routine (``SPECIAL_EMITTERS``).
     - ``"decompose"``: emitted as an expansion of ordinary ops.
     - ``"deferred"``: in DEFERRED_OPS or unmapped anywhere; the writer
       raises core.BackendError naming the op either way.
@@ -274,6 +317,8 @@ def status(op_name: str) -> Literal["v1", "decompose", "deferred"]:
         return "decompose"
     if op_name in DEFERRED_OPS:
         return "deferred"
+    if op_name in SPECIAL_EMITTERS:
+        return "v1"
     for table in _DIRECT_TABLES:
         if op_name in table:
             return "v1"

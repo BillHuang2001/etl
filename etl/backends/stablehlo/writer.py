@@ -86,6 +86,7 @@ import numpy as np
 from etl.core import BackendError, Dim, DimExpr
 
 from . import ops as mapping
+from . import random_export
 
 if TYPE_CHECKING:
     from etl.ir import Block, Function, Module, Op, Value
@@ -317,6 +318,29 @@ class Writer:
             return self._emit_while(op)
         if name in mapping.COLLECTIVE_MAP:
             return self._emit_collective(op)
+        if name in mapping.SPECIAL_EMITTERS:
+            return self._emit_special(op)
+        raise self._unsupported(op)
+
+    def _emit_special(self, op: Op) -> str:
+        """Dispatch ops that need dedicated multi-op emitters (see
+        ``mapping.SPECIAL_EMITTERS``): gather/scatter/sort/argsort/argmax/
+        argmin/tile and the SplitMix64 random expansions."""
+        family = mapping.SPECIAL_EMITTERS[op.name]
+        if family == "gather":
+            return self._emit_gather(op)
+        if family == "scatter":
+            return self._emit_scatter(op)
+        if family == "sort":
+            return self._emit_sort(op)
+        if family == "argsort":
+            return self._emit_argsort(op)
+        if family == "arg_reduce":
+            return self._emit_arg_reduce(op)
+        if family == "tile":
+            return self._emit_tile(op)
+        if family == "random":
+            return random_export.emit_random_op(self, op)
         raise self._unsupported(op)
 
     def _emit_elementwise(self, op: Op) -> str:
@@ -337,6 +361,21 @@ class Writer:
         (operand and result types differ by definition).
         """
         mnemonic = mapping.lookup_mapping(op.name)
+        if op.name == "bitwise_right_shift":
+            # numpy `np.right_shift` is dtype-natural: arithmetic on signed,
+            # logical on unsigned. Operands are converted to the result dtype
+            # below, so the result dtype decides the StableHLO mnemonic.
+            shift_dtype = np.dtype(op.result.type.dtype)
+            if shift_dtype.kind == "u":
+                mnemonic = "stablehlo.shift_right_logical"
+            elif shift_dtype.kind == "i":
+                mnemonic = "stablehlo.shift_right_arithmetic"
+            else:
+                raise BackendError(
+                    f"stablehlo export: op 'bitwise_right_shift'{self._loc(op)} "
+                    f"over dtype {shift_dtype!r} is not supported (the "
+                    "frontend requires integer operands)"
+                )
         result_shape = tuple(op.result.type.shape)
         result_name = self._bind_results(op)[0]
         shape_source = self._shape_source(op.operands, result_shape)
@@ -1028,6 +1067,780 @@ class Writer:
         raise BackendError(
             f"stablehlo export: unknown reduction kind {kind!r}"
         )
+
+    # --- Indexing / sorting / tile / arg-reduce emitters ---
+    #
+    # Syntax notes (empirically verified at iree 3.11.0): `stablehlo.sort`
+    # with multiple operands interleaves the comparator block args
+    # (lhs0, rhs0, lhs1, rhs1 — per operand, lhs before rhs);
+    # `stablehlo.reduce` with multiple operands GROUPS them
+    # (operand0_lhs, operand1_lhs, operand0_rhs, operand1_rhs). The
+    # comparator bodies follow the `_emit_reduce_core` region conventions
+    # (fresh counter-named block args, `stablehlo.return`).
+
+    @staticmethod
+    def _normalize_axis(axis, rank: int, op_name: str) -> int:
+        if rank == 0:
+            return 0
+        return int(axis) % rank
+
+    def _emit_iota(self, shape: tuple, axis: int, lines: list) -> str:
+        """Full-rank int64 iota along ``axis`` of the static ``shape``.
+
+        Custom-form emission: iree 3.11.0 rejects the generic attribute
+        form (``"stablehlo.iota" {dim = ...}`` — "expected '(' to start
+        operand list"); ``stablehlo.iota dim = N : tensor<...>`` parses.
+        """
+        name = self._new_name()
+        lines.append(
+            f"{name} = stablehlo.iota dim = {axis} : "
+            f"{self._type_str(np.dtype('int64'), shape)}"
+        )
+        return name
+
+    def _emit_to_i64(self, name: str, dtype, shape: tuple, lines: list) -> str:
+        """Convert an SSA value to int64 (identity when already int64)."""
+        if np.dtype(dtype) == np.dtype("int64"):
+            return name
+        t = self._new_name()
+        lines.append(
+            f"{t} = stablehlo.convert {name} : ({self._type_str(dtype, shape)}) -> "
+            f"{self._type_str(np.dtype('int64'), shape)}"
+        )
+        return t
+
+    def _emit_index_normalize(self, iname: str, idx_shape: tuple, axis_len: int,
+                              lines: list) -> str:
+        """Normalize indices to numpy semantics: wrap negatives by adding
+        the axis length (``select(idx < 0, idx + axis_len, idx)``) — numpy
+        ``take``/``put_along_axis`` wrap negative indices while StableHLO
+        treats out-of-range as poison."""
+        i64 = np.dtype("int64")
+        zero, zl = self._scalar_constant_for(i64, 0, idx_shape)
+        lines.extend(zl)
+        neg = self._new_name()
+        lines.append(
+            f'{neg} = "stablehlo.compare"({iname}, {zero}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : ({self._type_str(i64, idx_shape)}, "
+            f"{self._type_str(i64, idx_shape)}) -> "
+            f"{self._type_str(np.dtype('bool'), idx_shape)}"
+        )
+        alen, al = self._scalar_constant_for(i64, axis_len, idx_shape)
+        lines.extend(al)
+        plus = self._new_name()
+        lines.append(
+            f"{plus} = stablehlo.add {iname}, {alen} : {self._type_str(i64, idx_shape)}"
+        )
+        wrap = self._new_name()
+        lines.append(
+            f"{wrap} = stablehlo.select {neg}, {plus}, {iname} : "
+            f"({self._type_str(np.dtype('bool'), idx_shape)}, "
+            f"{self._type_str(i64, idx_shape)}, {self._type_str(i64, idx_shape)})"
+            f" -> {self._type_str(i64, idx_shape)}"
+        )
+        return wrap
+
+    def _emit_broadcast_static(self, name: str, src_dtype, src_shape: tuple,
+                               target_shape: tuple, lines: list, op: Op) -> str:
+        """Numpy-broadcast an SSA value to a static target shape (trailing
+        alignment, size-1 dims expand); BackendError when numpy broadcasting
+        would fail."""
+        if len(src_shape) > len(target_shape):
+            raise BackendError(
+                f"stablehlo export: op '{op.name}'{self._loc(op)} cannot "
+                f"broadcast shape {src_shape!r} to {target_shape!r} (numpy "
+                "broadcasting would fail)"
+            )
+        pad = len(target_shape) - len(src_shape)
+        for sd, td in zip(src_shape, target_shape[pad:]):
+            if sd != td and sd != 1:
+                raise BackendError(
+                    f"stablehlo export: op '{op.name}'{self._loc(op)} cannot "
+                    f"broadcast shapes {src_shape!r} and {target_shape!r} "
+                    "(numpy broadcasting would fail)"
+                )
+        if src_shape == target_shape:
+            return name
+        b = self._new_name()
+        dims = list(range(pad, len(target_shape)))
+        lines.append(
+            f'{b} = "stablehlo.broadcast_in_dim"({name}) '
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(src_dtype, src_shape)}) -> "
+            f"{self._type_str(src_dtype, target_shape)}"
+        )
+        return b
+
+    def _emit_gather(self, op: Op) -> str:
+        """``gather`` → ``stablehlo.gather`` with numpy ``take`` semantics
+        (single gathered axis; result = x[:axis] + idx + x[axis+1:]).
+
+        axis=0 is direct (offset_dims = [1..], collapsed slice dim 0,
+        start_index_map [0], index_vector_dim = indices rank); a general
+        static axis transposes the operand so the axis moves to 0, gathers,
+        and transposes back (exact for static shapes). Indices are
+        converted to i64, 0-d index tensors (the etl.scan counter pattern)
+        are promoted to (1,), and negative indices are wrapped by adding
+        the axis length (np.take semantics — StableHLO out-of-range is
+        poison). Multi-axis gather defers exactly like the numpy kernel."""
+        x, idx = op.operands
+        axes = op.attributes.get("axes", (0,))
+        if isinstance(axes, int):
+            axes = (axes,)
+        rank = x.type.rank
+        normalized = sorted(
+            {self._normalize_axis(a, rank, "gather.axes") for a in axes}
+        )
+        if len(normalized) != 1:
+            raise BackendError(
+                f"stablehlo export: op 'gather'{self._loc(op)} over axes "
+                f"{tuple(normalized)} is not supported (multi-axis gather "
+                "has no StableHLO emission; the numpy kernel defers it too)"
+            )
+        axis = normalized[0]
+        x_shape = tuple(x.type.shape)
+        idx_shape = tuple(idx.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        self._reject_dynamic_dims(op, idx_shape, "indices shape")
+        lines = []
+        i64 = np.dtype("int64")
+        # Indices → i64 (0-d promoted to (1,)).
+        iname = self._name(idx)
+        if np.dtype(idx.type.dtype) != i64:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {iname} : ({self._vt(idx.type)}) -> "
+                f"{self._type_str(i64, idx_shape)}"
+            )
+            iname = t
+        idx_was_scalar = idx_shape == ()
+        if idx_was_scalar:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {iname} : (tensor<i64>) -> tensor<1xi64>"
+            )
+            iname = t
+            idx_shape = (1,)
+        # Negative wrap (skipped for constant indices with no negatives —
+        # the common static-index case).
+        if idx.defining_op is not None and idx.defining_op.name == "constant":
+            vals = np.asarray(idx.defining_op.attributes["value"])
+            needs_wrap = bool(vals.size) and np.any(vals < 0)
+        else:
+            needs_wrap = True
+        if needs_wrap:
+            iname = self._emit_index_normalize(iname, idx_shape, x_shape[axis], lines)
+        # Append the index-vector dim: (idx_shape..., 1).
+        m = len(idx_shape)
+        iv_shape = idx_shape + (1,)
+        iv = self._new_name()
+        lines.append(
+            f"{iv} = stablehlo.reshape {iname} : "
+            f"({self._type_str(i64, idx_shape)}) -> {self._type_str(i64, iv_shape)}"
+        )
+        # Move the gathered axis to 0 when needed.
+        if axis == 0:
+            gx_name = self._name(x)
+            gx_shape = x_shape
+        else:
+            perm = [axis] + [i for i in range(rank) if i != axis]
+            gx_shape = (x_shape[axis],) + tuple(
+                d for i, d in enumerate(x_shape) if i != axis
+            )
+            gx_name = self._new_name()
+            lines.append(
+                f'{gx_name} = "stablehlo.transpose"({self._name(x)}) '
+                f"{{permutation = {self._i64_array(perm)}}} : "
+                f"({self._vt(x.type)}) -> {self._type_str(x.type.dtype, gx_shape)}"
+            )
+        rest = gx_shape[1:]
+        offset_dims = list(range(m, m + len(rest)))
+        gres_shape = tuple(idx_shape) + tuple(rest)
+        gres = self._new_name()
+        lines.append(
+            f'{gres} = "stablehlo.gather"({gx_name}, {iv}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = "
+            f"[{self._int_list(offset_dims)}], collapsed_slice_dims = [0], "
+            f"start_index_map = [0], index_vector_dim = {m}>, "
+            f"slice_sizes = {self._i64_array([1] + list(rest))}}} : "
+            f"({self._type_str(x.type.dtype, gx_shape)}, "
+            f"{self._type_str(i64, iv_shape)}) -> "
+            f"{self._type_str(x.type.dtype, gres_shape)}"
+        )
+        cur = gres
+        if axis != 0:
+            perm_back = (
+                list(range(m, m + axis))
+                + list(range(m))
+                + list(range(m + axis, m + len(rest)))
+            )
+            tshape = x_shape[:axis] + tuple(idx_shape) + x_shape[axis + 1 :]
+            cur = self._new_name()
+            lines.append(
+                f'{cur} = "stablehlo.transpose"({gres}) '
+                f"{{permutation = {self._i64_array(perm_back)}}} : "
+                f"({self._type_str(x.type.dtype, gres_shape)}) -> "
+                f"{self._type_str(x.type.dtype, tshape)}"
+            )
+        if idx_was_scalar:
+            cur = self._new_name()
+            lines.append(
+                f"{cur} = stablehlo.reshape {cur} : "
+                f"({self._type_str(x.type.dtype, tshape if axis != 0 else gres_shape)}) -> "
+                f"{self._vt(op.result.type)}"
+            )
+        self._names[id(op.result)] = cur
+        return "\n".join(lines)
+
+    def _emit_scatter(self, op: Op) -> str:
+        """``scatter`` → ``stablehlo.scatter`` with numpy ``put_along_axis``
+        semantics (functional; the kernel copies the operand first).
+
+        The kernel reshapes lower-rank indices to full rank
+        ``(1,)*axis + idx.shape + (1,)*(rank-axis-1)`` and broadcasts them
+        against the updates; every broadcast position p writes
+        ``out[p[:axis], idx[p], p[axis+1:]] = updates[p]``. v1 supports:
+        (a) rank-1 axis=0 (scalar-window form: any 0-d/1-d indices, updates
+        broadcast to (K,)); (b) rank-2 axis=0 row scatter (indices 0-d /
+        (1,) / (K,) / (K,1), updates broadcast to (K, D) — the
+        update-window form, used by the etl.scan stack pattern and NSGA2
+        crowding distance); (c) rank-2 axis=1 via a transpose of all
+        operands into (b). The general multi-row broadcast (indices and
+        updates both with >1 varying dims) has no single-scatter form —
+        explicit BackendError (never silent). Duplicate index targets:
+        numpy resolves last-write-wins, StableHLO leaves the result
+        undefined — document, don't guess.
+        """
+        x, idx, upd = op.operands
+        rank = x.type.rank
+        axis = self._normalize_axis(op.attributes.get("axis", 0), rank, "scatter.axis")
+        x_shape = tuple(x.type.shape)
+        idx_shape = tuple(idx.type.shape)
+        upd_shape = tuple(upd.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        self._reject_dynamic_dims(op, idx_shape, "indices shape")
+        self._reject_dynamic_dims(op, upd_shape, "updates shape")
+        if rank == 1 and axis == 0:
+            return self._emit_scatter_rank1(op, x, idx, upd, x_shape, idx_shape, upd_shape)
+        if rank == 2 and axis == 0:
+            return self._emit_scatter_row(op, x, idx, upd, x_shape, idx_shape, upd_shape)
+        if rank == 2 and axis == 1:
+            # Transpose all operands: axis 1 of x becomes axis 0 of x^T.
+            lines = []
+            xt = self._new_name()
+            lines.append(
+                f'{xt} = "stablehlo.transpose"({self._name(x)}) '
+                f"{{permutation = array<i64: 1, 0>}} : ({self._vt(x.type)}) -> "
+                f"{self._type_str(x.type.dtype, (x_shape[1], x_shape[0]))}"
+            )
+            ut = self._new_name()
+            if upd_shape == (x_shape[0],):
+                lines.append(
+                    f"{ut} = stablehlo.reshape {self._name(upd)} : "
+                    f"({self._vt(upd.type)}) -> "
+                    f"{self._type_str(upd.type.dtype, (1, x_shape[0]))}"
+                )
+                ut_shape = (1, x_shape[0])
+            else:
+                lines.append(
+                    f'{ut} = "stablehlo.transpose"({self._name(upd)}) '
+                    f"{{permutation = array<i64: 1, 0>}} : ({self._vt(upd.type)}) -> "
+                    f"{self._type_str(upd.type.dtype, (upd_shape[1], upd_shape[0]))}"
+                )
+                ut_shape = (upd_shape[1], upd_shape[0])
+            idx_shape_t = self._transposed_idx_shape(idx_shape)
+            body = self._emit_scatter_row_impl(
+                op, xt, x.type.dtype, idx, ut, ut_shape, (x_shape[1], x_shape[0]),
+                idx_shape_t, self._type_str(x.type.dtype, (x_shape[1], x_shape[0])),
+            )
+            lines.extend(body)
+            out = self._new_name()
+            lines.append(
+                f'{out} = "stablehlo.transpose"({self._scatter_row_result}) '
+                f"{{permutation = array<i64: 1, 0>}} : "
+                f"({self._type_str(x.type.dtype, (x_shape[1], x_shape[0]))}) -> "
+                f"{self._vt(op.result.type)}"
+            )
+            self._names[id(op.result)] = out
+            return "\n".join(lines)
+        raise BackendError(
+            f"stablehlo export: op 'scatter'{self._loc(op)} on a "
+            f"rank-{rank} operand along axis {axis} is not supported by the "
+            "v1 exporter (numpy put_along_axis broadcast scatter is "
+            "expressible for rank-1 axis=0 and rank-2 row/column writes; "
+            "use the numpy backend for the general case)"
+        )
+
+    @staticmethod
+    def _transposed_idx_shape(idx_shape: tuple) -> tuple:
+        """The axis=1 full-rank index grid (1,K) reshaped to (K,1) — the
+        same values, interpreted column-major (see _emit_scatter)."""
+        if idx_shape in ((), (1,)):
+            return (1, 1)
+        if len(idx_shape) == 1:  # (K,)
+            return (idx_shape[0], 1)
+        if idx_shape[0] == 1:  # (1, K) — kernel full-rank form for axis=1
+            return (idx_shape[1], 1)
+        return idx_shape  # (K, 1) passes through
+
+    def _emit_scatter_rank1(self, op, x, idx, upd, x_shape, idx_shape, upd_shape) -> str:
+        """Rank-1 axis=0 scalar-window scatter: indices (K,) or 0-d, updates
+        broadcast to (K,) — the general 1-d put_along_axis."""
+        i64 = np.dtype("int64")
+        lines = []
+        if idx_shape == ():
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (), lines)
+            iname = self._new_name()
+            lines.append(
+                f"{iname} = stablehlo.reshape {iname} : (tensor<i64>) -> tensor<1xi64>"
+            )
+            k = 1
+        else:
+            k = idx_shape[0]
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (k,), lines)
+            iname = self._emit_index_normalize(iname, (k,), x_shape[0], lines)
+        # updates → (K,), converted to the operand dtype.
+        uname = self._name(upd)
+        ushape = upd_shape
+        if upd_shape == ():
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {uname} : ({self._vt(upd.type)}) -> "
+                f"tensor<1x{self._elem_dtype_str(upd.type.dtype)}>"
+            )
+            uname = t
+            ushape = (1,)
+        if np.dtype(upd.type.dtype) != np.dtype(x.type.dtype):
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {uname} : "
+                f"({self._type_str(upd.type.dtype, ushape)}) -> "
+                f"{self._type_str(x.type.dtype, ushape)}"
+            )
+            uname = t
+        uname = self._emit_broadcast_static(
+            uname, x.type.dtype, ushape, (k,), lines, op
+        )
+        iv = self._new_name()
+        lines.append(
+            f"{iv} = stablehlo.reshape {iname} : (tensor<{k}xi64>) -> "
+            f"tensor<{k}x1xi64>"
+        )
+        result_name = self._bind_results(op)[0]
+        lines.append(
+            f'{result_name} = "stablehlo.scatter"({self._name(x)}, {iv}, {uname}) '
+            f"{{scatter_dimension_numbers = #stablehlo.scatter<"
+            f"update_window_dims = [], inserted_window_dims = [0], "
+            f"scatter_dims_to_operand_dims = [0], index_vector_dim = 1>}} : "
+            f"({self._vt(x.type)}, tensor<{k}x1xi64>, "
+            f"tensor<{k}x{self._elem_dtype_str(x.type.dtype)}>) -> "
+            f"{self._vt(op.result.type)}"
+        )
+        self._names[id(op.result)] = result_name
+        return "\n".join(lines)
+
+    def _emit_scatter_row(self, op, x, idx, upd, x_shape, idx_shape, upd_shape) -> str:
+        """Rank-2 axis=0 row scatter via the update-window form."""
+        lines = []
+        d = x_shape[1]
+        # Full-rank index grid: 0-d/(1,)/(K,)/(K,1) → (K,1).
+        if idx_shape == ():
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (), lines)
+            iname = self._new_name()
+            lines.append(
+                f"{iname} = stablehlo.reshape {iname} : (tensor<i64>) -> tensor<1x1xi64>"
+            )
+            k = 1
+        elif idx_shape == (1,):
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (1,), lines)
+            iname = self._new_name()
+            lines.append(
+                f"{iname} = stablehlo.reshape {iname} : (tensor<1xi64>) -> tensor<1x1xi64>"
+            )
+            k = 1
+        elif len(idx_shape) == 1:
+            k = idx_shape[0]
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (k,), lines)
+            iname = self._emit_index_normalize(iname, (k,), x_shape[0], lines)
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {iname} : (tensor<{k}xi64>) -> "
+                f"tensor<{k}x1xi64>"
+            )
+            iname = t
+        elif idx_shape == (1, 1):
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, (1, 1), lines)
+            iname = self._emit_index_normalize(iname, (1, 1), x_shape[0], lines)
+            k = 1
+        elif len(idx_shape) == 2 and idx_shape[1] == 1:
+            k = idx_shape[0]
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, idx_shape, lines)
+            iname = self._emit_index_normalize(iname, idx_shape, x_shape[0], lines)
+        else:
+            raise BackendError(
+                f"stablehlo export: op 'scatter'{self._loc(op)} with indices "
+                f"shape {idx_shape!r} on a rank-2 operand is not supported "
+                "(v1 supports 0-d/(1,)/(K,)/(K,1) indices — the etl.scan and "
+                "NSGA2 patterns; use the numpy backend for the general case)"
+            )
+        body = self._emit_scatter_row_impl(
+            op, x, x.type.dtype, idx, upd, upd_shape, x_shape, (k, 1),
+            self._vt(op.result.type), iname=iname
+        )
+        lines.extend(body)
+        self._names[id(op.result)] = self._scatter_row_result
+        return "\n".join(lines)
+
+    def _emit_scatter_row_impl(self, op, x_name, x_dtype, idx, upd, upd_shape,
+                               x_shape, idx_shape, result_type, iname=None) -> list:
+        """Shared row-window scatter body (rank-2 axis=0): indices (K,1)
+        [given as ``iname`` or emitted from ``idx``], updates broadcast to
+        (K, D), scatter with update_window_dims=[1], inserted=[0],
+        scatter_dims_to_operand_dims=[0], index_vector_dim=1. ``x_name`` /
+        ``x_dtype`` name the operand (a transpose alias in the axis=1
+        path), ``result_type`` the scatter result's MLIR type. Returns the
+        lines; the result name lands in ``self._scatter_row_result``."""
+        lines = []
+        i64 = np.dtype("int64")
+        k, d = idx_shape[0], x_shape[1]
+        if iname is None:
+            iname = self._name(idx)
+            iname = self._emit_to_i64(iname, idx.type.dtype, idx_shape, lines)
+            iname = self._emit_index_normalize(iname, idx_shape, x_shape[0], lines)
+        # updates → (K, D), converted to the operand dtype.
+        uname = self._name(upd)
+        ushape = upd_shape
+        if upd_shape == (x_shape[0],):
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {uname} : ({self._vt(upd.type)}) -> "
+                f"{self._type_str(upd.type.dtype, (1, x_shape[0]))}"
+            )
+            uname, ushape = t, (1, x_shape[0])
+        if np.dtype(upd.type.dtype) != np.dtype(x_dtype):
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {uname} : "
+                f"({self._type_str(upd.type.dtype, ushape)}) -> "
+                f"{self._type_str(x_dtype, ushape)}"
+            )
+            uname = t
+        uname = self._emit_broadcast_static(
+            uname, x_dtype, ushape, (k, d), lines, op
+        )
+        result_name = self._bind_results(op)[0]
+        lines.append(
+            f'{result_name} = "stablehlo.scatter"({x_name}, {iname}, {uname}) '
+            f"{{scatter_dimension_numbers = #stablehlo.scatter<"
+            f"update_window_dims = [1], inserted_window_dims = [0], "
+            f"scatter_dims_to_operand_dims = [0], index_vector_dim = 1>}} : "
+            f"({self._type_str(x_dtype, x_shape)}, {self._type_str(i64, idx_shape)}, "
+            f"{self._type_str(x_dtype, (k, d))}) -> {result_type}"
+        )
+        self._scatter_row_result = result_name
+        return lines
+
+    def _emit_sort(self, op: Op) -> str:
+        """``sort`` → ``stablehlo.sort`` with an LT comparator region;
+        descending = ``stablehlo.reverse`` after (the numpy composition).
+        Equal elements are indistinguishable in the output, so the
+        ``stable`` attr only fixes tie ORDER for argsort (via the iota
+        tie-break) — here it is irrelevant. Bool operands sort via an i8
+        key (StableHLO compare on i1 only supports EQ/NE)."""
+        x = op.operands[0]
+        rank = x.type.rank
+        axis = self._normalize_axis(op.attributes.get("axis", -1), rank, "sort.axis")
+        descending = bool(op.attributes.get("descending", False))
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        lines = []
+        keys_dtype = np.dtype(x.type.dtype)
+        key_name = self._name(x)
+        if keys_dtype.kind == "b":
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {key_name} : "
+                f"({self._type_str(keys_dtype, x_shape)}) -> "
+                f"{self._type_str(np.dtype('int8'), x_shape)}"
+            )
+            key_name, keys_dtype = t, np.dtype("int8")
+        elem = self._elem_type(keys_dtype)
+        a1, a2 = self._new_name(), self._new_name()
+        cmp = self._new_name()
+        region = (
+            "({\n"
+            f"  ^bb0({a1}: {elem}, {a2}: {elem}):\n"
+            f'    {cmp} = "stablehlo.compare"({a1}, {a2}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : ({elem}, {elem}) -> tensor<i1>\n"
+            f"    stablehlo.return {cmp} : tensor<i1>\n"
+            "  })"
+        )
+        s = self._new_name()
+        lines.append(
+            f'{s} = "stablehlo.sort"({key_name}) {region} '
+            f"{{dimension = {axis} : i64}} : "
+            f"({self._type_str(keys_dtype, x_shape)}) -> "
+            f"{self._type_str(keys_dtype, x_shape)}"
+        )
+        cur = s
+        if keys_dtype.kind != np.dtype(x.type.dtype).kind:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {cur} : "
+                f"({self._type_str(keys_dtype, x_shape)}) -> "
+                f"{self._type_str(x.type.dtype, x_shape)}"
+            )
+            cur = t
+        if descending:
+            t = self._new_name()
+            lines.append(
+                f'{t} = "stablehlo.reverse"({cur}) '
+                f"{{dimensions = {self._i64_array([axis])}}} : "
+                f"({self._vt(op.result.type)}) -> {self._vt(op.result.type)}"
+            )
+            cur = t
+        self._names[id(op.result)] = cur
+        return "\n".join(lines)
+
+    def _emit_argsort(self, op: Op) -> str:
+        """``argsort`` → pair sort of (value, full-rank iota) with the
+        stable tie-break comparator ``(ka < kb) OR (ka == kb AND ia < ib)``
+        — numpy stable semantics; descending = reverse of the index column
+        (the numpy composition). Bool keys sort via an i8 conversion."""
+        x = op.operands[0]
+        rank = x.type.rank
+        axis = self._normalize_axis(op.attributes.get("axis", -1), rank, "argsort.axis")
+        descending = bool(op.attributes.get("descending", False))
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        lines = []
+        keys_dtype = np.dtype(x.type.dtype)
+        key_name = self._name(x)
+        if keys_dtype.kind == "b":
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {key_name} : "
+                f"({self._type_str(keys_dtype, x_shape)}) -> "
+                f"{self._type_str(np.dtype('int8'), x_shape)}"
+            )
+            key_name, keys_dtype = t, np.dtype("int8")
+        si = self._emit_stable_argsort(key_name, keys_dtype, x_shape, axis, lines)
+        cur = si
+        if descending:
+            t = self._new_name()
+            lines.append(
+                f'{t} = "stablehlo.reverse"({cur}) '
+                f"{{dimensions = {self._i64_array([axis])}}} : "
+                f"({self._type_str(np.dtype('int64'), x_shape)}) -> "
+                f"{self._type_str(np.dtype('int64'), x_shape)}"
+            )
+            cur = t
+        self._names[id(op.result)] = cur
+        return "\n".join(lines)
+
+    def _emit_stable_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
+                             axis: int, lines: list) -> str:
+        """Pair-sort (keys, iota) ascending with the stable tie-break
+        comparator (iota order on equal keys — numpy stable semantics);
+        returns the iota-column name (int64, ``keys_shape``). Shared by the
+        ``argsort`` op and the permutation expansion."""
+        key_elem = self._elem_type(keys_dtype)
+        i64_type = self._type_str(np.dtype("int64"), keys_shape)
+        iota = self._emit_iota(keys_shape, axis, lines)
+        ka, kb, ia, ib = (self._new_name() for _ in range(4))
+        c1, c2, c3, c4, c5 = (self._new_name() for _ in range(5))
+        region = (
+            "({\n"
+            f"  ^bb0({ka}: {key_elem}, {kb}: {key_elem}, "
+            f"{ia}: tensor<i64>, {ib}: tensor<i64>):\n"
+            f'    {c1} = "stablehlo.compare"({ka}, {kb}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c2} = "stablehlo.compare"({ka}, {kb}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c3} = "stablehlo.compare"({ia}, {ib}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
+            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
+            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+            f"    stablehlo.return {c5} : tensor<i1>\n"
+            "  })"
+        )
+        key_type = self._type_str(keys_dtype, keys_shape)
+        sv, si = self._new_name(), self._new_name()
+        lines.append(
+            f'{sv}, {si} = "stablehlo.sort"({keys_name}, {iota}) {region} '
+            f"{{dimension = {axis} : i64}} : ({key_type}, {i64_type}) -> "
+            f"({key_type}, {i64_type})"
+        )
+        return si
+
+    def _emit_arg_reduce(self, op: Op) -> str:
+        """``argmax``/``argmin`` → a two-operand ``stablehlo.reduce`` over
+        (value, full-rank iota) with the comparator ``(value_gt|lt) OR
+        (value_eq AND idx_lt)`` — the first occurrence wins on ties,
+        matching ``np.argmax``/``np.argmin`` (index init 0 keeps the
+        reduce consistent: an element equal to the init never beats index
+        0). axis=None flattens first (numpy); keepdims reshapes after.
+        Float NaN: numpy returns the FIRST NaN position; StableHLO
+        comparisons with NaN are false, so NaN never beats a finite value
+        — divergence documented (evox fitnesses are finite)."""
+        x = op.operands[0]
+        kind = "max" if op.name == "argmax" else "min"
+        axis_attr = op.attributes.get("axis")
+        keepdims = bool(op.attributes.get("keepdims", False))
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        lines = []
+        if axis_attr is None:
+            flat = (int(np.prod(x_shape)),)
+            xf = self._new_name()
+            lines.append(
+                f"{xf} = stablehlo.reshape {self._name(x)} : "
+                f"({self._vt(x.type)}) -> {self._type_str(x.type.dtype, flat)}"
+            )
+            red_shape_in = flat
+            axis = 0
+        else:
+            rank = x.type.rank
+            axis = self._normalize_axis(axis_attr, rank, f"{op.name}.axis")
+            xf = self._name(x)
+            red_shape_in = x_shape
+        keys_dtype = np.dtype(x.type.dtype)
+        key_name = xf
+        if keys_dtype.kind == "b":
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {key_name} : "
+                f"({self._type_str(keys_dtype, red_shape_in)}) -> "
+                f"{self._type_str(np.dtype('int8'), red_shape_in)}"
+            )
+            key_name, keys_dtype = t, np.dtype("int8")
+        iota = self._emit_iota(red_shape_in, axis, lines)
+        i64 = np.dtype("int64")
+        v_init = self._reduce_init(kind, keys_dtype)
+        vi, vi_lines = self._scalar_constant_for(keys_dtype, v_init, ())
+        lines.extend(vi_lines)
+        ii = self._new_name()
+        lines.append(
+            f"{ii} = stablehlo.constant {self._constant_text(np.asarray(0, dtype=i64))}"
+            f" : tensor<i64>"
+        )
+        direction = "GT" if kind == "max" else "LT"
+        key_elem = self._elem_type(keys_dtype)
+        a, b, c, d = (self._new_name() for _ in range(4))
+        c1, c2, c3, c4, c5 = (self._new_name() for _ in range(5))
+        region = (
+            "({\n"
+            f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
+            f"{c}: {key_elem}, {d}: tensor<i64>):\n"
+            f'    {c1} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c2} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c3} = "stablehlo.compare"({b}, {d}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
+            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
+            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+            f"    stablehlo.return {c5} : tensor<i1>\n"
+            "  })"
+        )
+        red_shape_out = tuple(
+            d for i, d in enumerate(red_shape_in) if i != axis
+        )
+        vr, ir = self._new_name(), self._new_name()
+        lines.append(
+            f'{vr}, {ir} = "stablehlo.reduce"({key_name}, {iota}, {vi}, {ii}) '
+            f"{region} {{dimensions = {self._i64_array([axis])}}} : "
+            f"({self._type_str(keys_dtype, red_shape_in)}, "
+            f"{self._type_str(i64, red_shape_in)}, {key_elem}, tensor<i64>) -> "
+            f"({self._type_str(keys_dtype, red_shape_out)}, "
+            f"{self._type_str(i64, red_shape_out)})"
+        )
+        cur = ir
+        if keepdims and tuple(op.result.type.shape) != tuple(red_shape_out):
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {cur} : "
+                f"({self._type_str(i64, red_shape_out)}) -> "
+                f"{self._vt(op.result.type)}"
+            )
+            cur = t
+        self._names[id(op.result)] = cur
+        return "\n".join(lines)
+
+    def _emit_tile(self, op: Op) -> str:
+        """``tile`` → reshape + broadcast_in_dim + reshape decomposition
+        (numpy tile semantics: the operand is promoted with leading size-1
+        dims when len(reps) > rank; each aligned dim d_j is interleaved
+        with a 1, broadcast to (d_j, r_j), and the result is reshaped to
+        the declared output — exact for static shapes)."""
+        x = op.operands[0]
+        reps = tuple(int(r) for r in op.attributes["reps"])
+        x_shape = tuple(x.type.shape)
+        self._reject_dynamic_dims(op, x_shape, "operand shape")
+        if not reps:
+            self._names[id(op.result)] = self._name(x)
+            return ""
+        lines = []
+        out_rank = max(x.type.rank, len(reps))
+        pad = out_rank - x.type.rank
+        padded_shape = (1,) * pad + x_shape
+        cur = self._name(x)
+        cur_shape = x_shape
+        if pad:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.reshape {cur} : "
+                f"({self._type_str(x.type.dtype, x_shape)}) -> "
+                f"{self._type_str(x.type.dtype, padded_shape)}"
+            )
+            cur, cur_shape = t, padded_shape
+        d_dims = padded_shape[-len(reps):]
+        interleaved = tuple(d for dim in d_dims for d in (dim, 1))
+        it = self._new_name()
+        lines.append(
+            f"{it} = stablehlo.reshape {cur} : "
+            f"({self._type_str(x.type.dtype, cur_shape)}) -> "
+            f"{self._type_str(x.type.dtype, interleaved)}"
+        )
+        bcast_shape = tuple(
+            dim for d, r in zip(d_dims, reps) for dim in (d, r)
+        )
+        bt = self._new_name()
+        dims = list(range(0, 2 * len(reps), 2))
+        lines.append(
+            f'{bt} = "stablehlo.broadcast_in_dim"({it}) '
+            f"{{broadcast_dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(x.type.dtype, interleaved)}) -> "
+            f"{self._type_str(x.type.dtype, bcast_shape)}"
+        )
+        result_shape = tuple(op.result.type.shape)
+        self._reject_dynamic_dims(op, result_shape, "result shape", op_name="tile")
+        rt = self._new_name()
+        lines.append(
+            f"{rt} = stablehlo.reshape {bt} : "
+            f"({self._type_str(x.type.dtype, bcast_shape)}) -> "
+            f"{self._type_str(x.type.dtype, result_shape)}"
+        )
+        self._names[id(op.result)] = rt
+        return "\n".join(lines)
+
+    def _elem_dtype_str(self, dtype) -> str:
+        return mapping.mlir_dtype(np.dtype(dtype))
 
     # --- Linear algebra ---
 
