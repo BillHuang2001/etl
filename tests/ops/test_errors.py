@@ -79,6 +79,10 @@ OP_CALLS = {
     "gelu": (lambda t: (t["x"],), {}),
     "erf": (lambda t: (t["x"],), {}),
     "sign": (lambda t: (t["x"],), {}),
+    "acos": (lambda t: (t["x"],), {}),
+    "ceil": (lambda t: (t["x"],), {}),
+    "floor": (lambda t: (t["x"],), {}),
+    "round": (lambda t: (t["x"],), {}),
     "cast": (lambda t: (t["x"],), {"dtype": etl.float64}),
     "acos": (lambda t: (t["x"],), {}),
     "floor": (lambda t: (t["x"],), {}),
@@ -120,7 +124,7 @@ OP_CALLS = {
     "prod": (lambda t: (t["x"],), {}),
     "argmax": (lambda t: (t["x"],), {}),
     "argmin": (lambda t: (t["x"],), {}),
-    # --- linalg (9) ---
+    # --- linalg (15) ---
     "dot": (lambda t: (t["a"], t["b"]), {}),
     "conv": (lambda t: (t["xc"], t["wc"]), {}),
     "tril": (lambda t: (t["a"],), {}),
@@ -134,6 +138,12 @@ OP_CALLS = {
     "sort": (lambda t: (t["x"],), {}),
     "argsort": (lambda t: (t["x"],), {}),
     "topk": (lambda t: (t["x"], 2), {}),  # returns (values, indices)
+    "eigh": (lambda t: (t["a"],), {}),
+    "cholesky": (lambda t: (t["a"],), {}),
+    "qr": (lambda t: (t["a"],), {}),
+    "matrix_rank": (lambda t: (t["a"],), {}),
+    "svd": (lambda t: (t["a"],), {}),
+    "matrix_exp": (lambda t: (t["a"],), {}),
     # --- statistics (4) ---
     "var": (lambda t: (t["x"],), {}),
     "std": (lambda t: (t["x"],), {}),
@@ -218,14 +228,25 @@ def _tensor_variant(op_name, args_builder):
     return build
 
 
+def _op_ref(op_name):
+    """Map an op name to the callable.
+
+    ``etl.trace`` is the TRACING function (foundational API) — the
+    matrix-trace op is fetched from ``etl.ops`` instead.
+    """
+    if op_name == "trace":
+        return etl.ops.trace
+    return getattr(etl, op_name)
+
+
 # ---------------------------------------------------------------------------
 # Table integrity
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 82 public op names."""
+    """The table must exercise exactly the 99 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 93
+    assert len(etl.ops.__all__) == 99
 
 
 # ---------------------------------------------------------------------------

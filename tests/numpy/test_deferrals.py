@@ -108,9 +108,13 @@ def test_deferred_linalg_names_absent(name):
         getattr(enp.linalg, name)
 
 
-def test_linalg_exposes_only_solve():
-    """enp.linalg exposes exactly solve (top-level enp keeps matmul/dot)."""
-    assert set(enp.linalg.__all__) == {"solve"}
+def test_linalg_exposes_factorizations():
+    """enp.linalg exposes the v1 factorization surface: solve, eigh,
+    cholesky, qr, matrix_rank, svd, matrix_exp (top-level enp keeps
+    matmul/dot)."""
+    assert set(enp.linalg.__all__) == {
+        "solve", "eigh", "cholesky", "qr", "matrix_rank", "svd", "matrix_exp",
+    }
     assert getattr(enp.linalg, "inv", None) is None
     assert getattr(enp.linalg, "matmul", None) is None
     assert getattr(enp, "solve", None) is None

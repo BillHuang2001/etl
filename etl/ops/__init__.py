@@ -1,7 +1,7 @@
 """etl.ops — frontend tensor operations.
 
 Every numerical op that can appear in an EvoXIR graph. This module defines
-the full public op surface (93 functions), the unified operand/construction/
+the full public op surface (99 functions), the unified operand/construction/
 inference semantics (see this directory's ``CONTEXT.md`` — binding), and the
 ``SymbolicTensor`` operator handlers registered into ``etl.core`` at import
 time.
@@ -66,8 +66,8 @@ from .reductions import (  # noqa: F401
 
 # Linalg.
 from .linalg import (  # noqa: F401
-    conv, cumprod, cumsum, diagonal, dot, matmul, norm, solve,
-    trace, tril, triu,
+    cholesky, conv, cumprod, cumsum, diagonal, dot, eigh, matmul,
+    matrix_exp, matrix_rank, norm, qr, solve, svd, trace, tril, triu,
 )
 # Sorting.
 from .sorting import argsort, sort, topk  # noqa: F401
@@ -103,7 +103,8 @@ __all__ = [
     "sum", "max", "min", "mean", "prod", "argmax", "argmin",
     # linalg
     "dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod", "solve",
-    "diagonal", "trace", "norm",
+    "diagonal", "trace", "norm", "eigh", "cholesky", "qr", "matrix_rank",
+    "svd", "matrix_exp",
     # sorting
     "sort", "argsort", "topk",
     # structural / creation

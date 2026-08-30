@@ -151,7 +151,10 @@ COLLECTIVE_MAP: dict[str, str] = {
 # writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
 # only); `argmax`/`argmin` because StableHLO has no such ops; `sort`/
 # `diagonal` because their StableHLO emission is not wired in v1 (defer
-# explicitly, never silently). The 16
+# explicitly, never silently). The linalg factorizations
+# (`eigh`/`cholesky`/`qr`/`svd`) have StableHLO counterparts but are not
+# wired in v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff /
+# Padé) — all six defer explicitly. The 16
 # `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
 # in v1 — densify via `etl.sparse.to_dense` to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
@@ -169,6 +172,12 @@ DEFERRED_OPS: frozenset[str] = frozenset(
         "gelu",
         "sort",
         "diagonal",
+        "eigh",
+        "cholesky",
+        "qr",
+        "matrix_rank",
+        "svd",
+        "matrix_exp",
         "sparse_from_dense",
         "sparse_to_dense",
         "sparse_coo_to_csr",
