@@ -1,7 +1,7 @@
 """etl.ops — frontend tensor operations.
 
 Every numerical op that can appear in an EvoXIR graph. This module defines
-the full public op surface (82 functions), the unified operand/construction/
+the full public op surface (93 functions), the unified operand/construction/
 inference semantics (see this directory's ``CONTEXT.md`` — binding), and the
 ``SymbolicTensor`` operator handlers registered into ``etl.core`` at import
 time.
@@ -41,9 +41,10 @@ from . import reductions
 
 # Elementwise arithmetic / math / bitwise.
 from .elementwise import (  # noqa: F401
-    abs, add, bitwise_and, bitwise_or, bitwise_xor, cast, cos, divide, erf,
-    exp, gelu, log, log1p, maximum, minimum, multiply, negate, power, relu,
-    remainder, sign, sigmoid, sin, sqrt, square, subtract, tan, tanh,
+    abs, acos, add, bitwise_and, bitwise_or, bitwise_xor, cast, ceil, cos,
+    divide, erf, exp, floor, gelu, log, log1p, maximum, minimum, multiply,
+    negate, power, relu, remainder, round, sign, sigmoid, sin, sqrt, square,
+    subtract, tan, tanh,
 )
 
 # Comparison / logical / selection.
@@ -64,15 +65,19 @@ from .reductions import (  # noqa: F401
 )
 
 # Linalg.
-from .linalg import conv, cumprod, cumsum, dot, matmul, solve, tril, triu  # noqa: F401
-
+from .linalg import (  # noqa: F401
+    conv, cumprod, cumsum, diagonal, dot, matmul, norm, solve,
+    trace, tril, triu,
+)
 # Sorting.
 from .sorting import argsort, sort, topk  # noqa: F401
-
 # Structural / creation.
 from .structural import (  # noqa: F401
     clamp, diag, eye, flip, isnan, linspace, nan_to_num, roll, stack, tile,
 )
+# Statistics (documented compositions over ordinary ops — no dedicated IR ops).
+from . import stats  # noqa: F401
+from .stats import median, nansum, std, var  # noqa: F401
 
 # Constants / escape hatches.
 from .constant import constant, runtime_call, stop_gradient  # noqa: F401
@@ -84,8 +89,9 @@ __all__ = [
     # elementwise
     "add", "subtract", "multiply", "divide", "power", "remainder",
     "maximum", "minimum", "abs", "negate", "square", "sqrt", "exp", "log",
-    "log1p", "sin", "cos", "tan", "tanh", "sigmoid", "relu", "gelu", "erf",
-    "sign", "cast", "bitwise_and", "bitwise_or", "bitwise_xor",
+    "log1p", "sin", "cos", "tan", "acos", "floor", "ceil", "round", "tanh",
+    "sigmoid", "relu", "gelu", "erf", "sign", "cast", "bitwise_and",
+    "bitwise_or", "bitwise_xor",
     # comparison / logical / selection
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "logical_and", "logical_or", "logical_not", "select",
@@ -97,11 +103,14 @@ __all__ = [
     "sum", "max", "min", "mean", "prod", "argmax", "argmin",
     # linalg
     "dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod", "solve",
+    "diagonal", "trace", "norm",
     # sorting
     "sort", "argsort", "topk",
     # structural / creation
     "tile", "stack", "flip", "roll", "clamp", "diag", "isnan", "nan_to_num",
     "eye", "linspace",
+    # statistics
+    "var", "std", "median", "nansum",
     # constants / escape hatches
     "constant", "runtime_call", "stop_gradient",
 ]

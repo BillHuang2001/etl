@@ -870,6 +870,77 @@ def test_unary_math_integral_input_runs_in_float64():
     assert np.allclose(got, np.sqrt(x.astype(np.float64)))
 
 
+def test_acos_numerics_in_domain():
+    def traced(x):
+        return etl.acos(x)
+
+    x = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], np.float32)
+    got = run_numpy(traced, x)
+    assert got.dtype == np.dtype("float32")
+    assert np.allclose(got, np.arccos(x), rtol=1e-6)
+
+
+def test_acos_out_of_domain_matches_numpy_nan():
+    def traced(x):
+        return etl.acos(x)
+
+    x = np.array([-1.5, 2.0], np.float32)
+    got = run_numpy(traced, x)
+    assert np.all(np.isnan(got)) and np.all(np.isnan(np.arccos(x)))
+
+
+_ROUND_HALF_EVEN = np.array([0.5, 1.5, 2.5, -0.5, -1.5, 2.675], np.float64)
+
+
+def test_round_half_to_even_numerics():
+    def traced(x):
+        return etl.round(x)
+
+    got = run_numpy(traced, _ROUND_HALF_EVEN)
+    assert got.dtype == np.dtype("float64")
+    assert np.array_equal(got, np.round(_ROUND_HALF_EVEN))
+
+
+def test_round_preserves_int_dtype():
+    def traced(x):
+        return etl.round(x)
+
+    x = np.array([-3, 2], np.int32)
+    got = run_numpy(traced, x)
+    assert got.dtype == np.dtype("int32")
+    assert np.array_equal(got, x)
+
+
+def test_round_bool_input_gives_float64():
+    """numpy's round ufunc promotes bool ARRAYS to float16 (an artifact); etl
+    follows the scalar convention ``round(True) → 1.0`` (float64) via an
+    explicit frontend cast."""
+    def traced(x):
+        return etl.round(x)
+
+    graph, out = _trace_and_capture(traced, etl.TensorSpec((3,), etl.bool_))
+    assert out.dtype == np.dtype("float64")
+    assert len(ops_of(graph, "cast")) == 1
+    assert len(ops_of(graph, "round")) == 1
+
+    got = run_numpy(traced, np.array([True, False, True]))
+    assert got.dtype == np.dtype("float64")
+    assert np.array_equal(got, np.array([1.0, 0.0, 1.0]))
+
+
+@pytest.mark.parametrize("op_name", ["floor", "ceil", "round"])
+def test_rounding_ops_reject_complex_at_runtime(op_name):
+    """numpy defines no rounding of complex numbers (bare TypeError); etl
+    surfaces the failure as an explicit BackendError naming the op."""
+    z = np.array([1 + 2j, -3 - 4j], np.complex64)
+
+    def traced(x):
+        return getattr(etl, op_name)(x)
+
+    with pytest.raises(etl.BackendError, match=op_name):
+        run_numpy(traced, z)
+
+
 @pytest.mark.parametrize(
     "unary_name,np_fn",
     [("abs", np.abs), ("negate", np.negative), ("square", np.square)],

@@ -1,5 +1,5 @@
 """Linear-algebra and scan ops: dot, matmul, conv, tril, triu, cumsum,
-cumprod, solve.
+cumprod, solve, diagonal, trace, norm.
 
 All functions follow the unified semantics documented in this node's
 ``CONTEXT.md`` (operand normalization via ``_utils.as_operand``, active
@@ -16,6 +16,9 @@ builder, call-site ``Location``). Category-specific rules:
   ``DimExpr`` floor-division formulas.
 - ``tril``/``triu``/``cumsum``/``cumprod``/``solve``: numpy semantics; dtypes
   per numpy (bool → int64 for the cumulative scans).
+- ``diagonal``: numpy semantics; dtype preserved.
+- ``trace``/``norm``: documented compositions over ``diagonal`` + ``reduce``
+  and ``sqrt``/``abs`` + ``reduce`` respectively (no hidden semantics).
 """
 from __future__ import annotations
 
@@ -26,8 +29,12 @@ import numpy as np
 from etl import core
 
 from . import _utils
+from .elementwise import abs, sqrt, square
+from .indexing import reshape
+from .reductions import reduce_max, reduce_min, reduce_sum
 
-__all__ = ["dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod", "solve"]
+__all__ = ["dot", "matmul", "conv", "tril", "triu", "cumsum", "cumprod",
+           "solve", "diagonal", "trace", "norm"]
 
 PaddingSpec = Union[str, int, Tuple[Tuple[int, int], ...]]
 
@@ -498,3 +505,114 @@ def solve(a, b) -> "core.SymbolicTensor":
         "solve", operands=(a_sym.value, b_sym.value), location=loc
     )
     return _wrap_result(op, loc)
+
+
+def diagonal(x, offset=0, axis1=0, axis2=1) -> "core.SymbolicTensor":
+    """Extract the diagonal of a 2-D slice (numpy ``diagonal`` semantics).
+    Args:
+        x: ``SymbolicTensor`` of rank >= 2.
+        offset: int diagonal offset (0 = main diagonal; positive shifts the
+            diagonal up/right, negative down/left).
+        axis1: int first diagonal axis.
+        axis2: int second diagonal axis (must differ from ``axis1``).
+    Returns:
+        ``SymbolicTensor`` with the diagonal as a NEW last axis: the two
+        diagonal axes are removed (remaining dims keep their order) and the
+        diagonal length is appended; dtype preserved.
+    Raises:
+        core.TraceError: no active trace; concrete ``Tensor`` operand.
+        core.ShapeError: rank < 2; axis1 == axis2; axis out of range.
+    """
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    x_sym = _utils.as_operand(x, location=loc)
+    for name, value in (("offset", offset), ("axis1", axis1), ("axis2", axis2)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(
+                f"diagonal: {name} must be an int, got {value!r}"
+            )
+    rank = len(x_sym.shape)
+    if rank < 2:
+        raise core.ShapeError(
+            f"diagonal: input must have rank >= 2, got rank {rank}"
+        )
+    if not (-rank <= axis1 < rank) or not (-rank <= axis2 < rank):
+        raise core.ShapeError(
+            f"diagonal: axis1/axis2 out of range for rank {rank}: "
+            f"{axis1!r}/{axis2!r}"
+        )
+    if axis1 % rank == axis2 % rank:
+        raise core.ShapeError("diagonal: axis1 and axis2 must be different")
+    op = builder.create(
+        "diagonal",
+        operands=(x_sym.value,),
+        attributes={"offset": offset, "axis1": axis1, "axis2": axis2},
+        location=loc,
+    )
+    return _wrap_result(op, loc)
+
+
+def trace(x, offset=0) -> "core.SymbolicTensor":
+    """Sum of the diagonal of a 2-D slice (numpy ``trace`` semantics).
+    Documented composition: ``reduce_sum(diagonal(x, offset, 0, 1),
+    axes=(-1,))``.
+    Args:
+        x: ``SymbolicTensor`` of rank >= 2.
+        offset: int diagonal offset (0 = main diagonal).
+    Returns:
+        ``SymbolicTensor``: scalar for rank-2 input; for higher ranks the
+        (0, 1) diagonal is summed and the remaining dims are preserved.
+        Dtype per numpy (integer input → ``int64`` via the reduction).
+    Raises:
+        core.TraceError: no active trace; concrete ``Tensor`` operand.
+        core.ShapeError: rank < 2.
+    """
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    x_sym = _utils.as_operand(x, location=loc)
+    diag = diagonal(x_sym, offset=offset, axis1=0, axis2=1)
+    return reduce_sum(diag, axes=(-1,), keepdims=False)
+
+
+def norm(x, axis=None, keepdims=False, ord=2) -> "core.SymbolicTensor":
+    """Vector norm (numpy ``linalg.norm`` semantics for vectors).
+    Documented composition: ``ord=2`` → ``sqrt(reduce_sum(square(x)))``;
+    ``ord=1`` → ``sum(abs(x))``; ``ord=inf`` → ``max(abs(x))``;
+    ``ord=-inf`` → ``min(abs(x))`` — no hidden semantics.
+    Args:
+        x: ``SymbolicTensor``.
+        axis: None (all elements), int, or tuple of ints — the axes to
+            reduce over.
+        keepdims: bool; keep reduced axes as extent 1.
+        ord: 2 (default), 1, ``inf``, or ``-inf``. Any other ``ord`` raises
+            ``NotImplementedError`` (v1 scope — numpy supports arbitrary
+            p-norms, matrix norms, and ``"fro"``).
+    Returns:
+        ``SymbolicTensor`` — the norm along the given axes. Dtype per numpy:
+        integer input → ``float64``, float keeps its dtype.
+        NOTE: ``axis=None`` on a rank > 1 input reduces over ALL elements
+        (flat-vector norm; ``ord=2`` ≡ Frobenius) — numpy's ``linalg.norm``
+        would instead compute MATRIX norms for 2-D input (e.g. spectral for
+        ``ord=2``); those are not in v1 scope. Per-axis calls match numpy
+        ``vector_norm`` exactly.
+    Raises:
+        core.TraceError: no active trace; concrete ``Tensor`` operand.
+        NotImplementedError: unsupported ``ord``.
+    """
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    x_sym = _utils.as_operand(x, location=loc)
+    if not isinstance(keepdims, bool):
+        raise TypeError(f"norm: keepdims must be a bool, got {keepdims!r}")
+    if ord not in (1, 2, float("inf"), float("-inf")):
+        raise NotImplementedError(
+            f"norm: ord={ord!r} is not supported in v1 (supported: 2, 1, "
+            "inf, -inf)"
+        )
+    if ord == 2:
+        return sqrt(reduce_sum(square(x_sym), axes=axis, keepdims=keepdims))
+    if ord == 1:
+        return reduce_sum(abs(x_sym), axes=axis, keepdims=keepdims)
+    if ord == float("inf"):
+        return reduce_max(abs(x_sym), axes=axis, keepdims=keepdims)
+    return reduce_min(abs(x_sym), axes=axis, keepdims=keepdims)

@@ -3,7 +3,7 @@
 The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (97 ops) so any accidental addition/removal/rename/effect change in the
+set (110 ops) so any accidental addition/removal/rename/effect change in the
 ``etl`` package is caught here.
 """
 
@@ -32,6 +32,7 @@ _ELEMENTWISE_BINARY = (
 
 _ELEMENTWISE_UNARY = (
     "abs",
+    "acos",
     "negate",
     "square",
     "sqrt",
@@ -49,6 +50,9 @@ _ELEMENTWISE_UNARY = (
     "sign",
     "logical_not",
     "nan_to_num",
+    "floor",
+    "ceil",
+    "round",
 )
 
 _COMPARISON = ("equal", "not_equal", "less", "less_equal", "greater", "greater_equal")
@@ -81,7 +85,7 @@ _REDUCTION = (
     "cumprod",
 )
 
-_LINALG = ("dot", "conv", "tril", "triu", "solve")
+_LINALG = ("dot", "conv", "tril", "triu", "solve", "diagonal")
 
 _CONTROL = (
     "constant",
@@ -217,6 +221,7 @@ _SIGNATURE_EXPECTED = [
     ("conv", 2, 1, 0, False),
     ("solve", 2, 1, 0, False),
     ("tril", 1, 1, 0, False),
+    ("sort", 1, 1, 0, False),
     ("sparse_from_dense", 1, 2, 0, False),
     ("sparse_add", 4, 2, 0, False),
     ("sparse_concatenate", (4, None), 2, 0, False),
@@ -316,7 +321,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 105
+    assert len(names) == 110
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -332,7 +337,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 97) ---------------------------------------
+# --- 3. per-op effect mapping (all 103) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -487,7 +492,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 105
+    assert len(opdefs) == 110
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )

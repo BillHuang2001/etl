@@ -64,7 +64,11 @@ ELEMENTWISE_MAP: dict[str, str] = {
     "sin": "stablehlo.sine",
     "cos": "stablehlo.cosine",
     "tan": "stablehlo.tan",
+    "acos": "stablehlo.acos",
     "tanh": "stablehlo.tanh",
+    "floor": "stablehlo.floor",
+    "ceil": "stablehlo.ceil",
+    "round": "stablehlo.round_nearest_even",
     "sigmoid": "stablehlo.logistic",
     "bitwise_and": "stablehlo.and",
     "bitwise_or": "stablehlo.or",
@@ -145,7 +149,9 @@ COLLECTIVE_MAP: dict[str, str] = {
 # are the dist graph scalars; complex-number elementwise beyond cast is
 # additionally deferred (not an op name — enforced by dtype checks in the
 # writer). `erf`/`gelu` are deferred because StableHLO has no erf op (chlo
-# only); `argmax`/`argmin` because StableHLO has no such ops. The 16
+# only); `argmax`/`argmin` because StableHLO has no such ops; `sort`/
+# `diagonal` because their StableHLO emission is not wired in v1 (defer
+# explicitly, never silently). The 16
 # `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
 # in v1 — densify via `etl.sparse.to_dense` to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
@@ -161,6 +167,8 @@ DEFERRED_OPS: frozenset[str] = frozenset(
         "argmin",
         "erf",
         "gelu",
+        "sort",
+        "diagonal",
         "sparse_from_dense",
         "sparse_to_dense",
         "sparse_coo_to_csr",

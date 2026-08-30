@@ -348,6 +348,38 @@ def tan(x) -> "core.SymbolicTensor":
     return _unary("tan", x, math=True)
 
 
+def acos(x) -> "core.SymbolicTensor":
+    """Elementwise arccosine. Integer/bool input → ``float64``; float keeps
+    dtype. Shape preserved."""
+    return _unary("acos", x, math=True)
+
+
+def floor(x) -> "core.SymbolicTensor":
+    """Elementwise floor (numpy semantics; integer input is unchanged).
+    Shape and dtype preserved."""
+    return _unary("floor", x)
+
+
+def ceil(x) -> "core.SymbolicTensor":
+    """Elementwise ceiling (numpy semantics; integer input is unchanged).
+    Shape and dtype preserved."""
+    return _unary("ceil", x)
+
+
+def round(x) -> "core.SymbolicTensor":
+    """Elementwise round-half-to-even (numpy ``round`` semantics; integer
+    input is unchanged). Shape preserved; dtype preserved except bool input
+    → ``float64`` (numpy's round ufunc promotes bool ARRAYS to float16 — a
+    numpy artifact; etl follows the scalar convention ``round(True) → 1.0``
+    and the unary-math rule for bool)."""
+    builder = _utils.check_in_trace()
+    loc = _utils.get_location(depth=2)
+    xt = _utils.as_operand(x, dtype_hint=None, location=loc)
+    if xt.dtype.kind == "b":
+        xt = _cast(builder, xt, core.float64, loc)
+    return _emit_unary(builder, "round", xt, loc)
+
+
 def tanh(x) -> "core.SymbolicTensor":
     """Elementwise hyperbolic tangent. Integer/bool input → ``float64``;
     float keeps dtype. Shape preserved."""

@@ -29,7 +29,7 @@ import etl
 from tests.ops.conftest import ops_of
 
 # ---------------------------------------------------------------------------
-# Per-op table of MINIMAL VALID call arguments (all 82 public ops).
+# Per-op table of MINIMAL VALID call arguments (all 93 public ops).
 # Each entry: op name -> (args_builder, kwargs). ``args_builder`` receives the
 # dict ``t`` of symbolic tensors below and returns the positional args of a
 # valid call; ``kwargs`` are constant per op.
@@ -54,7 +54,7 @@ _TENSOR_SPECS = (
 )
 
 OP_CALLS = {
-    # --- elementwise arithmetic / math / bitwise (28) ---
+    # --- elementwise arithmetic / math / bitwise (32) ---
     "add": (lambda t: (t["x"], t["x"]), {}),
     "subtract": (lambda t: (t["x"], t["x"]), {}),
     "multiply": (lambda t: (t["x"], t["x"]), {}),
@@ -80,6 +80,10 @@ OP_CALLS = {
     "erf": (lambda t: (t["x"],), {}),
     "sign": (lambda t: (t["x"],), {}),
     "cast": (lambda t: (t["x"],), {"dtype": etl.float64}),
+    "acos": (lambda t: (t["x"],), {}),
+    "floor": (lambda t: (t["x"],), {}),
+    "ceil": (lambda t: (t["x"],), {}),
+    "round": (lambda t: (t["x"],), {}),
     "bitwise_and": (lambda t: (t["xi"], t["xi"]), {}),
     "bitwise_or": (lambda t: (t["xi"], t["xi"]), {}),
     "bitwise_xor": (lambda t: (t["xi"], t["xi"]), {}),
@@ -116,17 +120,25 @@ OP_CALLS = {
     "prod": (lambda t: (t["x"],), {}),
     "argmax": (lambda t: (t["x"],), {}),
     "argmin": (lambda t: (t["x"],), {}),
-    # --- linalg (6) ---
+    # --- linalg (9) ---
     "dot": (lambda t: (t["a"], t["b"]), {}),
     "conv": (lambda t: (t["xc"], t["wc"]), {}),
     "tril": (lambda t: (t["a"],), {}),
     "triu": (lambda t: (t["a"],), {}),
     "cumsum": (lambda t: (t["x"],), {}),
     "solve": (lambda t: (t["a"], t["b"]), {}),
+    "diagonal": (lambda t: (t["a"],), {}),
+    "trace": (lambda t: (t["a"],), {}),
+    "norm": (lambda t: (t["x"],), {}),
     # --- sorting (3) ---
     "sort": (lambda t: (t["x"],), {}),
     "argsort": (lambda t: (t["x"],), {}),
     "topk": (lambda t: (t["x"], 2), {}),  # returns (values, indices)
+    # --- statistics (4) ---
+    "var": (lambda t: (t["x"],), {}),
+    "std": (lambda t: (t["x"],), {}),
+    "median": (lambda t: (t["x"],), {}),
+    "nansum": (lambda t: (t["x"],), {}),
     # --- structural / creation (12) ---
     "tile": (lambda t: (t["x"],), {"reps": (2,)}),
     "flip": (lambda t: (t["x"],), {"axes": (0,)}),
@@ -164,6 +176,17 @@ def _specs():
     return [etl.TensorSpec(shape, dtype) for _, shape, dtype in _TENSOR_SPECS]
 
 
+def _op_ref(op_name):
+    """Map an op name to the callable.
+
+    ``etl.trace`` is the TRACING function (foundational API) — the
+    matrix-trace op is fetched from ``etl.ops`` instead.
+    """
+    if op_name == "trace":
+        return etl.ops.trace
+    return getattr(etl, op_name)
+
+
 def _trace_call(op_name, args_builder, kwargs=None):
     """Trace a fn that calls ``op_name(*args_builder(t), **kwargs)``."""
     kwargs = kwargs or {}
@@ -173,7 +196,7 @@ def _trace_call(op_name, args_builder, kwargs=None):
             "x": x, "y": y, "xi": xi, "xb": xb, "a": a, "b": b,
             "xc": xc, "wc": wc, "idx": idx, "u": u,
         }
-        return getattr(etl, op_name)(*args_builder(t), **kwargs)
+        return _op_ref(op_name)(*args_builder(t), **kwargs)
 
     return etl.trace(fn, *_specs())
 
@@ -202,7 +225,7 @@ def _tensor_variant(op_name, args_builder):
 def test_op_table_covers_all_public_ops():
     """The table must exercise exactly the 82 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 82
+    assert len(etl.ops.__all__) == 93
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +236,7 @@ def test_op_table_covers_all_public_ops():
 def test_op_outside_trace_raises_directing_trace_error(op_name):
     args_builder, kwargs = OP_CALLS[op_name]
     with pytest.raises(etl.TraceError) as exc:
-        getattr(etl, op_name)(*args_builder(_STANDINS), **kwargs)
+        _op_ref(op_name)(*args_builder(_STANDINS), **kwargs)
     message = str(exc.value)
     assert message.startswith(
         "No active trace: tensor ops can only be called while tracing"
@@ -268,7 +291,7 @@ def test_op_inside_trace_rejects_concrete_tensor_operand(op_name):
 @pytest.mark.parametrize("op_name", ["logical_and", "logical_or", "logical_not"])
 def test_logical_ops_require_bool_dtype(op_name):
     def fn(x):
-        op = getattr(etl, op_name)
+        op = _op_ref(op_name)
         return op(x) if op_name == "logical_not" else op(x, x)
 
     with pytest.raises(
@@ -280,7 +303,7 @@ def test_logical_ops_require_bool_dtype(op_name):
 @pytest.mark.parametrize("op_name", ["bitwise_and", "bitwise_or", "bitwise_xor"])
 def test_bitwise_ops_reject_float_dtype(op_name):
     def fn(x):
-        return getattr(etl, op_name)(x, x)
+        return _op_ref(op_name)(x, x)
 
     with pytest.raises(
         etl.DTypeError,
@@ -373,7 +396,7 @@ _BINARY_ELEMENTWISE = [
 @pytest.mark.parametrize("op_name", _BINARY_ELEMENTWISE)
 def test_binary_op_with_two_python_scalars_raises_trace_error(op_name):
     def fn(x):
-        return getattr(etl, op_name)(1, 2)
+        return _op_ref(op_name)(1, 2)
 
     with pytest.raises(
         etl.TraceError, match="at least one operand must be a SymbolicTensor"
@@ -384,7 +407,7 @@ def test_binary_op_with_two_python_scalars_raises_trace_error(op_name):
 @pytest.mark.parametrize("op_name", ["dot", "conv", "solve"])
 def test_linalg_binary_op_with_two_python_scalars_raises(op_name):
     def fn(x):
-        return getattr(etl, op_name)(1.0, 2.0)
+        return _op_ref(op_name)(1.0, 2.0)
 
     with pytest.raises(etl.TraceError, match="both operands are Python scalars"):
         etl.trace(fn, etl.TensorSpec((4,), etl.float32))

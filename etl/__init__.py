@@ -96,6 +96,7 @@ from .core import (  # noqa: F401
 from . import ops  # noqa: F401
 from .ops import (  # noqa: F401
     abs,
+    acos,
     add,
     argmax,
     argmin,
@@ -106,6 +107,8 @@ from .ops import (  # noqa: F401
     broadcast,
     cast,
     clamp,
+    ceil,
+
     concatenate,
     constant,
     conv,
@@ -113,6 +116,8 @@ from .ops import (  # noqa: F401
     cumprod,
     cumsum,
     diag,
+    diagonal,
+
     divide,
     dot,
     equal,
@@ -120,6 +125,8 @@ from .ops import (  # noqa: F401
     exp,
     eye,
     flip,
+    floor,
+
     gather,
     gelu,
     greater,
@@ -137,11 +144,15 @@ from .ops import (  # noqa: F401
     max,
     maximum,
     mean,
+    median,
     min,
     minimum,
     multiply,
     nan_to_num,
+    nansum,
+
     negate,
+    norm,
     not_equal,
     pad,
     power,
@@ -155,6 +166,8 @@ from .ops import (  # noqa: F401
     remainder,
     reshape,
     roll,
+    round,
+
     runtime_call,
     scatter,
     select,
@@ -162,11 +175,13 @@ from .ops import (  # noqa: F401
     sign,
     sin,
     slice,
-    solve,
     sort,
+    solve,
     sqrt,
     square,
     stack,
+    std,
+
     stop_gradient,
     subtract,
     sum,
@@ -174,9 +189,14 @@ from .ops import (  # noqa: F401
     tanh,
     tile,
     topk,
+    # NOTE: the matrix-trace op is NOT exported at the top level — `etl.trace`
+    # is the tracing function (foundational API). The op lives at
+    # `etl.ops.trace`.
+
     transpose,
     tril,
     triu,
+    var,
 )
 
 # --- Tracing (etl.trace) ---------------------------------------------------
