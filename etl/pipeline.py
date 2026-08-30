@@ -24,6 +24,13 @@ never embeds constants, never re-specializes, never recompiles. It validates
 that each binding names an existing input, and dtype/shape/device
 compatibility, and that no required input is accidentally omitted.
 
+Environment defaults (`build`/`evaluate` only — the explicit stage
+functions keep their documented defaults): explicit kwargs always win;
+unset `backend`/`device`/`target_backends` fall back to `ETL_BACKEND` /
+`ETL_DEVICE` / `ETL_TARGET_BACKENDS`, read lazily at call time, with
+iree-family `target_backends` inference from the resolved device — see
+`build`'s docstring.
+
 Staging rules (spec §10): no function here silently consumes an earlier-stage
 object and performs missing steps — each stage maps its documented input type
 to its documented output type, raising `TypeError`/`PersistenceError`/
@@ -58,6 +65,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import os
 from dataclasses import is_dataclass
 from typing import Any, Iterator, Tuple
 
@@ -291,6 +299,93 @@ def _normalize_device(device):
         f"device must be None, a kind string (e.g. 'cpu'), or a core.Device, "
         f"got {type(device).__name__}"
     )
+
+
+def _raise_bad_env_device(var: str, value: str) -> None:
+    """Canonical malformed ``ETL_DEVICE`` error: name the variable and value."""
+    raise core.DeviceError(
+        f"{var}={value!r} is not a valid device string: expected 'kind' or "
+        f"'kind:index' (e.g. 'cpu', 'cuda:0')"
+    ) from None
+
+
+def _parse_env_device(var: str, value: str) -> core.Device:
+    """Parse an ``ETL_DEVICE`` value ``"kind[:index]"`` into a ``core.Device``.
+
+    ``"cpu"`` -> ``Device("cpu", 0)``, ``"cuda:0"`` -> ``Device("cuda", 0)``,
+    ``"cuda:3"`` -> ``Device("cuda", 3)``. A malformed value (empty kind,
+    non-integer or negative index, stray colons) raises ``core.DeviceError``
+    naming the environment variable and the bad value (``from None`` — the
+    raw parse error never leaks).
+    """
+    kind, sep, index = value.partition(":")
+    kind = kind.strip()
+    if not kind or (sep and not index.strip()):
+        _raise_bad_env_device(var, value)
+    if not sep:
+        index_num = 0
+    else:
+        try:
+            index_num = int(index)
+        except ValueError:
+            _raise_bad_env_device(var, value)
+        if index_num < 0:
+            _raise_bad_env_device(var, value)
+    try:
+        return core.Device(kind, index_num)
+    except ValueError:
+        _raise_bad_env_device(var, value)
+
+
+def _resolve_backend_device(backend, device, options):
+    """Resolve default backend/device/compile-options for build/evaluate.
+
+    Explicit kwargs always win; unset ones fall back to environment
+    variables read lazily at call time:
+
+    - ``ETL_BACKEND`` — backend name (default ``"numpy"`` when unset; empty
+      values are treated as unset). Unset ``backend``/``device`` are resolved
+      through the same registry/device normalization as explicit arguments.
+    - ``ETL_DEVICE`` — device string ``"kind[:index]"`` (e.g. ``"cpu"``,
+      ``"cuda:0"``), parsed into a ``core.Device``; a malformed value raises
+      ``core.DeviceError`` naming the variable and the value.
+    - ``ETL_TARGET_BACKENDS`` — comma-separated ``target_backends`` compile
+      option list, applied when ``target_backends`` was not passed
+      explicitly (any backend; those that ignore the option are unaffected).
+
+    When neither an explicit ``target_backends`` nor ``ETL_TARGET_BACKENDS``
+    is present, an iree-family backend (resolved backend name starting with
+    ``"iree"``) infers it from the resolved device: ``"cuda"`` ->
+    ``["cuda"]``, ``"cpu"`` -> ``["llvm-cpu"]`` — mirroring the explicit
+    probe spelling ``target_backends=["cuda"]``. The numpy default path
+    (no env set) is unchanged: ``numpy_backend``, ``Device("cpu", 0)``,
+    options untouched.
+
+    Returns ``(backend, device, options)``: a resolved ``Backend`` instance,
+    a resolved ``core.Device``, and a copied options dict (the caller's dict
+    is never mutated).
+    """
+    if backend is None:
+        backend = os.environ.get("ETL_BACKEND") or "numpy"
+    if device is None:
+        raw = os.environ.get("ETL_DEVICE")
+        if raw:
+            device = _parse_env_device("ETL_DEVICE", raw)
+    backend = _resolve_backend(backend)
+    device = _normalize_device(device)
+    options = dict(options)
+    if "target_backends" not in options:
+        raw = os.environ.get("ETL_TARGET_BACKENDS")
+        if raw and raw.strip():
+            options["target_backends"] = [
+                part.strip() for part in raw.split(",") if part.strip()
+            ]
+        elif backend.name.startswith("iree"):
+            if device.kind == "cuda":
+                options["target_backends"] = ["cuda"]
+            elif device.kind == "cpu":
+                options["target_backends"] = ["llvm-cpu"]
+    return backend, device, options
 
 
 def lower(graph, backend=None, **options):
@@ -1158,7 +1253,20 @@ def build(fn, *specs, backend=None, device=None, **options):
     appropriate: each stage uses the keys it understands and ignores the
     rest, exactly as in the explicit pipeline — e.g. the iree adapter's
     compile reads ``target_backends`` while its lower ignores it).
+
+    Default resolution (explicit kwargs always win; environment variables
+    are read lazily at call time): an unset ``backend`` resolves from
+    ``ETL_BACKEND`` (backend name; default ``"numpy"`` when unset), an unset
+    ``device`` from ``ETL_DEVICE`` (``"kind[:index]"``, e.g. ``"cpu"`` or
+    ``"cuda:0"``, parsed into a ``core.Device``; a malformed value raises
+    ``core.DeviceError`` naming the variable and the value). When
+    ``target_backends`` is not passed explicitly, ``ETL_TARGET_BACKENDS``
+    (comma-separated list) supplies it; otherwise an iree-family backend
+    infers it from the resolved device — ``"cuda"`` -> ``["cuda"]``,
+    ``"cpu"`` -> ``["llvm-cpu"]``. With no environment set, the numpy
+    defaults are unchanged.
     """
+    backend, device, options = _resolve_backend_device(backend, device, options)
     from etl.trace import trace as trace_fn
 
     if not callable(fn) and not getattr(fn, "__etl_defn__", False):
