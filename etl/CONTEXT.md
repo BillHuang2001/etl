@@ -18,6 +18,25 @@ The `etl` package: an explicit, minimal tensor graph runtime. See root `../CONTE
 - `etl.evaluate(fn, *args, backend=None, device=None, **options)` — documented shorthand: derive specs → build → run. Deriving a spec from a concrete tensor snapshots shape+dtype only.
 - **`build`/`evaluate` env defaults** (process-wide defaulting; explicit kwargs ALWAYS win; env read lazily at call time): unset `backend` resolves from `ETL_BACKEND` (backend name, default `"numpy"` when unset/empty); unset `device` from `ETL_DEVICE` (`"kind[:index]"`, e.g. `"cpu"`/`"cuda:0"` — parsed to `core.Device`; malformed values raise `DeviceError` naming the variable and value); unset `target_backends` from `ETL_TARGET_BACKENDS` (comma-separated list) — otherwise an iree-family backend (name startswith `"iree"`) infers it from the resolved device: `cuda` → `["cuda"]`, `cpu` → `["llvm-cpu"]`. The explicit stage functions (`lower`/`compile`/`load`) keep their documented defaults. Implementation: `pipeline._resolve_backend_device` (also `_parse_env_device`); regression suite `tests/pipeline_env_defaults_test.py`.
 
+## Backend options override (binding)
+
+Design principle: *"we only took care of the graph, provide a clean pipeline, and everything else should be hack-able"* — etl must never hardcode compiler flags users cannot override (the round-4 `--cuda_async_allocations` bug: a hardcoded iree flag disabled the stream-ordered allocator and made every per-call result alloc/free a full device sync, 9.45 ms vs 0.10 ms per call).
+
+- **Every pipeline stage accepts backend options**: `lower(graph, backend=..., **options)`, `compile(lowered, backend=..., **options)`, `load(artifact, backend=..., device=..., **options)`, `run(executable, *args, **options)`, and the `build`/`evaluate` sugar forward one options dict through all stages. Option keys are ADDITIVE (backward compatible — existing signatures keep working).
+- **Option names are validated; values never are.** Each backend/executable declares `KNOWN_OPTIONS: dict[stage, frozenset[str]]`; a stage's options are validated against the UNION of all stages' sets (`etl.backends.options.validate_options`) — a key valid for any stage passes (accepted-and-ignored elsewhere, so `build`/`evaluate` can forward one dict), a key in no stage's set raises `core.BackendError` listing the per-stage known sets. Flag/option VALUES always pass through to the compiler — the compiler validates them (etl never parses compiler flags).
+- **Precedence (binding): explicit kwarg > env var > etl default.** Per-backend option env vars (read lazily at call time, per call; empty/whitespace = unset; malformed → `core.BackendError` naming the variable and value), stage-scoped application, full table and parsers in `etl/pipeline_options.py`:
+
+| Env var | Backend/stage | Option key | Value format |
+|---|---|---|---|
+| `ETL_IREE_COMPILE_ARGS` | iree / compile | `iree_compile_args` | whitespace-separated flag list (quotes NOT processed) |
+| `ETL_IREE_RUNTIME_ARGS` | iree / load | `iree_runtime_args` | whitespace-separated flag list |
+| `ETL_XLA_COMPILE_OPTIONS` | xla / compile | `xla_compile_options` | base64-encoded serialized `xla.CompileOptionsProto` bytes |
+| `ETL_TVM_TARGET` | tvm / compile | `tvm_target` | plain string |
+| `ETL_TVM_PASS_CONFIGS` | tvm / compile | `tvm_pass_configs` | JSON object |
+| `ETL_PJRT_PLUGIN`, `ETL_TARGET_BACKENDS`, `ETL_BACKEND`, `ETL_DEVICE` | (pre-existing) | `plugin_path`, `target_backends`, `backend`, `device` | as documented above |
+
+- **Backend defaults are minimal, documented, and OVERRIDABLE.** A user flag with the same NAME as an etl default drops the default (never both). iree keeps exactly: `--iree-input-demote-f64-to-f32=false` (always), `--iree-llvmcpu-target-cpu=generic` + `--iree-llvmcpu-link-embedded=false` (llvm-cpu only), and the process-global `--cuda_async_allocations=false` (suppressed when the user names `cuda_async_allocations` in `iree_runtime_args` or `IREE_PY_RUNTIME_FLAGS`); a small DENY list (`--iree-hal-target-backends`, `--iree-input-type`, `--iree-vm-bytecode-module-output-format`) is rejected with actionable reasons (use `target_backends` / StableHLO is always the input / the adapter requires the default VM flatbuffer output). The numpy reference backend documents-ignores unknown options; the compiler adapters' run stage has no v1 options (non-empty → loud `BackendError`, by design). Per-adapter option details: `etl/backends/adapters/CONTEXT.md` ("Options override"); contract: `etl/backends/CONTEXT.md` ("Backend options override").
+
 **Value model** (owned by `core`):
 - `etl.TensorSpec(shape, dtype, device=None, name=None)`; `etl.dim(name_or_int)` → `Dim`; `etl.dtype(obj)`; dtype constants `etl.float16/float32/float64/int8/int16/int32/int64/uint8/uint16/uint32/uint64/bool_/complex64/complex128` (numpy dtype objects; `bool_` to avoid shadowing the builtin)
 - Concrete creators: `etl.tensor(data, dtype=None, device=None)`, `etl.zeros/ones/full/empty(shape, dtype=...)`, `etl.from_numpy(array)`, `etl.from_dlpack(capsule_or_tensor)`
