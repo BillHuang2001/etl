@@ -3299,12 +3299,22 @@ class Writer:
     # same-shaped NON-constant pre-loop value + a dtype-changing `convert`
     # (+ `reduce` when the source is one axis larger) — the "P15" pattern.
     # Never `x - x` (subtract-derived) nor broadcast-of-scalar-0: iree's
-    # canonicalizer folds both back into constants. When no same-shaped
-    # non-constant value exists, an `iota`-derived zero is used (also
-    # non-foldable). Non-zero constants and rank-0 (scalar) inits are left
-    # untouched (scalars are unaffected; non-zero constants have no valid
-    # replacement — such loops remain broken on iree, use the unrolled
-    # fixed-point workaround; see stablehlo/CONTEXT.md Known Issues).
+    # canonicalizer folds both back into constants.
+    #
+    # SAFETY ORDERING (measured, iree 3.11): the SEGV is a use-graph-
+    # topology effect, not a property of the zero expression. The REDUCE
+    # path (source one axis larger, input-derived, bool/int) is the ONLY
+    # class validated safe at real-graph scale (10/10 llvm-cpu AND cuda,
+    # n=32/n=128/full NSGA2 tell). Exact-shape sources and the `iota`
+    # fallback are small-graph-safe only — on the real non_dominate_rank
+    # loop an exact-shape rank-1-derived source SEGVs 0/10 deterministically
+    # and the iota fallback 0/10 (the exact-shape preference over the
+    # reduce path was the bug in the first writer iteration; see
+    # _find_while_zero_source). Non-zero constants and rank-0 (scalar)
+    # inits are left untouched (scalars are unaffected; non-zero constants
+    # have no valid replacement — such loops remain broken on iree, use
+    # the unrolled fixed-point workaround; see stablehlo/CONTEXT.md Known
+    # Issues).
 
     def _rewrite_while_init(self, op: Op, value: Value, lines: list) -> str:
         """Return the SSA name to use for one `while` init operand,
@@ -3326,18 +3336,34 @@ class Writer:
         target_dtype = np.dtype(value.type.dtype)
         src = self._find_while_zero_source(op, target_shape)
         # No usable source → the iota-derived fallback (always available
-        # for a static target shape — validated against the SEGV trigger).
+        # for a static target shape). NOTE: validated safe on SMALL graphs
+        # only — at real-graph scale it also SEGVs (see the class comment).
         return self._emit_while_zero_init(src, target_shape, target_dtype, lines)
 
     def _find_while_zero_source(self, op: Op, target_shape: tuple):
         """Find a NON-constant pre-loop value (same block, emitted before
         the `while`) from which all-zero values of ``target_shape`` can be
-        derived: exact shape first, then a value reducible to the target
-        shape along one axis (the P15 dominance-matrix case: (n, n) →
-        (n,) reducing axis 0). Sources must be bool/int (``and``/``not``
-        operate on integer kinds). Returns ``(name, src_shape, src_dtype,
-        reduce_axis|None)`` or None (no usable source — the caller keeps
-        the constant init)."""
+        derived, with the classes ordered by validated safety on iree 3.11
+        (the AffinityAnalysis SEGV is a use-graph-topology effect, NOT a
+        property of the zero expression — the ordering below is the
+        measured one):
+
+        1. REDUCE path (validated-safe class, 10/10 clean compiles + bit
+           exact runs on llvm-cpu AND cuda at real-graph scale): a value
+           ONE axis larger than the target (input-derived, kind bool/int)
+           reduced along the extra axis — the P15 dominance-matrix case:
+           (n, n) i1 → not/and → convert i1→i32 → reduce dim 0 → (n,) init.
+        2. EXACT-shape source (block args / non-constant derived values,
+           kind bool/int): not/and over the same-shaped value (+ convert).
+           Validated-safe on small graphs only — on the REAL
+           non_dominate_rank loop an exact-shape rank-1-derived source
+           SEGVs 0/10 deterministically (preferring it over the reduce
+           path was the bug in the first writer iteration).
+        3. IOTA fallback (in ``_emit_while_zero_init`` when no source):
+           small-graph-safe only; at real-graph scale it also SEGVs.
+
+        Returns ``(name, src_shape, src_dtype, reduce_axis|None)`` or None
+        (no usable source — the caller keeps the constant init)."""
         block = op.parent
         candidates = []
         if block is not None:
@@ -3349,12 +3375,7 @@ class Writer:
                     break
                 if bop.name != "constant":
                     candidates.extend(bop.results)
-        for cand in candidates:
-            c_shape = tuple(cand.type.shape)
-            if c_shape == target_shape:
-                dtype = np.dtype(cand.type.dtype)
-                if dtype.kind in "biu":
-                    return (self._name(cand), c_shape, dtype, None)
+        # 1. reduce path first — the only class validated safe at scale.
         for cand in candidates:
             c_shape = tuple(cand.type.shape)
             dtype = np.dtype(cand.type.dtype)
@@ -3366,6 +3387,13 @@ class Writer:
                 for a in range(len(c_shape)):
                     if c_shape[:a] + c_shape[a + 1 :] == target_shape:
                         return (self._name(cand), c_shape, dtype, a)
+        # 2. exact-shape source (small-graph-safe only — see the docstring).
+        for cand in candidates:
+            c_shape = tuple(cand.type.shape)
+            if c_shape == target_shape:
+                dtype = np.dtype(cand.type.dtype)
+                if dtype.kind in "biu":
+                    return (self._name(cand), c_shape, dtype, None)
         return None
 
     def _emit_while_zero_init(self, src, target_shape: tuple, target_dtype,
