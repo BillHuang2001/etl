@@ -54,6 +54,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from etl import core
 from etl import ir
 
@@ -690,7 +692,7 @@ def _validate_static_outputs(
         where = f"{label} output {index}"
         if isinstance(entry, core.Tensor):
             entry = entry.numpy()
-        if not isinstance(entry, __import__("numpy").ndarray):
+        if not isinstance(entry, np.ndarray):
             raise core.BackendError(
                 f"{where}: kernel returned {type(entry).__name__}, expected "
                 "an ndarray or a core.Tensor"
