@@ -42,12 +42,18 @@ class Capabilities:
         custom_blocks: supports ``block_call`` ops (registered backend impls).
         async_collectives: collective execution may be asynchronous (numpy: False).
         sparse_ops: supports etl.sparse sparse-tensor ops (numpy: True).
-        rng_bit_generator: supports native ``stablehlo.rng_bit_generator``
-            emission (bit-exact vs the numpy reference) for the
-            threefry2x32/philox4x32_10 random algorithms. False targets use
-            the exporter's bit-exact inline expansions instead (numpy/tvm/
-            iree: False — iree 3.11 cannot legalize RNG_ALG_PHILOX; xla: True
-            by design, re-validated with a real PJRT plugin).
+        rng_bit_generator: frozenset of random algorithm names for which the
+            backend supports bit-exact native ``stablehlo.rng_bit_generator``
+            emission. Canonical names: ``"threefry2x32"`` and
+            ``"philox4x32_10"`` (splitmix64 has no native form — always the
+            exporter's inline expansion). The empty set = inline expansions
+            only. Per-adapter status: iree ``{"threefry2x32"}`` (native
+            THREE_FRY verified bit-exact on llvm-cpu AND cuda; PHILOX fails
+            iree legalization on both targets), xla
+            ``{"threefry2x32", "philox4x32_10"}`` by design — re-validate
+            with a real PJRT plugin, tvm ``frozenset()`` (no
+            rng_bit_generator support), numpy ``frozenset()`` (no StableHLO
+            emission).
     """
 
     dynamic_shapes: bool = False
@@ -57,7 +63,7 @@ class Capabilities:
     custom_blocks: bool = False
     async_collectives: bool = False
     sparse_ops: bool = False
-    rng_bit_generator: bool = False
+    rng_bit_generator: frozenset = field(default_factory=frozenset)
 
     def supports_dtype(self, dtype: Any) -> bool:
         """True iff ``dtype`` is among ``self.dtypes`` (numpy dtype equality)."""

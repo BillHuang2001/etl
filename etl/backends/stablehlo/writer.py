@@ -150,6 +150,22 @@ def _shape_is_static(shape) -> bool:
     return all(_is_static_dim(d) for d in shape)
 
 
+def _normalize_rng_bit_generator(value) -> frozenset:
+    """Normalize the ``rng_bit_generator`` exporter option to a frozenset
+    of algorithm names (see ``Writer.__init__``): ``True`` (legacy bool) →
+    ``{"threefry2x32", "philox4x32_10"}``, ``False``/``None`` →
+    ``frozenset()``, any collection of algorithm names → the names present
+    (unknown names are ignored — the native path only ever applies to the
+    threefry2x32/philox4x32_10 ciphers)."""
+    if value is None or value is False:
+        return frozenset()
+    if value is True:
+        return frozenset(
+            {random_export.ALGORITHM_THREEFRY2X32, random_export.ALGORITHM_PHILOX4X32_10}
+        )
+    return frozenset(value)
+
+
 class Writer:
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
@@ -160,10 +176,12 @@ class Writer:
 
         State: SSA name counter (module-wide), per-value name map
         (``id(Value) -> "%N"``), and the ``rng_bit_generator`` exporter
-        option (bool; selects the native ``stablehlo.rng_bit_generator``
-        emission for the threefry2x32/philox4x32_10 random algorithms —
-        default False = the bit-exact inline expansions; consumed by
-        ``random_export``).
+        option (normalized to a frozenset of algorithm names — the set of
+        threefry2x32/philox4x32_10-style random algorithms for which the
+        NATIVE ``stablehlo.rng_bit_generator`` emission is selected; the
+        empty set = the bit-exact inline expansions, always available; the
+        legacy bool ``True`` means both ciphers, ``False``/absent means
+        none — consumed by ``random_export``).
         Raises TypeError if `module` is not an `etl.ir.Module` (export()
         pre-validates; this is a defensive check only).
         """
@@ -180,8 +198,11 @@ class Writer:
         #: used where the emitted program's types legitimately differ from
         #: the IR's symbolic types (all_gather/reduce_scatter axis dims).
         self._type_overrides: dict[int, str] = {}
-        #: rng_bit_generator exporter option (see random_export).
-        self._rng_bit_generator = bool((options or {}).get("rng_bit_generator", False))
+        #: rng_bit_generator exporter option (see random_export): frozenset
+        #: of algorithm names with native emission enabled.
+        self._rng_bit_generator = _normalize_rng_bit_generator(
+            (options or {}).get("rng_bit_generator", False)
+        )
 
     # ------------------------------------------------------------------
     # Public API
