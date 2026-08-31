@@ -25,6 +25,10 @@ pytest suite asserting the op contracts in `../../etl/ops/CONTEXT.md` and `../..
 | `test_numeric.py` | 15-op-batch numeric ops: `isnan` (float/int/complex parity, bool result), `nan_to_num` (defaults incl. per-dtype max/min finite, partial None-keep, int passthrough), `cumprod` (axis/reverse, bool→int64, dtype preserved), `eye` (float32 default pinned, m≠n, zero-size, graph-op semantics), `linspace` (float64 default pinned, explicit dtype, exact np.linspace parity, symbolic bounds → TraceError v2 deferral) |
 | `test_matmul.py` | `etl.matmul` np.matmul semantics: 1-D@1-D→scalar, vector@matrix, matrix@vector, 2-D, batched + batch broadcast (incl. symbolic batch dims), dtype promotion, pinned errors (rank-0 → ShapeError, k mismatch → ShapeError, TraceError paths); contract guards: `etl.dot` still rank≥2-only, `__matmul__` routes to dot; IR-composition pin (reshape/dot/reshape sugar) |
 
+## Known issues
+
+- `test_external_call.py::test_iree_lower_rejects_with_host_dispatch_message` FAILS at commit 28b2162 (round-2 "external-kernel core" merge): the iree adapter now declares `Capabilities.external_calls=True` (`etl/backends/adapters/iree.py:540`) and `etl.lower(..., backend="iree")` takes the split host-dispatch path (`etl/backends/external_split.py`) instead of raising, so `pytest.raises(etl.BackendError)` gets "DID NOT RAISE" (32 passed / 1 failed in the file). The test asserts the round-1 v1-deferral contract; it needs updating for round 2 (or a round-2 split-path test added — none exists anywhere in `tests/` yet). The stablehlo export deferral test in the same file still passes.
+
 ## Notes for agents
 
 - Keep tests small/fast (CPU only, shapes ≤ ~256×256); `pytest.raises(..., match=...)`, `pytest.warns`/`recwarn`, heavy parametrization.
