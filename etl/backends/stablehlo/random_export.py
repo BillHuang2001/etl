@@ -17,11 +17,17 @@ default — no target support required), or — when the writer's
 set — as a native ``stablehlo.rng_bit_generator`` call with the verified
 state layout ``[key0, key1, ctr...]`` (key words FIRST, counter words
 zero). Key layouts: splitmix64 → rank-0 int64 (unchanged); threefry2x32 →
-``(2,)`` int32; philox4x32_10 → ``(4,)`` int32 (the cipher consumes the
-salt-folded words 0–1; the pinned key' definition folds all four). The
+``(2,)`` int32; philox4x32_10 → ``(4,)`` int32 (the pinned key'
+definition folds the salt into all four words; the INLINE cipher consumes
+them CYCLICALLY — round r uses the pair ``(k'_{2r mod 4},
+k'_{(2r+1) mod 4})`` plus the per-round Weyl bumps, mirroring the numpy
+kernel — while the NATIVE ``rng_bit_generator`` state carries only words
+0–1, a documented v1 caveat, see ``_emit_rng_bit_generator``). The
 word-stream contract (per-op salt folding, per-block counters, element→word
 mapping, post-processing) is pinned in the module body below and matches
-the numpy kernels bit-for-bit.
+the numpy kernels bit-for-bit (32-bit words scale as ``u = w * 2^-32`` —
+the full word — per ``_word_uniforms``; the ``(w >> 11) * 2^-53`` form is
+the splitmix64 64-bit-word scaling only).
 
 Bit-identity argument: the kernels compute in uint64 with wrapping
 arithmetic. Two's-complement i64 xor/mul/add/and are bit-identical to the
@@ -86,6 +92,7 @@ _B_MUL = 0xBF58476D1CE4E5B9
 _C_MUL = 0x94D049BB133111EB
 _SIGN_FLIP = 0x8000000000000000
 _INV_2P53 = 1.0 / 2.0**53
+_INV_2P32 = 1.0 / 2.0**32  # exact float64; full-word 32-bit uniform scaling
 _TWO_PI = 2.0 * np.pi
 # Per-op stream salts (must match kernels/random.py `_SALTS` EXACTLY).
 _SALTS = {
@@ -379,10 +386,14 @@ def _emit_u_scaled(w, words_name, count, dtype, lines) -> str:
 # Word-stream contract (PINNED, bit-exactness reference — see the module
 # docstring): the key operand is the algorithm's key layout; per-op salt
 # folds into the key words (threefry: k0^salt_lo, k1^salt_hi; philox:
-# k0..k3 with the [lo, hi, lo, hi] pattern — the cipher consumes words
-# 0–1); cipher block p (0-based) uses counter (p, 0) / (p, 0, 0, 0)
-# (low word = call index, high words 0); element i uses flat word i
-# (uniform/randint/permutation) or flat words 2i/2i+1 (normal's u1/u2).
+# k0..k3 with the [lo, hi, lo, hi] pattern — the inline cipher's round-r
+# key pair is (k'_{2r mod 4} + r*W0, k'_{(2r+1) mod 4} + r*W1), matching
+# the numpy kernel); cipher block p (0-based) uses counter (p, 0) /
+# (p, 0, 0, 0) (low word = call index, high words 0); element i uses flat
+# word i (uniform/randint/permutation) or flat words 2i/2i+1 (normal's
+# u1/u2). u-scaling by word width: 32-bit words (threefry/philox) use the
+# FULL word u = w * 2^-32 (mirrors ``_word_uniforms`` — no shift); the
+# splitmix64 (w >> 11) * 2^-53 form applies to 64-bit words only.
 # ---------------------------------------------------------------------------
 
 
@@ -561,11 +572,14 @@ def _emit_threefry_words_inline(w, key, salt, n_words, lines) -> str:
 def _emit_philox_words_inline(w, key, salt, n_words, lines) -> str:
     """Flat ``(n_words,)`` i32 word stream for philox4x32-10 as an INLINE
     ui32 elementwise expansion: the ``(4,)`` i32 key (salt-folded per the
-    pinned key' — words 0–1 are the cipher key) with per-block counters
-    ``(p, 0, 0, 0)`` runs the 10 rounds of the pinned cipher — M0/M1
-    multiplies with the i64 mulhilo chain (ui32→i64 zero-extend multiply +
-    logical shift 32 + truncate = the exact high half), W0/W1 scalar key
-    bumps — bit-exact vs the numpy reference. The final ui32 stream
+    pinned key') with per-block counters ``(p, 0, 0, 0)`` runs the 10
+    rounds of the pinned cipher — M0/M1 multiplies with the i64 mulhilo
+    chain (ui32→i64 zero-extend multiply + logical shift 32 + truncate =
+    the exact high half) — and the ROUND-KEY SCHEDULE mirrors
+    ``kernels/random.py`` ``_philox4x32`` EXACTLY: round r (0-based) uses
+    the cyclically permuted pair ``(k'_{2r mod 4} + r*W0, k'_{(2r+1) mod 4}
+    + r*W1)`` mod 2^32 — (k0', k1') on even rounds, (k2', k3') on odd
+    rounds, each with the per-round Weyl bump. The final ui32 stream
     converts to i32 (bit-preserving)."""
     M = -(-n_words // 4)
     if n_words == 0:
@@ -620,7 +634,13 @@ def _emit_philox_words_inline(w, key, salt, n_words, lines) -> str:
     lines.extend(extra)
     w1s, extra = _ui32(w, _PHILOX_W1, ())
     lines.extend(extra)
-    k0, k1 = k0f, k1f
+    # Round-key schedule (mirrors ``kernels/random.py`` ``_philox4x32``
+    # EXACTLY): round r (0-based) uses the cyclically permuted pair
+    # (k'_{2r mod 4} + r*W0, k'_{(2r+1) mod 4} + r*W1) mod 2^32 — the
+    # (k0', k1') pair on even rounds, (k2', k3') on odd rounds. All four
+    # accumulators bump by W0/W1 once per round, so after r bumps word i
+    # holds k_i' + r*W — the kernel's r*W term for round r.
+    k0, k1, k2, k3 = k0f, k1f, k2f, k3f
     for rnd in range(10):
         if rnd > 0:
             nk0 = w._new_name()
@@ -629,6 +649,14 @@ def _emit_philox_words_inline(w, key, salt, n_words, lines) -> str:
             nk1 = w._new_name()
             lines.append(f"{nk1} = stablehlo.add {k1}, {w1s} : tensor<ui32>")
             k1 = nk1
+            nk2 = w._new_name()
+            lines.append(f"{nk2} = stablehlo.add {k2}, {w0s} : tensor<ui32>")
+            k2 = nk2
+            nk3 = w._new_name()
+            lines.append(f"{nk3} = stablehlo.add {k3}, {w1s} : tensor<ui32>")
+            k3 = nk3
+        rk0 = k0 if rnd % 2 == 0 else k2
+        rk1 = k1 if rnd % 2 == 0 else k3
         # lo0 = M0 * x0 mod 2^32; hi0 = mulhi32(M0, x0).
         lo0 = w._new_name()
         lines.append(f"{lo0} = stablehlo.multiply {x0}, {m0_32} : tensor<{M}xui32>")
@@ -665,13 +693,13 @@ def _emit_philox_words_inline(w, key, salt, n_words, lines) -> str:
         lines.append(
             f"{hi1} = stablehlo.convert {h1} : (tensor<{M}xi64>) -> tensor<{M}xui32>"
         )
-        # x0' = hi1 ^ x1 ^ k0; x1' = lo1; x2' = hi0 ^ x3 ^ k1; x3' = lo0.
-        kb0 = _bcast_scalar(w, k0, _UI32, (M,), lines)
+        # x0' = hi1 ^ x1 ^ rk0; x1' = lo1; x2' = hi0 ^ x3 ^ rk1; x3' = lo0.
+        kb0 = _bcast_scalar(w, rk0, _UI32, (M,), lines)
         t = w._new_name()
         lines.append(f"{t} = stablehlo.xor {hi1}, {x1} : tensor<{M}xui32>")
         nx0 = w._new_name()
         lines.append(f"{nx0} = stablehlo.xor {t}, {kb0} : tensor<{M}xui32>")
-        kb1 = _bcast_scalar(w, k1, _UI32, (M,), lines)
+        kb1 = _bcast_scalar(w, rk1, _UI32, (M,), lines)
         t = w._new_name()
         lines.append(f"{t} = stablehlo.xor {hi0}, {x3} : tensor<{M}xui32>")
         nx2 = w._new_name()
@@ -713,12 +741,24 @@ def _emit_rng_bit_generator(w, op, alg, key, salt, n_words, lines) -> str:
     ``rng_bit_generator`` option is set): one call emits ``n_words`` words
     from the salt-folded state — key words FIRST, then the counter words
     (zero, so block p advances the counter internally per the spec).
-    State layouts (EMPRICALLY verified on iree 3.11 llvm-cpu for
-    THREE_FRY, bit-exact): threefry ``[k0', k1', ctr0, ctr1]``
-    (tensor<4xui32>), philox ``[k0', k1', ctr0..ctr3]`` (tensor<6xui32> —
-    the cipher consumes key words 0–1; the k2'/k3' fold does not feed the
-    cipher, so the state carries words 0–1 only). ``%state_out`` is unused.
-    The ui32 output converts to i32 (bit-preserving)."""
+    State layouts: threefry ``[k0', k1', ctr0, ctr1]`` (tensor<4xui32>),
+    philox ``[k0', k1', ctr0..ctr3]`` (tensor<6xui32> — the native philox
+    state carries a 2-WORD key, so it takes words 0–1 of the salt-folded
+    4-word key; the k2'/k3' fold words are dropped). ``%state_out`` is
+    unused. The ui32 output converts to i32 (bit-preserving).
+
+    V1 CAVEAT (native PHILOX — documented, export-only): native
+    ``stablehlo.rng_bit_generator`` with ``algorithm = PHILOX`` is NOT
+    validated against the numpy reference anywhere — iree 3.11 fails to
+    legalize it (``rng_bit_generator=False`` on iree), tvm has no
+    rng_bit_generator support, and the xla adapter's ``True`` flag is
+    gate-skipped without a user-provided PJRT plugin. The StableHLO philox
+    cipher consumes only the 2-word key (Random123 semantics), while the
+    etl reference uses the 4-word CYCLIC round-key schedule — so native
+    philox words may differ from the numpy reference for nonzero keys.
+    Bit-exactness MUST be re-validated against a real XLA plugin before
+    any adapter enables native philox; if XLA's philox semantics differ,
+    philox stays on the bit-exact INLINE path for xla."""
     key_name = w._name(key)
     if alg == ALGORITHM_THREEFRY2X32:
         key_words, counter_words, alg_enum = 2, 2, "THREE_FRY"
@@ -784,27 +824,36 @@ def _emit_words_for(w, op, alg, salt, n_words, lines) -> str:
 
 
 def _emit_u_scaled32(w, words_name, count, dtype, lines) -> str:
-    """``u = (word >> 11) * 2^-53`` over i32 words — the u-scaling for the
-    threefry/philox streams: ``shift_right_logical`` 11 clears bit 31, so
-    the i32→dtype convert of the shifted value is exact = the unsigned
-    value (f64: bit-exact vs the kernel; f32: the documented f32
-    fast-path rounding, mirroring ``_emit_u_scaled``)."""
-    amt, extra = _i32(w, 11, (count,))
-    lines.extend(extra)
-    s = w._new_name()
+    """``u = w * 2^-32`` over i32 words — the u-scaling for the
+    threefry/philox streams (mirrors ``kernels/random.py``
+    ``_word_uniforms`` EXACTLY: the FULL 32-bit unsigned word scaled to
+    [0, 1) via /2^32 — NO shift; the ``(w >> 11) * 2^-53`` form is the
+    splitmix64 64-bit-word scaling only). The i32 words zero-extend to
+    i64 (sign-extending convert + 0xFFFFFFFF mask — the i32 SSA values
+    are the two's-complement word bit patterns), so the i64→dtype convert
+    sees the UNSIGNED value (f64: bit-exact vs the kernel; f32: the
+    documented f32 fast-path rounding, mirroring ``_emit_u_scaled``).
+    (An i32→ui32 intermediate would be equivalent but would put ui32 into
+    the threefry INLINE expansion, which is pinned as a pure-i32
+    emission.)"""
+    e = w._new_name()
     lines.append(
-        f"{s} = stablehlo.shift_right_logical {words_name}, {amt} : "
-        f"tensor<{count}xi32>"
+        f"{e} = stablehlo.convert {words_name} : (tensor<{count}xi32>) -> "
+        f"tensor<{count}xi64>"
     )
+    mask, extra = _i64(w, 0xFFFFFFFF, (count,))
+    lines.extend(extra)
+    a = w._new_name()
+    lines.append(f"{a} = stablehlo.and {e}, {mask} : tensor<{count}xi64>")
     cv = w._new_name()
     lines.append(
-        f"{cv} = stablehlo.convert {s} : (tensor<{count}xi32>) -> "
+        f"{cv} = stablehlo.convert {a} : (tensor<{count}xi64>) -> "
         f"{w._type_str(dtype, (count,))}"
     )
     if dtype == _F32:
-        inv, extra = _scalar_f32(w, _INV_2P53, (count,))
+        inv, extra = _scalar_f32(w, _INV_2P32, (count,))
     else:
-        inv, extra = _scalar_f64(w, _INV_2P53, (count,))
+        inv, extra = _scalar_f64(w, _INV_2P32, (count,))
     lines.extend(extra)
     u = w._new_name()
     lines.append(
@@ -814,14 +863,16 @@ def _emit_u_scaled32(w, words_name, count, dtype, lines) -> str:
 
 
 def _emit_bm_tail(w, u1, u2, count, comp, fast, lines) -> str:
-    """The Box–Muller tail shared by the threefry/philox normal paths
-    (mirrors the splitmix64 tail exactly): ``u1 = max(u1, 2^-53)`` (the
-    kernel's log(0) guard), ``z = sqrt(-2 log u1) * cos(2π u2)`` in
-    ``comp`` (f32 fast path / f64); returns the ``(count,)`` name."""
+    """The Box–Muller tail shared by the threefry/philox normal paths:
+    ``u1 = max(u1, 2^-32)`` (the 32-bit word-width grid-step guard —
+    ``kernels/random.py`` ``_normal_kernel`` uses ``min_u1 = _INV_2P32``
+    for 32-bit words; the splitmix64 64-bit path guards with 2^-53 in its
+    own body), ``z = sqrt(-2 log u1) * cos(2π u2)`` in ``comp`` (f32 fast
+    path / f64); returns the ``(count,)`` name."""
     if fast:
-        eps, extra = _scalar_f32(w, _INV_2P53, (count,))
+        eps, extra = _scalar_f32(w, _INV_2P32, (count,))
     else:
-        eps, extra = _scalar_f64(w, _INV_2P53, (count,))
+        eps, extra = _scalar_f64(w, _INV_2P32, (count,))
     lines.extend(extra)
     u1m = w._new_name()
     lines.append(
@@ -1175,7 +1226,9 @@ def _emit_random_key_mix(w, op) -> str:
 
 def _emit_random_uniform(w, op) -> str:
     """``random_uniform`` → the algorithm's word stream, then the shared
-    splitmix64 tail: u = (word >> 11) * 2^-53 in f64, vals =
+    tail: u = (w >> 11) * 2^-53 (splitmix64 64-bit words) or u = w * 2^-32
+    (threefry/philox 32-bit words — ``_emit_u_scaled32``, mirroring the
+    kernel's ``_word_uniforms``) in f64; vals =
     (low + u * (high - low)).astype(dtype) — all f64, then converted."""
     alg = _algorithm_of(w, op)
     if alg == ALGORITHM_SPLITMIX64:
@@ -1218,8 +1271,9 @@ def _emit_random_uniform(w, op) -> str:
 def _emit_random_normal(w, op) -> str:
     """``random_normal`` → the algorithm's 2*count word stream with u1 =
     words[0::2], u2 = words[1::2] (strided slices), then the shared
-    Box–Muller tail (f32 fast path / f64 math) + mean/std affine — the
-    splitmix64 post-processing, verbatim."""
+    Box–Muller tail (f32 fast path / f64 math; the u1 guard is the
+    word-width grid step — 2^-32 for the 32-bit streams) + mean/std
+    affine — the kernel's post-processing."""
     alg = _algorithm_of(w, op)
     if alg == ALGORITHM_SPLITMIX64:
         return _emit_random_normal_splitmix64(w, op)
@@ -1268,8 +1322,9 @@ def _emit_random_normal(w, op) -> str:
 
 def _emit_random_randint(w, op) -> str:
     """``random_randint`` → the algorithm's word stream, then the shared
-    splitmix64 tail: u in f64; low/high cast to int64, span = high - low
-    (wrapping int64); vals = (low + floor(u * span)).astype(dtype)."""
+    tail (u per word width — 2^-53 for 64-bit words, 2^-32 for 32-bit):
+    u in f64; low/high cast to int64, span = high - low (wrapping int64);
+    vals = (low + floor(u * span)).astype(dtype)."""
     alg = _algorithm_of(w, op)
     if alg == ALGORITHM_SPLITMIX64:
         return _emit_random_randint_splitmix64(w, op)
