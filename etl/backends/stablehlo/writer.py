@@ -1760,22 +1760,20 @@ class Writer:
         )
         return sv, si
 
-    # --- eigh (unrolled cyclic-Jacobi) ---
+    # --- eigh (while-loop cyclic-Jacobi) ---
 
     #: Adaptive cyclic-Jacobi sweep count for the ``eigh`` composition (see
     #: ``_eigh_sweeps``). Each sweep zeroes every off-diagonal (p, q) once;
     #: the off-diagonal norm converges quadratically with a sharp knee
     #: (measured on the numpy spike, 10x10 fp32: sweep 4 → 1.1e-5, sweep 6 →
-    #: 3.7e-7). The sweep loop is unrolled in the emitted MLIR (no
-    #: while-loops — iree cuda HAL crashes on while-loops with certain
-    #: shapes, see the bench Known Issues), so each sweep is ~40.5·n·(n−1)
-    #: MLIR lines of composition — the count directly trades compile time
-    #: against accuracy.
+    #: 3.7e-7). The sweep loop runs inside a ``stablehlo.while`` at runtime
+    #: (``_emit_eigh``), so the count costs O(1) MLIR text per extra sweep —
+    #: it only trades runtime against accuracy, never compile time.
     _EIGH_SWEEPS_F64 = 8
 
     @staticmethod
     def _eigh_sweeps(n: int, dtype) -> int:
-        """Cyclic-Jacobi sweep count for the unrolled ``eigh`` composition.
+        """Cyclic-Jacobi sweep count for the while-loop ``eigh`` composition.
 
         fp32: dim-based schedule (n ≤ 5 → 3, n = 6 → 4, 7 ≤ n ≤ 15 → 5,
         16 ≤ n ≤ 30 → 6, 31 ≤ n ≤ 50 → 7, n > 50 → 8), validated by a
@@ -1803,21 +1801,29 @@ class Writer:
         return 8
 
     def _emit_eigh(self, op: Op) -> str:
-        """``eigh`` → unrolled cyclic-Jacobi symmetric eigensolver.
+        """``eigh`` → while-loop cyclic-Jacobi symmetric eigensolver.
 
         StableHLO 1.0 removed ``stablehlo.eigh``/``qr``/``svd`` (iree 3.11
         ships only ``cholesky`` of the factorizations), so the symmetric
-        eigendecomposition is composed from v1 ops: ``_eigh_sweeps(n, dtype)``
-        unrolled sweeps of the cyclic
-        (p, q) rotation pairs — each zeroing the (p, q) off-diagonal with
-        the textbook rotation ``J = [[c, s], [-s, c]]`` via
-        ``B = A·J`` (column updates), ``A' = J^T·B`` (row updates),
-        ``V = V·J`` (column updates; V starts as the identity) — then a
-        stable pair-sort of the final diagonal for the ASCENDING
-        eigenvalue order (numpy ``linalg.eigh`` contract) and a column
-        reorder of V by the sorted permutation. Every rotation is applied
-        with full-matrix selects (mask = ``iota == index``), never scatter
-        regions.
+        eigendecomposition is composed from v1 ops: a ``stablehlo.while``
+        loop carrying ``(a, v, p, q, k)`` applies
+        ``_eigh_sweeps(n, dtype) × n(n−1)/2`` cyclic (p, q) rotations —
+        each zeroing the (p, q) off-diagonal with the textbook rotation
+        ``J = [[c, s], [-s, c]]`` via ``B = A·J`` (column updates),
+        ``A' = J^T·B`` (row updates), ``V = V·J`` (column updates; V starts
+        as the identity). The carried pair counter walks the sweep order
+        (0,1), (0,2), …, (n−2, n−1) and ``k`` counts total rotations (cond
+        ``k < total``). Dynamic (p, q) indexing uses gathers (never
+        ``stablehlo.slice`` — its start indices must be static), and every
+        constant/iota is hoisted OUTSIDE the loop (iree crashes on
+        constants inside while bodies — ``util.global.load`` undefined
+        ``@__hoisted_*``; see Known Issues). The emitted text is O(1) in n
+        and in the sweep count — the unrolled predecessor's O(n²·sweeps)
+        text (10x10 ~17 s build) is gone, so dim ≥ 25 compiles. A stable
+        pair-sort then orders the final diagonal ASCENDING (numpy
+        ``linalg.eigh`` contract) and a gather reorders the V columns by
+        the sorted permutation. Every rotation is applied with full-matrix
+        selects (mask = ``iota == index``), never scatter regions.
 
         Dtype rule mirrors the numpy kernel: int/bool → float64 (converted
         first); float32/float64 pass through; complex and float16 defer
@@ -1825,12 +1831,16 @@ class Writer:
         f16 has no defined parity). Dynamic dims → explicit BackendError.
 
         Parity note: LAPACK-based numpy vs the Jacobi composition agree to
-        fp32 tolerance, NOT bit-exact. Jacobi converges off-diagonals to
-        the fp32 floor (measured ~4e-7 for 10x10 in 8 sweeps), eigenvalue
-        ordering among (near-)degenerate values is fixed by the sort, and
-        the eigenvectors of degenerate eigenspaces are basis-dependent —
-        tests compare reconstruction ``A ≈ v diag(w) v^T`` and column
-        orthogonality, never elementwise v.
+        fp32 tolerance, NOT bit-exact. The rotation sequence and arithmetic
+        are identical to the old unrolled emission (same ops, same order —
+        slices become gathers, fresh constants become hoisted names), so
+        the numerics are bit-for-bit unchanged. Jacobi converges
+        off-diagonals to the fp32 floor (measured ~4e-7 for 10x10 in 8
+        sweeps), eigenvalue ordering among (near-)degenerate values is
+        fixed by the sort, and the eigenvectors of degenerate eigenspaces
+        are basis-dependent — tests compare reconstruction
+        ``A ≈ v diag(w) v^T`` and column orthogonality, never elementwise
+        v.
         """
         x = op.operands[0]
         x_shape = tuple(x.type.shape)
@@ -1865,6 +1875,7 @@ class Writer:
                 "inputs; int/bool upcast to float64)"
             )
         batch = x_shape[:-2]
+        i64 = np.dtype("int64")
         lines = []
         # int/bool → float64 (numpy linalg upcast rule).
         a = self._name(x)
@@ -1876,12 +1887,39 @@ class Writer:
                 f"{self._type_str(dtype, x_shape)}"
             )
             a = t
-        # Hoisted index masks: iota along the matrix axes, compared against
-        # the (p, q) constants per rotation (shape-independent of the sweep
-        # state, so emitted once).
-        iota_row = self._emit_iota(x_shape, rank - 2, lines)
-        iota_col = self._emit_iota(x_shape, rank - 1, lines)
-        # V starts as the identity (..., n, n).
+        # --- loop-invariant setup (hoisted OUTSIDE the while — iree
+        # crashes on constants/iotas defined inside while bodies, see
+        # Known Issues) ---
+        # Layout: the carried matrices live TRANSPOSED as (n, n, batch...)
+        # (batch dims trailing — the `_emit_diagonal_extract` pattern).
+        # The runtime-index gathers then have STATIC trailing batch offset
+        # dims, so the indices are tiny (2,)/(1,) tensors of the loop
+        # carries (p, q) — no per-batch index arithmetic inside the loop.
+        t_shape = (n, n) + batch
+        # Hoisted index masks: iota along the transposed matrix axes,
+        # compared against rank-0 broadcasts of the carried (p, q) per
+        # iteration.
+        iota_row = self._emit_iota(t_shape, 0, lines)
+        iota_col = self._emit_iota(t_shape, 1, lines)
+        # The carried A, transposed into that layout (identity for
+        # batch = (), where the (n, n) block already sits at dims 0,1; the
+        # matrix data stays bit-identical because A remains symmetric
+        # through the rotations).
+        if batch:
+            perm = [rank - 1, rank - 2] + list(range(rank - 2))
+            a_t = self._new_name()
+            lines.append(
+                f'{a_t} = "stablehlo.transpose"({a}) '
+                f"{{permutation = {self._i64_array(perm)}}} : "
+                f"({self._type_str(dtype, x_shape)}) -> "
+                f"{self._type_str(dtype, t_shape)}"
+            )
+            a = a_t
+        # V starts as the identity, in the same transposed layout. V is NOT
+        # symmetric, so the data transpose is real at every rank (the same
+        # permutation formula covers rank 2: [1, 0]) — the body's dim-0
+        # "row gathers" then address V's columns (and A's columns, which
+        # coincide with A's rows while A stays symmetric).
         eye = np.eye(n, dtype=dtype)
         v = self._new_name()
         lines.append(
@@ -1890,13 +1928,125 @@ class Writer:
         )
         if batch:
             v = self._emit_broadcast_static(v, dtype, (n, n), x_shape, lines, op)
-        for _ in range(self._eigh_sweeps(n, dtype)):
-            for p in range(n):
-                for q in range(p + 1, n):
-                    a, v = self._emit_jacobi_rotation(
-                        a, v, p, q, n, batch, dtype, x_shape,
-                        iota_row, iota_col, lines, op,
-                    )
+        v_perm = [rank - 1, rank - 2] + list(range(rank - 2))
+        v_t = self._new_name()
+        lines.append(
+            f'{v_t} = "stablehlo.transpose"({v}) '
+            f"{{permutation = {self._i64_array(v_perm)}}} : "
+            f"({self._type_str(dtype, x_shape)}) -> "
+            f"{self._type_str(dtype, t_shape)}"
+        )
+        v = v_t
+        # Rotation-formula scalar constants (batch,)-shaped.
+        c_two, extra = self._scalar_constant_for(dtype, 2.0, batch)
+        lines.extend(extra)
+        c_one, extra = self._scalar_constant_for(dtype, 1.0, batch)
+        lines.extend(extra)
+        c_neg_one, extra = self._scalar_constant_for(dtype, -1.0, batch)
+        lines.extend(extra)
+        c_zero, extra = self._scalar_constant_for(dtype, 0.0, batch)
+        lines.extend(extra)
+        # Rank-0 i64 loop constants: counter init / pair-step / bound.
+        i_zero, extra = self._scalar_constant_for(i64, 0, ())
+        lines.extend(extra)
+        i_one, extra = self._scalar_constant_for(i64, 1, ())
+        lines.extend(extra)
+        i_two, extra = self._scalar_constant_for(i64, 2, ())
+        lines.extend(extra)
+        i_n_minus_1, extra = self._scalar_constant_for(i64, n - 1, ())
+        lines.extend(extra)
+        i_n_minus_2, extra = self._scalar_constant_for(i64, n - 2, ())
+        lines.extend(extra)
+        total = self._eigh_sweeps(n, dtype) * n * (n - 1) // 2
+        i_total, extra = self._scalar_constant_for(i64, total, ())
+        lines.extend(extra)
+        # --- the while loop: carries (a, v, p, q, k) ----------------------
+        a_type = self._type_str(dtype, t_shape)
+        i64_scalar = self._elem_type(i64)
+        carry_types = (
+            f"({a_type}, {a_type}, {i64_scalar}, {i64_scalar}, {i64_scalar})"
+        )
+        arg_types = (a_type, a_type, i64_scalar, i64_scalar, i64_scalar)
+        # Cond region: k < total (no closing brace — `_emit_while` style).
+        cond_args = [self._new_name() for _ in range(5)]
+        cond_lines = []
+        cnd = self._cmp(cond_args[4], i_total, "LT", i64, (), cond_lines)
+        cond_region = (
+            "  ^bb0("
+            + ", ".join(f"{nm} : {tp}" for nm, tp in zip(cond_args, arg_types))
+            + "):\n"
+            + "\n".join("    " + line for line in cond_lines)
+            + f"\n    stablehlo.return {cnd} : tensor<i1>"
+        )
+        # Body region: one rotation on (p, q), then the pair/counter step.
+        body_args = [self._new_name() for _ in range(5)]
+        body_lines = []
+        a2, v2 = self._emit_jacobi_rotation_loop_body(
+            body_args[0], body_args[1], body_args[2], body_args[3],
+            n, batch, dtype, x_shape, iota_row, iota_col,
+            c_two, c_one, c_neg_one, c_zero, body_lines,
+        )
+        # k' = k+1; if q == n-1: (p', q') = (p+1, p+2) else (p, q+1).
+        # The pair (n-2, n-1) ends a sweep: the NEXT pair must wrap to
+        # (0, 1) — without the sweep-end reset the pair walks out of range
+        # ((n-1, n)) after the FIRST sweep's last pair, corrupting gathers.
+        # (k' == total only at the end of the LAST sweep.)
+        k2 = self._ew("add", body_args[4], i_one, i64, (), body_lines)
+        q_last = self._cmp(body_args[3], i_n_minus_1, "EQ", i64, (), body_lines)
+        p_next = self._ew("add", body_args[2], i_one, i64, (), body_lines)
+        q_after = self._ew("add", body_args[2], i_two, i64, (), body_lines)
+        q_inc = self._ew("add", body_args[3], i_one, i64, (), body_lines)
+        p_end = self._cmp(body_args[2], i_n_minus_2, "EQ", i64, (), body_lines)
+        sweep_end = self._ew("and", p_end, q_last, np.dtype("bool"), (), body_lines)
+        p2 = self._sel(q_last, p_next, body_args[2], i64, (), body_lines)
+        q2 = self._sel(q_last, q_after, q_inc, i64, (), body_lines)
+        p2 = self._sel(sweep_end, i_zero, p2, i64, (), body_lines)
+        q2 = self._sel(sweep_end, i_one, q2, i64, (), body_lines)
+        body_region = (
+            "  ^bb0("
+            + ", ".join(f"{nm} : {tp}" for nm, tp in zip(body_args, arg_types))
+            + "):\n"
+            + "\n".join("    " + line for line in body_lines)
+            + f"\n    stablehlo.return {a2}, {v2}, {p2}, {q2}, {k2} : "
+            + f"{a_type}, {a_type}, {i64_scalar}, {i64_scalar}, {i64_scalar}"
+        )
+        result_names = [self._new_name() for _ in range(5)]
+        lines.append(
+            f"{', '.join(result_names)} = \"stablehlo.while\"("
+            f"{', '.join([a, v, i_zero, i_one, i_zero])}) ({{\n"
+            + cond_region
+            + "\n  }, {\n"
+            + body_region
+            + f"\n  }}) : {carry_types} -> {carry_types}"
+        )
+        a, v = result_names[0], result_names[1]
+        # The carried matrices are in the transposed layout — transpose
+        # back to (batch..., n, n) for the diagonal extract and the column
+        # reorder. The inverse of the init perm [rank-1, rank-2]+[0..rank-3]
+        # is [2..rank-1] + [1, 0] (batch dims in order, MATRIX DIMS
+        # REVERSED — both are involutions on the matrix block). A's
+        # back-transpose is only needed for batch dims (rank 2: a stayed
+        # (n, n) throughout); V's is real at every rank (rank 2: [1, 0] —
+        # the same formula).
+        if batch:
+            perm = list(range(2, rank)) + [1, 0]
+            a2 = self._new_name()
+            lines.append(
+                f'{a2} = "stablehlo.transpose"({a}) '
+                f"{{permutation = {self._i64_array(perm)}}} : "
+                f"({self._type_str(dtype, t_shape)}) -> "
+                f"{self._type_str(dtype, x_shape)}"
+            )
+            a = a2
+        v_perm = list(range(2, rank)) + [1, 0]
+        v2 = self._new_name()
+        lines.append(
+            f'{v2} = "stablehlo.transpose"({v}) '
+            f"{{permutation = {self._i64_array(v_perm)}}} : "
+            f"({self._type_str(dtype, t_shape)}) -> "
+            f"{self._type_str(dtype, x_shape)}"
+        )
+        v = v2
         # The diagonal now holds the (unsorted) eigenvalues.
         w = self._emit_diagonal_extract(a, dtype, x_shape, n, lines)
         # Ascending order + the permutation, then the V column reorder.
@@ -1907,106 +2057,203 @@ class Writer:
         self._names[id(op.results[1])] = vs
         return "\n".join(lines)
 
-    def _emit_jacobi_rotation(self, a_name, v_name, p, q, n, batch, dtype,
-                              x_shape, iota_row, iota_col, lines, op):
-        """One cyclic-Jacobi rotation zeroing ``A[p, q]`` (``p < q``) with
-        ``J = [[c, s], [-s, c]]``: ``B = A·J`` (column updates),
-        ``A' = J^T·B`` (row updates), ``V = V·J`` (column updates). Each
-        updated column/row is applied with a full-matrix select against the
-        hoisted iota masks. Per-batch-element scalars ``c``/``s`` come from
-        the textbook formulas ``tau = (a_qq - a_pp)/(2 a_pq)``,
+    def _emit_jacobi_rotation_loop_body(self, a_name, v_name, p_name, q_name,
+                                        n, batch, dtype, x_shape, iota_row,
+                                        iota_col, c_two, c_one, c_neg_one,
+                                        c_zero, lines):
+        """One while-body cyclic-Jacobi rotation zeroing ``A[p, q]``
+        (``p < q``) with ``J = [[c, s], [-s, c]]``: ``B = A·J`` (column
+        updates), ``A' = J^T·B`` (row updates), ``V = V·J`` (column
+        updates). The carried matrices are in the TRANSPOSED layout
+        ``(n, n, batch...)`` (``t_shape``; see ``_emit_eigh``), the (p, q)
+        pair arrives as RUNTIME rank-0 i64 loop scalars, and all indexing
+        goes through ``stablehlo.gather`` (``stablehlo.slice`` requires
+        static start indices). The batch dims are STATIC trailing offset
+        dims of every gather, so the indices are batch-free ``(2,)``
+        (scalars) / ``(1,)`` (rows/columns) tensors. In this layout the
+        "column p of A" values ``A[b, i, p]`` sit at ``AT[i, p, b]`` (a
+        dim-1 gather, applied to the ROW dim of the mask selects), and the
+        "row p" values at ``BT[p, j, b]`` (a dim-0 gather, applied to the
+        COLUMN dim). The arithmetic sequence is identical to the
+        pre-while unrolled rotation (same op order, same formulas — only
+        slice→gather, fresh-constant→hoisted-name, and the static layout
+        transpose differ), so results are bit-identical to the old
+        emission. Per-batch-element scalars ``c``/``s`` come from the
+        textbook formulas ``tau = (a_qq - a_pp)/(2 a_pq)``,
         ``t = sign(tau)/(|tau| + sqrt(1 + tau^2))`` (``sign(0) = +1`` —
         the equal-diagonal case needs the 45° rotation, not no-op),
         ``c = 1/sqrt(1 + t^2)``, ``s = t c``, guarded by ``a_pq == 0``
         (``c = 1, s = 0``; also shields the ``0/0 -> NaN`` degenerate case
         — the guard select happens AFTER the formulas, so the NaN is never
-        propagated). Returns ``(new_a, new_v)`` SSA names."""
+        propagated). Returns ``(new_a, new_v)`` SSA names (still in the
+        transposed layout)."""
         i64 = np.dtype("int64")
-        rank = len(x_shape)
+        k = len(batch)
+        t_shape = (n, n) + batch
+        vec_shape = (n,) + batch
+        # --- per-iteration index tensors (batch-free — the batch dims are
+        # static offset dims; the pair (p, q) is shared across the batch) --
+        idx_pp = self._index_pair(p_name, p_name, lines)
+        idx_qq = self._index_pair(q_name, q_name, lines)
+        idx_pq = self._index_pair(p_name, q_name, lines)
+        idx_p = self._index_single(p_name, lines)
+        idx_q = self._index_single(q_name, lines)
         # --- per-batch-element scalars: apq, app, aqq ---------------------
-        apq = self._slice_matrix_scalar(a_name, p, q, batch, dtype, x_shape, lines)
-        app = self._slice_matrix_scalar(a_name, p, p, batch, dtype, x_shape, lines)
-        aqq = self._slice_matrix_scalar(a_name, q, q, batch, dtype, x_shape, lines)
-        # --- c, s from the textbook formulas ------------------------------
-        two, extra = self._scalar_constant_for(dtype, 2.0, batch)
-        lines.extend(extra)
-        one, extra = self._scalar_constant_for(dtype, 1.0, batch)
-        lines.extend(extra)
-        neg_one, extra = self._scalar_constant_for(dtype, -1.0, batch)
-        lines.extend(extra)
-        zero, extra = self._scalar_constant_for(dtype, 0.0, batch)
-        lines.extend(extra)
+        apq = self._gather_scalar(a_name, idx_pq, dtype, n, batch, lines)
+        app = self._gather_scalar(a_name, idx_pp, dtype, n, batch, lines)
+        aqq = self._gather_scalar(a_name, idx_qq, dtype, n, batch, lines)
+        # --- c, s from the textbook formulas (hoisted constants) ----------
         t1 = self._ew("subtract", aqq, app, dtype, batch, lines)
-        t2 = self._ew("multiply", two, apq, dtype, batch, lines)
+        t2 = self._ew("multiply", c_two, apq, dtype, batch, lines)
         tau = self._ew("divide", t1, t2, dtype, batch, lines)
         tau2 = self._ew("multiply", tau, tau, dtype, batch, lines)
-        oneptau2 = self._ew("add", one, tau2, dtype, batch, lines)
+        oneptau2 = self._ew("add", c_one, tau2, dtype, batch, lines)
         sq = self._ew("sqrt", oneptau2, None, dtype, batch, lines)
         abst = self._ew("abs", tau, None, dtype, batch, lines)
         denom = self._ew("add", abst, sq, dtype, batch, lines)
-        ge0 = self._cmp(tau, zero, "GE", dtype, batch, lines)
-        sgn = self._sel(ge0, one, neg_one, dtype, batch, lines)
+        ge0 = self._cmp(tau, c_zero, "GE", dtype, batch, lines)
+        sgn = self._sel(ge0, c_one, c_neg_one, dtype, batch, lines)
         t = self._ew("divide", sgn, denom, dtype, batch, lines)
         t2 = self._ew("multiply", t, t, dtype, batch, lines)
-        onept2 = self._ew("add", one, t2, dtype, batch, lines)
+        onept2 = self._ew("add", c_one, t2, dtype, batch, lines)
         sqt = self._ew("sqrt", onept2, None, dtype, batch, lines)
-        c_calc = self._ew("divide", one, sqt, dtype, batch, lines)
+        c_calc = self._ew("divide", c_one, sqt, dtype, batch, lines)
         s_calc = self._ew("multiply", t, c_calc, dtype, batch, lines)
-        apq_ne0 = self._cmp(apq, zero, "NE", dtype, batch, lines)
-        c = self._sel(apq_ne0, c_calc, one, dtype, batch, lines)
-        s = self._sel(apq_ne0, s_calc, zero, dtype, batch, lines)
-        # Broadcasts with EXPLICIT dimension mappings (numpy trailing
-        # alignment does not apply here — the batch dims stay leading):
-        #   c/s (batch,) → (batch..., n):     batch dims → leading dims
-        #   column vec (..., n) → (..., n, n): n dim → ROW dim (rank-2)
-        #   row vec (..., n) → (..., n, n):   n dim → COLUMN dim (rank-1)
-        c_b = self._bcast(c, dtype, batch, batch + (n,), list(range(len(batch))), lines)
-        s_b = self._bcast(s, dtype, batch, batch + (n,), list(range(len(batch))), lines)
-        col_dims = list(range(rank - 1))
-        row_dims = list(range(rank - 2)) + [rank - 1]
-        # --- rotation masks (iota vs the pair constants) -------------------
-        p_const, extra = self._scalar_constant_for(i64, p, x_shape)
-        lines.extend(extra)
-        q_const, extra = self._scalar_constant_for(i64, q, x_shape)
-        lines.extend(extra)
-        row_p = self._cmp(iota_row, p_const, "EQ", i64, x_shape, lines)
-        row_q = self._cmp(iota_row, q_const, "EQ", i64, x_shape, lines)
-        col_p = self._cmp(iota_col, p_const, "EQ", i64, x_shape, lines)
-        col_q = self._cmp(iota_col, q_const, "EQ", i64, x_shape, lines)
-        # --- B = A·J: column updates ---------------------------------------
-        acp = self._slice_matrix_vec(a_name, "col", p, batch, dtype, x_shape, lines)
-        acq = self._slice_matrix_vec(a_name, "col", q, batch, dtype, x_shape, lines)
-        ncp = self._ew("subtract", self._ew("multiply", c_b, acp, dtype, batch + (n,), lines),
-                       self._ew("multiply", s_b, acq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        ncq = self._ew("add", self._ew("multiply", s_b, acp, dtype, batch + (n,), lines),
-                       self._ew("multiply", c_b, acq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        b = self._sel(col_p, self._bcast(ncp, dtype, batch + (n,), x_shape, col_dims, lines), a_name, dtype, x_shape, lines)
-        b = self._sel(col_q, self._bcast(ncq, dtype, batch + (n,), x_shape, col_dims, lines), b, dtype, x_shape, lines)
-        # --- A' = J^T·B: row updates (slices from the updated B) ------------
-        brp = self._slice_matrix_vec(b, "row", p, batch, dtype, x_shape, lines)
-        brq = self._slice_matrix_vec(b, "row", q, batch, dtype, x_shape, lines)
-        nrp = self._ew("subtract", self._ew("multiply", c_b, brp, dtype, batch + (n,), lines),
-                       self._ew("multiply", s_b, brq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        nrq = self._ew("add", self._ew("multiply", s_b, brp, dtype, batch + (n,), lines),
-                       self._ew("multiply", c_b, brq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        a2 = self._sel(row_p, self._bcast(nrp, dtype, batch + (n,), x_shape, row_dims, lines), b, dtype, x_shape, lines)
-        a2 = self._sel(row_q, self._bcast(nrq, dtype, batch + (n,), x_shape, row_dims, lines), a2, dtype, x_shape, lines)
-        # --- V = V·J: column updates ----------------------------------------
-        vcp = self._slice_matrix_vec(v_name, "col", p, batch, dtype, x_shape, lines)
-        vcq = self._slice_matrix_vec(v_name, "col", q, batch, dtype, x_shape, lines)
-        nvp = self._ew("subtract", self._ew("multiply", c_b, vcp, dtype, batch + (n,), lines),
-                       self._ew("multiply", s_b, vcq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        nvq = self._ew("add", self._ew("multiply", s_b, vcp, dtype, batch + (n,), lines),
-                       self._ew("multiply", c_b, vcq, dtype, batch + (n,), lines),
-                       dtype, batch + (n,), lines)
-        v2 = self._sel(col_p, self._bcast(nvp, dtype, batch + (n,), x_shape, col_dims, lines), v_name, dtype, x_shape, lines)
-        v2 = self._sel(col_q, self._bcast(nvq, dtype, batch + (n,), x_shape, col_dims, lines), v2, dtype, x_shape, lines)
+        apq_ne0 = self._cmp(apq, c_zero, "NE", dtype, batch, lines)
+        c = self._sel(apq_ne0, c_calc, c_one, dtype, batch, lines)
+        s = self._sel(apq_ne0, s_calc, c_zero, dtype, batch, lines)
+        # Broadcasts with EXPLICIT dimension mappings (the transposed
+        # layout (n, n, batch...) — numpy trailing alignment does not
+        # apply, the batch dims stay trailing):
+        #   c/s (batch,) → (n, batch...):      batch dims → 1..k
+        #   col vec (n, batch...) → (n,n,batch...): n → ROW dim (0)
+        #   row vec (n, batch...) → (n,n,batch...): n → COLUMN dim (1)
+        c_b = self._bcast(c, dtype, batch, vec_shape, list(range(1, k + 1)), lines)
+        s_b = self._bcast(s, dtype, batch, vec_shape, list(range(1, k + 1)), lines)
+        col_dims = [0] + list(range(2, k + 2))
+        row_dims = [1] + list(range(2, k + 2))
+        # --- rotation masks (iota vs rank-0 broadcast of the pair) --------
+        p_x = self._bcast(p_name, i64, (), t_shape, [], lines)
+        q_x = self._bcast(q_name, i64, (), t_shape, [], lines)
+        row_p = self._cmp(iota_row, p_x, "EQ", i64, t_shape, lines)
+        row_q = self._cmp(iota_row, q_x, "EQ", i64, t_shape, lines)
+        col_p = self._cmp(iota_col, p_x, "EQ", i64, t_shape, lines)
+        col_q = self._cmp(iota_col, q_x, "EQ", i64, t_shape, lines)
+        # --- B = A·J: column updates (dim-1 gathers of the transposed A) --
+        acp = self._gather_vec(a_name, idx_p, "col", dtype, n, batch, lines)
+        acq = self._gather_vec(a_name, idx_q, "col", dtype, n, batch, lines)
+        ncp = self._ew("subtract", self._ew("multiply", c_b, acp, dtype, vec_shape, lines),
+                       self._ew("multiply", s_b, acq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        ncq = self._ew("add", self._ew("multiply", s_b, acp, dtype, vec_shape, lines),
+                       self._ew("multiply", c_b, acq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        b = self._sel(col_p, self._bcast(ncp, dtype, vec_shape, t_shape, col_dims, lines), a_name, dtype, t_shape, lines)
+        b = self._sel(col_q, self._bcast(ncq, dtype, vec_shape, t_shape, col_dims, lines), b, dtype, t_shape, lines)
+        # --- A' = J^T·B: row updates (dim-0 gathers of the updated B) -----
+        brp = self._gather_vec(b, idx_p, "row", dtype, n, batch, lines)
+        brq = self._gather_vec(b, idx_q, "row", dtype, n, batch, lines)
+        nrp = self._ew("subtract", self._ew("multiply", c_b, brp, dtype, vec_shape, lines),
+                       self._ew("multiply", s_b, brq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        nrq = self._ew("add", self._ew("multiply", s_b, brp, dtype, vec_shape, lines),
+                       self._ew("multiply", c_b, brq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        a2 = self._sel(row_p, self._bcast(nrp, dtype, vec_shape, t_shape, row_dims, lines), b, dtype, t_shape, lines)
+        a2 = self._sel(row_q, self._bcast(nrq, dtype, vec_shape, t_shape, row_dims, lines), a2, dtype, t_shape, lines)
+        # --- V = V·J: column updates (dim-0 gathers of the transposed V) --
+        vcp = self._gather_vec(v_name, idx_p, "row", dtype, n, batch, lines)
+        vcq = self._gather_vec(v_name, idx_q, "row", dtype, n, batch, lines)
+        nvp = self._ew("subtract", self._ew("multiply", c_b, vcp, dtype, vec_shape, lines),
+                       self._ew("multiply", s_b, vcq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        nvq = self._ew("add", self._ew("multiply", s_b, vcp, dtype, vec_shape, lines),
+                       self._ew("multiply", c_b, vcq, dtype, vec_shape, lines),
+                       dtype, vec_shape, lines)
+        v2 = self._sel(row_p, self._bcast(nvp, dtype, vec_shape, t_shape, row_dims, lines), v_name, dtype, t_shape, lines)
+        v2 = self._sel(row_q, self._bcast(nvq, dtype, vec_shape, t_shape, row_dims, lines), v2, dtype, t_shape, lines)
         return a2, v2
+
+    def _index_single(self, idx_name, lines) -> str:
+        """Rank-0 i64 scalar → a ``(1,)`` i64 index tensor — the index
+        vector (``index_vector_dim = 0``) for a single-axis gather on the
+        transposed-layout matrix. Batch-free: the batch dims of the operand
+        are static trailing offset dims, so the index carries only the
+        runtime (p, q)."""
+        i64 = np.dtype("int64")
+        b = self._new_name()
+        lines.append(
+            f"{b} = stablehlo.reshape {idx_name} : "
+            f"({self._elem_type(i64)}) -> tensor<1xi64>"
+        )
+        return b
+
+    def _index_pair(self, p_name, q_name, lines) -> str:
+        """Two rank-0 i64 scalars → a ``(2,)`` i64 index tensor (two
+        single-index reshapes concatenated along dim 0) — the index vector
+        for a 2-axis (row, col) scalar gather on the transposed-layout
+        matrix."""
+        i64 = np.dtype("int64")
+        p1 = self._index_single(p_name, lines)
+        q1 = self._index_single(q_name, lines)
+        idx = self._new_name()
+        lines.append(
+            f'{idx} = "stablehlo.concatenate"({p1}, {q1}) '
+            f"{{dimension = 0 : i64}} : "
+            f"(tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>"
+        )
+        return idx
+
+    def _gather_scalar(self, src, idx_name, dtype, n, batch, lines) -> str:
+        """``A[..., p, q]`` with RUNTIME (p, q) → ``(batch...,)``: a
+        two-axis gather collapsing both matrix dims of the transposed
+        ``(n, n, batch...)`` operand. The indices are a batch-free ``(2,)``
+        pair tensor with ``index_vector_dim = 0``; the batch dims come
+        back as trailing offset dims (the ``_emit_diagonal_extract``
+        pattern — ``stablehlo.slice`` needs static start indices, so
+        loop-carried pairs must gather)."""
+        k = len(batch)
+        g = self._new_name()
+        lines.append(
+            f'{g} = "stablehlo.gather"({src}, {idx_name}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = "
+            f"[{self._int_list(range(k))}], "
+            f"collapsed_slice_dims = [0, 1], start_index_map = [0, 1], "
+            f"index_vector_dim = 0>, "
+            f"slice_sizes = {self._i64_array([1, 1] + list(batch))}}} : "
+            f"({self._type_str(dtype, (n, n) + batch)}, "
+            f"tensor<2xi64>) -> {self._type_str(dtype, batch)}"
+        )
+        return g
+
+    def _gather_vec(self, src, idx_name, which, dtype, n, batch, lines) -> str:
+        """A single axis of the transposed-layout matrix with a RUNTIME
+        index → ``(n, batch...)``: ``which="row"`` gathers ``[p, :, b...]``
+        (collapses dim 0, the A-row/B-row index), ``which="col"`` gathers
+        ``[:, p, b...]`` (collapses dim 1, the A-column index). The
+        indices are a batch-free ``(1,)`` tensor with
+        ``index_vector_dim = 0``; the n dim is the leading offset dim and
+        the batch dims follow as trailing offset dims."""
+        k = len(batch)
+        if which == "row":
+            collapsed, mapped = 0, 0
+            slice_sizes = [1, n] + list(batch)
+        else:
+            collapsed, mapped = 1, 1
+            slice_sizes = [n, 1] + list(batch)
+        g = self._new_name()
+        lines.append(
+            f'{g} = "stablehlo.gather"({src}, {idx_name}) '
+            f"{{dimension_numbers = #stablehlo.gather<offset_dims = "
+            f"[{self._int_list(range(k + 1))}], "
+            f"collapsed_slice_dims = [{collapsed}], "
+            f"start_index_map = [{mapped}], "
+            f"index_vector_dim = 0>, "
+            f"slice_sizes = {self._i64_array(slice_sizes)}}} : "
+            f"({self._type_str(dtype, (n, n) + batch)}, "
+            f"tensor<1xi64>) -> {self._type_str(dtype, (n,) + batch)}"
+        )
+        return g
 
     def _bcast(self, name, dtype, src_shape, target_shape, dims, lines) -> str:
         """``stablehlo.broadcast_in_dim`` with an explicit dimension mapping
@@ -2052,55 +2299,6 @@ class Writer:
             f"{self._type_str(dtype, shape)}) -> {self._type_str(dtype, shape)}"
         )
         return name
-
-    def _slice_matrix_scalar(self, src, i, j, batch, dtype, x_shape, lines) -> str:
-        """``A[..., i, j]`` (batch...,) — slice of the matrix axes + reshape."""
-        rank = len(x_shape)
-        s = self._new_name()
-        r = self._new_name()
-        lines.append(
-            f'{s} = "stablehlo.slice"({src}) '
-            f"{{start_indices = {self._i64_array([0] * len(batch) + [i, j])}, "
-            f"limit_indices = {self._i64_array(batch + (i + 1, j + 1))}, "
-            f"strides = {self._i64_array([1] * rank)}}} : "
-            f"({self._type_str(dtype, x_shape)}) -> "
-            f"{self._type_str(dtype, batch + (1, 1))}"
-        )
-        lines.append(
-            f"{r} = stablehlo.reshape {s} : "
-            f"({self._type_str(dtype, batch + (1, 1))}) -> "
-            f"{self._type_str(dtype, batch)}"
-        )
-        return r
-
-    def _slice_matrix_vec(self, src, which, idx, batch, dtype, x_shape, lines) -> str:
-        """``A[..., idx, :]`` (``which="row"``) or ``A[..., :, idx]``
-        (``which="col"``) → (batch..., n) — slice + reshape."""
-        rank = len(x_shape)
-        n = x_shape[-1]
-        s = self._new_name()
-        r = self._new_name()
-        if which == "row":
-            starts = [0] * len(batch) + [idx, 0]
-            limits = batch + (idx + 1, n)
-            inter = batch + (1, n)
-        else:
-            starts = [0] * len(batch) + [0, idx]
-            limits = batch + (n, idx + 1)
-            inter = batch + (n, 1)
-        lines.append(
-            f'{s} = "stablehlo.slice"({src}) '
-            f"{{start_indices = {self._i64_array(starts)}, "
-            f"limit_indices = {self._i64_array(limits)}, "
-            f"strides = {self._i64_array([1] * rank)}}} : "
-            f"({self._type_str(dtype, x_shape)}) -> {self._type_str(dtype, inter)}"
-        )
-        lines.append(
-            f"{r} = stablehlo.reshape {s} : "
-            f"({self._type_str(dtype, inter)}) -> "
-            f"{self._type_str(dtype, batch + (n,))}"
-        )
-        return r
 
     def _emit_diagonal_extract(self, a_name, dtype, x_shape, n, lines) -> str:
         """Main diagonal of a square matrix (batch..., n, n) → (batch..., n):

@@ -38,14 +38,20 @@ stablehlo/dialect/StablehloOps.td):
     two's-complement equivalence; NOT ``stablehlo.rng`` (implementation-
     defined algorithm would break the same-key⇒same-values determinism
     contract).
-  - ``eigh`` → an unrolled cyclic-Jacobi eigensolver (adaptive dim-based sweeps — 3–7 f32 by size, 8 f64 — of the
-    (p, q) rotation pairs) built from v1 ops (slice/iota/compare/select/
-    elementwise) + a pair-sort for the ascending eigenvalue order and a
-    column reorder of the eigenvector matrix — StableHLO 1.0 removed
+  - ``eigh`` → a while-loop cyclic-Jacobi eigensolver (a ``stablehlo.while``
+    carrying ``(a, v, p, q, k)`` applies ``_eigh_sweeps(n, dtype)``
+    (adaptive dim-based sweeps — 3–7 f32 by size, 8 f64) × n(n−1)/2
+    rotations; the (p, q) pair and rotation counter are loop-carried
+    rank-0 scalars, cond ``k < total``) with gather-based dynamic indexing
+    and all constants hoisted outside the loop, + a pair-sort for the
+    ascending eigenvalue order and a column reorder of the eigenvector
+    matrix — StableHLO 1.0 removed
     ``stablehlo.eigh``/``qr``/``svd`` (iree 3.11: only ``cholesky``
     survives), so the LAPACK-based numpy kernel has no mnemonic
     counterpart; parity is fp32-tolerance, NOT bit-exact (see the writer's
-    ``_emit_eigh`` docstring).
+    ``_emit_eigh`` docstring). The emitted text is O(1) in n and sweep
+    count — the unrolled predecessor's O(n²·sweeps) text (10x10 ~17 s
+    build, dim ≥ 25 blocked) is gone.
   - ``diag`` → rank-2: flatten + constant-index gather (the main
     diagonal); rank-1: iota-EQ mask + select (the diagonal matrix). No
     StableHLO diag op exists.
@@ -117,7 +123,7 @@ ELEMENTWISE_MAP: dict[str, str] = {
 # argmax/argmin/tile use multi-op StableHLO compositions; the random_* ops
 # are expanded as inline SplitMix64 i64 subgraphs in `./random_export.py` —
 # never `stablehlo.rng`, whose implementation-defined algorithm would break
-# the same-key⇒same-values determinism contract; `eigh` is an unrolled
+# the same-key⇒same-values determinism contract; `eigh` is a while-loop
 # cyclic-Jacobi composition (see the module docstring); `diag` is a
 # flatten+gather / iota+select composition per direction). The values are
 # emitter family keys; `status()` reports these as supported ("v1").
@@ -214,7 +220,7 @@ COLLECTIVE_MAP: dict[str, str] = {
 # (defer explicitly, never silently). The linalg factorizations
 # (`cholesky`/`qr`/`svd`) have StableHLO counterparts but are not wired in
 # v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff / Padé) —
-# all five defer explicitly (`eigh` is v1 via the unrolled cyclic-Jacobi
+# all five defer explicitly (`eigh` is v1 via the while-loop cyclic-Jacobi
 # composition in `_emit_eigh`). `random_multinomial` defers because its
 # cumulative-search decomposition is not wired in v1. The 16
 # `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
