@@ -8,7 +8,8 @@ pytest suite validating the `etl` package (sibling — see `../etl/CONTEXT.md` f
 
 Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `tests/trace/`, `tests/block/`, `tests/transforms/`, `tests/backends/`, `tests/dist/`, `tests/persist/`, `tests/bench/` (`etl.bench` harness — see its own CONTEXT.md), plus:
 
-- `tests/pipeline_test.py` — end-to-end staging pipeline (trace→lower→compile→load→run), bind, build, evaluate
+- `tests/pipeline_env_defaults_test.py` — process-wide backend/device defaulting env vars (`ETL_BACKEND`/`ETL_DEVICE`/`ETL_TARGET_BACKENDS`) for `etl.build`/`etl.evaluate`: explicit kwargs win, env read lazily at call time, stub-backed full-path tests (registered `"iree"` stub; never imports a real adapter)
+- `tests/test_pipeline_options.py` — per-backend option env vars (the options-override env half, `etl.pipeline_options.apply_env_options`/`ENV_OPTION_TABLE`): per-stage application (`ETL_IREE_COMPILE_ARGS` at compile, `ETL_IREE_RUNTIME_ARGS` at load), explicit > env > default precedence, empty/whitespace = unset, lazy per-call reads, tvm target + pass-configs JSON, xla base64 decode, malformed values → `BackendError` naming var+value, unknown backend no-op; stub full-path tests (compile args reach compile, runtime args reach load, run options forwarded, numpy documented-ignore, `BoundExecutable.backend`); no real adapter imports — the backend half is `tests/backends/test_options_override.py`
 - `tests/test_spec_compliance.py` — design-principle compliance:
   - no implicit tracing/eager mode: ops outside a trace → TraceError; direct `Defn` call raises helpfully
   - closure-captured Tensor in ops → TraceError; `etl.constant` opt-in works (warns above `ETL_LARGE_CONSTANT_BYTES`)
