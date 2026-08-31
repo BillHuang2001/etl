@@ -282,13 +282,16 @@ class IreeBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
-        # False (empirically): iree 3.11 legalizes RNG_ALG_THREE_FRY
-        # bit-exactly (state layout [key0,key1,ctr0,ctr1]) but FAILS to
-        # legalize RNG_ALG_PHILOX — the bool capability cannot express
-        # per-algorithm support, so the exporter uses its bit-exact inline
-        # expansions for both algorithms on this target (see
-        # adapters/CONTEXT.md Known Issues).
-        rng_bit_generator=False,
+        # {"threefry2x32"} (measured): native THREE_FRY via
+        # stablehlo.rng_bit_generator is verified BIT-EXACT vs numpy on
+        # llvm-cpu AND cuda (iree 3.11.0) and faster than the inline
+        # expansion (benchmark in etl/bench/rng_bench.py: ~1.6-2.1x, e.g.
+        # cuda randint 2^24: 3.84 ms native vs 8.16 ms inline; uniform
+        # 4.27 vs 7.64; llvm-cpu uniform 2^24: 100 vs 164). PHILOX is
+        # excluded because iree cannot legalize RNG_ALG_PHILOX on either
+        # target (see adapters/CONTEXT.md Known Issues) — philox graphs
+        # use the exporter's bit-exact inline expansion.
+        rng_bit_generator=frozenset({"threefry2x32"}),
     )
 
     @classmethod

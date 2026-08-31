@@ -26,13 +26,17 @@ def export(graph_or_module, options: dict | None = None) -> str:
             attribute is used; no `etl.trace` import is needed here) or an
             `etl.ir.Module` directly.
         options: optional dict of exporter options. ``rng_bit_generator``
-            (bool, default False) selects the NATIVE
-            ``stablehlo.rng_bit_generator`` emission for the
-            threefry2x32/philox4x32_10 random algorithms; when False (the
-            default) they are expanded as bit-exact inline i32/ui32
-            elementwise subgraphs, so bare exports always work. The
-            compiler adapters pass their ``Capabilities.rng_bit_generator``
-            flag through here from ``lower()``.
+            accepts a bool (backward compat: ``True`` → both ciphers,
+            ``False``/absent → none) or a collection of random algorithm
+            names — the native ``stablehlo.rng_bit_generator`` emission is
+            used per-algorithm iff the name is in the set (canonical names:
+            ``"threefry2x32"``, ``"philox4x32_10"``; splitmix64 has no
+            native form — always the inline expansion). Algorithms outside
+            the set are expanded as bit-exact inline i32/ui32 elementwise
+            subgraphs, so bare exports always work. The compiler adapters
+            pass their ``Capabilities.rng_bit_generator`` set through here
+            from ``lower()`` (overridable per call via the reserved
+            ``rng_bit_generator`` lower option).
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external

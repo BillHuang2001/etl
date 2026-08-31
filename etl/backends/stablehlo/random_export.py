@@ -12,11 +12,11 @@ Multi-algorithm lowering (the ``algorithm`` attribute on random ops; absent
 unchanged): besides the splitmix64 inline i64 expansion, the
 ``threefry2x32`` and ``philox4x32_10`` algorithms lower as INLINE bit-exact
 i32/ui32 elementwise expansions of the pinned Random123/JAX ciphers (the
-default — no target support required), or — when the writer's
-``rng_bit_generator`` option (fed from the backend's capability flag) is
-set — as a native ``stablehlo.rng_bit_generator`` call with the verified
-state layout ``[key0, key1, ctr...]`` (key words FIRST, counter words
-zero). Key layouts: splitmix64 → rank-0 int64 (unchanged); threefry2x32 →
+default — no target support required), or — when the algorithm is in the
+writer's ``rng_bit_generator`` option (fed from the backend's capability
+set, per algorithm) — as a native ``stablehlo.rng_bit_generator`` call with
+the verified state layout ``[key0, key1, ctr...]`` (key words FIRST, counter
+words zero). Key layouts: splitmix64 → rank-0 int64 (unchanged); threefry2x32 →
 ``(2,)`` int32; philox4x32_10 → ``(4,)`` int32 (the pinned key'
 definition folds the salt into all four words; the INLINE cipher consumes
 them CYCLICALLY — round r uses the pair ``(k'_{2r mod 4},
@@ -750,9 +750,10 @@ def _emit_rng_bit_generator(w, op, alg, key, salt, n_words, lines) -> str:
     V1 CAVEAT (native PHILOX — documented, export-only): native
     ``stablehlo.rng_bit_generator`` with ``algorithm = PHILOX`` is NOT
     validated against the numpy reference anywhere — iree 3.11 fails to
-    legalize it (``rng_bit_generator=False`` on iree), tvm has no
-    rng_bit_generator support, and the xla adapter's ``True`` flag is
-    gate-skipped without a user-provided PJRT plugin. The StableHLO philox
+    legalize it (so "philox4x32_10" is absent from the iree capability
+    set), tvm has no rng_bit_generator support, and the xla adapter's
+    capability set includes philox only by design, gate-skipped without a
+    user-provided PJRT plugin. The StableHLO philox
     cipher consumes only the 2-word key (Random123 semantics), while the
     etl reference uses the 4-word CYCLIC round-key schedule — so native
     philox words may differ from the numpy reference for nonzero keys.
@@ -809,13 +810,17 @@ def _emit_rng_bit_generator(w, op, alg, key, salt, n_words, lines) -> str:
 
 def _emit_words_for(w, op, alg, salt, n_words, lines) -> str:
     """The flat ``(n_words,)`` i32 word stream for the algorithm: the
-    native ``rng_bit_generator`` when the writer's flag is set, else the
-    inline bit-exact expansion (the default — no target support needed)."""
+    native ``rng_bit_generator`` when the algorithm is in the writer's
+    ``rng_bit_generator`` set, else the inline bit-exact expansion (the
+    default — no target support needed). splitmix64 never reaches this
+    function (its word stream is the inline i64 expansion only); the
+    threefry2x32/philox4x32_10 ciphers dispatch per-algorithm, so a target
+    can enable native THREE_FRY while keeping PHILOX inline."""
     if n_words == 0:
         name = w._new_name()
         lines.append(f"{name} = stablehlo.constant dense<> : tensor<0xi32>")
         return name
-    if w._rng_bit_generator:
+    if alg in w._rng_bit_generator:
         return _emit_rng_bit_generator(w, op, alg, op.operands[0], salt, n_words, lines)
     if alg == ALGORITHM_THREEFRY2X32:
         return _emit_threefry_words_inline(w, op.operands[0], salt, n_words, lines)

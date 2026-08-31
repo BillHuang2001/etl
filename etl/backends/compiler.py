@@ -191,12 +191,18 @@ class CompilerBackend(Backend):
            ``custom_blocks=False`` have already rejected ``block_call``
            at step 2).
         4. ``graph.verify()`` again (defensive, cheap).
-        5. ``stablehlo.export(graph, options={"rng_bit_generator":
-           self.capabilities.rng_bit_generator})`` — the capability gate for
-           ops: deferred ops raise ``core.BackendError`` naming them; the
-           flag selects the native ``stablehlo.rng_bit_generator`` emission
-           for the threefry2x32/philox4x32_10 random algorithms (False →
-           the exporter's bit-exact inline expansions, always available).
+        5. ``stablehlo.export(graph, options={"rng_bit_generator": ...})`` —
+           the capability gate for ops: deferred ops raise
+           ``core.BackendError`` naming them; the ``rng_bit_generator``
+           exporter option selects the native ``stablehlo.rng_bit_generator``
+           emission per random algorithm (threefry2x32/philox4x32_10; absent
+           from the set → the exporter's bit-exact inline expansions, always
+           available). The caller's ``options`` dict may carry the RESERVED
+           ``rng_bit_generator`` key (a bool or a collection of algorithm
+           names) which OVERRIDES the capability — otherwise the
+           ``Capabilities.rng_bit_generator`` set is used. The pipeline
+           ``lower``/``build``/``evaluate`` sugar forwards it; ``compile()``
+           ignores unknown keys (this key is lower-only).
         6. Record the ``Signature`` EXACTLY like ``NumpyBackend.lower``
            (input/output TreeSpec + per-leaf specs + static values, from
            the Graph's LIVE attributes).
@@ -248,8 +254,15 @@ class CompilerBackend(Backend):
 
         from .stablehlo import export
 
+        # The reserved per-call ``rng_bit_generator`` key (bool or collection
+        # of algorithm names) overrides the capability — the pipeline
+        # lower/build/evaluate sugar forwards it; compile() ignores unknown
+        # keys, so it is lower-only.
+        rng_option = (options or {}).get(
+            "rng_bit_generator", self.capabilities.rng_bit_generator
+        )
         mlir_text = export(
-            graph, options={"rng_bit_generator": self.capabilities.rng_bit_generator}
+            graph, options={"rng_bit_generator": rng_option}
         )
 
         from etl.backends.numpy.interpreter import entry_function

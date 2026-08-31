@@ -126,13 +126,14 @@ class XlaBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
-        # True by design: XLA ships RngBitGenerator with THREE_FRY/PHILOX
-        # (the exporter's native rng_bit_generator path with the verified
-        # [key0,key1,ctr...] state layout). The xla tests stay gate-skipped
-        # without a user-provided PJRT plugin — bit-exactness must be
-        # re-validated against the numpy reference with a real plugin
-        # (see adapters/CONTEXT.md).
-        rng_bit_generator=True,
+        # {"threefry2x32", "philox4x32_10"} by design: XLA ships
+        # RngBitGenerator with THREE_FRY/PHILOX (the exporter's native
+        # rng_bit_generator path with the verified [key0,key1,ctr...]
+        # state layout). The xla tests stay gate-skipped without a
+        # user-provided PJRT plugin — bit-exactness of BOTH algorithms
+        # must be re-validated against the numpy reference with a real
+        # plugin (see adapters/CONTEXT.md).
+        rng_bit_generator=frozenset({"threefry2x32", "philox4x32_10"}),
     )
 
     # ---------------------------------------------------------- availability
