@@ -9,7 +9,9 @@ int64 tensors) are created with :func:`key`, split with :func:`split` /
 ``cond``/``while_loop``/``scan`` regions, since the ops are pure).
 
 Design decisions (binding — see ``etl/CONTEXT.md``, section "etl.random"):
-key representation, SplitMix64 stream derivation with per-op salts,
+key representation, three canonical algorithms (``ALGORITHMS``: SplitMix64,
+Threefry2x32, Philox4x32_10 — selectable via :func:`key`'s ``algorithm``
+argument as canonical strings or ``Algorithm`` members), per-op salts,
 key-consumption semantics (ops never consume/mutate a key — split for
 independence), dtype rules, symbolic-shape and symbolic-``high`` handling,
 and the numpy-backend-only v1 coverage (compiler backends reject every
@@ -30,6 +32,8 @@ from etl.ops.random import (  # noqa: F401
     randint,
     permutation,
     multinomial,
+    Algorithm,
+    ALGORITHMS,
 )
 
 __all__ = [
@@ -41,4 +45,6 @@ __all__ = [
     "randint",
     "permutation",
     "multinomial",
+    "Algorithm",
+    "ALGORITHMS",
 ]

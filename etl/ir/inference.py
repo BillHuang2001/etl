@@ -1300,23 +1300,85 @@ def infer_scalar_int64(
 # Random hooks (referenced by the random.py OpDefs)
 #
 # Key-based functional RNG (etl.random): every random op is PURE and a
-# deterministic function of its key operand (a rank-0 int64 tensor). The
-# result dtype comes from the ``dtype`` attribute; the result shape is the
-# symbolic broadcast of the ``shape`` attribute with the broadcastable
-# parameter operands (low/high/mean/std), matching the numpy kernels' natural
-# broadcasting (the interpreter validates the runtime output against these
-# declared types). ``random_permutation``'s length is a runtime operand, so
-# its result dim is ``None`` (runtime-dynamic, unchecked). Shape functions
-# validate arity and the key operand type so IR-level construction errors are
-# caught here, not at run time.
+# deterministic function of its key operand. The key's static shape/dtype is
+# determined by the op's ``algorithm`` attribute (canonical names in
+# ``etl/ir/op_defs/random.py`` — the single source of truth): splitmix64 keys
+# are rank-0 int64, threefry2x32 keys are shape (2,) int32, philox4x32_10 keys
+# are shape (4,) int32. The result dtype comes from the ``dtype`` attribute;
+# the result shape is the symbolic broadcast of the ``shape`` attribute with
+# the broadcastable parameter operands (low/high/mean/std), matching the numpy
+# kernels' natural broadcasting (the interpreter validates the runtime output
+# against these declared types). ``random_permutation``'s length is a runtime
+# operand, so its result dim is ``None`` (runtime-dynamic, unchecked). Shape
+# functions validate arity, the ``algorithm`` attribute, and the key operand
+# type so IR-level construction errors are caught here, not at run time.
 # ---------------------------------------------------------------------------
-def _check_random_key(t: ValueType, name: str) -> None:
-    """Validate one key operand type (rank-0 int64)."""
-    if t.dtype != np.dtype("int64") or t.shape != ():
+def _random_algorithm(attributes: dict[str, Any]) -> str:
+    """The op's ``algorithm`` attribute (canonical default when unset)."""
+    from .op_defs.random import DEFAULT_ALGORITHM
+
+    return attributes.get("algorithm", DEFAULT_ALGORITHM)
+
+
+def _random_key_forms() -> str:
+    """Human-readable list of the three accepted key forms.
+
+    e.g. "a rank-0 int64 tensor (splitmix64), a shape (2,) int32 tensor
+    (threefry2x32), or a shape (4,) int32 tensor (philox4x32_10)".
+    """
+    from .op_defs.random import ALGORITHMS, algorithm_key_type
+
+    parts = []
+    for alg in ALGORITHMS:
+        shape, key_dtype = algorithm_key_type(alg)
+        if shape == ():
+            parts.append(f"a rank-0 {key_dtype} tensor ({alg})")
+        else:
+            parts.append(f"a shape {shape} {key_dtype} tensor ({alg})")
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + ", or " + parts[-1]
+
+
+def _check_random_key(
+    t: ValueType, name: str, algorithm: str
+) -> tuple[tuple[int, ...], np.dtype]:
+    """Validate one key operand type against the op's ``algorithm``.
+
+    Accepts the three canonical key forms — rank-0 int64 (splitmix64),
+    shape (2,) int32 (threefry2x32), shape (4,) int32 (philox4x32_10) — and
+    requires the key's static shape/dtype to match the op's ``algorithm``
+    attribute. Returns the algorithm's key type (shape, dtype) on success.
+
+    Raises:
+        ValueError: Unknown ``algorithm`` name (via ``validate_algorithm``).
+        ShapeError: Key shape/dtype inconsistent with the algorithm — either
+            a key form belonging to a DIFFERENT algorithm, or a form that
+            matches no algorithm at all (the message names the three
+            accepted forms).
+    """
+    from .op_defs.random import ALGORITHMS, algorithm_key_type, validate_algorithm
+
+    alg = validate_algorithm(algorithm)
+    shape, key_dtype = algorithm_key_type(alg)
+    if t.shape == shape and t.dtype == key_dtype:
+        return shape, key_dtype
+    matched = [
+        a
+        for a in ALGORITHMS
+        if algorithm_key_type(a)[0] == t.shape
+        and algorithm_key_type(a)[1] == t.dtype
+    ]
+    if matched:
         raise ShapeError(
-            f"{name}: key must be a rank-0 int64 tensor, got "
-            f"dtype={t.dtype} shape={t.shape}"
+            f"{name}: key has the {matched[0]} key form "
+            f"(dtype={t.dtype} shape={t.shape}) but the op declares "
+            f"algorithm {alg!r}"
         )
+    raise ShapeError(
+        f"{name}: key must be {_random_key_forms()}, got "
+        f"dtype={t.dtype} shape={t.shape}"
+    )
 
 
 def _random_broadcast_shape(
@@ -1335,7 +1397,7 @@ def _random_broadcast_shape(
             f"{name}: expected at least 2 operands (key + parameters), got "
             f"{len(input_types)}"
         )
-    _check_random_key(input_types[0], name)
+    _check_random_key(input_types[0], name, _random_algorithm(attributes))
     shape_attr = attributes["shape"]
     if not isinstance(shape_attr, (tuple, list)):
         raise ShapeError(
@@ -1350,14 +1412,18 @@ def _random_broadcast_shape(
 def infer_random_key_mix(
     input_types: tuple[ValueType, ...], attributes: dict[str, Any]
 ) -> tuple[ValueType, ...]:
-    """Result type of ``random_key_mix``: one derived rank-0 int64 key."""
+    """Result type of ``random_key_mix``: one derived key of the
+    algorithm's key type (rank-0 int64 for splitmix64, shape (2,) int32 for
+    threefry2x32, shape (4,) int32 for philox4x32_10)."""
     if len(input_types) != 1:
         raise ShapeError(
             f"random_key_mix: expected 1 operand (the key), got "
             f"{len(input_types)}"
         )
-    _check_random_key(input_types[0], "random_key_mix")
-    return (ValueType(np.dtype("int64"), ()),)
+    shape, key_dtype = _check_random_key(
+        input_types[0], "random_key_mix", _random_algorithm(attributes)
+    )
+    return (ValueType(key_dtype, shape),)
 
 
 def infer_random_uniform(
@@ -1416,7 +1482,9 @@ def infer_random_permutation(
             f"random_permutation: expected 2 operands (key, n), got "
             f"{len(input_types)}"
         )
-    _check_random_key(input_types[0], "random_permutation")
+    _check_random_key(
+        input_types[0], "random_permutation", _random_algorithm(attributes)
+    )
     n = attributes.get("n")
     if n is None:
         return (ValueType(dtype(attributes["dtype"]), (None,)),)
@@ -1437,7 +1505,9 @@ def infer_random_multinomial(
             f"random_multinomial: expected 2 operands (key, input), got "
             f"{len(input_types)}"
         )
-    _check_random_key(input_types[0], "random_multinomial")
+    _check_random_key(
+        input_types[0], "random_multinomial", _random_algorithm(attributes)
+    )
     num_samples = attributes["num_samples"]
     if not isinstance(num_samples, int) or isinstance(num_samples, bool) or num_samples < 0:
         raise ShapeError(
