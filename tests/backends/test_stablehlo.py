@@ -783,11 +783,15 @@ def test_matching_dtype_graphs_emit_no_convert(fn, specs):
 
 # eigh/diag have no mnemonic StableHLO op (StableHLO 1.0 removed
 # eigh/qr/svd; there is no diag), so the writer emits multi-op compositions
-# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = adaptive unrolled cyclic-Jacobi
-# sweeps (fp32: dim-based 3-7; f64: 8 — see writer.py `_eigh_sweeps`)
-# (slice/iota/compare/select/elementwise rotations) + a stable pair-sort for
-# the ascending eigenvalue order + a gather column reorder of V; diag =
-# iota-EQ mask + select (rank-1 → diagonal matrix) or flatten +
+# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = a `stablehlo.while` cyclic-Jacobi
+# eigensolver — ONE while loop carrying (a, v, p, q, k) applies the adaptive
+# sweep schedule (fp32: dim-based 3-7; f64: 8 — see writer.py
+# `_eigh_sweeps`) rotation by rotation, with dynamic (p, q) indexing via
+# gathers (never `stablehlo.slice` — its start indices must be static) and
+# constants/iota hoisted outside the loop, so the emitted text is O(1) in n
+# (the unrolled predecessor's O(n^2·sweeps) text is gone) + a stable
+# pair-sort for the ascending eigenvalue order + a gather column reorder of
+# V; diag = iota-EQ mask + select (rank-1 → diagonal matrix) or flatten +
 # constant-index gather (rank-2 → main diagonal). These tests pin the
 # composition markers, the dtype rules, and the dynamic-dims rejection;
 # iree-llvm-cpu round-trip correctness lives in
@@ -801,13 +805,16 @@ def _fn_eigh(x):
 
 def test_eigh_exports_jacobi_composition():
     mlir = _export(_fn_eigh, etl.TensorSpec((3, 3), etl.float32))
-    # The ascending-order reorder is a stable pair-sort of the final
-    # diagonal; the diagonal extract + the V column reorder are gathers;
-    # the rotations are slice-based (no while-loops — unrolled sweeps).
+    # The sweeps run inside ONE while loop (carrying (a, v, p, q, k)) with
+    # dynamic (p, q) indexing via gathers; the ascending-order reorder is a
+    # stable pair-sort of the final diagonal and the V column reorder is a
+    # gather. The while emission has ZERO slices (their start indices must
+    # be static, so the dynamic indexing uses gathers instead).
+    assert '"stablehlo.while"' in mlir
     assert "stablehlo.sort" in mlir
     assert "stablehlo.gather" in mlir
-    assert "stablehlo.slice" in mlir
     assert "stablehlo.iota" in mlir
+    assert "stablehlo.slice" not in mlir
     # (w, v) result types: w (..., n), v (..., n, n).
     assert "-> (tensor<3xf32>, tensor<3x3xf32>)" in mlir
 
