@@ -4,12 +4,16 @@ Both are multi-op compositions — no mnemonic StableHLO op exists (StableHLO
 1.0 removed ``eigh``/``qr``/``svd``, and there is no diag op), see
 ``etl/backends/stablehlo/ops.py``:
 
-* ``eigh`` — an unrolled cyclic-Jacobi symmetric eigensolver (an ADAPTIVE
-  sweep count: dim-based for fp32 — n ≤ 5 → 3, n = 6 → 4, 7 ≤ n ≤ 15 → 5,
+* ``eigh`` — a while-loop cyclic-Jacobi symmetric eigensolver: ONE
+  ``stablehlo.while`` loop carrying ``(a, v, p, q, k)`` applies the ADAPTIVE
+  sweep schedule (dim-based for fp32 — n ≤ 5 → 3, n = 6 → 4, 7 ≤ n ≤ 15 → 5,
   16 ≤ n ≤ 30 → 6, 31 ≤ n ≤ 50 → 7; f64 always 8 — of the (p, q) rotation
-  pairs built from slice/iota/compare/select/elementwise, NO while-loops) +
-  a stable pair-sort for the ASCENDING eigenvalue order + a gather column
-  reorder of V.
+  pairs, with dynamic (p, q) indexing via gathers (never ``stablehlo.slice``
+  — its start indices must be static) and constants/iota hoisted outside the
+  loop. The emitted text is O(1) in n — the unrolled predecessor's
+  O(n²·sweeps) text is gone, so dim ≥ 25 compiles — while the runtime stays
+  O(n⁴) (the rotations still execute sequentially). A stable pair-sort then
+  orders the final diagonal ASCENDING + a gather reorders the V columns.
 * ``diag`` — rank-1 → iota-EQ mask + select (the diagonal matrix); rank-2 →
   flatten reshape + constant-index single-axis gather (the main diagonal).
 
@@ -23,12 +27,15 @@ are basis-dependent, so tests check the mathematical contract — ascending
 Measured max diffs (seed 7, iree-llvm-cpu, fp32): 3x3 rec 1.2e-6 / orth
 1.8e-7 / w-vs-numpy 9.5e-7; 10x10 (CMAES size) rec 1.7e-5 / orth 6e-7 /
 w-vs-numpy 1.5e-5; batched (2, 3, 3) rec 9.5e-7; f64 3x3 rec + w-vs-numpy
-2.7e-15; int32 3x3 (upcast f64) rec 4.9e-15.
+2.7e-15; int32 3x3 (upcast f64) rec 4.9e-15; dim 25 rec 1.7e-3 / orth
+8.7e-6 — the fp32 tolerance band across sizes is rec 1.2e-6..1.7e-3,
+orth 1.8e-7..8.7e-6.
 
-Build+run times: the unrolled composition grows with n² per sweep — 10x10
-takes ~22-24 s (8 sweeps x 45 rotations), every other case ~2 s. CPU only
-(llvm-cpu — iree-cuda while fragility does not apply, there are no
-while-loops, but the 10x10 compile is heavy; keep these on llvm-cpu).
+Build+run times: the while composition is O(1) emitted text, so the build is
+~1.6-2.3 s at ANY dim (3x3 f32 ~1.94 s build / 0.005 s run; 10x10 ~1.6 s /
+0.035 s; dim 25 ~2.26 s / 0.37 s; dim 50 ~1.79 s / 3.6 s — the run grows
+O(n⁴) with the rotation count). CPU only (llvm-cpu — well-shaped carries,
+no iree-cuda while fragility, and no slices; keep these on llvm-cpu).
 """
 
 import numpy as np
@@ -188,4 +195,17 @@ def test_eigh_int32_upcast_f64_contract():
     _check_eigh_contract(A.astype(np.float64), gw, gv, rtol=1e-12, atol=1e-12)
     assert np.allclose(gw, _np(want[0]), rtol=1e-12, atol=1e-12), (
         f"w vs numpy: {gw} != {_np(want[0])}"
+    )
+
+
+def test_eigh_dim25_f32_contract():
+    # while-loop emission sanity at a larger dim: the emitted text is O(1)
+    # in n, so the build stays ~2.3 s (single build) and only the run grows
+    # O(n^4). fp32 tolerance band measured at dim 25: rec 1.7e-3 / orth
+    # 8.7e-6 — still inside the 1e-3 contract.
+    A = _sym(25, scale=10.0)
+    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((25, 25), etl.float32))
+    _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
+    assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3), (
+        f"w vs numpy: max abs diff {np.max(np.abs(gw - ww))}"
     )
