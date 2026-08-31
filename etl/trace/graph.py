@@ -41,6 +41,8 @@ from etl import ir
 from etl.core import describe_node, first_mismatch_path, format_path
 from etl.core.tree import _subtree_spec_at  # shared mismatch-path subtree lookup
 
+from ._tree import _iter_leaf_paths  # the ONE leaf-path iterator (see _tree.py)
+
 __all__ = ["Graph", "StaticValue"]
 
 #: Persist-container payload type tag for `.etlgraph` files.
@@ -65,6 +67,18 @@ class StaticValue:
     path: Tuple[Any, ...]
     value: Any
     kind: str
+
+
+def _static_record(index: int, path: Tuple[Any, ...], value: Any) -> StaticValue:
+    """One `StaticValue` record for a static input/output leaf.
+
+    The single construction site for static-leaf records (trace.py records
+    inputs AND outputs with it; `kind` snapshots `type(value).__qualname__`
+    so a recorded `1` never matches a run-time `True`).
+    """
+    return StaticValue(
+        index=index, path=path, value=value, kind=type(value).__qualname__
+    )
 
 
 # --- persistence helpers (StaticValue/Location have no codec entries) ----------
@@ -166,23 +180,6 @@ def _same_structure(spec: "core.TreeSpec", other: "core.TreeSpec") -> bool:
     count is checked by the caller against the recorded specs.
     """
     return first_mismatch_path(spec, other) is None
-
-
-def _leaf_paths(spec: "core.TreeSpec", leaves, counter, prefix=()):
-    """Yield ``(path, leaf)`` pairs for every leaf of ``spec`` (pre-order).
-
-    Mirrors `core.flatten`'s traversal: dict children take their sorted key
-    from ``node_data``; all other container kinds use positional indices.
-    """
-    if not spec.children:
-        if spec.num_leaves == 1:
-            yield prefix, leaves[counter[0]]
-            counter[0] += 1
-        return
-    is_dict = isinstance(spec.type, type) and issubclass(spec.type, dict)
-    for i, child in enumerate(spec.children):
-        key = spec.node_data[i] if is_dict else i
-        yield from _leaf_paths(child, leaves, counter, prefix + (key,))
 
 
 def _check_shape(actual_shape: Tuple[int, ...], spec_shape: Tuple[Any, ...], path) -> None:
@@ -476,7 +473,9 @@ class Graph:
 
         tensors = []
         specs = iter(self.tensor_specs)
-        for i, (path, leaf) in enumerate(_leaf_paths(spec, leaves, [0])):
+        for i, (path, leaf) in enumerate(
+            zip(_iter_leaf_paths(spec), leaves)  # shared leaf-path iterator
+        ):
             record = static_by_index.get(i)
             if record is not None:
                 kind = type(leaf).__qualname__
@@ -506,9 +505,10 @@ class Graph:
         1. Each flat element: use as-is if already a `core.Tensor`; wrap
            numpy `ndarray` via `core.from_numpy`; anything else →
            `core.BackendError`.
-        2. Insert `output_static_values` back at their recorded flat indices
-           (in ascending index order, so each insertion lands at the right
-           absolute position).
+        2. Insert `output_static_values` back at their recorded flat indices.
+           Built in ONE pass over the combined leaf positions: tensor leaves
+           come from `flat_tensors` in order, static leaves from the records
+           at their recorded indices (validated: in range, no duplicates).
         3. `core.unflatten(leaves, normalized_output_tree)` → the structured
            result. The tree is normalized via `_normalize_leaf_types` first:
            trace records `core.SymbolicTensor` (a dataclass) as leaf types,
@@ -526,15 +526,29 @@ class Graph:
                     f"{i}: expected core.Tensor or numpy ndarray, got "
                     f"{type(element).__qualname__}"
                 )
-        leaves = list(wrapped)
-        for record in sorted(self.output_static_values, key=lambda r: r.index):
-            if not 0 <= record.index <= len(leaves):
+        static_by_index = {}
+        for record in self.output_static_values:
+            if record.index in static_by_index:
+                raise core.TraceError(
+                    f"graph records duplicate static output leaf index "
+                    f"{record.index}"
+                )
+            static_by_index[record.index] = record.value
+        total = len(wrapped) + len(static_by_index)
+        for record in self.output_static_values:
+            if not 0 <= record.index < total:
                 raise core.TraceError(
                     f"graph records a static output at leaf index "
-                    f"{record.index}, out of range for {len(leaves)} tensor "
+                    f"{record.index}, out of range for {len(wrapped)} tensor "
                     f"outputs"
                 )
-            leaves.insert(record.index, record.value)
+        leaves = []
+        wrapped_iter = iter(wrapped)
+        for i in range(total):
+            if i in static_by_index:
+                leaves.append(static_by_index[i])
+            else:
+                leaves.append(next(wrapped_iter))
         try:
             return core.unflatten(leaves, _normalize_leaf_types(self.output_tree))
         except ValueError as exc:

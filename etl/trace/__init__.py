@@ -6,11 +6,15 @@ Static Python values keep Python semantics and specialize the graph; runtime
 tensor control flow is explicit (`cond` / `while_loop` / `scan`, traced into
 IR regions). See `./CONTEXT.md` for the full contract.
 
-Note on naming: inside the package, `etl.trace` the *function* (re-exported
-below) shadows `etl.trace` the *submodule* at attribute level after
-`etl/__init__.py` imports it. Module attributes remain reachable via
-`import etl.trace as trace_mod` or `from etl.trace import current_builder`
-(the import system resolves `etl.trace` as the submodule).
+Name shadowing (verified): `etl/__init__.py` re-exports the `trace` FUNCTION
+under the attribute name `etl.trace`, so after `import etl` the ATTRIBUTE is
+the function, NOT this submodule — and `import etl.trace as mod` therefore
+binds the function too (it resolves the attribute, not `sys.modules`). To
+reach this module's contents use `from etl.trace import current_builder`
+(works — the import system consults `sys.modules` first) or
+`import sys; sys.modules["etl.trace"]`. The tracing functions below are
+re-exported at package level, so in practice you never need the module
+object itself.
 """
 
 from .builder import builder_stack, current_builder, with_builder

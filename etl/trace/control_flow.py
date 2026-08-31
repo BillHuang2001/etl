@@ -6,8 +6,7 @@ support. Region ops are built through `ir.opdef(...)` + the `ir.Builder`
 directly; this module NEVER imports `etl.ops` (ops imports trace for the
 active-builder hook — the DAG stays acyclic).
 
-REGION CONVENTIONS (the implemented `etl.ir` reality — binding; the
-CONTEXT.md sketch is superseded where it differs; see
+REGION CONVENTIONS (the implemented `etl.ir` reality — binding; see
 `./etl/ir/op_defs/control.py`, `./etl/ir/builder.py`, `./etl/ir/verify.py`):
 
 * `if` op  (registry name "if"; effects: none; `regions` = 2)
@@ -38,23 +37,23 @@ CONTEXT.md sketch is superseded where it differs; see
   - body region terminator: `return` of n next-iteration carried values.
   - op results: n final carried values.
 * `return` op: terminator-only (no results, no regions); operands = yielded
-  values. Emitted via `Builder.set_terminator` so it is APPENDED as the
-  block's last op (a terminator is never emitted via `create` at the
-  insertion point).
+  values. Emitted via `builder._return_terminator` (`Builder.set_terminator`)
+  so it is APPENDED as the block's last op (a terminator is never emitted
+  via `create` at the insertion point).
 
 Region building (the `ir.Builder` workflow): ONE Builder instance serves the
 whole trace. `builder.build_region(input_types)` creates a DETACHED
 single-block region whose entry args are fresh `Value`s;
 `builder.create("if"/"while", operands=..., regions=(region,), ...)` wires
-the region parents. To run a callable inside a region:
-`builder.push_region(region)` (insertion point → region entry), run the
-callable under `with_builder(builder)` (installs the active-builder context
-for `current_builder()` — the SAME builder), emit the region's `return` via
-`set_terminator`, then `builder.pop_region()` (always in a `finally` so the
-stack stays consistent on error).
+the region parents. To run a callable inside a region, use `_run_in_region`
+(defined below): it pushes the region onto the builder's insertion-point
+stack, installs the builder as the active-builder context for
+`current_builder()` (the SAME builder), runs the callable, lets the caller's
+`after` callback emit the region's `return` via `_return_terminator`, and
+pops the region in a `finally` so the stack stays consistent on error.
 
 Static values: `*operands` / `init` / kwargs may contain static Python values
-(per the static-value predicate in `./trace.py`); they specialize the regions
+(per the static-value predicate in `./_tree.py`); they specialize the regions
 (Python semantics — evaluated once at trace time, NOT per iteration) and are
 passed to the callables unchanged. Static values are never loop-carried or
 op results.
@@ -62,48 +61,48 @@ op results.
 Local pytree note: `core.flatten` treats etl-module dataclasses
 (`SymbolicTensor`, `Tensor`, `Device`, ir structures, ...) as LEAVES (the
 module check in `core.tree._flatten_into`); only user-defined dataclasses
-act as pytree containers. This module walks pytrees itself (`_flatten_tree`)
-so the leaf conventions stay explicit — `SymbolicTensor`, `core.Tensor`,
-`core` value objects, and `ir` structural dataclasses are LEAVES — while
-mirroring `core.TreeSpec`'s container conventions (tuple/list/dict — keys
-sorted — namedtuple/dataclass), so `core.unflatten` can rebuild the trees.
-Leaf nodes use `TreeSpec(type=None)`, which `core.unflatten` treats as a
-plain leaf. `_flatten_tree` consults the core pytree registry FIRST (an MRO
-walk over `core.tree._PYTREE_NODE_REGISTRY`, same as `core.flatten` and the
-tracer), so types registered via `core.register_pytree_node` (e.g. a sparse
-tensor) flatten through their registered `flatten_fn` and their children
-recurse normally; rebuild via `core.unflatten` then uses the registered
-`unflatten_fn` (the recorded `TreeSpec.type` is the registered base type).
-Registered nodes flow through `cond`/`while_loop` generically — NEVER via an
-import of the registering module: `cond` captures a registered-node
-operand's tensor leaves and passes its static leaves through, `while_loop`
-carries registered nodes via the ordinary static-leaf machinery, and both
-accept static leaves INSIDE registered nodes in their outputs/returns
-(sparse tensors work end-to-end on the numpy backend).
+act as pytree containers. This module walks pytrees via the SHARED walker in
+`./_tree.py` with the `_cf_leaf_spec` policy (`_LEAF_TYPES` → plain leaves;
+everything else → walker default), so the leaf conventions stay explicit —
+`SymbolicTensor`, `core.Tensor`, `core` value objects, and `ir` structural
+dataclasses are LEAVES — while mirroring `core.TreeSpec`'s container
+conventions (tuple/list/dict — keys sorted — namedtuple/dataclass), so
+`core.unflatten` can rebuild the trees. Leaf nodes use `TreeSpec(type=None)`,
+which `core.unflatten` treats as a plain leaf. `_flatten` consults the
+core pytree registry FIRST (an MRO walk over `core.tree._PYTREE_NODE_REGISTRY`,
+same as `core.flatten` and the tracer), so types registered via
+`core.register_pytree_node` (e.g. a sparse tensor) flatten through their
+registered `flatten_fn` and their children recurse normally; rebuild via
+`core.unflatten` then uses the registered `unflatten_fn` (the recorded
+`TreeSpec.type` is the registered base type). Registered nodes flow through
+`cond`/`while_loop` generically — NEVER via an import of the registering
+module: `cond` captures a registered-node operand's tensor leaves and passes
+its static leaves through, `while_loop` carries registered nodes via the
+ordinary static-leaf machinery, and both accept static leaves INSIDE
+registered nodes in their outputs/returns (sparse tensors work end-to-end on
+the numpy backend).
 """
 
 from __future__ import annotations
 
-import dataclasses
-import enum
 from typing import Any, List, Optional
 
 import numpy as np
 
 from etl import core
 from etl import ir
-from etl.core import tree as _core_tree
 
-from .builder import current_builder, with_builder
+from ._tree import (
+    _flatten as _flatten_shared,
+    _is_static_value,
+    _registered_pytree_base,
+    _to_symbolic,
+)
+from .builder import _return_terminator, current_builder, with_builder
 
 __all__ = ["cond", "scan", "while_loop"]
 
 _BOOL = np.dtype("bool")
-
-# The registered-custom-node table of core's pytrees. `register_pytree_node`
-# mutates this dict in place, so the alias stays live. Control-flow trees
-# honor the same registrations as `core.flatten` and the tracer (`trace.py`).
-_PYTREE_NODE_REGISTRY = _core_tree._PYTREE_NODE_REGISTRY
 
 #: Objects that must be treated as LEAVES by the local pytree walk (etl
 #: value types — ir SSA structures and core value objects — are never
@@ -126,71 +125,32 @@ _LEAF_TYPES = (
 )
 
 
-def _is_static_value(obj: Any) -> bool:
-    """True iff `obj` is a static Python value that specializes the graph.
+def _cf_leaf_spec(obj: Any) -> "Optional[Tuple[Any, core.TreeSpec]]":
+    """The control-flow leaf policy for the shared walker (`./_tree.py`).
 
-    Local copy of the predicate in `./trace.py` (avoids coupling this module
-    to the tracer's internals; keep the two in sync): `None`, bool, int,
-    float, complex, str, `enum.Enum`, numpy `dtype` objects, `slice`,
-    `core.Dim` / `core.DimExpr`, `core.Device`.
+    `_LEAF_TYPES` instances (SymbolicTensor and every other non-container etl
+    value) become plain leaves (`TreeSpec(type=None)`); everything else
+    defers to the walker's default leaf (``None`` policy result → container
+    descent or plain leaf). The returned pair is ``(leaf_to_record,
+    TreeSpec)`` — the walker appends the object itself.
     """
-    if obj is None:
-        return True
-    # bool must be checked before int (True is an int instance).
-    if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
-        return True
-    if isinstance(obj, np.dtype):
-        return True
-    if isinstance(obj, (core.Dim, core.DimExpr)):
-        return True
-    if isinstance(obj, core.Device):
-        return True
-    return False
-
-
-def _registered_pytree_base(obj_type: Any) -> Optional[type]:
-    """The first type in `obj_type`'s MRO registered in the core pytree
-    registry, or None.
-
-    Mirrors the MRO walk `_flatten_tree` uses (registered base classes catch
-    subclasses); used both for object-level checks (`_is_registered_node`)
-    and for TreeSpec node-type checks (`_leaf_registered_flags`). Non-type
-    spec entries (e.g. the `None` leaf type) return None.
-    """
-    if not isinstance(obj_type, type):
-        return None
-    for base in obj_type.__mro__:
-        if base in _PYTREE_NODE_REGISTRY:
-            return base
+    if isinstance(obj, _LEAF_TYPES):
+        return (obj, core.TreeSpec(type=None))
     return None
+
+
+def _flatten(obj: Any) -> tuple:
+    """`(leaves, treespec)` — the local leaf variant of `core.flatten`
+    (shared walker + `_cf_leaf_spec`; see the module docstring)."""
+    return _flatten_shared(obj, _cf_leaf_spec)
 
 
 def _is_registered_node(obj: Any) -> bool:
     """True iff `obj`'s type (or an MRO base) is registered via
-    `core.register_pytree_node` — the same registry walk `_flatten_tree`
-    uses, so such operands flatten through their registered flatten_fn
-    (e.g. a symbolic sparse tensor)."""
+    `core.register_pytree_node` — the same registry walk `_flatten` uses, so
+    such operands flatten through their registered flatten_fn (e.g. a
+    symbolic sparse tensor)."""
     return _registered_pytree_base(type(obj)) is not None
-
-
-def _is_flattenable_operand(obj: Any) -> bool:
-    """True iff `obj` is a pytree CONTAINER operand — a registered pytree
-    node (e.g. a symbolic sparse tensor) or a plain container
-    (tuple/namedtuple/list/dict/plain user dataclass) — i.e. `_flatten`
-    expands it into leaves. Leaves (`SymbolicTensor`, static Python values,
-    concrete `Tensor`s, ir structures) return False; the callers handle
-    those separately. Mirrors `_flatten_tree`'s container conventions, so
-    any operand `core.flatten`/the tracer accept is accepted here too."""
-    if isinstance(obj, _LEAF_TYPES) or _is_static_value(obj):
-        return False
-    return len(_flatten(obj)[1].children) > 0
-
-
-def _to_symbolic(value: "ir.Value") -> "core.SymbolicTensor":
-    """Wrap an `ir.Value` (op result or region block arg) as a SymbolicTensor."""
-    return core.SymbolicTensor(
-        value=value, dtype=value.type.dtype, shape=value.type.shape
-    )
 
 
 def _check_pred(pred: Any, where: str) -> None:
@@ -210,67 +170,6 @@ def _check_pred(pred: Any, where: str) -> None:
         raise core.TraceError(
             f"{where}: pred must be 0-d (scalar), got shape {pred.shape!r}"
         )
-
-
-def _flatten_tree(obj: Any, leaves: List[Any]) -> "core.TreeSpec":
-    """Local pytree walk treating `SymbolicTensor` (and every other
-    non-container) as a LEAF; see the module docstring "Local pytree note"."""
-    obj_type = type(obj)
-    # 1. Registered custom types (walk the MRO so registered base classes
-    #    catch subclasses; exact type first) — same registry and order as
-    #    `core.tree._flatten_into` and the tracer (`trace.py`). A registered
-    #    node (e.g. a sparse tensor) flattens via its registered flatten_fn
-    #    and its children recurse; `TreeSpec.type` records the registered
-    #    base type so `core.unflatten` rebuilds via the registered
-    #    unflatten_fn.
-    for base in obj_type.__mro__:
-        registered = _PYTREE_NODE_REGISTRY.get(base)
-        if registered is not None:
-            flatten_fn, _ = registered
-            children, context = flatten_fn(obj)
-            child_specs = tuple(
-                _flatten_tree(child, leaves) for child in children
-            )
-            return core.TreeSpec(type=base, children=child_specs, context=context)
-    if isinstance(obj, _LEAF_TYPES):
-        leaves.append(obj)
-        return core.TreeSpec(type=None)
-    if isinstance(obj, tuple) and hasattr(obj_type, "_fields"):
-        # namedtuple (checked before plain tuples, like core.TreeSpec).
-        child_specs = tuple(_flatten_tree(child, leaves) for child in obj)
-        return core.TreeSpec(
-            type=obj_type, children=child_specs, node_data=obj_type._fields
-        )
-    if (
-        dataclasses.is_dataclass(obj)
-        and not isinstance(obj, type)
-        and not obj_type.__module__.split(".")[0] == "etl"
-    ):
-        field_names = [field.name for field in dataclasses.fields(obj)]
-        child_specs = tuple(
-            _flatten_tree(getattr(obj, name), leaves) for name in field_names
-        )
-        return core.TreeSpec(
-            type=obj_type, children=child_specs, node_data=field_names
-        )
-    if isinstance(obj, tuple):
-        child_specs = tuple(_flatten_tree(child, leaves) for child in obj)
-        return core.TreeSpec(type=obj_type, children=child_specs)
-    if isinstance(obj, list):
-        child_specs = tuple(_flatten_tree(child, leaves) for child in obj)
-        return core.TreeSpec(type=obj_type, children=child_specs)
-    if isinstance(obj, dict):
-        keys = sorted(obj)  # core.TreeSpec convention: keys sorted
-        child_specs = tuple(_flatten_tree(obj[key], leaves) for key in keys)
-        return core.TreeSpec(type=obj_type, children=child_specs, node_data=keys)
-    leaves.append(obj)
-    return core.TreeSpec(type=None)
-
-
-def _flatten(obj: Any) -> tuple:
-    """`(leaves, treespec)` — the local-leaf variant of `core.flatten`."""
-    leaves: List[Any] = []
-    return leaves, _flatten_tree(obj, leaves)
 
 
 def _leaf_registered_flags(tree: "core.TreeSpec") -> List[bool]:
@@ -314,17 +213,95 @@ def _rebuild_carried(
     return core.unflatten(rebuilt, tree)
 
 
+def _run_in_region(
+    builder: "ir.Builder",
+    region: "ir.Region",
+    fn: Any,
+    *args: Any,
+    after: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """Run `fn(*args, **kwargs)` inside `region` (single-Builder workflow).
+
+    Pushes the region's entry block onto the builder's insertion-point stack
+    (creating the block first if the region is empty) and installs the
+    builder as the active builder for `current_builder()` (the SAME builder —
+    control flow never creates a second builder). After `fn` returns,
+    `after(result)` runs while still inside the region — callbacks emit the
+    region's `return` terminator, which must be appended at the region's
+    insertion point. The region is popped in a `finally`, so the
+    insertion-point stack stays consistent on error.
+
+    Returns `after(result)` when `after` is given, else `fn`'s result.
+    """
+    if not region.blocks:
+        builder.insert_block(region)
+    builder.push_region(region)
+    try:
+        with with_builder(builder):
+            result = fn(*args, **kwargs)
+        if after is not None:
+            return after(result)
+        return result
+    finally:
+        builder.pop_region()
+
+
+def _classify_operands(operands: tuple) -> List[tuple]:
+    """Classify every `cond` operand ONCE per call (flatten memoization).
+
+    Returns one plan per operand, consumed by both the operand validation
+    and `_run_branch`:
+
+    - ``("symbolic", st)`` — a captured `SymbolicTensor`;
+    - ``("static", value)`` — a static Python value (specialization);
+    - ``("container", leaves, tree)`` — a pytree container (registered node
+      or plain tuple/namedtuple/list/dict/dataclass): its tensor leaves are
+      captured as `if`-op operands, its static leaves pass through.
+
+    Raises the same `core.TraceError`s the inline checks used to (a container
+    operand with no leaves — e.g. ``()`` — is an error, matching the old
+    behavior). Before this helper, a container operand was flattened ~5
+    times per `cond` call (validation + operand list + once per branch);
+    now it is flattened exactly once.
+    """
+    plans: List[tuple] = []
+    for i, operand in enumerate(operands):
+        if isinstance(operand, core.SymbolicTensor):
+            plans.append(("symbolic", operand))
+        elif _is_static_value(operand):
+            plans.append(("static", operand))
+        else:
+            leaves, tree = _flatten(operand)
+            if not tree.children:
+                raise core.TraceError(
+                    f"etl.cond: operand {i} must be a core.SymbolicTensor or "
+                    f"a static Python value, got {type(operand).__name__}"
+                )
+            for j, leaf in enumerate(leaves):
+                if not isinstance(leaf, core.SymbolicTensor) and not _is_static_value(
+                    leaf
+                ):
+                    raise core.TraceError(
+                        f"etl.cond: operand {i} (a pytree node) "
+                        f"leaf {j} must be a core.SymbolicTensor or a static "
+                        f"Python value, got {type(leaf).__name__}"
+                    )
+            plans.append(("container", leaves, tree))
+    return plans
+
+
 def _run_branch(
     builder: "ir.Builder",
     region: "ir.Region",
     branch_name: str,
     fn: Any,
-    operands: tuple,
+    operand_plans: List[tuple],
     static_kwargs: dict,
 ) -> tuple:
     """Run one `if` branch callable inside `region` and emit its `return`.
 
-    Positions the builder inside the region, runs
+    Positions the builder inside the region via `_run_in_region`, runs
     `fn(*call_args, **static_kwargs)` exactly ONCE under `with_builder`,
     validates the outputs, emits the region's `return` terminator with the
     symbolic leaf values, and restores the insertion point.
@@ -333,40 +310,42 @@ def _run_branch(
     the v1 verify convention); the branch callable receives the
     captured-operand entry args (wrapped as SymbolicTensor) at the symbolic
     positions, with static operands passed unchanged. A pytree CONTAINER
-    operand (a registered node — e.g. a symbolic sparse tensor — or a plain
-    tuple/namedtuple/dict/dataclass) is flattened via `_flatten`: its tensor
-    leaves are captured as if-operands (each bound to one entry arg) and
-    rebuilt per the container's tree, its static leaves passed through
-    unchanged.
+    operand plan (a registered node — e.g. a symbolic sparse tensor — or a
+    plain tuple/namedtuple/dict/dataclass) rebuilds per its recorded tree:
+    its tensor leaves bind to entry args, its static leaves pass through
+    unchanged. (Plans come from `_classify_operands` — each operand is
+    flattened exactly once per `cond` call.)
 
     Output leaves must be `SymbolicTensor`s; a static leaf is allowed only
     when it sits INSIDE a registered pytree node (e.g. a sparse tensor's
     `dense_shape`/`dtype`/`format` leaves) — bare static output leaves
     (top-level or inside plain containers) raise `core.TraceError`.
 
-    Returns `(output_leaves, output_tree)`.
+    Returns `(output_leaves, output_tree, inside_flags)` where
+    `inside_flags` = `_leaf_registered_flags(output_tree)` — computed here
+    (once, per branch) and reused by `cond` for the both-static unification
+    check.
     """
     entry_args = region.entry.arguments
     arg_iter = iter(entry_args[1:])  # skip the predicate binding at index 0
     call_args = []
-    for operand in operands:
-        if isinstance(operand, core.SymbolicTensor):
+    for plan in operand_plans:
+        kind = plan[0]
+        if kind == "symbolic":
             call_args.append(_to_symbolic(next(arg_iter)))
-        elif _is_flattenable_operand(operand):
-            op_leaves, op_tree = _flatten(operand)
+        elif kind == "container":
+            _, leaves, tree = plan
             rebuilt = []
-            for leaf in op_leaves:
+            for leaf in leaves:
                 if isinstance(leaf, core.SymbolicTensor):
                     rebuilt.append(_to_symbolic(next(arg_iter)))
                 else:
                     rebuilt.append(leaf)  # static leaf passed through unchanged
-            call_args.append(core.unflatten(rebuilt, op_tree))
-        else:
-            call_args.append(operand)  # static value, passed unchanged
-    region_builder = _region_builder(builder, region)
-    try:
-        with with_builder(region_builder):
-            result = fn(*call_args, **static_kwargs)
+            call_args.append(core.unflatten(rebuilt, tree))
+        else:  # "static": passed unchanged
+            call_args.append(plan[1])
+
+    def finish(result: Any) -> tuple:
         leaves, tree = _flatten(result)
         inside_flags = _leaf_registered_flags(tree)
         for i, (leaf, inside) in enumerate(zip(leaves, inside_flags)):
@@ -381,14 +360,14 @@ def _run_branch(
                 "not supported)"
             )
         _return_terminator(
-            region_builder,
+            builder,
             tuple(
                 leaf.value for leaf in leaves if isinstance(leaf, core.SymbolicTensor)
             ),
         )
-        return leaves, tree
-    finally:
-        region_builder.pop_region()
+        return leaves, tree, inside_flags
+
+    return _run_in_region(builder, region, fn, *call_args, after=finish, **static_kwargs)
 
 
 def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: Any, **static_kwargs: Any) -> Any:
@@ -406,7 +385,9 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
        if-operands, its static leaves are passed through unchanged; every
        leaf must be a `SymbolicTensor` or a static value (else
        `core.TraceError`). Operands are passed positionally to both
-       branches.
+       branches. (Classification happens ONCE per call via
+       `_classify_operands` — each container operand is flattened exactly
+       once, not once per use.)
     3. Build the `if` op via `ir.opdef("if")` with two regions per the
        conventions above. Run `true_fn(*operands, **static_kwargs)` inside
        the then-region under `with_builder(...)`, `false_fn` likewise in the
@@ -438,39 +419,18 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
                 f"value (got {type(value).__name__}); static kwargs "
                 "specialize the branches at trace time"
             )
-    for i, operand in enumerate(operands):
-        if isinstance(operand, core.SymbolicTensor) or _is_static_value(operand):
-            continue
-        if _is_flattenable_operand(operand):
-            # Pytree container (registered node — e.g. a sparse tensor — or
-            # a plain tuple/namedtuple/dict/dataclass): flatten it; the
-            # tensor leaves are captured, the static leaves pass through.
-            op_leaves, _ = _flatten(operand)
-            for j, leaf in enumerate(op_leaves):
-                if not isinstance(leaf, core.SymbolicTensor) and not _is_static_value(
-                    leaf
-                ):
-                    raise core.TraceError(
-                        f"etl.cond: operand {i} (a pytree node) "
-                        f"leaf {j} must be a core.SymbolicTensor or a static "
-                        f"Python value, got {type(leaf).__name__}"
-                    )
-            continue
-        raise core.TraceError(
-            f"etl.cond: operand {i} must be a core.SymbolicTensor or a "
-            f"static Python value, got {type(operand).__name__}"
-        )
+    operand_plans = _classify_operands(operands)
 
     builder = current_builder()
     if_values = [pred.value]
-    for operand in operands:
-        if isinstance(operand, core.SymbolicTensor):
-            if_values.append(operand.value)
-        elif _is_flattenable_operand(operand):
-            op_leaves, _ = _flatten(operand)
+    for plan in operand_plans:
+        if plan[0] == "symbolic":
+            if_values.append(plan[1].value)
+        elif plan[0] == "container":
+            _, leaves, _ = plan
             if_values.extend(
                 leaf.value
-                for leaf in op_leaves
+                for leaf in leaves
                 if isinstance(leaf, core.SymbolicTensor)
             )
     if_values = tuple(if_values)
@@ -478,11 +438,11 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
     then_region = builder.build_region(input_types)
     else_region = builder.build_region(input_types)
 
-    then_leaves, then_tree = _run_branch(
-        builder, then_region, "true", true_fn, operands, static_kwargs
+    then_leaves, then_tree, then_flags = _run_branch(
+        builder, then_region, "true", true_fn, operand_plans, static_kwargs
     )
-    else_leaves, else_tree = _run_branch(
-        builder, else_region, "false", false_fn, operands, static_kwargs
+    else_leaves, else_tree, _ = _run_branch(
+        builder, else_region, "false", false_fn, operand_plans, static_kwargs
     )
 
     if then_tree != else_tree:
@@ -495,7 +455,7 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
             f"etl.cond: branch arity mismatch — true yields "
             f"{len(then_leaves)} output(s), false yields {len(else_leaves)}"
         )
-    inside_flags = _leaf_registered_flags(then_tree)
+    inside_flags = then_flags
     result_types = []
     for i, (true_leaf, false_leaf) in enumerate(zip(then_leaves, else_leaves)):
         if isinstance(true_leaf, core.SymbolicTensor) and isinstance(
@@ -605,8 +565,9 @@ def while_loop(cond_fn: Any, body_fn: Any, init: Any) -> Any:
     5. Return the `while` op's results (final carried values) unflattened
        per init's tree.
 
-    v1 note: the condition/body callables run ONCE at trace time; the traced
-    regions repeat their IR at run time — no Python callbacks.
+    v1 note: the condition/body callables run ONCE at trace time (via
+    `_run_in_region`, which keeps the insertion-point stack consistent); the
+    traced regions repeat their IR at run time — no Python callbacks.
     """
     leaves, tree = _flatten(init)
     carried = []
@@ -635,22 +596,18 @@ def while_loop(cond_fn: Any, body_fn: Any, init: Any) -> Any:
 
     # --- condition region: cond_fn(carried) → ONE 0-d bool tensor ---
     cond_carried = _rebuild_carried(leaves, tree, cond_region.entry.arguments)
-    _region_builder(builder, cond_region)
-    try:
-        with with_builder(builder):
-            cond_result = cond_fn(cond_carried)
-        _check_pred(cond_result, "etl.while_loop cond_fn result")
-        _return_terminator(builder, (cond_result.value,))
-    finally:
-        builder.pop_region()
+
+    def finish_cond(result: Any) -> None:
+        _check_pred(result, "etl.while_loop cond_fn result")
+        _return_terminator(builder, (result.value,))
+
+    _run_in_region(builder, cond_region, cond_fn, cond_carried, after=finish_cond)
 
     # --- body region: body_fn(carried) → next carried values ---
     body_carried = _rebuild_carried(leaves, tree, body_region.entry.arguments)
-    _region_builder(builder, body_region)
-    try:
-        with with_builder(builder):
-            body_result = body_fn(body_carried)
-        body_leaves, body_tree = _flatten(body_result)
+
+    def finish_body(result: Any) -> None:
+        body_leaves, body_tree = _flatten(result)
         if body_tree != tree:
             raise core.TraceError(
                 "etl.while_loop: body_fn output tree must match init's tree "
@@ -692,8 +649,8 @@ def while_loop(cond_fn: Any, body_fn: Any, init: Any) -> Any:
                         "loop-carried"
                     )
         _return_terminator(builder, tuple(next_values))
-    finally:
-        builder.pop_region()
+
+    _run_in_region(builder, body_region, body_fn, body_carried, after=finish_body)
 
     op = builder.create(
         "while", operands=carried_values, regions=(cond_region, body_region)
@@ -980,37 +937,5 @@ def scan(f: Any, init: Any, xs: Any, length: Optional[int] = None) -> tuple:
         )
         return (_to_symbolic(incremented.result), new_carry, stacked_out)
 
-    final_counter, final_carry, final_stacked = while_loop(
-        cond_fn, body_fn, loop_init
-    )
+    _, final_carry, final_stacked = while_loop(cond_fn, body_fn, loop_init)
     return (final_carry, final_stacked)
-
-
-def _return_terminator(builder: "ir.Builder", values: Any) -> "ir.Op":
-    """Build the `return` terminator op (`ir.opdef("return")`) yielding
-    `values` (a flat sequence of `ir.Value`) in the builder's current block.
-
-    Delegates to `Builder.set_terminator`, which APPENDS the op (last by
-    construction) — a terminator is never emitted via `create` at the
-    insertion point. Private helper for `trace`, `cond`, `while_loop`,
-    `scan`.
-    """
-    return builder.set_terminator(builder.current_block, "return", tuple(values))
-
-
-def _region_builder(enclosing: "ir.Builder", region: "ir.Region") -> "ir.Builder":
-    """Position `enclosing` inside `region`'s entry block and return it.
-
-    With the single-Builder workflow there is no separate "region builder"
-    object: this pushes `region`'s entry block onto the enclosing builder's
-    insertion-point stack (creating the block first if the region is empty)
-    and returns the SAME builder. The caller runs the region callable under
-    `with_builder(builder)` (the active-builder context for
-    `current_builder()`) and MUST call `builder.pop_region()` afterwards —
-    `cond`/`while_loop`/`scan` do so in a `finally` block so the stack stays
-    consistent on error.
-    """
-    if not region.blocks:
-        enclosing.insert_block(region)
-    enclosing.push_region(region)
-    return enclosing
