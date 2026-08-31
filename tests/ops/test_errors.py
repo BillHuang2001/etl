@@ -1,6 +1,6 @@
 """Error semantics of the full public op surface (contract: ``etl/ops/CONTEXT.md``).
 
-Every public op in ``etl.ops.__all__`` (101 names) is exercised in three
+Every public op in ``etl.ops.__all__`` (102 names) is exercised in three
 parametrized error categories:
 
 (a) called OUTSIDE a trace -> ``TraceError`` with the directing message
@@ -164,12 +164,16 @@ OP_CALLS = {
     "isnan": (lambda t: (t["x"],), {}),
     "nan_to_num": (lambda t: (t["x"],), {}),
     "linspace": (lambda t: (0.0, 1.0, 5), {}),  # all-static creation op
-    # --- constants / escape hatches (3) ---
+    # --- constants / escape hatches (4) ---
     # ``constant`` takes a concrete Tensor by design — it is excluded from
     # the concrete-Tensor-operand category but present in the no-trace one.
     "constant": (lambda t: (_CONST_TENSOR,), {}),
     "runtime_call": (
         lambda t: (_RUNTIME_CALLBACK, t["x"], t["x"]),
+        {"result": _RUNTIME_RESULT},
+    ),
+    "external_call": (
+        lambda t: ("external_k", t["x"], t["x"]),
         {"result": _RUNTIME_RESULT},
     ),
     "stop_gradient": (lambda t: (t["x"],), {}),
@@ -223,6 +227,8 @@ def _tensor_variant(op_name, args_builder):
             args[0] = [t["x"], tensor]  # Tensor inside the container
         elif op_name == "runtime_call":
             args[1] = tensor  # args[0] is the callback, args[1] the 1st operand
+        elif op_name == "external_call":
+            args[1] = tensor  # args[0] is the kernel name, args[1] the 1st operand
         else:
             args[0] = tensor
         return tuple(args)
@@ -246,9 +252,9 @@ def _op_ref(op_name):
 # ---------------------------------------------------------------------------
 
 def test_op_table_covers_all_public_ops():
-    """The table must exercise exactly the 101 public op names."""
+    """The table must exercise exactly the 102 public op names."""
     assert set(OP_CALLS) == set(etl.ops.__all__)
-    assert len(etl.ops.__all__) == 101
+    assert len(etl.ops.__all__) == 102
 
 
 # ---------------------------------------------------------------------------

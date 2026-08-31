@@ -53,7 +53,7 @@ Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace �
 
 ## IR op definitions (ownership decision — binding)
 
-The generic SSA machinery and the op **registry** live in `etl.ir`, and the canonical op-definition table (which ops exist, their arities/attrs/effects) lives there too — `ir` must not import `ops` (layering `core ← ir ← ops`), and `ops` must NOT maintain a parallel table (`_opdefs.py` was deleted as superseded; `Builder.create` validates against `ir.opdef()`). Any missing arity/attr spec is fixed in `ir`, not duplicated here. **Effect policy:** all frontend ops are `pure` except `runtime_call` (`callback`). Ops are functional SSA dataflow (`scatter`/`constant`/`pad` produce new values, no `write` effect); `write`/`read`/`collective` kinds are reserved for other layers (e.g. `dist`).
+The generic SSA machinery and the op **registry** live in `etl.ir`, and the canonical op-definition table (which ops exist, their arities/attrs/effects) lives there too — `ir` must not import `ops` (layering `core ← ir ← ops`), and `ops` must NOT maintain a parallel table (`_opdefs.py` was deleted as superseded; `Builder.create` validates against `ir.opdef()`). Any missing arity/attr spec is fixed in `ir`, not duplicated here. **Effect policy:** all frontend ops are `pure` except `runtime_call`/`external_call` (`callback`). Ops are functional SSA dataflow (`scatter`/`constant`/`pad` produce new values, no `write` effect); `write`/`read`/`collective` kinds are reserved for other layers (e.g. `dist`).
 
 ## Error semantics
 
@@ -73,6 +73,7 @@ The generic SSA machinery and the op **registry** live in `etl.ir`, and the cano
 | `sorting.py` | `sort argsort topk` |
 | `structural.py` | `tile stack flip roll clamp diag isnan nan_to_num eye linspace` |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `ETL_LARGE_CONSTANT_BYTES`, `constant_like`) |
+| `external.py` | `external_call` — the graph-side declaration of a named external-kernel call (see `../CONTEXT.md` "External kernels") |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
 
 Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, TensorSpec, register_operator_handlers hook), `../ir/` (Builder, Location, Value, op registry — sibling, read-only: expectations are listed below), `../trace/` (`current_builder` ONLY — never import anything else), `../../tests/ops/` (test suite — sibling, read-only; escalate test writes to root).
@@ -89,7 +90,7 @@ Cross-references: `../core/` (TraceError/ShapeError/DTypeError, SymbolicTensor, 
 - No eager computation of results; no numpy kernels here (they live ONLY in `backends/numpy`); no silent fallback or workaround for any error.
 - Files < ~1000 lines; if a module grows, split along the op categories above.
 - `slice` shadows the builtin inside `indexing.py` (use `builtins.slice`); `sum/max/min/abs` shadow builtins in their modules — intentional, documented.
-- `constant` warns (UserWarning) above `ETL_LARGE_CONSTANT_BYTES` (default 1 MiB, env-tunable) and SNAPSHOTS (copies) data; `runtime_call` carries the callback as an op attr with effect `callback` — backends may reject it (`BackendError`) but never silently drop/reorder it; `stop_gradient` is effect `pure` but transform layers MUST process it before any constant-folding (gradient barrier).
+- `constant` warns (UserWarning) above `ETL_LARGE_CONSTANT_BYTES` (default 1 MiB, env-tunable) and SNAPSHOTS (copies) data; `runtime_call` carries the callback as an op attr with effect `callback` — backends may reject it (`BackendError`) but never silently drop/reorder it; `external_call` carries the stable kernel `name` string + `result_specs` (effect `callback`, same rule) and is dispatched by name through `etl.external` at run time — the kernel need NOT be registered at trace time (run-time concern); `stop_gradient` is effect `pure` but transform layers MUST process it before any constant-folding (gradient barrier).
 
 ## Test strategy
 

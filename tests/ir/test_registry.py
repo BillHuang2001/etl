@@ -3,7 +3,7 @@
 The registry (``etl.ir.op_defs``) declares the contract of every EvoXIR op:
 name, category, arity/result arity, effect, attribute schema, shape-inference
 hook, region structure, and terminator role. These tests pin the canonical
-set (118 ops) so any accidental addition/removal/rename/effect change in the
+set (119 ops) so any accidental addition/removal/rename/effect change in the
 ``etl`` package is caught here.
 """
 
@@ -100,6 +100,7 @@ _CONTROL = (
     "while",
     "call",
     "runtime_call",
+    "external_call",
     "block_call",
 )
 
@@ -183,6 +184,7 @@ _CATEGORY_EXPECTED = {
 
 _EFFECT_EXPECTED = {name: "pure" for name in CANONICAL_NAMES}
 _EFFECT_EXPECTED["runtime_call"] = "callback"
+_EFFECT_EXPECTED["external_call"] = "callback"
 _EFFECT_EXPECTED["block_call"] = "read"
 _EFFECT_EXPECTED["rank"] = "read"
 _EFFECT_EXPECTED["world_size"] = "read"
@@ -213,6 +215,7 @@ _SIGNATURE_EXPECTED = [
     ("while", (1, None), None, 2, False),
     ("call", (0, None), None, 0, False),
     ("runtime_call", (0, None), None, 0, False),
+    ("external_call", (0, None), None, 0, False),
     ("block_call", (0, None), None, 0, False),
     ("return", (0, None), 0, 0, True),
     ("select", 3, 1, 0, False),
@@ -256,6 +259,8 @@ _ATTR_SCHEMA_EXPECTED = [
     ("constant", "value", ir.ATTR_NDARRAY, True),
     ("runtime_call", "callback", ir.ATTR_STR, True),
     ("runtime_call", "result_specs", ir.ATTR_ANY, True),
+    ("external_call", "name", ir.ATTR_STR, True),
+    ("external_call", "result_specs", ir.ATTR_ANY, True),
     ("block_call", "block_name", ir.ATTR_STR, True),
     ("block_call", "static_args", ir.ATTR_ANY, False),
     ("collective_permute", "source_target_pairs", ir.ATTR_NESTED_INTS, True),
@@ -328,7 +333,7 @@ def _attrs(name):
 
 def test_registry_size_and_canonical_name_set():
     names = ir.op_names()
-    assert len(names) == 118
+    assert len(names) == 119
     assert names == tuple(sorted(CANONICAL_NAMES))
 
 
@@ -344,7 +349,7 @@ def test_op_category(name, category):
     assert ir.opdef(name).category == category
 
 
-# --- 3. per-op effect mapping (all 118) --------------------------------------
+# --- 3. per-op effect mapping (all 119) --------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -421,7 +426,7 @@ _SHAPE_FN_OPS = (
     + _SORTING
 )
 
-_NO_SHAPE_FN_OPS = ("constant", "call", "if", "runtime_call", "block_call")
+_NO_SHAPE_FN_OPS = ("constant", "call", "if", "runtime_call", "external_call", "block_call")
 
 
 @pytest.mark.parametrize("name", _SHAPE_FN_OPS)
@@ -499,7 +504,7 @@ def test_op_names_returns_sorted_tuple():
 
 def test_all_opdefs_sorted_instances():
     opdefs = ir.all_opdefs()
-    assert len(opdefs) == 118
+    assert len(opdefs) == 119
     assert [opdef.name for opdef in opdefs] == sorted(
         opdef.name for opdef in opdefs
     )
