@@ -14,9 +14,15 @@ verifies/compiles), **Python value → Python semantics** (static values
 specialize the graph; only tensor values need explicit control flow), and
 **no magic** (no caching, no hidden re-traces).
 
+Architecture rule for this module: **all trace-time state lives in one
+`_TraceSession` object; there is no global state besides the contextvars
+builder stack.** See "Data structures & ownership" below — that section is
+the map you need before touching any file here.
+
 ## API Surface
 
-Exported from `__init__.py` (the public contract — exact names):
+Exported from `__init__.py` (the public contract — exact names, unchanged
+by the 2025-08 cleanup refactor):
 
 - `defn(fn=None, **options) -> Defn` — decorator (bare or with options).
   `Defn` stores `fn` (+ `__etl_defn__` marker on both), `options` dict
@@ -46,18 +52,91 @@ Exported from `__init__.py` (the public contract — exact names):
 - `scan(f, init, xs, length=None) -> (carry, stacked_outputs)`
 - `StaticValue` — frozen dataclass record for static leaves.
 
-## Trace algorithm (binding contract — Phase 2 must implement exactly)
+## Module layout & routing table
 
-1. Unwrap `Defn`/`__etl_defn__` → plain fn.
-2. Treat `specs` (positional args) as ONE pytree; flatten via
-   `core.TreeSpec`. Leaves must be `TensorSpec` (tensor input; shape may
-   hold `Dim`/`DimExpr`, `None` = dynamic) or static Python values
-   (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/`slice`/
-   `core.Dim`/`core.DimExpr`/`core.Device` — see `_is_static_value`).
-   Anything else (concrete
-   `Tensor`, ndarray, `SymbolicTensor`, …) → `TraceError` with the pytree
-   path. Capturing a
-   concrete tensor is NEVER silently allowed.
+Flat module — no child directories. Responsibility split (single owner per
+concern):
+
+| File | Owns |
+|---|---|
+| `defn.py` | the `Defn` marker decorator (nothing else) |
+| `builder.py` | the active-builder context (contextvars tuple stack) + `_return_terminator` (the canonical block-ending op) |
+| `_tree.py` | ALL shared pytree/static helpers: `_is_static_value`, `_registered_pytree_base`, `_flatten`/`_flatten_into` (parameterized leaf policy), `_iter_leaf_paths`, `_to_symbolic`, `_PYTREE_NODE_REGISTRY` alias. Imports core/ir ONLY — any trace module may import it. |
+| `trace.py` | the 7-step tracer: `_TraceSession`, input classification, output classification, `_trace_call_site`. Re-exports `_format_path` / `_iter_leaf_paths` for `etl.transforms.grad` (private cross-module import — keep the names and paths stable). |
+| `graph.py` | the `Graph` type: I/O validation, `StaticValue` records, `_static_record` factory, persistence delegation. Also exports `_normalize_leaf_types` (imported by `etl.transforms.vmap` — keep stable). |
+| `control_flow.py` | `cond`/`while_loop`/`scan`: region building via the `ir.Builder` (`_run_in_region`), operand classification (`_classify_operands`), registered-node rules. NEVER imports `etl.ops` (ops imports trace — the DAG stays acyclic). |
+| `__init__.py` | re-exports only + the shadowing note |
+
+Sibling: `../tests/` → test suite (read-only from here; escalate test
+writes to the package root).
+
+Private cross-module imports that MUST keep working (do not rename/move
+without updating consumers): `etl.pipeline` imports
+`_SymbolicLeaf`/`_TensorSpecLeaf` from `etl.trace.trace`;
+`etl.transforms.grad` imports `_format_path`/`_iter_leaf_paths` from
+`etl.trace.trace`; `etl.transforms.vmap` imports `_normalize_leaf_types`
+from `etl.trace.graph`.
+
+## Data structures & ownership (the map)
+
+**`_TraceSession`** (`trace.py`) — the single named owner of one `trace()`
+call. Fields: `builder`/`module`/`function` (the IR under construction; ONE
+builder serves the whole trace — control flow re-positions it via
+`push_region`/`pop_region`, never creates a second), `input_tree`/
+`tensor_specs`/`static_values` (the classified input contract),
+`symbolics` (block-arg SymbolicTensors, one per tensor spec),
+`source_locations` (input value id → trace call-site), `args` (the
+reconstructed call arguments), `call_site` (`ir.Location`). Lifecycle maps
+1:1 onto the trace algorithm: `open(specs)` = steps 2–4, `run(fn)` = step
+5, `finish(outputs)` = steps 6–7. One session per call — traces are never
+cached or reused.
+
+**Builder context** (`builder.py`) — a `contextvars.ContextVar` holding an
+immutable tuple stack (outermost first). `with_builder` copies the tuple on
+push and restores the saved parent on exit (even on error) — never mutated
+in place, so nested contexts and async tasks cannot corrupt each other.
+`current_builder()` returns the innermost builder or raises `TraceError`.
+
+**Leaf markers & static records** — trace trees record tensor positions as
+plain non-dataclass markers (`_TensorSpecLeaf` carrying the `TensorSpec`,
+`_SymbolicLeaf` carrying the `SymbolicTensor`) so leaf-type equality
+distinguishes tensor leaves from static leaves while the TreeSpec stays
+`core.unflatten`-compatible. Static leaves are recorded as the object
+itself with `TreeSpec.type = type(obj)` (pipeline's `_is_tensor_leaf_spec`
+relies on this: any non-marker, non-None leaf type = static position).
+`StaticValue` (`graph.py`) is the run-time validation record: frozen
+dataclass with `index` (flat leaf index), `path`, `value`, `kind`
+(`type(value).__qualname__` — so a recorded `1` never matches run-time
+`True`). The single construction site is `graph._static_record(index, path,
+value)`.
+
+**The shared walker** (`_tree.py::_flatten`/`_flatten_into`) — one pytree
+walk with two knobs so every caller's leaf convention stays explicit
+instead of being copy-pasted:
+- `leaf_spec(obj) -> (recorded_leaf, TreeSpec) | None` — decides which
+  objects are leaves and what gets appended (trace: marker leaves; control
+  flow: plain leaves for `_LEAF_TYPES`).
+- `plain_leaf_type(obj) -> type` — the `TreeSpec.type` for fallback leaves
+  (objects the policy declined that are not containers). trace passes
+  `type` (static leaves record their own Python type — pipeline depends on
+  it); control flow uses the default constant `None`.
+Container descent mirrors `core.tree._flatten_into` (registered nodes via
+MRO walk first, namedtuple before tuple, user dataclasses — etl-module
+dataclasses stay leaves, tuple/list/dict with sorted keys). Deliberate
+difference: no `defaultdict`/`Counter` default-factory handling in
+`node_data` — that is a `core.flatten`-only feature.
+
+## Trace algorithm (binding contract)
+
+1. Unwrap `Defn`/`__etl_defn__` → plain fn (`_unwrap_defn`).
+2. Treat `specs` (positional args) as ONE pytree; flatten via the shared
+   walker with the trace leaf policy. Leaves must be `TensorSpec` (tensor
+   input; shape may hold `Dim`/`DimExpr`, `None` = dynamic) or static
+   Python values (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/
+   `slice`/`core.Dim`/`core.DimExpr`/`core.Device` — see `_is_static_value`).
+   Anything else (concrete `Tensor`, ndarray, `SymbolicTensor`, …) →
+   `TraceError` with the pytree path. Capturing a concrete tensor is NEVER
+   silently allowed.
 3. Build `ir.Module` + entry `ir.Function` "main" with one block arg per
    tensor leaf (arg type = (shape, dtype)). Wrap each block arg as
    `core.SymbolicTensor`; record trace-call-site `ir.Location`s.
@@ -69,19 +148,21 @@ Exported from `__init__.py` (the public contract — exact names):
    (ops' `TraceError`) — the tracer does not pre-scan closures.
 6. Flatten outputs (pytree). `SymbolicTensor` leaves → results; static
    leaves → `output_static_values` (re-inserted by `unflatten_outputs`);
-   anything else → `TraceError`. Emit the function `return` terminator
-   with the symbolic leaves (zero-result graphs are legal).
+   anything else → `TraceError`. Emit the function `return` terminator with
+   the symbolic leaves (zero-result graphs are legal).
 7. Return `Graph(...)` — NOT verified automatically (staging explicit;
    `etl.build` verifies). Every `trace` call yields a NEW Graph.
 
-Static-value snapshot semantics: closure static values are naturally
-snapshotted because the function body runs once at trace time — the values
-are read when ops are built, and only explicit tensor values ever reach the
-IR. Run-time graph specialization is validated by `Graph.flatten_inputs`
-(static leaves must match recorded type+value; dtype/shape/device checked
-against specs with `DTypeError`/`ShapeError`/`DeviceError`; tree mismatch →
-`TraceError`). numpy arrays are accepted at run time and wrapped via
-`core.from_numpy` (documented convenience).
+## Static-value snapshot semantics
+
+Closure static values are naturally snapshotted because the function body
+runs once at trace time — the values are read when ops are built, and only
+explicit tensor values ever reach the IR. Run-time graph specialization is
+validated by `Graph.flatten_inputs` (static leaves must match recorded
+type+value; dtype/shape/device checked against specs with
+`DTypeError`/`ShapeError`/`DeviceError`; tree mismatch → `TraceError`).
+numpy arrays are accepted at run time and wrapped via `core.from_numpy`
+(documented convenience).
 
 ## Graph layout
 
@@ -90,15 +171,9 @@ order; terminator `return` yields results in output-tree SymbolicTensor-leaf
 order. `input_specs`/`output_tree` carry the structured I/O contract
 (tuple/list/dict/namedtuple/dataclass — pytree machinery from `core`).
 Static leaves live ONLY in `static_values`/`output_static_values` records,
-never in the IR.
-
-## Builder context
-
-`current_builder()` / `with_builder()` (contextvars-backed tuple stack in
-`builder.py` — fully implemented, thread/async-safe). `etl.ops` op functions
-query `current_builder()` and build into the function body or the innermost
-control-flow region. `control_flow.py` swaps builders per region so user
-branch/body callables target the right region.
+never in the IR. `unflatten_outputs` interleaves tensor results and static
+records in ONE pass over the combined leaf positions (validates indices in
+range, no duplicates).
 
 ## Control-flow region conventions (binding — implemented against the real `etl/ir` registry)
 
@@ -107,11 +182,14 @@ NEVER imports `etl.ops` (ops imports trace — keep the DAG acyclic). The
 conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
 (they differ from earlier architecture assumptions — `ir` is authoritative):
 
-- `ir.Builder` region workflow: `builder.build_region(input_types)` creates a
-  detached single-block region whose entry args are fresh Values; pass it via
-  `create(op_name, operands=..., regions=(...))` (wires `region.parent`);
-  build inside it with `builder.push_region(region)` / `builder.pop_region()`
-  under `with_builder(builder)` (same builder instance).
+- **Region execution** is unified in `_run_in_region(builder, region, fn,
+  *args, after=None)` (`control_flow.py`): it pushes the region's entry
+  block onto the builder's insertion-point stack (creating the block first
+  if the region is empty), installs the builder as the active builder for
+  `current_builder()` (the SAME builder — control flow never creates a
+  second), runs `fn`, then calls `after(result)` still inside the region
+  (callbacks emit the `return` terminator via `_return_terminator`), and
+  pops the region in a `finally` so the stack stays consistent on error.
 - `if` op ("if", effects none, 2 regions, arity (1, None)): **operand 0 IS
   the boolean predicate**; operands 1..n are the captured tensor values.
   `ir.verify` binds EVERY operand (predicate included) to each region's
@@ -130,11 +208,12 @@ conventions below are what the IMPLEMENTED `ir` registry + `verify` enforce
   region returns n next-carried values. Loop-carried types must stay constant
   across iterations (checked at trace time). cond_fn/body_fn run once each.
 - `return` op: terminator-only (operands = yielded values), emitted via
-  `builder.set_terminator(block, "return", operands)` — it appends as the
-  last op (never via `create`).
+  `_return_terminator(builder, values)` (`builder.py`) which delegates to
+  `Builder.set_terminator` — it APPENDS as the block's last op (never via
+  `create` at the insertion point).
 - Registered pytree nodes (types registered via `core.register_pytree_node`,
   e.g. sparse tensors) are valid carried values / branch outputs /
-  scan carries: `_flatten_tree` consults the registry FIRST (MRO walk over
+  scan carries: the shared walker consults the registry FIRST (MRO walk over
   `core.tree._PYTREE_NODE_REGISTRY`), the node's registered `flatten_fn`
   yields its children (SymbolicTensor leaves + static leaves) which recurse
   and classify as usual, and reconstruction goes through `core.unflatten`
@@ -158,6 +237,36 @@ an explicit `length` LARGER than a statically-known leading dim raises
 `TraceError`. Symbolic length → `TraceError` (dynamic-scan region ops
 reserved; no silent fallback).
 
+## Caching & performance (what the 2025-08 cleanup did, where the time goes)
+
+Measured after the cleanup (same machine, `$TMPDIR/etl_trace_bench.py`):
+chain (~100-op elementwise+reduce defn) 47.4 ms/trace (was 48.7), MLP
+5-input 1.33 ms/trace (was 1.35), control-flow while+cond 3.30 ms/trace
+(was 3.32). Modest — expected, because tracing is NOT the bottleneck.
+
+Where tracing time actually goes (~89% on the chain benchmark):
+`inspect.stack()` inside `etl/ops/_utils.py::get_location` (~0.48 ms per
+op). OUT OF SCOPE for this module — it is ops' source-location capture. The
+escape hatch `ETL_DISABLE_LOCATIONS=1` exists (set it to skip location
+capture entirely); a `sys._getframe`-based walk or a per-trace location
+cache would remove most of it — flagged to the package root.
+
+Caching that EXISTS in this module (all semantic-neutral dedup):
+- `_classify_operands` (`cond`): every container operand is flattened
+  EXACTLY once per `cond` call (was ~5×: validation + operand list + once
+  per branch); `_leaf_registered_flags` is computed once per `cond` call.
+- `Graph.unflatten_outputs`: single pass interleaving tensor results and
+  static records (was O(n·s) repeated list inserts).
+- `_return_terminator`/`_run_in_region`: one canonical spelling each for
+  block-ending and region-running (dedup, not speed).
+
+Caching deliberately NOT added: per-`Graph` input-validation plans
+(`flatten_inputs` plan caching). The dominant per-call cost is the input
+pytree walk itself, which a plan cannot remove, and `etl.pipeline`
+already caches input/output plans per `Executable`/`BoundExecutable` — a
+second cache here would just duplicate that. Traces themselves are never
+cached (every `trace()` call builds a fresh Graph — that is the contract).
+
 ## Error cases (all public errors derive from `core.ETLError`)
 
 `Defn.__call__` (always), `current_builder()` outside trace, invalid trace
@@ -167,6 +276,8 @@ input/output leaves, branch tree/arity mismatch or non-scalar-bool `pred`/
 applicable. `flatten_inputs`: `ShapeError` (shape vs DimExpr), `DTypeError`,
 `DeviceError`, `TraceError` (tree/static mismatch). `Graph.load` mismatch →
 `PersistenceError` (from persist). `verify()` → `VerificationError`.
+Error messages are byte-stable (the test suite matches substrings) — when
+editing messages, keep the wording of existing paths intact.
 
 ## Constraints
 
@@ -174,23 +285,85 @@ applicable. `flatten_inputs`: `ShapeError` (shape vs DimExpr), `DTypeError`,
   is imported lazily inside `Graph.save/load` (persist does not import
   trace). NEVER import `etl.ops` — ops imports trace for
   `current_builder()`; control flow builds raw ops via `ir.opdef`.
-- Files < ~1000 lines; current layout: `defn.py`, `builder.py`, `graph.py`,
-  `trace.py`, `control_flow.py`, `__init__.py`.
+- Files < ~1000 lines; current layout: `defn.py`, `builder.py`, `_tree.py`,
+  `graph.py`, `trace.py`, `control_flow.py`, `__init__.py`.
 - All `trace` outputs are ordinary ops — backends need no control-flow
   runtime support (numpy interpreter selects regions/loops natively).
 - No caching, no eager execution, no silent fallbacks anywhere in this
   module.
 
-## Routing table
+## Design decisions
 
-Flat module — no child directories. All tracing work lands in the five
-modules above (`trace.py` = the tracer + input classification,
-`control_flow.py` = region building, `graph.py` = Graph I/O validation +
-persistence delegation, `builder.py` = the ops hook, `defn.py` = marker
-decorator).
+- **`_TraceSession` owns all trace state.** The alternative (module-level
+  globals, or threading a state object through every helper) either leaks
+  state across nested/reentrant traces or buries it in signatures. The
+  dataclass makes the trace lifecycle visible: `open`/`run`/`finish` map
+  1:1 onto the documented algorithm steps.
+- **The leaf policy is a parameter, not a copy.** `trace.py` and
+  `control_flow.py` previously shipped separate pytree walkers that drifted
+  apart (they disagreed about which objects are leaves). `_tree.py`
+  parameterizes the ONLY thing that differed. The two knobs
+  (`leaf_spec` + `plain_leaf_type`) are explicit because the leaf
+  conventions are load-bearing for `etl.pipeline` (`_is_tensor_leaf_spec`
+  reads `TreeSpec.type`).
+- **A fully-static dataclass config object passed as a trace argument is
+  legitimate static specialization, not an error.** Dataclass instances are
+  pytree containers: the tracer descends into them, and a config whose
+  fields are all static Python values specializes statically at trace time —
+  each static leaf is recorded in `static_values` and validated at run time
+  via `Graph.flatten_inputs`. (A dataclass containing non-static,
+  non-`TensorSpec` leaves still raises `TraceError` per the trace algorithm
+  above.)
+- **Markers are plain classes, not dataclasses.** `_TensorSpecLeaf` /
+  `_SymbolicLeaf` are deliberately not dataclasses (no `__eq__`): identity
+  is enough, and `TreeSpec` equality never has to compare their payloads.
 
-Sibling: `../tests/` → test suite (read-only from here; escalate test
-writes to the package root).
+## Known warts
+
+- **`get_location` is ~89% of trace time** (`etl/ops/_utils.py`,
+  `inspect.stack()` per op). Escape hatch: `ETL_DISABLE_LOCATIONS=1`. Fix
+  belongs in ops/ (see "Caching & performance").
+- **`Graph.input_specs` is a TreeSpec, not "specs".** The name predates the
+  input_tree concept; it is kept for API stability. New code should read
+  `tensor_specs` + `static_values` for leaf-level data.
+- **`StaticValue` (this module) collides in name with
+  `etl.block.decl.StaticValue`.** Different types, both public-ish; do not
+  import one where the other is expected. (No import conflict — separate
+  modules.)
+- **Marker-leaf privates are cross-module imports.** `etl.pipeline`
+  imports `_TensorSpecLeaf`/`_SymbolicLeaf` by name — they must stay at
+  `etl.trace.trace` with those names (see "Module layout").
+- **`etl.trace` is the function, not the submodule**, after `import etl`
+  (the package re-exports the function under that attribute). Use
+  `from etl.trace import ...` (works — the import system consults
+  `sys.modules` first) or `sys.modules["etl.trace"]` for the module object.
+- **`core.TreeSpec.context` (registered-node aux) is invisible to
+  `core.first_mismatch_path`** — aux-bearing registered nodes get no
+  automatic run-time aux-equality validation via `Graph.flatten_inputs`;
+  check aux explicitly or model it as static leaves.
+
+## How to extend (hack-ability)
+
+- **Add a new traceable op**: nothing to do in trace/ — `etl.ops` builds IR
+  via `current_builder()`, and control flow needs no changes. (The op's
+  shape/dtype rules live in ops/ir.)
+- **Add a new static leaf type** (e.g. a config object): extend
+  `_is_static_value` in `_tree.py` (the single copy) and check that the
+  type survives `Graph.save/load` (persist codec in `etl/persist/`).
+- **Add a new control-flow construct**: copy the `_run_in_region` pattern —
+  build a detached region via `builder.build_region(...)`, classify operands
+  (`_classify_operands` for cond-style, the carry rules for while-style),
+  run callables inside the region, emit the `return` via
+  `_return_terminator`, `create` the region op with explicit `result_types`
+  (or `shape_fn`), pop in `finally`. Follow the `scan` desugar pattern for
+  anything loop-shaped.
+- **Change how static values are recorded**: the single construction site
+  is `graph._static_record`; the classification sits in
+  `trace._flatten_specs` / `trace._classify_outputs`. The recording format
+  (`StaticValue.index/path/value/kind`) is consumed by `graph.py` and
+  encoded by `etl.persist` — change all three together.
+- **Add an input/output plan cache**: see "Caching deliberately NOT added"
+  before doing it.
 
 ## Test strategy
 
@@ -216,109 +389,10 @@ pytest; mirror under `../tests/test_trace/` (or per-module files):
 
 ## Status
 
-Fully implemented (Phase 2 complete): `trace.py` (7-step tracer),
-`graph.py` (Graph I/O, validation, persistence), `control_flow.py`
-(cond/while_loop/scan region building), plus `builder.py`/`defn.py`
-(pre-existing). All graphs produced by `etl.trace` pass `ir.verify`;
-Graph save/load round-trips through the persist container.
-
-## Design Decisions
-
-- **A fully-static dataclass config object passed as a trace argument is
-  legitimate static specialization, not an error.** Dataclass instances are
-  pytree containers: the tracer descends into them, and a config whose
-  fields are all static Python values specializes statically at trace time —
-  each static leaf is recorded in `static_values` and validated at run time
-  via `Graph.flatten_inputs`. (A dataclass containing non-static,
-  non-`TensorSpec` leaves still raises `TraceError` per the trace algorithm
-  above.)
-
-## Notes for agents
-
-- **Leaf conventions match core**: `core.flatten` treats etl-module
-  dataclasses (`Device`, `Dim`, `TensorSpec`, `TreeSpec`, `SymbolicTensor`,
-  …) as single leaves, and trace's walkers apply the same etl-module leaf
-  check: `trace.py::_flatten_trace_into` and
-  `control_flow.py::_flatten_tree` both treat any etl-module dataclass as
-  ONE leaf (no descent into its fields; non-etl dataclasses are still
-  descended). `Device`/`Dim`/`DimExpr` trace inputs are each ONE static leaf
-  — `_is_static_value` accepts `core.Device` and `core.Dim`/`core.DimExpr`
-  in both files (keep the two `_is_static_value` implementations in sync).
-  `trace.py` still records
-  `TensorSpec`/`SymbolicTensor` leaves via private non-dataclass markers
-  (`_TensorSpecLeaf`/`_SymbolicLeaf`) carrying the original object —
-  load-bearing for `graph.py`'s container-SKELETON comparison
-  (`_normalize_leaf_types` before `core.unflatten`) and for persist
-  signature encoding. Any code touching `Graph.input_specs`/`output_tree`
-  must respect this. `control_flow.py`'s local `_flatten_tree` records
-  `TreeSpec(type=None)`-style leaves (rebuilt fine by `core.unflatten`).
-- **`signature_info()` returns persist-ENCODED (JSON-safe) values** — it is
-  metadata for the persistence container; its keys mirror the
-  `etl.backends.Signature` fields exactly (`input_tree`, `output_tree`,
-  `input_specs`, `output_specs`, `static_values`, `output_static_values`).
-  In-process consumers that need live objects must use the Graph's live
-  attributes (`input_specs`, `tensor_specs`, `output_tree`) or
-  `persist.decode_value` the entries.
-- **`flatten_inputs` accepts `core.Tensor` or `np.ndarray` only** — numpy
-  SCALARS (`np.float32(1)`) are rejected with `TraceError` (contract: wrap
-  via `core.from_numpy`, which also rejects scalars). Error messages carry
-  the pytree path and spec-vs-actual values.
-- **`etl.trace` attribute shadowing**: inside the package, `etl.trace` is
-  the FUNCTION after `etl/__init__.py` imports; the submodule is reachable
-  via `import etl.trace as mod` or `from etl.trace import ...` (see
-  `__init__.py` docstring).
-- Gaps found in lower layers (flagged to the package root): `core.Dim` has no
-  `evaluate()` (only `DimExpr`); registry has no `expand_dims` and no
-  dynamic-index `slice` (scan works around via gather/reshape); `ir.verify`
-  does not check `while` body-return types against operand types (checked
-  at trace time here instead).
-- **Registered pytree nodes in control flow:** `_flatten_tree` consults the
-  core pytree registry FIRST (MRO walk over
-  `core.tree._PYTREE_NODE_REGISTRY` — same registry and order as
-  `trace.py::_flatten_trace_into` and `core.tree._flatten_into`), so even an
-  etl-module dataclass registered via `register_pytree_node` becomes a
-  container: it flattens via its registered `flatten_fn`, its children
-  recurse, and `TreeSpec.type` records the REGISTERED base type so
-  `core.unflatten` rebuilds via the registered `unflatten_fn`. Unregistered
-  objects keep the pre-registry behavior exactly (`_LEAF_TYPES` fast path,
-  namedtuple/dataclass/tuple/list/dict descent, opaque leaves). Consequently
-  `cond`/`while_loop`/`scan` carry registered nodes whose children are
-  `SymbolicTensor` leaves + static leaves (e.g. sparse tensors); tensor
-  children become region block args / op results, static children pass
-  through unchanged. Note `core.TreeSpec.context` (the registered node's
-  aux) is also invisible to `core.first_mismatch_path` (it compares
-  `type`/`node_data`/children only), so aux-bearing nodes get no automatic
-  run-time aux-equality validation via `Graph.flatten_inputs` — aux equality
-  must be checked explicitly or the aux must live as static leaves.
-  Registered-node support in `control_flow.py` (generic — it NEVER imports
-  the registering module, e.g. `etl.sparse`; `_is_registered_node` /
-  `_leaf_registered_flags` walk the registry only):
-  (a) **cond pytree-operand rule** — a pytree CONTAINER operand (a
-  registered node — e.g. a sparse tensor — OR a plain container:
-  tuple/namedtuple/list/dict/plain user dataclass) is flattened via
-  `_flatten`; its tensor leaves are captured as `if`-op operands (bound
-  to region entry args) and rebuilt per the container's tree inside
-  `_run_branch`, its static leaves pass through unchanged; every operand
-  leaf must be a `SymbolicTensor` or a static value (else `TraceError`).
-  Branch outputs may
-  carry static leaves ONLY inside registered nodes; such leaves must be
-  equal across branches (mirroring `while_loop`'s static-leaf semantics) —
-  bare static output leaves (top-level or in plain containers) still raise
-  the old `TraceError` ("branches yield tensors only"). The `if` op's
-  `result_types`/results stay tensor-leaves only; static positions are
-  re-inserted at unflatten.
-  (b) **while shape-unify rule** — `while_loop`'s trace-time shape check is
-  positional (`_shapes_compatible`): same rank; per position equal entries
-  pass, and a `None` (runtime-dynamic) on ONE side passes when the other
-  side is a symbolic `core.Dim`/`core.DimExpr` (sparse nnz: the traced
-  input's `Dim("_dynamic_...")` wrapper vs the sparse-op result's true
-  `None`); the INIT (loop-carried) type wins — the while-op result types
-  mirror the operand/IR types carrying the true `None`, and the numpy
-  interpreter treats `None` result dims as unchecked. Int-vs-Dim, different
-  ints, Dim-vs-Dim, and rank mismatches still raise `core.ShapeError`.
-  (c) **scan with sparse** — a sparse CARRY (init with tensor + static
-  leaves) works via the `while_loop` desugar (step-0/carry leaf validation
-  accepts ST-or-static leaves; `while_loop` carries the node generically);
-  sparse `xs` and sparse `y` stacking remain v1 deferrals with explicit
-  `TraceError`s ("xs leaf i must be a core.SymbolicTensor" /
-  "f's y outputs must be SymbolicTensors") — no sparse scatter/stack path.
+Implemented and green. The 2025-08 cleanup refactor (commit 507e42a):
+extracted `_tree.py` (shared walker + static helpers), introduced
+`_TraceSession`, unified region execution (`_run_in_region`) and block
+termination (`_return_terminator`), deduped `cond` operand flattening and
+output unflattening. Public API unchanged; error messages byte-identical;
+full suite 5665 passed / 0 failed (skips environmental: torch/xla/GPU);
+`etl.bench` conformance 97/97.
