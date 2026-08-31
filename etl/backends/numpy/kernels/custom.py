@@ -20,6 +20,15 @@ Implemented kernels:
   NEVER embedded in artifacts (the op carries only the string id); a missing
   registration raises ``core.BackendError`` naming the id.
 
+- ``external_call``: dispatches a NAMED kernel from the ``etl.external``
+  registry (``etl.register_external_kernel`` — kernel-agnostic; the same
+  registry serves round-2 compiler-adapter host-dispatch). The op's ``name``
+  attribute is the stable user-chosen string; the registry is resolved LAZILY
+  at run time (import acyclicity) and an unknown name raises
+  ``core.BackendError`` naming the kernel. Outputs are validated against the
+  op's declared ``result_specs`` exactly like ``runtime_call``/``block_call``
+  (shared helpers below).
+
 - ``block_call``: dispatches a registered numpy block impl.
 
   FINALIZED v1 BLOCK IMPL CALL CONVENTION::
@@ -268,6 +277,37 @@ def _runtime_call(ctx: Any, op: Any, operands: tuple):
     return _finish(op.name, outputs)
 
 
+def _external_call(ctx: Any, op: Any, operands: tuple):
+    """``external_call``: dispatch the named kernel from ``etl.external``.
+
+    Kernel resolution goes through ``etl.external.get_external_kernel``
+    (lazy import — import acyclicity): an unknown name raises
+    ``core.BackendError`` naming the kernel and pointing at
+    ``etl.register_external_kernel`` (the registry is never serialized —
+    graphs require the same kernel registrations in the process at run
+    time). The kernel receives operand tensors as numpy arrays; its return
+    is normalized and validated against the declared ``result_specs``
+    exactly like ``runtime_call`` (shared helpers).
+    """
+    from etl.external import get_external_kernel
+
+    name = op.attributes["name"]
+    kernel = get_external_kernel(name)
+    if kernel is None:
+        raise core.BackendError(
+            f"op 'external_call': no external kernel registered under name "
+            f"{name!r} — register it with "
+            "etl.register_external_kernel(name, callable) in this process "
+            "before running graphs that call it (kernels are never "
+            "embedded in artifacts)"
+        )
+    result = kernel(*[t.numpy() for t in operands])
+    label = f"op 'external_call' (kernel {name!r})"
+    arrays = _normalize_results(result, label)
+    outputs = _validate_outputs(ctx, op, arrays, op.attributes["result_specs"], label)
+    return _finish(op.name, outputs)
+
+
 def _block_call(ctx: Any, op: Any, operands: tuple):
     """``block_call``: dispatch the block's registered numpy impl.
 
@@ -319,4 +359,5 @@ def register_kernels(table: dict) -> None:
     """
     table["constant"] = _constant
     table["runtime_call"] = _runtime_call
+    table["external_call"] = _external_call
     table["block_call"] = _block_call

@@ -694,7 +694,7 @@ def _verify_op_specific_results(module: Module, op: Op, loc: Location | None) ->
                 f"results are {result_types}",
                 loc,
             )
-    elif name in ("runtime_call", "block_call"):
+    elif name in ("runtime_call", "block_call", "external_call"):
         specs = op.attributes["result_specs"]
         if not isinstance(specs, (tuple, list)) or not all(
             isinstance(spec, ValueType) for spec in specs

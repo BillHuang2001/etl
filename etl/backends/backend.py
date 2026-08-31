@@ -39,6 +39,9 @@ class Capabilities:
         dtypes: frozenset of supported numpy dtypes.
         collectives: supports ``etl.dist`` collective ops (numpy: single-process simulation).
         runtime_calls: supports ``runtime_call`` (executing Python callbacks).
+        external_calls: supports ``external_call`` ops (named external
+            kernels; v1: numpy-backend-only — compiler-backend host-dispatch
+            is not wired yet, see ``etl/CONTEXT.md`` "External kernels").
         custom_blocks: supports ``block_call`` ops (registered backend impls).
         async_collectives: collective execution may be asynchronous (numpy: False).
         sparse_ops: supports etl.sparse sparse-tensor ops (numpy: True).
@@ -60,6 +63,7 @@ class Capabilities:
     dtypes: frozenset = field(default_factory=frozenset)
     collectives: bool = False
     runtime_calls: bool = False
+    external_calls: bool = False
     custom_blocks: bool = False
     async_collectives: bool = False
     sparse_ops: bool = False
