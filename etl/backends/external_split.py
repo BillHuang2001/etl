@@ -554,8 +554,10 @@ def _clone_region(
 def decode_plan(plan: dict) -> List[dict]:
     """Decode a JSON-safe plan into the run-time segment list.
 
-    Each segment record gains ``input_specs`` (tuple of ``ir.ValueType``)
-    and ``call["result_specs"]`` (tuple of ``ir.ValueType``); everything
+    Each segment record gains ``input_specs`` (tuple of ``ir.ValueType``),
+    ``call["result_specs"]`` (tuple of ``ir.ValueType``) and
+    ``call["result_outputs"]`` (tuple of int slot indices — where the
+    kernel results land in the segment's output-slot space); everything
     else is copied as-is. Raises ``core.BackendError`` for malformed plans
     (artifacts are never executed with a silently partial plan).
     """
@@ -604,11 +606,28 @@ def decode_plan(plan: dict) -> List[dict]:
                     f"corrupt: external-call plan segment {index} 'call' has "
                     "no 'result_specs'"
                 )
+            result_outputs = call.get("result_outputs")
+            if not isinstance(result_outputs, list) or not all(
+                isinstance(slot, int) and not isinstance(slot, bool)
+                for slot in result_outputs
+            ):
+                raise core.BackendError(
+                    f"corrupt: external-call plan segment {index} 'call' has "
+                    "no 'result_outputs' slot list"
+                )
+            if len(result_outputs) != len(result_specs):
+                raise core.BackendError(
+                    f"corrupt: external-call plan segment {index} 'call' "
+                    "declares "
+                    f"{len(result_specs)} result spec(s) but "
+                    f"{len(result_outputs)} result output slot(s)"
+                )
             decoded["call"] = {
                 "index": call.get("index"),
                 "name": call["name"],
                 "operand_outputs": tuple(call.get("operand_outputs") or ()),
                 "result_specs": tuple(decode_type(spec) for spec in result_specs),
+                "result_outputs": tuple(result_outputs),
             }
         segments.append(decoded)
     return segments

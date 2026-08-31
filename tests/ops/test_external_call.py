@@ -15,8 +15,11 @@ kernels") and ``etl/ops/external.py``:
   ``KeyError`` on unknown unregister, ``TypeError`` on bad arguments).
 - Errors: unknown name at run time -> ``BackendError`` naming the kernel;
   spec mismatches -> ``BackendError``/``ShapeError``; vmap/grad/jvp/vjp ->
-  ``TransformError``; compiler backends -> ``BackendError`` (host-dispatch
-  not wired in v1).
+  ``TransformError``; the stablehlo exporter and the xla/tvm adapters ->
+  ``BackendError`` (host-dispatch not wired); the iree adapter (round 2)
+  SPLITS external-call graphs at lower() into segment programs
+  (``stablehlo-segments`` payload) — end-to-end iree coverage lives in
+  ``tests/backends/test_external_call_iree.py``.
 - Control flow: the op works inside ``cond``/``while_loop`` bodies (numpy).
 - Persistence: graphs round-trip through ``Graph.save``/``load``; the kernel
   must be re-registered in the process that runs a loaded graph.
@@ -571,7 +574,7 @@ def test_loaded_graph_requires_reregistered_kernel(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Compiler backends: explicit BackendError (host-dispatch not wired in v1)
+# Compiler backends: explicit BackendError (xla/tvm) vs iree segment split
 # ---------------------------------------------------------------------------
 
 
@@ -594,15 +597,34 @@ def test_stablehlo_export_deferred_with_backend_error():
     assert "external_call" in message  # names the op
 
 
-def test_iree_lower_rejects_with_host_dispatch_message():
-    """Compiler adapters reject at lower() with the round-2 message. When
-    iree-compiler is not installed the adapter raises its own explicit
-    BackendError (``pip install etl[iree]``) — that env-dependent error is
-    skipped, the capability contract is what's under test."""
-    with pytest.raises(etl.BackendError) as exc:
-        etl.lower(_compiler_graph(), backend="iree")
-    message = str(exc.value)
-    if "external_call" not in message:
-        pytest.skip(f"iree adapter not available in this env: {message}")
-    assert "host-dispatch" in message
-    assert "not yet wired" in message
+def test_iree_lower_splits_external_call_graphs_xla_tvm_still_reject():
+    """The iree adapter host-dispatches external-call graphs at lower()
+    time by SPLITTING them into segment programs (round 2 — payload
+    ``stablehlo-segments``); xla and tvm still reject with the round-1
+    message. When an adapter is not installed it raises its own explicit
+    BackendError (``pip install etl[iree]`` / plugin guidance) — that
+    env-dependent error is skipped, the capability contract is what's
+    under test."""
+    graph = _compiler_graph()
+
+    try:
+        lowered = etl.lower(graph, backend="iree")
+    except etl.BackendError as exc:
+        if "external_call" not in str(exc):
+            pytest.skip(f"iree adapter not available in this env: {exc}")
+        raise
+    assert lowered.backend == "iree"
+    assert lowered.payload["format"] == "stablehlo-segments"
+    assert lowered.payload["plan"]["segments"]
+    assert lowered.payload["segments"]
+
+    for backend in ("xla", "tvm"):
+        with pytest.raises(etl.BackendError) as exc:
+            etl.lower(graph, backend=backend)
+        message = str(exc.value)
+        if "external_call" not in message:
+            pytest.skip(
+                f"{backend} adapter not available in this env: {message}"
+            )
+        assert "host-dispatch" in message
+        assert "not yet wired" in message
