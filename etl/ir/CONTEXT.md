@@ -127,6 +127,26 @@ Module's counters (stable ids for serialization). Parent pointers
 | collective.py | collective | all_reduce all_gather reduce_scatter all_to_all broadcast_collective collective_permute | collective |
 | collective.py | collective | rank world_size (scalar int64) | read |
 | sparse.py | sparse | sparse_from_dense sparse_to_dense sparse_coo_to_csr sparse_csr_to_coo sparse_coo_to_csc sparse_csc_to_coo sparse_negate sparse_add sparse_multiply sparse_multiply_dense sparse_reduce_sum sparse_transpose sparse_reshape sparse_concatenate sparse_dot_dense dense_dot_sparse | pure |
+| random.py | random | random_key_mix random_uniform random_normal random_randint random_permutation random_multinomial | pure |
+
+**Multi-algorithm random framework (binding):** `op_defs/random.py` is the
+SINGLE source of truth for the canonical algorithm names — `ALGORITHMS =
+("splitmix64", "threefry2x32", "philox4x32_10")`, `DEFAULT_ALGORITHM =
+ALGORITHMS[0]` (splitmix64, the v1 default), `validate_algorithm(name)` and
+`algorithm_key_type(name) -> (shape, dtype)` — imported by `ops` and the
+backend writers (never duplicate the literals). Key types: splitmix64 →
+rank-0 int64; threefry2x32 → shape (2,) int32; philox4x32_10 → shape (4,)
+int32. All 6 random OpDefs carry the shared `algorithm` attribute
+(`AttrSpec("algorithm", ATTR_STR, default=DEFAULT_ALGORITHM)`); the frontend
+stamps it explicitly once multi-algorithm support lands — until then the
+default applies and behavior is unchanged. `inference.py` validates key
+shape/dtype against the op's `algorithm` in `_check_random_key` (key form of
+a different algorithm → `ShapeError` naming both; a form matching no
+algorithm → `ShapeError` naming the three accepted forms; unknown algorithm
+name → `ValueError` via `validate_algorithm`); `infer_random_key_mix`'s
+result type is the algorithm's key type via `algorithm_key_type`. Hooks read
+the attribute with `attributes.get("algorithm", DEFAULT_ALGORITHM)` so
+graphs serialized before the attribute existed still verify with the default.
 
 Declaring an op here does NOT mean every backend implements it — backends
 reject unsupported ops explicitly via capabilities, never silently. IR name
