@@ -28,26 +28,6 @@ deterministic (same key => bit-identical across runs) but ~1e-6 vs the numpy
 f64 math, so the f32 parity checks are tolerance-based
 (``RANDOM_NORMAL_TOL``; measured budget ~4.8e-7).
 
-BUG(etl) status at this commit: two distinct exporter defects make the
-threefry/philox paths on iree NOT bit-exact vs numpy where the contract pins
-bit-exactness — the affected tests below carry ``# BUG(etl):`` markers and
-stay FAILING per the repo protocol (this dir is read-only w.r.t. etl):
-
-1. ``_emit_u_scaled32`` applies the 64-bit-word scaling
-   ``(word >> 11) * 2^-53`` to the 32-bit words instead of the pinned
-   full-word ``word * 2^-32``, so iree's u == numpy's u * 2^-32 —
-   uniform/randint/normal wrong by ~2^-32 on BOTH algorithms (inline and
-   native, incl. cuda).
-2. ``_emit_philox_words_inline`` uses only the (k0', k1') round-key pair for
-   all 10 rounds instead of the pinned cyclic (k0,k1)/(k2,k3) alternation
-   (numpy ``_philox4x32``: round r uses ``(k_{2r mod 4} + r*W0,
-   k_{(2r+1) mod 4} + r*W1)``) — philox key_mix/split/split_n/permutation
-   words wrong for keys with distinct words (zero/all-equal keys still
-   match).
-
-Green despite the above: threefry permutation + split/split_n, native
-threefry permutation (native == inline), and ALL determinism checks.
-
 The xla adapter declares ``Capabilities.rng_bit_generator=True``, but xla
 run tests stay gate-skipped without a user-provided PJRT plugin
 (``ETL_PJRT_PLUGIN``/``plugin_path``) — there are NO xla tests here.
@@ -255,22 +235,6 @@ INLINE_PARAMS = [
 #    per (case, algorithm), every key looped through the same executable
 # ---------------------------------------------------------------------------
 
-# BUG(etl): the uniform/randint AND philox-permutation ids below are NOT
-# bit-exact on iree. Two distinct exporter defects (see the module docstring):
-# (1) `_emit_u_scaled32` (etl/backends/stablehlo/random_export.py) scales the
-# 32-bit words with the SPLITMIX64 64-bit formula `(word >> 11) * 2^-53`
-# instead of the pinned 32-bit FULL-word scaling `word * 2^-32`
-# (etl/backends/numpy/kernels/random.py `_word_uniforms`), so iree's u ==
-# numpy's u * 2^-32: uniform values ~2^-32 too small and randint collapses to
-# the low bound (floor(u*span) == 0 for span < 2^32). Repro (threefry2x32,
-# key (0, 0), uniform (5,)): iree [1.4111967e-10 3.1785241e-11 2.0577884e-10
-# ...] vs numpy [0.60610473 0.136517 0.8838137 ...]; randint (8,) iree
-# [0 0 0 0 0 0 0 0] vs numpy [63 1 94 41 45 47 44 11]. (2)
-# `_emit_philox_words_inline` never switches the round-key pair to (k2', k3')
-# on odd rounds — the philox permutation ids fail on the seed-derived key
-# (words wrong; keys with k0==k2 and k1==k3 still match). The threefry
-# permutation ids stay bit-exact (order-based — neither defect enters). Do
-# NOT skip/xfail/weaken.
 @pytest.mark.parametrize(
     "case_id,fn,spec,algorithm",
     [(c[0], c[1], c[2], c[3]) for c in INLINE_PARAMS],
@@ -299,13 +263,6 @@ def test_inline_bit_exact(case_id, fn, spec, algorithm):
 #    AND bit-identical across two separate runs (determinism)
 # ---------------------------------------------------------------------------
 
-# BUG(etl): the same `_emit_u_scaled32` scaling violation breaks normal: both
-# Box-Muller uniforms are ~2^-32 too small, so z = sqrt(-2 log u1) saturates
-# at ~6.66 (log of 2^-32) with cos(2*pi*u2) ~ 1. Repro (threefry2x32, key 42,
-# normal (4, 5) f64): iree all-positive [6.68..7.53] vs numpy
-# [-1.92..2.21] — NOT bit-exact (f64) and far outside RANDOM_NORMAL_TOL
-# (f32). The determinism assertion below still holds (same key => the same
-# wrong values, bit-identical). Do NOT skip/xfail/weaken.
 @pytest.mark.parametrize("algorithm", ALGORITHMS, ids=ALGORITHMS)
 def test_normal_f64_bit_exact(algorithm):
     """f64 output normal: bit-exact vs the numpy kernel (both algorithms)."""
@@ -334,17 +291,6 @@ def test_normal_f32_tolerance_and_determinism(algorithm):
 # ---------------------------------------------------------------------------
 # 3. key_mix / split — the algorithm's key shape, bit-exact vs numpy
 # ---------------------------------------------------------------------------
-
-# BUG(etl): philox key_mix (split/split_n) is NOT bit-exact — the exporter's
-# `_emit_philox_words_inline` uses only the (k0', k1') round-key pair for all
-# 10 rounds instead of the pinned cyclic (k0,k1)/(k2,k3) alternation (numpy
-# `_philox4x32`: round r uses `(k_{2r mod 4} + r*W0, k_{(2r+1) mod 4} + r*W1)`).
-# Repro (philox key from seed 42, split's salt-0 first key): iree
-# [-1408616261 2096774548 810715712 -217573850] vs numpy
-# [-619790300 899531137 425014980 -1284574911]. The threefry ids pass
-# (cipher verified); philox keys with k0==k2 and k1==k3 also pass (the
-# alternation is a no-op there). Do NOT skip/xfail/weaken.
-
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS, ids=ALGORITHMS)
 def test_split_bit_exact(algorithm):
@@ -383,13 +329,6 @@ NATIVE_CASES = [
 ]
 
 
-# BUG(etl): the native THREE_FRY uniform/randint ids share the same
-# `_emit_u_scaled32` scaling bug — their words ARE bit-identical to the
-# inline cipher on iree (the "native == inline" assertion below holds) but
-# the shared u-scaling tail is wrong, so both differ from numpy by the
-# 2^-32 factor (native uniform == inline uniform == numpy * 2^-32; native
-# randint all zeros). The permutation id is bit-exact (order-based). Do NOT
-# skip/xfail/weaken.
 @pytest.mark.parametrize(
     "case_id,fn",
     [(c[0], c[1]) for c in NATIVE_CASES],
@@ -441,11 +380,6 @@ def test_cross_roundtrip_determinism():
 # ---------------------------------------------------------------------------
 
 
-# BUG(etl): same `_emit_u_scaled32` scaling violation on cuda — the inline
-# uniform paths run (the compile itself is fine) but produce numpy * 2^-32
-# (threefry) / the full-word-scaled mismatch (philox), and the native
-# THREE_FRY uniform likewise; see the marker on test_inline_bit_exact for
-# the repro values. Do NOT skip/xfail/weaken.
 def test_iree_cuda_threefry_inline_uniform_smoke():
     _require_cuda()
     _parity(
