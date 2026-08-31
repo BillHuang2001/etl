@@ -6,34 +6,40 @@ semantics (normal `if`/loops over static values work — they specialize the
 graph). Runtime tensor control flow must use `etl.cond` / `etl.while_loop` /
 `etl.scan` (see `./control_flow.py`).
 
-The step-by-step algorithm below is the BINDING CONTRACT for the Phase 2
-implementation; `./CONTEXT.md` summarizes it.
+The step-by-step algorithm in `trace()`'s docstring is the BINDING contract;
+`./CONTEXT.md` summarizes it. All trace-time state lives in one
+`_TraceSession` object (see below) — there is no hidden global state besides
+the active-builder context (`./builder.py`), which `_TraceSession.run`
+installs only for the duration of the user-function call.
+
+`_TensorSpecLeaf` / `_SymbolicLeaf` are deliberately NOT dataclasses: they
+stand in for `TensorSpec`/`SymbolicTensor` at trace-tree leaf positions so
+leaf-type equality tells tensor leaves apart from static leaves while the
+TreeSpec stays `core.unflatten`-compatible. They are plain marker objects
+carrying the original value.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import enum
 import inspect
 import os
-from typing import Any, Iterator, Tuple
-
-import numpy as np
+from typing import Any, Tuple
 
 from etl import core
 from etl import ir
-from etl.core import tree as _core_tree
 
-from .builder import with_builder
+from ._tree import (
+    _flatten,
+    _format_path,  # noqa: F401  (re-exported: etl.transforms.grad imports it)
+    _is_static_value,
+    _iter_leaf_paths,  # noqa: F401  (re-exported: etl.transforms.grad imports it)
+)
+from .builder import _return_terminator, with_builder
 from .defn import Defn
-from .graph import Graph, StaticValue
+from .graph import Graph, StaticValue, _static_record
 
 __all__ = ["trace"]
-
-# The registered-custom-node table of core's pytrees. `register_pytree_node`
-# mutates this dict in place, so the alias stays live. Trace trees honor the
-# same registrations as `core.flatten`.
-_PYTREE_NODE_REGISTRY = _core_tree._PYTREE_NODE_REGISTRY
 
 
 class _TensorSpecLeaf:
@@ -48,6 +54,10 @@ class _TensorSpecLeaf:
     tree skeleton comparisons in ``graph.py`` and for signature encoding.)
     The marker carries the original ``core.TensorSpec`` for
     classification/error messages.
+
+    IMPORTANT: `etl/pipeline.py` imports this class by name
+    (``from etl.trace.trace import _TensorSpecLeaf``) — keep the name and
+    module path stable.
     """
 
     __slots__ = ("spec",)
@@ -67,6 +77,10 @@ class _SymbolicLeaf:
     module check): trace trees record symbolic-result positions with this
     plain marker so leaf-type equality distinguishes them from static output
     leaves. Carries the ``core.SymbolicTensor`` result.
+
+    IMPORTANT: `etl/pipeline.py` imports this class by name
+    (``from etl.trace.trace import _SymbolicLeaf``) — keep the name and
+    module path stable.
     """
 
     __slots__ = ("symbolic",)
@@ -78,80 +92,153 @@ class _SymbolicLeaf:
         return f"_SymbolicLeaf({self.symbolic!r})"
 
 
+def _trace_leaf_spec(obj: Any) -> "Optional[Tuple[Any, core.TreeSpec]]":
+    """The trace-tree leaf policy for the shared walker (`./_tree.py`).
+
+    `TensorSpec`/`SymbolicTensor` become typed marker leaves
+    (`_TensorSpecLeaf`/`_SymbolicLeaf`); every other object defers to the
+    walker's default leaf (``None`` policy result → container descent or
+    plain leaf). The returned pair is ``(leaf_to_record, TreeSpec)`` — the
+    walker appends the marker to the leaves list.
+    """
+    if isinstance(obj, core.TensorSpec):
+        return (_TensorSpecLeaf(obj), core.TreeSpec(type=_TensorSpecLeaf))
+    if isinstance(obj, core.SymbolicTensor):
+        return (_SymbolicLeaf(obj), core.TreeSpec(type=_SymbolicLeaf))
+    return None
+
+
 def _flatten_trace(obj: Any) -> Tuple[list, "core.TreeSpec"]:
     """Flatten a pytree like ``core.flatten``, keeping ``TensorSpec`` and
     ``SymbolicTensor`` instances as leaves (via the markers above).
 
-    Mirrors ``core.tree._flatten_into``'s container rules exactly (registered
-    custom nodes, namedtuple, dataclass, tuple, list, dict with sorted keys);
-    the only difference is the stop-set: ``TensorSpec``/``SymbolicTensor``
-    are caught by the marker rules first, and etl-module dataclasses stay
-    leaves under the same module check ``core.tree`` applies. The returned
-    ``core.TreeSpec`` is fully ``core.unflatten``-compatible.
+    Uses the SHARED walker in ``./_tree.py`` (same container rules as
+    ``core.tree._flatten_into``: registered custom nodes, namedtuple,
+    dataclass, tuple, list, dict with sorted keys) with the trace leaf
+    policy. Fallback (static) leaves record their own Python type as the
+    ``TreeSpec.type`` (``plain_leaf_type=type``) — pipeline's
+    ``_is_tensor_leaf_spec`` relies on leaf types to tell static positions
+    from tensor markers. The returned ``core.TreeSpec`` is fully
+    ``core.unflatten``-compatible.
     """
-    leaves: list = []
-    return leaves, _flatten_trace_into(obj, leaves)
+    return _flatten(obj, _trace_leaf_spec, plain_leaf_type=type)
 
 
-def _flatten_trace_into(obj: Any, leaves: list) -> "core.TreeSpec":
-    if isinstance(obj, core.TensorSpec):
-        leaves.append(_TensorSpecLeaf(obj))
-        return core.TreeSpec(type=_TensorSpecLeaf)
-    if isinstance(obj, core.SymbolicTensor):
-        leaves.append(_SymbolicLeaf(obj))
-        return core.TreeSpec(type=_SymbolicLeaf)
-    obj_type = type(obj)
-    # 1. Registered custom types (walk the MRO so registered base classes
-    #    catch subclasses; exact type first) — same as core.tree.
-    for base in obj_type.__mro__:
-        registered = _PYTREE_NODE_REGISTRY.get(base)
-        if registered is not None:
-            flatten_fn, _ = registered
-            children, context = flatten_fn(obj)
-            child_specs = tuple(
-                _flatten_trace_into(child, leaves) for child in children
-            )
-            return core.TreeSpec(type=base, children=child_specs, context=context)
-    # 2. namedtuple instances (checked before plain tuples).
-    if isinstance(obj, tuple) and hasattr(obj_type, "_fields"):
-        child_specs = tuple(_flatten_trace_into(child, leaves) for child in obj)
-        return core.TreeSpec(
-            type=obj_type, children=child_specs, node_data=obj_type._fields
+@dataclasses.dataclass
+class _TraceSession:
+    """The complete state of one `trace()` call — the single named owner of
+    trace state while the user function runs.
+
+    Ownership rules (what lives where):
+
+    - ``builder`` / ``module`` / ``function``: the IR under construction.
+      ONE builder serves the whole trace; control flow re-positions it via
+      ``push_region``/``pop_region`` and never creates new builders.
+    - ``input_tree`` / ``tensor_specs`` / ``static_values``: the classified
+      input contract (built by `_flatten_specs`). ``input_tree``'s leaves
+      hold the original leaf objects; ``tensor_specs`` is in flat leaf order
+      == function block-arg order.
+    - ``symbolics``: the block-arg ``SymbolicTensor``s, one per tensor spec.
+    - ``source_locations``: maps each input symbolic's value id to the
+      ``trace()`` call site (``call_site``), so error messages can name the
+      user's trace line.
+    - ``args``: the reconstructed call arguments passed to the user function
+      (SymbolicTensors at tensor positions, original static values at static
+      positions) — built by `_reconstruct_args`.
+
+    Lifecycle: ``open(specs)`` performs trace algorithm steps 1-4 (builds the
+    IR skeleton + classifies inputs + reconstructs args), ``run(fn)`` is step
+    5 (the single user-function call under ``with_builder``), ``finish`` is
+    steps 6-7 (classifies outputs, emits the ``return`` terminator, wraps the
+    ``Graph``). One session per call — traces are never cached or reused.
+    """
+
+    builder: "ir.Builder"
+    module: "ir.Module"
+    function: "ir.Function"
+    input_tree: "core.TreeSpec"
+    tensor_specs: Tuple["core.TensorSpec", ...]
+    static_values: Tuple[StaticValue, ...]
+    args: Tuple[Any, ...]
+    symbolics: list
+    source_locations: dict
+    call_site: "ir.Location"
+
+    @classmethod
+    def open(cls, specs: Tuple[Any, ...]) -> "_TraceSession":
+        """Trace-algorithm steps 1-4: IR skeleton + classified inputs + args.
+
+        1. (Unwrapping the ``Defn`` marker is `trace()`'s job — this is pure
+           input handling.)
+        2. Classify the specs tuple as one pytree (`_flatten_specs`).
+        3. Build the module + entry function with one block arg per tensor
+           input; wrap each block arg as a `SymbolicTensor` and record the
+           `trace()` call-site location.
+        4. Reconstruct the call arguments.
+        """
+        builder = ir.Builder()
+        module = builder.build_module(name="main")
+        input_tree, tensor_specs, static_values = _flatten_specs(specs)
+        input_types = tuple(
+            ir.ValueType(spec.dtype, tuple(spec.shape)) for spec in tensor_specs
         )
-    # 3. dataclass instances (never the class itself). etl's own value types
-    #    (Device, Dim, Group, ...) are LEAVES — the same module check as
-    #    core.tree._flatten_into; only user-defined dataclasses act as pytree
-    #    containers.
-    if (
-        dataclasses.is_dataclass(obj)
-        and not isinstance(obj, type)
-        and not obj_type.__module__.split(".")[0] == "etl"
-    ):
-        fields = dataclasses.fields(obj)
-        child_specs = tuple(
-            _flatten_trace_into(getattr(obj, field.name), leaves) for field in fields
+        function = builder.build_function(name="main", input_types=input_types)
+        block_args = function.entry_block.arguments
+
+        call_site = _trace_call_site()
+        symbolics = []
+        source_locations = {}
+        for block_arg, spec in zip(block_args, tensor_specs):
+            symbolic = _spec_to_symbolic(block_arg, spec)
+            symbolics.append(symbolic)
+            source_locations[symbolic.id] = call_site
+
+        args = _reconstruct_args(input_tree, tensor_specs, static_values, symbolics)
+        return cls(
+            builder=builder,
+            module=module,
+            function=function,
+            input_tree=input_tree,
+            tensor_specs=tensor_specs,
+            static_values=static_values,
+            args=args,
+            symbolics=symbolics,
+            source_locations=source_locations,
+            call_site=call_site,
         )
-        return core.TreeSpec(
-            type=obj_type,
-            children=child_specs,
-            node_data=[field.name for field in fields],
+
+    def run(self, fn: Any) -> Any:
+        """Trace-algorithm step 5: call `fn(*args)` exactly ONCE.
+
+        Normal Python execution under the active builder: static values
+        behave like Python (control flow over them specializes the graph);
+        tensor ops build IR via `current_builder()`. Closure-captured
+        concrete tensors fail inside ops themselves (`core.TraceError` from
+        ops — see the ops contract); the tracer does not pre-scan closures.
+        """
+        with with_builder(self.builder):
+            return fn(*self.args)
+
+    def finish(self, outputs: Any) -> Graph:
+        """Trace-algorithm steps 6-7: classify outputs, emit the `return`
+        terminator, wrap the `Graph`.
+
+        NOT verified automatically (staging stays explicit); `etl.build`
+        runs `graph.verify()` as part of its documented composition.
+        """
+        result_values, output_static_values, output_tree = _classify_outputs(
+            outputs, self.call_site
         )
-    # 4-6. Plain containers: tuple, list, dict (keys sorted for determinism).
-    if isinstance(obj, tuple):
-        child_specs = tuple(_flatten_trace_into(child, leaves) for child in obj)
-        return core.TreeSpec(type=obj_type, children=child_specs)
-    if isinstance(obj, list):
-        child_specs = tuple(_flatten_trace_into(child, leaves) for child in obj)
-        return core.TreeSpec(type=obj_type, children=child_specs)
-    if isinstance(obj, dict):
-        keys = sorted(obj)
-        child_specs = tuple(
-            _flatten_trace_into(obj[key], leaves) for key in keys
+        _return_terminator(self.builder, result_values)
+        return Graph(
+            self.module,
+            self.input_tree,
+            self.tensor_specs,
+            output_tree,
+            self.static_values,
+            output_static_values,
+            self.source_locations,
         )
-        return core.TreeSpec(type=obj_type, children=child_specs, node_data=keys)
-    # Leaf: anything else (None, scalars, static values, concrete tensors, ...).
-    leaves.append(obj)
-    return core.TreeSpec(type=obj_type)
 
 
 def trace(fn_or_defn: Any, *specs: Any) -> Graph:
@@ -162,7 +249,10 @@ def trace(fn_or_defn: Any, *specs: Any) -> Graph:
     1. Unwrap: a `Defn` (or any object with `__etl_defn__`) yields its `fn`;
        plain callables are accepted as-is.
     2. Treat the `specs` tuple (the traced function's positional arguments)
-       as one pytree. Flatten via `core.TreeSpec`; every leaf must be either:
+       as one pytree. Flatten via the local `_flatten_trace` (the shared
+       `./_tree.py` walker with the trace leaf policy — mirrors
+       `core.flatten`'s container rules; `TensorSpec`/`SymbolicTensor`
+       become typed marker leaves). Every leaf must be either:
          - `core.TensorSpec` → tensor input (shape may contain `Dim`/
            `DimExpr`; `None` dims = runtime-dynamic, unchecked),
          - a static Python value per `_is_static_value` → graph
@@ -201,100 +291,17 @@ def trace(fn_or_defn: Any, *specs: Any) -> Graph:
        NOT verified automatically (staging stays explicit); `etl.build`
        runs `graph.verify()` as part of its documented composition.
 
+    The whole trace state lives in one `_TraceSession` (steps 2-4 = `open`,
+    step 5 = `run`, steps 6-7 = `finish`).
+
     Notes: zero specs → a zero-input graph (valid). Every call produces a NEW
     `Graph` (no caching). `**kwargs` is deliberately not part of the public
     signature.
     """
-    # 1. Unwrap the graph-definition marker.
     fn = _unwrap_defn(fn_or_defn)
-
-    # 2. Flatten + classify the specs tuple (ONE pytree).
-    input_tree, tensor_specs, static_values = _flatten_specs(specs)
-
-    # 3. IR: module + entry function with one block arg per tensor input.
-    builder = ir.Builder()
-    module = builder.build_module(name="main")
-    input_types = tuple(
-        ir.ValueType(spec.dtype, tuple(spec.shape)) for spec in tensor_specs
-    )
-    function = builder.build_function(name="main", input_types=input_types)
-    block_args = function.entry_block.arguments
-
-    location = _trace_call_site()
-    symbolics = []
-    source_locations = {}
-    for block_arg, spec in zip(block_args, tensor_specs):
-        symbolic = _spec_to_symbolic(block_arg, spec)
-        symbolics.append(symbolic)
-        source_locations[symbolic.id] = location
-
-    # 4. Reconstruct the argument structure: SymbolicTensors at tensor
-    #    positions, the original static values at static positions.
-    static_by_index = {static.index: static.value for static in static_values}
-    arg_leaves = []
-    tensor_pos = 0
-    for index in range(input_tree.num_leaves):
-        if index in static_by_index:
-            arg_leaves.append(static_by_index[index])
-        else:
-            arg_leaves.append(symbolics[tensor_pos])
-            tensor_pos += 1
-    args = core.unflatten(arg_leaves, input_tree)
-
-    # 5. Run the function exactly ONCE under the active builder.
-    with with_builder(builder):
-        outputs = fn(*args)
-
-    # 6. Flatten + classify the outputs; emit the return terminator.
-    output_leaves, output_tree = _flatten_trace(outputs)
-    result_values = []
-    output_static_values = []
-    for index, (leaf, path) in enumerate(
-        zip(output_leaves, _iter_leaf_paths(output_tree))
-    ):
-        if isinstance(leaf, _SymbolicLeaf):
-            result_values.append(leaf.symbolic.value)
-        elif isinstance(leaf, _TensorSpecLeaf):
-            raise core.TraceError(
-                f"Invalid trace output at pytree path {_format_path(path)} "
-                f"(traced at {location}): a core.TensorSpec cannot be "
-                "returned from a traced function — TensorSpecs describe "
-                "future runtime tensors (inputs); return the SymbolicTensor "
-                "produced by tensor ops instead."
-            )
-        elif _is_static_value(leaf):
-            output_static_values.append(
-                StaticValue(
-                    index=index,
-                    path=path,
-                    value=leaf,
-                    kind=type(leaf).__qualname__,
-                )
-            )
-        else:
-            raise core.TraceError(
-                f"Invalid trace output at pytree path {_format_path(path)} "
-                f"(traced at {location}): got {leaf!r} of type "
-                f"{type(leaf).__name__}. Graph outputs must be "
-                "core.SymbolicTensor values (built by tensor ops) or static "
-                "Python values (None/bool/int/float/complex/str/Enum/dtype/"
-                "slice). There is no eager mode — concrete tensors (Tensor/"
-                "numpy arrays) can never be returned from a traced function."
-            )
-    builder.set_terminator(
-        builder.current_block, "return", operands=tuple(result_values)
-    )
-
-    # 7. Wrap into a Graph — NOT verified automatically (staging explicit).
-    return Graph(
-        module,
-        input_tree,
-        tensor_specs,
-        output_tree,
-        static_values,
-        tuple(output_static_values),
-        source_locations,
-    )
+    session = _TraceSession.open(specs)
+    outputs = session.run(fn)
+    return session.finish(outputs)
 
 
 def _unwrap_defn(fn_or_defn: Any) -> Any:
@@ -309,35 +316,10 @@ def _unwrap_defn(fn_or_defn: Any) -> Any:
     return fn_or_defn
 
 
-def _is_static_value(obj: Any) -> bool:
-    """True iff `obj` is a static Python value that specializes the graph.
-
-    Accepted (per the root value-model contract): `None`, bool, int, float,
-    complex, str, `enum.Enum`, numpy `dtype` objects, `slice`, `core.Dim` /
-    `core.DimExpr` (symbolic shape expressions — one leaf, snapshotted like
-    any other static value), and `core.Device` (a static device spec — one
-    leaf, snapshotted like any other static value). Everything else
-    (including numpy scalars and other config objects) is NOT static in v1 —
-    `trace` raises `TraceError` for it.
-    """
-    if obj is None:
-        return True
-    # bool must be checked before int (True is an int instance).
-    if isinstance(obj, (bool, int, float, complex, str, slice, enum.Enum)):
-        return True
-    if isinstance(obj, np.dtype):
-        return True
-    if isinstance(obj, (core.Dim, core.DimExpr)):
-        return True
-    if isinstance(obj, core.Device):
-        return True
-    return False
-
-
 def _flatten_specs(
     specs: Tuple[Any, ...],
 ) -> Tuple["core.TreeSpec", Tuple["core.TensorSpec", ...], Tuple[StaticValue, ...]]:
-    """Flatten + classify the trace inputs.
+    """Flatten + classify the trace inputs (trace-algorithm step 2).
 
     Contract: treat `specs` (a tuple of positional arguments) as one pytree;
     each leaf is a `TensorSpec` (tensor input), a static value (specializes),
@@ -347,8 +329,6 @@ def _flatten_specs(
     `input_tree`'s leaves hold the original leaf objects, `tensor_specs` is
     in flat leaf order, and each `StaticValue` records (flat index, path,
     value, type name).
-
-    Implement in Phase 2 (pure tree walking over `core.TreeSpec`).
     """
     leaves, input_tree = _flatten_trace(specs)
     tensor_specs = []
@@ -364,14 +344,7 @@ def _flatten_specs(
                 "Declare tensor inputs with core.TensorSpec(shape, dtype)."
             )
         elif _is_static_value(leaf):
-            static_values.append(
-                StaticValue(
-                    index=index,
-                    path=path,
-                    value=leaf,
-                    kind=type(leaf).__qualname__,
-                )
-            )
+            static_values.append(_static_record(index, path, leaf))
         else:
             raise core.TraceError(
                 f"Invalid trace input at pytree path {_format_path(path)}: "
@@ -387,12 +360,80 @@ def _flatten_specs(
     return input_tree, tuple(tensor_specs), tuple(static_values)
 
 
+def _reconstruct_args(
+    input_tree: "core.TreeSpec",
+    tensor_specs: Tuple["core.TensorSpec", ...],
+    static_values: Tuple[StaticValue, ...],
+    symbolics: list,
+) -> Tuple[Any, ...]:
+    """Trace-algorithm step 4: rebuild the call arguments.
+
+    Unflatten the input tree with `SymbolicTensor`s at tensor positions
+    (consumed in `tensor_specs` order) and the original static values at the
+    recorded static indices.
+    """
+    static_by_index = {static.index: static.value for static in static_values}
+    arg_leaves = []
+    tensor_pos = 0
+    for index in range(input_tree.num_leaves):
+        if index in static_by_index:
+            arg_leaves.append(static_by_index[index])
+        else:
+            arg_leaves.append(symbolics[tensor_pos])
+            tensor_pos += 1
+    return core.unflatten(arg_leaves, input_tree)
+
+
+def _classify_outputs(
+    outputs: Any, call_site: "ir.Location"
+) -> Tuple[tuple, tuple, "core.TreeSpec"]:
+    """Trace-algorithm step 6: flatten + classify the traced function's
+    outputs.
+
+    Returns `(result_values, output_static_values, output_tree)`:
+    `result_values` are the flat `ir.Value`s for the `return` terminator
+    (SymbolicTensor leaves only), `output_static_values` are the recorded
+    static leaves (re-inserted by `Graph.unflatten_outputs`), and
+    `output_tree` is the output TreeSpec. Anything that is neither a
+    SymbolicTensor nor a static value → `core.TraceError` naming the path.
+    """
+    output_leaves, output_tree = _flatten_trace(outputs)
+    result_values = []
+    output_static_values = []
+    for index, (leaf, path) in enumerate(
+        zip(output_leaves, _iter_leaf_paths(output_tree))
+    ):
+        if isinstance(leaf, _SymbolicLeaf):
+            result_values.append(leaf.symbolic.value)
+        elif isinstance(leaf, _TensorSpecLeaf):
+            raise core.TraceError(
+                f"Invalid trace output at pytree path {_format_path(path)} "
+                f"(traced at {call_site}): a core.TensorSpec cannot be "
+                "returned from a traced function — TensorSpecs describe "
+                "future runtime tensors (inputs); return the SymbolicTensor "
+                "produced by tensor ops instead."
+            )
+        elif _is_static_value(leaf):
+            output_static_values.append(_static_record(index, path, leaf))
+        else:
+            raise core.TraceError(
+                f"Invalid trace output at pytree path {_format_path(path)} "
+                f"(traced at {call_site}): got {leaf!r} of type "
+                f"{type(leaf).__name__}. Graph outputs must be "
+                "core.SymbolicTensor values (built by tensor ops) or static "
+                "Python values (None/bool/int/float/complex/str/Enum/dtype/"
+                "slice). There is no eager mode — concrete tensors (Tensor/"
+                "numpy arrays) can never be returned from a traced function."
+            )
+    return tuple(result_values), tuple(output_static_values), output_tree
+
+
 def _spec_to_symbolic(
     block_arg: "ir.Value", spec: "core.TensorSpec"
 ) -> "core.SymbolicTensor":
     """Wrap a function block arg as `core.SymbolicTensor` with the spec's
     dtype and symbolic shape (`Dim`/`DimExpr` from `spec.shape`; `None` dims
-    stay dynamic). Implement in Phase 2."""
+    stay dynamic)."""
     shape = []
     for axis, entry in enumerate(spec.shape):
         if entry is None:
@@ -409,42 +450,6 @@ def _spec_to_symbolic(
     return core.SymbolicTensor(
         value=block_arg, dtype=spec.dtype, shape=tuple(shape)
     )
-
-
-def _iter_leaf_paths(
-    tree_spec: "core.TreeSpec", prefix: Tuple[Any, ...] = ()
-) -> Iterator[Tuple[Any, ...]]:
-    """Yield the pytree key path of every leaf in pre-order.
-
-    Matches `core.flatten`'s leaf order exactly (one path per leaf). Path
-    entries are child indices, except `dict` nodes where the recorded sorted
-    key (`node_data`) is used.
-    """
-    if tree_spec.num_leaves == 0:
-        # Empty container (or a container of empty containers): no leaves.
-        return
-    if not tree_spec.children:
-        yield prefix  # a leaf
-        return
-    for index, child in enumerate(tree_spec.children):
-        if isinstance(tree_spec.type, type) and issubclass(tree_spec.type, dict):
-            key = tree_spec.node_data[index]
-        else:
-            key = index
-        yield from _iter_leaf_paths(child, prefix + (key,))
-
-
-def _format_path(path: Tuple[Any, ...]) -> str:
-    """Render a pytree path readably, e.g. ``[0]['weights'][1]``."""
-    if not path:
-        return "()"
-    parts = []
-    for key in path:
-        if isinstance(key, str):
-            parts.append(f"[{key!r}]")
-        else:
-            parts.append(f"[{key}]")
-    return "".join(parts)
 
 
 def _trace_call_site() -> "ir.Location":
