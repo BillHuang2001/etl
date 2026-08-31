@@ -1,10 +1,11 @@
 """Control op defs: constant, stop_gradient, if, while, call, runtime_call,
-block_call, and the ``return`` terminator.
+external_call, block_call, and the ``return`` terminator.
 
 Effects: ``constant``/``stop_gradient``/``if``/``while``/``call``/``return``
 are ``pure`` at the IR level (see CONTEXT.md for the ``call`` caveat);
-``runtime_call`` is ``callback``; ``block_call`` defaults to ``read`` (the
-declared block's actual effects are consulted by verification/backends).
+``runtime_call`` and ``external_call`` are ``callback``; ``block_call``
+defaults to ``read`` (the declared block's actual effects are consulted by
+verification/backends).
 """
 
 from __future__ import annotations
@@ -129,6 +130,35 @@ def _register_control() -> None:
                     name="callback",
                     type=ATTR_STR,
                     description="Registered callback identifier.",
+                ),
+                AttrSpec(
+                    name="result_specs",
+                    type=ATTR_ANY,
+                    description="Declared result ValueTypes (serialized "
+                    "structurally).",
+                ),
+            ),
+        )
+    )
+    register_opdef(
+        OpDef(
+            name="external_call",
+            category=_CATEGORY,
+            description="Invoke a named externally-registered kernel at "
+            "runtime (opaque external-kernel call; effect 'callback': never "
+            "reordered/duplicated/eliminated). The kernel is resolved by "
+            "NAME from the etl.external registry at run time — graph "
+            "artifacts carry only the name string.",
+            arity=(0, None),
+            result_count=None,
+            effect=EFFECT_CALLBACK,
+            attributes=(
+                AttrSpec(
+                    name="name",
+                    type=ATTR_STR,
+                    description="Registered external-kernel name (stable, "
+                    "user-chosen; must be re-registered in any process that "
+                    "loads the graph).",
                 ),
                 AttrSpec(
                     name="result_specs",

@@ -261,6 +261,14 @@ class CompilerBackend(Backend):
                     f"capability drift: the {self.name} backend cannot "
                     "execute runtime_call"
                 )
+            if op.name == "external_call" and not capabilities.external_calls:
+                raise core.BackendError(
+                    f"capability drift: the {self.name} backend cannot "
+                    f"execute external_call op '{op.attributes['name']}' — "
+                    "adapter host-dispatch for external kernels is not yet "
+                    "wired (v1); use the numpy backend or remove the "
+                    "external call from the graph"
+                )
             if op.effect == "collective" and not capabilities.collectives:
                 raise core.BackendError(
                     f"capability drift: the {self.name} backend cannot "

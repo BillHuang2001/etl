@@ -81,6 +81,7 @@ from .stats import median, nansum, std, var  # noqa: F401
 
 # Constants / escape hatches.
 from .constant import constant, runtime_call, stop_gradient  # noqa: F401
+from .external import external_call  # noqa: F401
 
 # Import-time side effect: wire SymbolicTensor operator handlers into core.
 _registration.register_operator_handlers()
@@ -113,5 +114,5 @@ __all__ = [
     # statistics
     "var", "std", "median", "nansum",
     # constants / escape hatches
-    "constant", "runtime_call", "stop_gradient",
+    "constant", "runtime_call", "stop_gradient", "external_call",
 ]

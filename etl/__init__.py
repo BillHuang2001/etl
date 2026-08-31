@@ -187,7 +187,6 @@ from .ops import (  # noqa: F401
     square,
     stack,
     std,
-
     stop_gradient,
     subtract,
     sum,
@@ -204,6 +203,7 @@ from .ops import (  # noqa: F401
     tril,
     triu,
     var,
+    external_call,
 )
 
 # --- Tracing (etl.trace) ---------------------------------------------------
@@ -236,6 +236,14 @@ from . import sparse  # noqa: F401
 # --- Custom blocks (etl.block) ---------------------------------------------
 from . import block  # noqa: F401  (submodule)
 from .block import BlockOp, block, get_block  # noqa: F401
+
+# --- External kernels (etl.external) ----------------------------------------
+from . import external  # noqa: F401  (submodule; the kernel registry)
+from .external import (  # noqa: F401
+    get_external_kernel,
+    register_external_kernel,
+    unregister_external_kernel,
+)
 
 # --- NumPy-like namespace (etl.numpy) --------------------------------------
 from . import numpy  # noqa: F401

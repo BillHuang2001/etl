@@ -222,12 +222,15 @@ COLLECTIVE_MAP: dict[str, str] = {
 # v1; `matrix_rank`/`matrix_exp` need decomposition (SVD cutoff / Padé) —
 # all five defer explicitly (`eigh` is v1 via the while-loop cyclic-Jacobi
 # composition in `_emit_eigh`). `random_multinomial` defers because its
-# cumulative-search decomposition is not wired in v1. The 16
-# `sparse_*`/`dense_dot_sparse` ops (etl.sparse family) are numpy-backend-only
-# in v1 — densify via `etl.sparse.to_dense` to export.
+# cumulative-search decomposition is not wired in v1. `external_call`
+# (named external kernels) defers because adapter host-dispatch is not wired
+# in v1 — round 2. The 16 `sparse_*`/`dense_dot_sparse` ops (etl.sparse
+# family) are numpy-backend-only in v1 — densify via `etl.sparse.to_dense`
+# to export.
 DEFERRED_OPS: frozenset[str] = frozenset(
     {
         "runtime_call",
+        "external_call",
         "block_call",
         "rank",
         "world_size",
