@@ -120,6 +120,14 @@ class CompilerBackend(Backend):
 
     name: ClassVar[str] = ""
     capabilities: ClassVar[Capabilities] = Capabilities()
+    #: Default for the reserved per-call ``sort_emission`` lower option
+    #: ("pair" | "count" | "auto") — forwarded to ``stablehlo.export``; see
+    #: the stablehlo Writer. "pair" keeps the two-operand (key, iota)
+    #: ``stablehlo.sort`` composition everywhere; adapters whose targets
+    #: cannot bufferize multi-operand sorts at sorted-axis extent >= 32
+    #: (iree cuda — upstream bug) override to "auto" (per argsort: count
+    #: composition when the extent >= 32, bit-exact vs numpy, else pair).
+    default_sort_emission: ClassVar[str] = "pair"
 
     @classmethod
     def check_available(cls) -> None:
@@ -257,12 +265,24 @@ class CompilerBackend(Backend):
         # The reserved per-call ``rng_bit_generator`` key (bool or collection
         # of algorithm names) overrides the capability — the pipeline
         # lower/build/evaluate sugar forwards it; compile() ignores unknown
-        # keys, so it is lower-only.
+        # keys, so it is lower-only. ``sort_emission`` and
+        # ``while_init_rewrite`` are analogous reserved keys (see the stablehlo
+        # Writer): the latter defaults ON at export (the iree AffinityAnalysis
+        # SEGV workaround), the former to this adapter's class default.
         rng_option = (options or {}).get(
             "rng_bit_generator", self.capabilities.rng_bit_generator
         )
+        sort_emission = (options or {}).get(
+            "sort_emission", self.default_sort_emission
+        )
+        while_init_rewrite = (options or {}).get("while_init_rewrite", True)
         mlir_text = export(
-            graph, options={"rng_bit_generator": rng_option}
+            graph,
+            options={
+                "rng_bit_generator": rng_option,
+                "sort_emission": sort_emission,
+                "while_init_rewrite": while_init_rewrite,
+            },
         )
 
         from etl.backends.numpy.interpreter import entry_function

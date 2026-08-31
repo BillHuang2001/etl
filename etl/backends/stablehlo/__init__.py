@@ -36,7 +36,18 @@ def export(graph_or_module, options: dict | None = None) -> str:
             subgraphs, so bare exports always work. The compiler adapters
             pass their ``Capabilities.rng_bit_generator`` set through here
             from ``lower()`` (overridable per call via the reserved
-            ``rng_bit_generator`` lower option).
+            ``rng_bit_generator`` lower option). ``sort_emission`` selects
+            the argsort emission: ``"pair"`` (default; the two-operand
+            (key, iota) ``stablehlo.sort``), ``"count"`` (the count-based
+            O(n^2) composition with NO sort op — bit-exact vs numpy, used
+            on iree cuda where multi-operand sorts at sorted-axis extent
+            >= 32 cannot be bufferized), or ``"auto"`` (per argsort: count
+            when the sorted-axis extent >= 32, else pair). The iree
+            adapter defaults to ``"auto"`` (see
+            ``CompilerBackend.default_sort_emission``). ``while_init_rewrite``
+            (bool, default True) rewrites all-zero rank>=1 constant while
+            INIT operands into computed zeros (the iree 3.11.0
+            AffinityAnalysis SEGV workaround — see the Writer).
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external

@@ -275,6 +275,12 @@ class IreeBackend(CompilerBackend):
     """
 
     name = "iree"
+    # "auto" sort emission: the iree-cuda HAL cannot bufferize multi-operand
+    # `stablehlo.sort` whenever the sorted-axis extent is >= 32 (upstream
+    # iree 3.11.0 bug) — the count-based composition (bit-exact vs numpy on
+    # both targets) is used for those argsorts, the two-operand sort for the
+    # rest. Explicit per-call override: `lower(..., sort_emission="pair"|"count")`.
+    default_sort_emission = "auto"
     capabilities = Capabilities(
         dynamic_shapes=True,
         dtypes=_dtype_capabilities(),

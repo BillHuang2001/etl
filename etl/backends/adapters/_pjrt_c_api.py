@@ -789,11 +789,22 @@ def load_plugin_library(path: str):
             f"failed to load the PJRT plugin library {path!r}: {exc}"
         ) from exc
     try:
-        get_api = library.GetPjRtApi
+        get_api = getattr(library, "GetPjRtApi", None)
+        if get_api is None:
+            # Real-world plugins (e.g. jax_cuda12_pjrt 0.4.38's
+            # xla_cuda_plugin.so) export the C symbol as ``GetPjrtApi``
+            # (lowercase "t" — the plugin's C++ shim spelling); accept
+            # both spellings.
+            get_api = getattr(library, "GetPjrtApi", None)
+        if get_api is None:
+            raise PJRTError(
+                f"the library at {path!r} does not export GetPjRtApi()/"
+                "GetPjrtApi() — it is not a PJRT C API plugin"
+            )
     except AttributeError as exc:
         raise PJRTError(
-            f"the library at {path!r} does not export GetPjRtApi() — it is "
-            "not a PJRT C API plugin"
+            f"the library at {path!r} does not export GetPjRtApi()/"
+            "GetPjrtApi() — it is not a PJRT C API plugin"
         ) from exc
     get_api.restype = POINTER(PJRT_Api)
     get_api.argtypes = []
