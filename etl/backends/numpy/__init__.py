@@ -303,12 +303,16 @@ class NumpyExecutable:
     """Backend executable for the numpy interpreter (satisfies ``Executable``).
 
     Attributes:
+        backend_name: ``"numpy"`` (the pipeline uses it to identify the
+            backend for run-stage option/env resolution).
         functions: tuple of module function names.
         device: runtime device (v1: CPU only).
         signature: input/output contract (TreeSpecs + per-leaf specs + static
             values) — used to validate inputs at ``run`` time.
         artifact: the underlying CompiledArtifact — what ``save`` persists.
     """
+
+    backend_name = "numpy"
 
     def __init__(
         self,
@@ -325,7 +329,11 @@ class NumpyExecutable:
         self._interpreter = Interpreter(module=module, signature=signature)
 
     def run(
-        self, flat_input_tensors: list["Tensor"], *, rank_context: Any = None
+        self,
+        flat_input_tensors: list["Tensor"],
+        options: dict | None = None,
+        *,
+        rank_context: Any = None,
     ) -> list["Tensor"]:
         """Execute the program on flat input tensors, returning flat outputs.
 
@@ -350,8 +358,18 @@ class NumpyExecutable:
         ``rank_context`` optionally overrides the execution context
         (``etl.dist.RankContext``) for this run — rank/world_size graph
         scalars and multi-rank collective simulations resolve from it
-        (thread-local, restored afterwards).
+        (thread-local, restored afterwards). It may be passed either as the
+        keyword argument or inside the ``options`` dict (key ``"rank_context"``
+        — the pipeline forwards per-run kwargs through the options dict).
+
+        Options contract: the numpy backend is the REFERENCE interpreter and
+        DELIBERATELY does not validate options — cross-backend scripts pass
+        compiler-option dicts (e.g. ``target_backends``) with a numpy backend
+        too, so unknown keys are ignored here (documented; the compiler
+        adapters validate strictly via their ``KNOWN_OPTIONS``).
         """
+        if options:
+            rank_context = options.get("rank_context", rank_context)
         return self._interpreter.run(flat_input_tensors, rank_context=rank_context)
 
     def save(self, path: str | os.PathLike) -> None:

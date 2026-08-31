@@ -318,8 +318,18 @@ class _Client(_Handle):
             "utf-8", "replace"
         )
 
-    def compile(self, mlir_text: str) -> "_LoadedExecutable":
-        """Compile StableHLO MLIR text (``PJRT_Client_Compile``)."""
+    def compile(
+        self, mlir_text: str, compile_options: bytes | None = None
+    ) -> "_LoadedExecutable":
+        """Compile StableHLO MLIR text (``PJRT_Client_Compile``).
+
+        ``compile_options``: an optional SERIALIZED ``xla.CompileOptionsProto``
+        (raw bytes) handed to the plugin through
+        ``PJRT_Client_Compile_Args.compile_options``/``compile_options_size``
+        — the plugin validates the payload (an invalid proto surfaces as a
+        plugin error). ``None`` (default) = the plugin's default compile
+        options (NULL/0 — the previous behavior).
+        """
         code_buf = ctypes.create_string_buffer(mlir_text.encode("utf-8"))
         fmt_buf = ctypes.create_string_buffer(b"mlir")
         program = pjrt.PJRT_Program(
@@ -329,12 +339,23 @@ class _Client(_Handle):
             format=ctypes.cast(fmt_buf, ctypes.c_void_p),
             format_size=4,  # len("mlir")
         )
+        compile_opts_buf = (
+            ctypes.create_string_buffer(compile_options)
+            if compile_options is not None
+            else None
+        )
         args = pjrt.PJRT_Client_Compile_Args(
             struct_size=pjrt.sizeof(pjrt.PJRT_Client_Compile_Args),
             client=self.ptr,
             program=ctypes.pointer(program),
-            compile_options=None,
-            compile_options_size=0,
+            compile_options=(
+                ctypes.cast(compile_opts_buf, ctypes.c_void_p)
+                if compile_opts_buf is not None
+                else None
+            ),
+            compile_options_size=(
+                len(compile_options) if compile_options is not None else 0
+            ),
             executable=None,
         )
         self.plugin._check(

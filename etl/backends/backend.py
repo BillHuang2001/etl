@@ -82,13 +82,26 @@ class Executable(Protocol):
     Persistence: ``save`` must save the underlying ``CompiledArtifact`` (or an
     equivalent self-describing form) so the executable can be reconstructed
     EXPLICITLY at ``load`` — device handles are never serialized.
+
+    Options contract (binding): ``run`` accepts an optional ``options`` dict
+    of backend-specific RUN options (validated against the backend's
+    ``KNOWN_OPTIONS["run"]`` set — unknown keys raise ``core.BackendError``;
+    the numpy reference backend documents ignoring options instead).
     """
 
     functions: tuple[str, ...]
     device: Device | None
 
-    def run(self, flat_input_tensors: list[Tensor]) -> list[Tensor]:
+    def run(
+        self, flat_input_tensors: list[Tensor], options: dict | None = None
+    ) -> list[Tensor]:
         """Execute the program on flat input tensors, returning flat outputs.
+
+        ``options``: backend-specific per-run options (e.g. the numpy
+        backend's ``rank_context`` execution context); validated by the
+        backend against its known run options — unknown keys raise
+        ``core.BackendError`` (never silently swallowed; the numpy reference
+        backend is the documented exception that ignores options).
 
         Raises ``core.BackendError`` for unsupported ops/features encountered
         at run time (v1 numpy backend supports everything it compiles, so this
@@ -150,11 +163,21 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    def load(self, artifact: "CompiledArtifact", device: Device | None = None) -> "Executable":
+    def load(
+        self,
+        artifact: "CompiledArtifact",
+        device: Device | None = None,
+        options: dict | None = None,
+    ) -> "Executable":
         """Reconstruct a backend executable from an artifact.
 
         NEVER silently re-traces, re-lowers, or re-compiles; backend/device
         mismatches raise ``core.PersistenceError`` (or ``core.BackendError``
         for unsupported device kinds).
+
+        ``options``: backend-specific load/loader options (e.g. the iree
+        adapter's ``iree_runtime_args``, the xla adapter's ``plugin_path``),
+        validated against the backend's ``KNOWN_OPTIONS["load"]`` set —
+        unknown keys raise ``core.BackendError`` (never silently swallowed).
         """
         ...

@@ -124,6 +124,19 @@ class TvmBackend(CompilerBackend):
     """
 
     name: ClassVar[str] = "tvm"
+    #: Options-override contract (see ../options.py): the compile options
+    #: ``tvm_target`` (TVM target string, default "llvm" — e.g. "llvm
+    #: -mcpu=native") and ``tvm_pass_configs`` (dict forwarded to the Relax
+    #: build when the installed TVM accepts it; a non-None value on a TVM
+    #: build without the parameter raises BackendError — never silently
+    #: dropped). No load/run options in v1 (a non-empty options dict at
+    #: those stages raises BackendError).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = {
+        "lower": frozenset({"rng_bit_generator"}),
+        "compile": frozenset({"tvm_target", "tvm_pass_configs"}),
+        "load": frozenset(),
+        "run": frozenset(),
+    }
     capabilities: ClassVar[Capabilities] = Capabilities(
         dynamic_shapes=True,
         dtypes=frozenset(_VALIDATED_DTYPES),
@@ -193,10 +206,36 @@ class TvmBackend(CompilerBackend):
         self.check_available()
         tvm_util.ensure_compat()
 
+        # Options contract: unknown keys raise BackendError; ``tvm_target``
+        # (str, default "llvm") and ``tvm_pass_configs`` (dict | None) are
+        # forwarded to the Relax VM build — arbitrary values pass through,
+        # the build validates them.
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
+        opts = options or {}
+        tvm_target = opts.get("tvm_target", "llvm")
+        if not isinstance(tvm_target, str):
+            raise core.BackendError(
+                f"the {self.name} 'tvm_target' compile option must be a "
+                f"target string (e.g. 'llvm' or 'llvm -mcpu=native'), got "
+                f"{tvm_target!r}"
+            )
+        tvm_pass_configs = opts.get("tvm_pass_configs")
+        if tvm_pass_configs is not None and not isinstance(
+            tvm_pass_configs, dict
+        ):
+            raise core.BackendError(
+                f"the {self.name} 'tvm_pass_configs' compile option must be "
+                f"a dict, got {tvm_pass_configs!r}"
+            )
+
         mlir_module = tvm_util.parse_stablehlo(mlir_text)
         tvm_util.precheck_module(mlir_module)
         relax_module = tvm_util.translate(mlir_text)
-        executable = tvm_util.build_vm_executable(relax_module, target="llvm")
+        executable = tvm_util.build_vm_executable(
+            relax_module, target=tvm_target, pass_configs=tvm_pass_configs
+        )
         library_base64 = tvm_util.export_library_base64(executable)
 
         runtime_dependencies = {
@@ -296,7 +335,16 @@ class TvmExecutable(CompilerExecutable):
 
     backend_name: ClassVar[str] = "tvm"
 
-    def run(self, flat_input_tensors: list[core.Tensor]) -> list[core.Tensor]:
+    # Run-stage option validation table — mirrors ``TvmBackend.KNOWN_OPTIONS``
+    # (single source of truth; the class attribute is defined here so the
+    # executable validates independently of the backend instance).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = TvmBackend.KNOWN_OPTIONS
+
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
         """Execute the compiled program on flat input tensors.
 
         Validation mirrors the numpy interpreter's contract:
@@ -309,7 +357,15 @@ class TvmExecutable(CompilerExecutable):
         validated: the VM accepts multiple concrete sizes);
         (d) outputs are validated against ``signature.output_specs``
         (count + dtype, ``BackendError``).
+
+        ``options``: per-run options, validated against ``KNOWN_OPTIONS`` —
+        the tvm run stage has NO known options in v1, so any non-empty
+        options dict raises ``core.BackendError`` (loud; never silently
+        swallowed).
         """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
         vm = self.native_module
         signature = self.signature
         input_specs = tuple(signature.input_specs) if signature is not None else ()

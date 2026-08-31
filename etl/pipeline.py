@@ -76,6 +76,7 @@ from etl import core
 from etl.backends import CompiledArtifact, LoweredProgram
 from etl.core import first_mismatch_path, format_path
 from etl.core import tree as _core_tree
+from etl.pipeline_options import apply_env_options
 from etl.trace import Graph
 from etl.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
@@ -123,6 +124,16 @@ class Executable:
             plan = _build_output_plan(self.signature)
             self._output_plan = plan
         return plan
+
+    @property
+    def backend(self):
+        """Backend name the executable runs on (e.g. ``"numpy"``, ``"iree"``).
+
+        Delegates to the backend executable's ``backend_name`` class
+        attribute (declared by every in-tree backend) — used by ``etl.run``
+        for run-stage option/env resolution.
+        """
+        return getattr(self.backend_executable, "backend_name", None)
 
     @property
     def functions(self):
@@ -263,6 +274,11 @@ class BoundExecutable:
         """Device the wrapped executable is bound to."""
         return self.executable.device
 
+    @property
+    def backend(self):
+        """Backend name the wrapped executable runs on (delegates)."""
+        return self.executable.backend
+
 
 # ---------------------------------------------------------------------------
 # Orchestration
@@ -397,6 +413,12 @@ def lower(graph, backend=None, **options):
     (input/output TreeSpec, specs, static values) and produces a
     backend-specific lowered program. A non-``Graph`` input raises
     ``TypeError`` — no earlier-stage object is silently consumed.
+
+    Options contract: ``options`` are validated by the backend against its
+    ``KNOWN_OPTIONS`` union (unknown keys -> ``core.BackendError``; keys
+    valid for other stages pass). Per-backend option env vars
+    (``ETL_*``, see ``etl.pipeline_options``) are applied for keys not
+    passed explicitly — precedence: explicit kwarg > env var > etl default.
     """
     if not isinstance(graph, Graph):
         raise TypeError(
@@ -404,6 +426,7 @@ def lower(graph, backend=None, **options):
             f"{type(graph).__name__}"
         )
     backend = _resolve_backend(backend)
+    options = apply_env_options(backend.name, options, "lower")
     return backend.lower(graph, dict(options))
 
 
@@ -413,6 +436,13 @@ def compile(lowered, backend=None, **options):
     ``backend`` may be omitted (taken from the lowered program) but must
     match if given (``core.BackendError`` naming both otherwise). Does NOT
     silently re-lower. A non-``LoweredProgram`` input raises ``TypeError``.
+
+    Options contract: ``options`` are validated by the backend against its
+    ``KNOWN_OPTIONS`` union (unknown keys -> ``core.BackendError``; keys
+    valid for other stages pass). Per-backend option env vars (e.g.
+    ``ETL_IREE_COMPILE_ARGS``, ``ETL_XLA_COMPILE_OPTIONS``,
+    ``ETL_TVM_TARGET``/``ETL_TVM_PASS_CONFIGS``) are applied for keys not
+    passed explicitly — precedence: explicit kwarg > env var > etl default.
     """
     if not isinstance(lowered, LoweredProgram):
         raise TypeError(
@@ -429,10 +459,11 @@ def compile(lowered, backend=None, **options):
             )
     else:
         resolved = backends.get(lowered.backend)
+    options = apply_env_options(resolved.name, options, "compile")
     return resolved.compile(lowered, dict(options))
 
 
-def load(artifact, backend=None, device=None):
+def load(artifact, backend=None, device=None, **options):
     """``load(artifact) -> Executable``.
 
     ``backend`` may be omitted (taken from the artifact) but must match if
@@ -442,6 +473,14 @@ def load(artifact, backend=None, device=None):
     anything else -> ``core.DeviceError``. Returns the user-facing wrapper
     carrying the structured signature (the artifact's live decoded
     signature). A non-``CompiledArtifact`` input raises ``TypeError``.
+
+    Options contract: ``options`` are backend-specific load/loader options
+    (e.g. the iree adapter's ``iree_runtime_args``, the xla adapter's
+    ``plugin_path``), validated by the backend against its ``KNOWN_OPTIONS``
+    union (unknown keys -> ``core.BackendError``; keys valid for other
+    stages pass). Per-backend option env vars (e.g. ``ETL_IREE_RUNTIME_ARGS``)
+    are applied for keys not passed explicitly — precedence: explicit kwarg
+    > env var > etl default.
     """
     if not isinstance(artifact, CompiledArtifact):
         raise TypeError(
@@ -466,7 +505,11 @@ def load(artifact, backend=None, device=None):
             )
     resolved = backends.get(artifact.backend)
     device = _normalize_device(device)
-    backend_executable = resolved.load(artifact, device)
+    options = apply_env_options(artifact.backend, options, "load")
+    if options:
+        backend_executable = resolved.load(artifact, device, options)
+    else:
+        backend_executable = resolved.load(artifact, device)
     return Executable(backend_executable, artifact.signature)
 
 
@@ -1139,7 +1182,7 @@ def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def run(executable, *args):
+def run(executable, *args, **options):
     """``run(executable, *tensors) -> structured outputs``.
 
     Accepts an ``Executable`` or a ``BoundExecutable`` (anything else ->
@@ -1148,6 +1191,15 @@ def run(executable, *args):
     (DTypeError/ShapeError/DeviceError/TraceError), calls the backend
     executable with flat tensors, and reconstructs the structured outputs
     (including recorded static output leaves).
+
+    Options contract: ``options`` are backend-specific per-run options,
+    validated by the backend executable against its ``KNOWN_OPTIONS`` union
+    (unknown keys -> ``core.BackendError``; the numpy reference backend
+    documents ignoring options — e.g. ``rank_context`` may be passed here
+    and is forwarded to the numpy interpreter's execution context). No
+    run-stage env vars exist in v1 (the plumbing is in place).
+    ``evaluate`` does not forward explicit run options in v1 — pass them to
+    ``etl.run`` directly.
 
     Internally, the executable caches the input/output leaf layouts built
     lazily on the first call (see ``_build_input_plan`` /
@@ -1169,7 +1221,12 @@ def run(executable, *args):
     flat_tensors = _prepare_flat_inputs(
         signature, bound, args, executable._get_input_plan()
     )
-    flat_outputs = executable.backend_executable.run(flat_tensors)
+    options = apply_env_options(executable.backend, options, "run")
+    backend_executable = executable.backend_executable
+    if options:
+        flat_outputs = backend_executable.run(flat_tensors, options)
+    else:
+        flat_outputs = backend_executable.run(flat_tensors)
     return _unflatten_outputs(
         signature, flat_outputs, executable._get_output_plan()
     )
@@ -1241,18 +1298,21 @@ def build(fn, *specs, backend=None, device=None, **options):
     """``build(f, *specs) -> Executable``.
 
     Documented shorthand for ``load(compile(lower(trace(fn, *specs),
-    backend), **options), backend, device)`` — no other behavior (docstring
-    must stay in sync with the expansion)::
+    backend), **options), backend, device, **options)`` — no other behavior
+    (docstring must stay in sync with the expansion)::
 
         graph = etl.trace(fn, *specs)
         lowered = lower(graph, backend=backend, **options)
         artifact = compile(lowered, **options)
-        return load(artifact, backend=backend, device=device)
+        return load(artifact, backend=backend, device=device, **options)
 
-    ``options`` are forwarded to BOTH ``lower`` and ``compile`` (stage-
-    appropriate: each stage uses the keys it understands and ignores the
-    rest, exactly as in the explicit pipeline — e.g. the iree adapter's
-    compile reads ``target_backends`` while its lower ignores it).
+    ``options`` are forwarded to ``lower``, ``compile`` AND ``load``
+    (stage-appropriate: each stage uses the keys it understands, validates
+    them against the backend's ``KNOWN_OPTIONS`` union — a key valid for no
+    stage raises ``core.BackendError`` — and ignores the rest, exactly as in
+    the explicit pipeline: e.g. the iree adapter's compile reads
+    ``target_backends``/``iree_compile_args`` while its load reads
+    ``iree_runtime_args``).
 
     Default resolution (explicit kwargs always win; environment variables
     are read lazily at call time): an unset ``backend`` resolves from
@@ -1263,8 +1323,12 @@ def build(fn, *specs, backend=None, device=None, **options):
     ``target_backends`` is not passed explicitly, ``ETL_TARGET_BACKENDS``
     (comma-separated list) supplies it; otherwise an iree-family backend
     infers it from the resolved device — ``"cuda"`` -> ``["cuda"]``,
-    ``"cpu"`` -> ``["llvm-cpu"]``. With no environment set, the numpy
-    defaults are unchanged.
+    ``"cpu"`` -> ``["llvm-cpu"]``. Per-backend option env vars
+    (``ETL_IREE_COMPILE_ARGS``, ``ETL_IREE_RUNTIME_ARGS``,
+    ``ETL_XLA_COMPILE_OPTIONS``, ``ETL_TVM_TARGET``/``ETL_TVM_PASS_CONFIGS``
+    — see ``etl.pipeline_options``) are applied per stage for option keys
+    not passed explicitly. Precedence (binding): explicit kwarg > env var >
+    etl default. With no environment set, the numpy defaults are unchanged.
     """
     backend, device, options = _resolve_backend_device(backend, device, options)
     from etl.trace import trace as trace_fn
