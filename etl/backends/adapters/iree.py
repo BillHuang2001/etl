@@ -268,6 +268,110 @@ def _resolve_iree_compile_args(
     ] + list(user_args)
 
 
+def _artifact_target(target_backends: tuple[str, ...]) -> str:
+    """The ``CompiledArtifact.target`` label for a target-backends tuple."""
+    if set(target_backends) == {"llvm-cpu"}:
+        return "cpu"
+    if set(target_backends) == {"cuda"}:
+        return "cuda"
+    return "+".join(target_backends)
+
+
+def _runtime_dependencies() -> dict:
+    """Self-describing runtime-dependency versions for CompiledArtifacts."""
+    import numpy as np
+
+    return {
+        "numpy": np.__version__,
+        "iree-base-compiler": _iree_distribution_version(
+            "iree-base-compiler", "iree-compiler"
+        ),
+        "iree-base-runtime": _iree_distribution_version(
+            "iree-base-runtime", "iree-runtime"
+        ),
+    }
+
+
+def _acquire_runtime_device(
+    device_kind: str, device: Device | None, runtime_args: list[str]
+) -> Any:
+    """Acquire the IREE runtime HAL device (shared by single/segment loads).
+
+    CPU: the reliable path (``rt.get_driver("local-task")`` +
+    ``create_default_device()``). CUDA: ``rt.get_driver("cuda")`` +
+    ``driver.create_device(device_id=index+1)`` (IREE cuda device ids are
+    1-BASED: etl ``Device("cuda", index)`` maps to ``device_id = index + 1``
+    — verified empirically on 3.11.0: device_id=4 -> physical GPU 3;
+    device_id=0 raises ValueError "Device id 0 not found", never pass 0);
+    the driver's ``ValueError`` for an out-of-range index is surfaced as
+    ``core.BackendError`` naming the index.
+    """
+    import iree.runtime as rt
+
+    if device_kind == "cuda":
+        _configure_cuda_runtime_flags(tuple(runtime_args))
+        driver = rt.get_driver("cuda")
+        device_id = device.index + 1
+        try:
+            return driver.create_device(device_id=device_id)
+        except ValueError as exc:
+            raise core.BackendError(
+                f"IREE could not acquire CUDA device id {device_id} "
+                f"(1-based; physical GPU index {device.index}): {exc}. "
+                f"IREE cuda device ids are 1-based and device_id=0 does "
+                f"not exist; the requested index must be less than the "
+                f"number of available GPUs (check nvidia-smi)"
+            ) from exc
+    driver = rt.get_driver("local-task")
+    return driver.create_default_device()
+
+
+def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
+    """Load one VM flatbuffer onto ``runtime_device`` (shared load path).
+
+    CUDA: the ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
+    vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module, config)`` path —
+    ``load_vm_flatbuffer``'s driver-name form always creates the DEFAULT
+    device and cannot select a CUDA index. CPU: ``load_vm_flatbuffer(vmfb,
+    driver="local-task")``; a ``ValueError`` (the runtime VM verifier
+    rejecting the module's required features — the mixed-install trap, see
+    ``adapters/CONTEXT.md`` Known Issue #7) is surfaced as an actionable
+    ``core.BackendError`` naming the cause and remedy.
+    """
+    import iree.runtime as rt
+
+    if device_kind == "cuda":
+        config = rt.Config(device=runtime_device)
+        vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
+        return rt.load_vm_module(vm_module, config)
+    try:
+        return rt.load_vm_flatbuffer(vmfb, driver="local-task")
+    except ValueError as exc:
+        # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md): the
+        # legacy iree-compiler/iree-runtime distributions and the current
+        # iree-base-* distributions share the SAME 'iree' Python namespace
+        # and must NOT coexist; a mixed/residual install makes the runtime
+        # VM verifier reject the module ("required module features [Ch] are
+        # not available in this runtime configuration") with a raw ValueError
+        # deep inside the runtime. Surface it as an actionable BackendError
+        # instead of the cryptic raw error.
+        raise core.BackendError(
+            f"IREE could not load the compiled VM module: the runtime "
+            f"rejected the module's required features at load ({exc}). "
+            f"This is almost certainly a MIXED IREE INSTALL: the legacy "
+            f"'iree-compiler'/'iree-runtime' distributions and the "
+            f"current 'iree-base-compiler'/'iree-base-runtime' "
+            f"distributions share the SAME 'iree' Python namespace and "
+            f"must NOT coexist — a mixed or residual install (e.g. pip "
+            f"uninstall leaving dist-info/egg-info residue) makes the "
+            f"runtime verifier claim the module's features are "
+            f"unavailable. Remedy: purge ALL 'iree*' distributions from "
+            f"site-packages (including stale dist-info/egg-info residue) "
+            f"and reinstall ONLY 'iree-base-compiler' and "
+            f"'iree-base-runtime'."
+        ) from exc
+
+
 def _configure_cuda_runtime_flags(user_args: tuple[str, ...] = ()) -> None:
     """Parse the process-global CUDA allocator flag ONCE (idempotent).
 
@@ -427,6 +531,13 @@ class IreeBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
+        # Round 2: adapter host-dispatch for ``external_call`` — graphs
+        # containing the op are split at lower() time into compiled segments
+        # (``CompilerBackend._lower_external_segments`` + ``external_split``)
+        # and the kernel calls are dispatched on the HOST between segment
+        # runs (staging via the existing device-resident Tensor paths). See
+        # ``etl/CONTEXT.md`` "External kernels" and ``IreeExternalExecutable``.
+        external_calls=True,
         # {"threefry2x32"} (measured): native THREE_FRY via
         # stablehlo.rng_bit_generator is verified BIT-EXACT vs numpy on
         # llvm-cpu AND cuda (iree 3.11.0) and faster than the inline
@@ -511,6 +622,8 @@ class IreeBackend(CompilerBackend):
                 "silently re-lower"
             )
         payload = lowered.payload
+        if isinstance(payload, dict) and payload.get("format") == "stablehlo-segments":
+            return self._compile_segments(lowered, payload, options)
         if not (
             isinstance(payload, dict)
             and payload.get("format") == "stablehlo"
@@ -528,7 +641,6 @@ class IreeBackend(CompilerBackend):
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
 
-        import iree.compiler as iree_compiler
         import numpy as np
 
         entry_functions = tuple(payload.get("entry_functions", ()))
@@ -540,9 +652,44 @@ class IreeBackend(CompilerBackend):
                 "entry functions"
             )
         mlir_text = payload["mlir_text"]
-        # Compile targets come from the ``target_backends`` compile option
-        # (default ["llvm-cpu"] — unchanged CPU behavior). v1 supported set:
-        # {"llvm-cpu", "cuda"}.
+        target_backends, extra_args = self._resolve_compile_options(options)
+        vmfb = self._compile_mlir(mlir_text, target_backends, extra_args)
+
+        artifact_target = _artifact_target(target_backends)
+        artifact_payload = {
+            "format": "iree-vmfb",
+            "format_version": 1,
+            "mlir_text": mlir_text,
+            "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
+            "entry_functions": entry_functions,
+            "target_backends": target_backends,
+        }
+        return CompiledArtifact(
+            backend=self.name,
+            signature=lowered.signature,
+            target=artifact_target,
+            payload=artifact_payload,
+            required_custom_ops=(),
+            runtime_dependencies=_runtime_dependencies(),
+        )
+
+    # -------------------------------------------------- external-call split
+
+    def _resolve_compile_options(
+        self, options: dict | None
+    ) -> tuple[tuple[str, ...], list[str]]:
+        """Resolve the ``target_backends`` + ``iree_compile_args`` options.
+
+        Compile targets come from the ``target_backends`` compile option
+        (default ``["llvm-cpu"]`` — unchanged CPU behavior). v1 supported
+        set: ``{"llvm-cpu", "cuda"}``. ``iree_compile_args`` carries
+        arbitrary iree-compile flags (list/tuple of flag strings; values are
+        NEVER validated here — the compiler validates them and its
+        diagnostics surface as BackendError). etl's minimal defaults are
+        dropped when a user flag overrides them by name; the small
+        documented deny list guards the genuinely required flags (see module
+        constants). Returns ``(target_backends, extra_args)``.
+        """
         raw_targets = (options or {}).get("target_backends", ["llvm-cpu"])
         if (
             not isinstance(raw_targets, (list, tuple))
@@ -562,12 +709,6 @@ class IreeBackend(CompilerBackend):
                     f"{', '.join(sorted(supported_targets))}"
                 )
         target_backends = tuple(raw_targets)
-        # ``iree_compile_args`` — arbitrary iree-compile flags (list/tuple of
-        # flag strings; values are NEVER validated here — the compiler
-        # validates them and its diagnostics surface as BackendError). etl's
-        # minimal defaults are dropped when a user flag overrides them by
-        # name; the small documented deny list guards the genuinely required
-        # flags (see module constants).
         raw_extra = (options or {}).get("iree_compile_args")
         if raw_extra is None:
             user_args: list[str] = []
@@ -582,8 +723,16 @@ class IreeBackend(CompilerBackend):
                 f'["--iree-llvmcpu-target-cpu=native"]), got {raw_extra!r}'
             )
         extra_args = _resolve_iree_compile_args(target_backends, user_args)
+        return target_backends, extra_args
+
+    def _compile_mlir(
+        self, mlir_text: str, target_backends: tuple[str, ...], extra_args: list[str]
+    ) -> bytes:
+        """Invoke iree-compile on one MLIR text; diagnostics -> BackendError."""
+        import iree.compiler as iree_compiler
+
         try:
-            vmfb = iree_compiler.compile_str(
+            return iree_compiler.compile_str(
                 mlir_text,
                 target_backends=list(target_backends),
                 input_type="stablehlo",
@@ -596,35 +745,86 @@ class IreeBackend(CompilerBackend):
                 f"{', '.join(target_backends)}):\n{exc}"
             ) from exc
 
-        if set(target_backends) == {"llvm-cpu"}:
-            artifact_target = "cpu"
-        elif set(target_backends) == {"cuda"}:
-            artifact_target = "cuda"
-        else:
-            artifact_target = "+".join(target_backends)
+    def _compile_segments(
+        self, lowered: LoweredProgram, payload: dict, options: dict | None
+    ) -> CompiledArtifact:
+        """Compile a split external-call payload (``stablehlo-segments``).
+
+        Every segment's MLIR text is compiled to its own VM flatbuffer with
+        the SAME ``target_backends`` / ``iree_compile_args`` options as the
+        single-program path; the artifact records the per-segment vmfbs plus
+        the kernel-call plan (JSON-safe, so the artifact persists without
+        re-lowering). The artifact format is ``iree-vmfb-segments`` — ``load``
+        reconstructs an ``IreeExternalExecutable`` from it.
+        """
+        self.check_available()
+
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
+
+        raw_segments = payload.get("segments")
+        plan = payload.get("plan")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload records no segments"
+            )
+        if not isinstance(plan, dict):
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload records no plan"
+            )
+        from ..external_split import decode_plan
+
+        try:
+            decode_plan(plan)
+        except core.BackendError as exc:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split payload has a malformed "
+                f"plan: {exc}"
+            ) from exc
+
+        target_backends, extra_args = self._resolve_compile_options(options)
+        segments = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict) or not isinstance(
+                raw.get("mlir_text"), str
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split payload segment "
+                    f"{index} is malformed (expected dict with an "
+                    "'mlir_text' string)"
+                )
+            entry_functions = tuple(raw.get("entry_functions", ()))
+            if not entry_functions or not all(
+                isinstance(name, str) for name in entry_functions
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split payload segment "
+                    f"{index} records no entry functions"
+                )
+            vmfb = self._compile_mlir(
+                raw["mlir_text"], target_backends, extra_args
+            )
+            segments.append(
+                {
+                    "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
+                    "entry_functions": entry_functions,
+                    "target_backends": target_backends,
+                }
+            )
         artifact_payload = {
-            "format": "iree-vmfb",
+            "format": "iree-vmfb-segments",
             "format_version": 1,
-            "mlir_text": mlir_text,
-            "vmfb_base64": base64.b64encode(vmfb).decode("ascii"),
-            "entry_functions": entry_functions,
-            "target_backends": target_backends,
+            "segments": segments,
+            "plan": plan,
         }
         return CompiledArtifact(
             backend=self.name,
             signature=lowered.signature,
-            target=artifact_target,
+            target=_artifact_target(target_backends),
             payload=artifact_payload,
             required_custom_ops=(),
-            runtime_dependencies={
-                "numpy": np.__version__,
-                "iree-base-compiler": _iree_distribution_version(
-                    "iree-base-compiler", "iree-compiler"
-                ),
-                "iree-base-runtime": _iree_distribution_version(
-                    "iree-base-runtime", "iree-runtime"
-                ),
-            },
+            runtime_dependencies=_runtime_dependencies(),
         )
 
     def load(
@@ -691,6 +891,8 @@ class IreeBackend(CompilerBackend):
                 "recompile"
             )
         payload = artifact.payload
+        if isinstance(payload, dict) and payload.get("format") == "iree-vmfb-segments":
+            return self._load_segments(artifact, payload, device, options)
         if not (
             isinstance(payload, dict)
             and payload.get("format") == "iree-vmfb"
@@ -766,66 +968,145 @@ class IreeBackend(CompilerBackend):
         import iree.runtime as rt
 
         vmfb = base64.b64decode(payload["vmfb_base64"].encode("ascii"))
-        if device_kind == "cuda":
-            # IREE cuda device ids are 1-BASED: etl Device("cuda", index)
-            # maps to device_id = index + 1 (verified empirically on 3.11.0:
-            # device_id=4 -> physical GPU 3; device_id=0 raises ValueError
-            # "Device id 0 not found" — never pass 0).
-            _configure_cuda_runtime_flags(tuple(runtime_args))
-            driver = rt.get_driver("cuda")
-            device_id = device.index + 1
-            try:
-                runtime_device = driver.create_device(device_id=device_id)
-            except ValueError as exc:
-                raise core.BackendError(
-                    f"IREE could not acquire CUDA device id {device_id} "
-                    f"(1-based; physical GPU index {device.index}): {exc}. "
-                    f"IREE cuda device ids are 1-based and device_id=0 does "
-                    f"not exist; the requested index must be less than the "
-                    f"number of available GPUs (check nvidia-smi)"
-                ) from exc
-            # load_vm_flatbuffer's driver-name form always creates the DEFAULT
-            # device, so it cannot select a CUDA index — bind the module to
-            # the specific acquired device via Config(device=...).
-            config = rt.Config(device=runtime_device)
-            vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
-            module = rt.load_vm_module(vm_module, config)
-        else:
-            driver = rt.get_driver("local-task")
-            runtime_device = driver.create_default_device()
-            try:
-                module = rt.load_vm_flatbuffer(vmfb, driver="local-task")
-            except ValueError as exc:
-                # Mixed-install trap (Known Issue #7 in adapters/CONTEXT.md):
-                # the legacy iree-compiler/iree-runtime distributions and the
-                # current iree-base-* distributions share the SAME 'iree'
-                # Python namespace and must NOT coexist; a mixed/residual
-                # install makes the runtime VM verifier reject the module
-                # ("required module features [Ch] are not available in this
-                # runtime configuration") with a raw ValueError deep inside
-                # the runtime. Surface it as an actionable BackendError
-                # instead of the cryptic raw error.
-                raise core.BackendError(
-                f"IREE could not load the compiled VM module: the runtime "
-                f"rejected the module's required features at load ({exc}). "
-                f"This is almost certainly a MIXED IREE INSTALL: the legacy "
-                f"'iree-compiler'/'iree-runtime' distributions and the "
-                f"current 'iree-base-compiler'/'iree-base-runtime' "
-                f"distributions share the SAME 'iree' Python namespace and "
-                f"must NOT coexist — a mixed or residual install (e.g. pip "
-                f"uninstall leaving dist-info/egg-info residue) makes the "
-                f"runtime verifier claim the module's features are "
-                f"unavailable. Remedy: purge ALL 'iree*' distributions from "
-                f"site-packages (including stale dist-info/egg-info residue) "
-                f"and reinstall ONLY 'iree-base-compiler' and "
-                f"'iree-base-runtime'."
-            ) from exc
+        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        module = _load_vm_module(vmfb, device_kind, runtime_device)
         return IreeExecutable(
             artifact=artifact,
             signature=artifact.signature,
             device=device,
             module=module,
             entry_functions=entry_functions,
+            runtime_device=runtime_device,
+        )
+
+    def _load_segments(
+        self,
+        artifact: CompiledArtifact,
+        payload: dict,
+        device: Device | None,
+        options: dict | None,
+    ) -> "IreeExternalExecutable":
+        """Reconstruct an ``IreeExternalExecutable`` from a split artifact.
+
+        The artifact records one VM flatbuffer per segment plus the kernel-
+        call plan (``format == "iree-vmfb-segments"``). The device is
+        acquired ONCE and every segment module is loaded onto it — segment
+        modules are ordinary compiled functions (no ``external_call``
+        inside), so the same load path as the single-program case applies
+        per segment. The plan is decoded and validated here (malformed =>
+        ``core.BackendError`` "corrupt"); the executable interprets it at
+        run time.
+        """
+        self.check_available()
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
+        raw_runtime = (options or {}).get("iree_runtime_args")
+        if raw_runtime is None:
+            runtime_args: list[str] = []
+        elif isinstance(raw_runtime, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_runtime
+        ):
+            runtime_args = list(raw_runtime)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_runtime_args' load option must be a "
+                f"list/tuple of flag strings (e.g. "
+                f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
+            )
+        _apply_iree_runtime_args(runtime_args)
+        device_kind = "cpu"  # device=None = default CPU device
+        if device is not None:
+            if not isinstance(device, Device):
+                raise core.DeviceError(
+                    f"device must be a core.Device, got "
+                    f"{type(device).__name__}"
+                )
+            if device.kind not in ("cpu", "cuda"):
+                raise core.BackendError(
+                    f"the {self.name} backend supports cpu and cuda devices "
+                    f"only, got device kind {device.kind!r}"
+                )
+            device_kind = device.kind
+        expected_target = "llvm-cpu" if device_kind == "cpu" else "cuda"
+
+        raw_segments = payload.get("segments")
+        plan = payload.get("plan")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact records no segments"
+            )
+        if not isinstance(plan, dict):
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact records no plan"
+            )
+        from ..external_split import decode_plan
+
+        try:
+            decoded_plan = decode_plan(plan)
+        except core.BackendError as exc:
+            raise core.BackendError(
+                f"corrupt: the {self.name} split artifact has a malformed "
+                f"plan: {exc}"
+            ) from exc
+
+        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        segment_execs: list[_IreeSegmentExecutable] = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict) or not isinstance(
+                raw.get("vmfb_base64"), str
+            ):
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split artifact segment "
+                    f"{index} is malformed (expected dict with a "
+                    "'vmfb_base64' string)"
+                )
+            entry_functions = tuple(raw.get("entry_functions", ()))
+            if not entry_functions:
+                raise core.BackendError(
+                    f"corrupt: the {self.name} split artifact segment "
+                    f"{index} records no entry functions"
+                )
+            # Per-segment artifact/device target compatibility (same rule as
+            # the single-program path).
+            raw_targets = raw.get("target_backends")
+            if raw_targets is None:
+                segment_targets = ("llvm-cpu",)
+            elif isinstance(raw_targets, str):
+                segment_targets = (raw_targets,)
+            else:
+                segment_targets = tuple(raw_targets)
+            if expected_target not in segment_targets:
+                raise core.BackendError(
+                    f"the {self.name} split artifact segment {index} was "
+                    f"compiled for target(s) "
+                    f"{', '.join(segment_targets) or '(none)'} and cannot "
+                    f"run on the requested device {device!r} (device kind "
+                    f"{device_kind!r} requires compile target "
+                    f"{expected_target!r}) — never silently recompile"
+                )
+            vmfb = base64.b64decode(raw["vmfb_base64"].encode("ascii"))
+            module = _load_vm_module(vmfb, device_kind, runtime_device)
+            core_device = device if device is not None else Device("cpu", 0)
+            input_specs = tuple(
+                core.TensorSpec(shape=value_type.shape, dtype=value_type.dtype)
+                for value_type in decoded_plan[index]["input_specs"]
+            )
+            segment_execs.append(
+                _IreeSegmentExecutable(
+                    module=module,
+                    runtime_device=runtime_device,
+                    core_device=core_device,
+                    input_specs=input_specs,
+                    cuda=(device_kind == "cuda"),
+                )
+            )
+        return IreeExternalExecutable(
+            artifact=artifact,
+            signature=artifact.signature,
+            device=device,
+            segments=segment_execs,
+            plan=decoded_plan,
             runtime_device=runtime_device,
         )
 
@@ -949,8 +1230,6 @@ class IreeExecutable(CompilerExecutable):
         from ..options import validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
-        import iree.runtime as rt
-        import numpy as np
 
         input_specs = self._input_specs
         output_specs = self._output_specs
@@ -973,39 +1252,13 @@ class IreeExecutable(CompilerExecutable):
                 )
             _validate_input_shape(i, spec.shape, tensor.shape)
 
-        buffers = []
-        for i, tensor in enumerate(flat_input_tensors):
-            data = tensor.data
-            # Device-resident pass-through: an input tensor already living on
-            # THIS executable's device (payload-backed with a matching
-            # core.Device) is handed to the invoke as-is — no host
-            # round-trip, no re-upload. Two payload kinds qualify: our own
-            # _IreeDevicePayload (run outputs of this or another iree
-            # executable — unwrapped to the underlying DeviceArray) and a
-            # raw iree DeviceArray (e.g. a user-constructed payload). The
-            # validation loop above already proved dtype/shape against the
-            # signature, so the payload is guaranteed correct. Anything else
-            # (numpy-backed host input, payload on a different device) takes
-            # the staged upload on cuda (see _staged_input), else the classic
-            # asdevicearray H2D copy path.
-            if isinstance(data, _IreeDevicePayload) and (
-                tensor.device == self._core_device
-            ):
-                buffers.append(data.device_array)
-            elif (
-                not isinstance(data, np.ndarray)
-                and isinstance(data, rt.DeviceArray)
-                and tensor.device == self._core_device
-            ):
-                buffers.append(data)
-            else:
-                staged = self._staged_input(i, tensor)
-                if staged is not None:
-                    buffers.append(staged)
-                else:
-                    buffers.append(
-                        rt.asdevicearray(self.runtime_device, tensor.numpy())
-                    )
+        buffers = _build_buffers(
+            flat_input_tensors,
+            input_specs,
+            self.runtime_device,
+            self._core_device,
+            self._staged_inputs,
+        )
         entry = self._entry_function()
         results = entry(*buffers)
         if results is None:
@@ -1064,133 +1317,440 @@ class IreeExecutable(CompilerExecutable):
         self._entry = entry
         return entry
 
-    def _staged_input(self, index: int, tensor: core.Tensor) -> Any | None:
-        """Upload a host tensor through persistent staging buffers.
+def _staged_input(
+    staged_inputs: dict | None,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+) -> Any | None:
+    """Upload a host tensor through persistent staging buffers.
 
-        CUDA fast path replacing ``rt.asdevicearray`` for host inputs, in
-        two tiers (both fully synchronous — nothing is left racing):
+    CUDA fast path replacing ``rt.asdevicearray`` for host inputs, in
+    two tiers (both fully synchronous — nothing is left racing):
 
-        * TINY inputs (nbytes <= ``_PINNED_DIRECT_MAX_BYTES``): the values
-          are memcpy'd (``np.copyto``) into the mapped view of a persistent
-          DEVICE_LOCAL | HOST_VISIBLE ("pinned") buffer that the dispatches
-          read DIRECTLY — no queue_copy, no semaphore, no wait. The driver
-          serializes the host write against device reads of the mapped
-          memory, so the dispatch always sees the new values; that same
-          serialization is what makes large pinned uploads slow (hence the
-          cutoff — measured 0.5-1.2 ms at 160 KB vs ~0.05-0.06 ms at 8 B
-          including the invoke, and the pinned tier does NOT degrade when
-          the upload follows another invoke, unlike the DMA tier's wait).
-        * LARGER inputs: the values are memcpy'd into the mapped view of a
-          persistent HOST_LOCAL (plain host memory) source buffer, then a
-          per-call ``queue_copy`` (DMA) transfers them into a persistent
-          DEVICE_LOCAL staging buffer the dispatches read, waiting on a
-          FRESH semaphore signaled by the copy before returning. The fresh
-          semaphore is REQUIRED (reusing a waited event-semaphore aborts
-          the cuda HAL, event_semaphore.c:354, on the second use) and the
-          wait is REQUIRED for correctness: the copy and the invoke's
-          dispatches are NOT reliably ordered on the cuda HAL — dropping
-          the wait races the dispatch against the copy (~0.4 % of runs
-          return garbage under alternating-value stress).
+    * TINY inputs (nbytes <= ``_PINNED_DIRECT_MAX_BYTES``): the values
+      are memcpy'd (``np.copyto``) into the mapped view of a persistent
+      DEVICE_LOCAL | HOST_VISIBLE ("pinned") buffer that the dispatches
+      read DIRECTLY — no queue_copy, no semaphore, no wait. The driver
+      serializes the host write against device reads of the mapped
+      memory, so the dispatch always sees the new values; that same
+      serialization is what makes large pinned uploads slow (hence the
+      cutoff — measured 0.5-1.2 ms at 160 KB vs ~0.05-0.06 ms at 8 B
+      including the invoke, and the pinned tier does NOT degrade when
+      the upload follows another invoke, unlike the DMA tier's wait).
+    * LARGER inputs: the values are memcpy'd into the mapped view of a
+      persistent HOST_LOCAL (plain host memory) source buffer, then a
+      per-call ``queue_copy`` (DMA) transfers them into a persistent
+      DEVICE_LOCAL staging buffer the dispatches read, waiting on a
+      FRESH semaphore signaled by the copy before returning. The fresh
+      semaphore is REQUIRED (reusing a waited event-semaphore aborts
+      the cuda HAL, event_semaphore.c:354, on the second use) and the
+      wait is REQUIRED for correctness: the copy and the invoke's
+      dispatches are NOT reliably ordered on the cuda HAL — dropping
+      the wait races the dispatch against the copy (~0.4 % of runs
+      return garbage under alternating-value stress).
 
-        The DeviceArray over the staging/pinned buffer is built ONCE per
-        (input index, shape, dtype) and cached; every call re-copies the
-        current host values into the same mapped view (runs are
-        synchronous, so reuse cannot race).
+    The DeviceArray over the staging/pinned buffer is built ONCE per
+    (input index, shape, dtype) and cached in ``staged_inputs`` (per
+    executable); every call re-copies the current host values into the
+    same mapped view (runs are synchronous, so reuse cannot race).
 
-        Why not use the pinned tier for everything? Measured on IREE
-        3.11.0 / RTX A6000: host writes into host-mapped DEVICE memory go
-        over PCIe write-through AND the driver serializes a host write
-        against outstanding device reads of that memory (~0.3-0.6 ms stall
-        per call at 160 KB), while HOST_LOCAL writes are a plain cached
-        memcpy (~0.01 ms for 160 KB) and the DMA queue_copy is ~0.01 ms —
-        the DMA tier tracks the pure invoke cost at scale.
+    Why not use the pinned tier for everything? Measured on IREE
+    3.11.0 / RTX A6000: host writes into host-mapped DEVICE memory go
+    over PCIe write-through AND the driver serializes a host write
+    against outstanding device reads of that memory (~0.3-0.6 ms stall
+    per call at 160 KB), while HOST_LOCAL writes are a plain cached
+    memcpy (~0.01 ms for 160 KB) and the DMA queue_copy is ~0.01 ms —
+    the DMA tier tracks the pure invoke cost at scale.
 
-        Falls back to ``None`` (caller uses ``asdevicearray``) for
-        non-cuda executables, oversized inputs, unmappable dtypes, and a
-        full cache — semantics identical either way.
-        """
-        if self._staged_inputs is None:
-            return None
-        import numpy as np
-        import iree.runtime as rt
-        from iree.runtime.array_interop import map_dtype_to_element_type
+    Falls back to ``None`` (caller uses ``asdevicearray``) for
+    non-cuda executables (``staged_inputs is None``), oversized inputs,
+    unmappable dtypes, and a full cache — semantics identical either way.
+    """
+    if staged_inputs is None:
+        return None
+    import numpy as np
+    import iree.runtime as rt
+    from iree.runtime.array_interop import map_dtype_to_element_type
 
-        dtype = tensor.dtype
-        shape = tuple(tensor.shape)
-        nbytes = int(np.prod(shape)) * dtype.itemsize
-        if nbytes > _STAGED_INPUT_MAX_BYTES:
-            return None
-        element_type = map_dtype_to_element_type(dtype)
-        if element_type is None:
-            return None
-        key = (index, shape, dtype)
-        cached = self._staged_inputs.get(key)
-        if cached is not None:
-            kind, payload = cached
-            if kind == "pin":
-                da, view = payload
-                np.copyto(view, tensor.numpy())
-                return da
-            hl_buf, hl_view, staging_da = payload
-            np.copyto(hl_view, tensor.numpy())
-            sem = self.runtime_device.create_semaphore(0)
-            self.runtime_device.queue_copy(
-                hl_buf,
-                staging_da._buffer_view.get_buffer(),
-                rt.HalFence.create_at(sem, 0),
-                rt.HalFence.create_at(sem, 1),
-            )
-            rt.HalFence.create_at(sem, 1).wait()
-            return staging_da
-        if len(self._staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
-            self._staged_inputs.clear()  # bounded cache; correctness unaffected
-        if nbytes <= _PINNED_DIRECT_MAX_BYTES:
-            # Pinned direct-read tier: dispatch reads the host-mapped
-            # DEVICE_LOCAL buffer directly; the driver's write/read
-            # serialization orders the host write before the dispatch.
-            buf = self.runtime_device.allocator.allocate_buffer(
-                rt.MemoryType.DEVICE_LOCAL | rt.MemoryType.HOST_VISIBLE,
-                rt.BufferUsage.DEFAULT | rt.BufferUsage.MAPPING,
-                nbytes,
-            )
-            view = buf.map().asarray(shape, np.dtype(dtype))
-            da = rt.DeviceArray(
-                self.runtime_device,
-                rt.HalBufferView(buf, shape, element_type),
-                implicit_host_transfer=False,
-                override_dtype=dtype,
-            )
+    dtype = tensor.dtype
+    shape = tuple(tensor.shape)
+    nbytes = int(np.prod(shape)) * dtype.itemsize
+    if nbytes > _STAGED_INPUT_MAX_BYTES:
+        return None
+    element_type = map_dtype_to_element_type(dtype)
+    if element_type is None:
+        return None
+    key = (index, shape, dtype)
+    cached = staged_inputs.get(key)
+    if cached is not None:
+        kind, payload = cached
+        if kind == "pin":
+            da, view = payload
             np.copyto(view, tensor.numpy())
-            self._staged_inputs[key] = ("pin", (da, view))
             return da
-        # DMA tier: host-local source (plain host memory — cached writes) +
-        # persistent device staging buffer (dispatch storage).
-        hl_buf = self.runtime_device.allocator.allocate_buffer(
-            rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
-            rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
-            nbytes,
-        )
-        hl_view = hl_buf.map().asarray(shape, np.dtype(dtype))
-        stg_buf = self.runtime_device.allocator.allocate_buffer(
-            rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
-        )
-        staging_da = rt.DeviceArray(
-            self.runtime_device,
-            rt.HalBufferView(stg_buf, shape, element_type),
-            implicit_host_transfer=False,
-            override_dtype=dtype,
-        )
+        hl_buf, hl_view, staging_da = payload
         np.copyto(hl_view, tensor.numpy())
-        sem = self.runtime_device.create_semaphore(0)
-        self.runtime_device.queue_copy(
+        sem = runtime_device.create_semaphore(0)
+        runtime_device.queue_copy(
             hl_buf,
             staging_da._buffer_view.get_buffer(),
             rt.HalFence.create_at(sem, 0),
             rt.HalFence.create_at(sem, 1),
         )
         rt.HalFence.create_at(sem, 1).wait()
-        self._staged_inputs[key] = ("dma", (hl_buf, hl_view, staging_da))
         return staging_da
+    if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+        staged_inputs.clear()  # bounded cache; correctness unaffected
+    if nbytes <= _PINNED_DIRECT_MAX_BYTES:
+        # Pinned direct-read tier: dispatch reads the host-mapped
+        # DEVICE_LOCAL buffer directly; the driver's write/read
+        # serialization orders the host write before the dispatch.
+        buf = runtime_device.allocator.allocate_buffer(
+            rt.MemoryType.DEVICE_LOCAL | rt.MemoryType.HOST_VISIBLE,
+            rt.BufferUsage.DEFAULT | rt.BufferUsage.MAPPING,
+            nbytes,
+        )
+        view = buf.map().asarray(shape, np.dtype(dtype))
+        da = rt.DeviceArray(
+            runtime_device,
+            rt.HalBufferView(buf, shape, element_type),
+            implicit_host_transfer=False,
+            override_dtype=dtype,
+        )
+        np.copyto(view, tensor.numpy())
+        staged_inputs[key] = ("pin", (da, view))
+        return da
+    # DMA tier: host-local source (plain host memory — cached writes) +
+    # persistent device staging buffer (dispatch storage).
+    hl_buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
+        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        nbytes,
+    )
+    hl_view = hl_buf.map().asarray(shape, np.dtype(dtype))
+    stg_buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+    )
+    staging_da = rt.DeviceArray(
+        runtime_device,
+        rt.HalBufferView(stg_buf, shape, element_type),
+        implicit_host_transfer=False,
+        override_dtype=dtype,
+    )
+    np.copyto(hl_view, tensor.numpy())
+    sem = runtime_device.create_semaphore(0)
+    runtime_device.queue_copy(
+        hl_buf,
+        staging_da._buffer_view.get_buffer(),
+        rt.HalFence.create_at(sem, 0),
+        rt.HalFence.create_at(sem, 1),
+    )
+    rt.HalFence.create_at(sem, 1).wait()
+    staged_inputs[key] = ("dma", (hl_buf, hl_view, staging_da))
+    return staging_da
+
+
+def _build_buffers(
+    flat_input_tensors: list[core.Tensor],
+    input_specs: tuple,
+    runtime_device: Any,
+    core_device: Device,
+    staged_inputs: dict | None,
+) -> list:
+    """Build the HAL buffers for one invoke from validated input tensors.
+
+    Shared by ``IreeExecutable.run`` and the per-segment executor: an input
+    tensor already living on THIS device (payload-backed with a matching
+    ``core.Device`` — our own ``_IreeDevicePayload`` (run outputs of this or
+    another iree executable, unwrapped to the underlying DeviceArray) or a
+    raw iree ``DeviceArray``) is handed to the invoke as-is — no host
+    round-trip, no re-upload; the caller's validation loop already proved
+    dtype/shape, so the payload is guaranteed correct. Anything else
+    (numpy-backed host input, payload on a different device) takes the
+    staged upload on cuda (``_staged_input``), else the classic
+    ``asdevicearray`` H2D copy path.
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    buffers = []
+    for i, tensor in enumerate(flat_input_tensors):
+        data = tensor.data
+        if isinstance(data, _IreeDevicePayload) and tensor.device == core_device:
+            buffers.append(data.device_array)
+        elif (
+            not isinstance(data, np.ndarray)
+            and isinstance(data, rt.DeviceArray)
+            and tensor.device == core_device
+        ):
+            buffers.append(data)
+        else:
+            staged = _staged_input(staged_inputs, runtime_device, i, tensor)
+            if staged is not None:
+                buffers.append(staged)
+            else:
+                buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
+    return buffers
+
+
+class _IreeSegmentExecutable:
+    """One compiled segment of an external-call graph (internal).
+
+    A segment is an ordinary compiled function (no ``external_call``
+    inside) with its own static input spec list. ``run`` mirrors
+    ``IreeExecutable.run``'s validation + buffer-building + invoke + lazy
+    device-resident output wrapping (shared helpers), against the segment's
+    own input specs.
+    """
+
+    def __init__(
+        self,
+        module: Any,
+        runtime_device: Any,
+        core_device: Device,
+        input_specs: tuple,
+        cuda: bool,
+    ) -> None:
+        self.module = module
+        self.runtime_device = runtime_device
+        self.core_device = core_device
+        self.input_specs = input_specs
+        self._entry: Any = None
+        # CUDA per-call fast path: the same persistent staging machinery as
+        # IreeExecutable (one cache per segment — inputs repeat per run).
+        self._staged_inputs: dict | None = None
+        self._pool_anchor: Any = None
+        if cuda:
+            import iree.runtime as rt
+
+            self._staged_inputs = {}
+            try:
+                self._pool_anchor = runtime_device.allocator.allocate_buffer(
+                    rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
+                )
+            except Exception:
+                self._pool_anchor = None  # best-effort perf anchor, never fatal
+
+    def _entry_function(self) -> Any:
+        """Resolve the segment's "main" entry function (cached once)."""
+        if self._entry is None:
+            self._entry = getattr(self.module, "main")
+        return self._entry
+
+    def run(self, flat_input_tensors: list[core.Tensor]) -> list[core.Tensor]:
+        """Validate + invoke the segment; outputs stay DEVICE-RESIDENT."""
+        input_specs = self.input_specs
+        if len(flat_input_tensors) != len(input_specs):
+            raise core.BackendError(
+                f"external-call segment expects {len(input_specs)} input "
+                f"tensor(s), got {len(flat_input_tensors)}"
+            )
+        for i, tensor in enumerate(flat_input_tensors):
+            if not isinstance(tensor, core.Tensor):
+                raise core.BackendError(
+                    f"external-call segment input {i} must be a core.Tensor, "
+                    f"got {type(tensor).__name__}"
+                )
+            spec = input_specs[i]
+            if tensor.dtype != spec.dtype:
+                raise core.BackendError(
+                    f"external-call segment input {i}: expected dtype "
+                    f"{spec.dtype}, got {tensor.dtype} — never silently "
+                    "coerce"
+                )
+            _validate_input_shape(i, spec.shape, tensor.shape)
+        buffers = _build_buffers(
+            flat_input_tensors,
+            input_specs,
+            self.runtime_device,
+            self.core_device,
+            self._staged_inputs,
+        )
+        results = self._entry_function()(*buffers)
+        if results is None:
+            results = ()
+        elif not isinstance(results, tuple):
+            results = (results,)
+        return [
+            core.Tensor(_IreeDevicePayload(result, self.core_device))
+            for result in results
+        ]
+
+
+class IreeExternalExecutable(CompilerExecutable):
+    """IREE executable for a SPLIT external-call graph (round 2 host-dispatch).
+
+    Runs the graph's compiled segments strictly in plan order on the IREE
+    HAL device; at each ``external_call`` boundary the kernel's operand
+    tensors are staged to HOST numpy arrays (lazy ``.numpy()`` on the
+    device-resident outputs of the producing segment), the registered
+    kernel is dispatched through ``etl.external.get_external_kernel`` (the
+    SAME name-keyed registry the numpy backend uses; an unregistered name
+    raises ``core.BackendError`` pointing at
+    ``etl.register_external_kernel``), and its validated results are staged
+    BACK as host tensors into the following segment's inputs (the existing
+    host-input staging machinery uploads them). Carried plain values that
+    are NOT kernel operands stay device-resident across segment runs —
+    zero extra host round-trips for them.
+
+    Execution model / determinism:
+    - Segments execute strictly sequentially in plan order; the ``callback``
+      effect anchors of the original graph are preserved (a kernel call is
+      never reordered against the compiled ops around it).
+    - Kernels are assumed PURE (same inputs -> same outputs): the same
+      inputs + the same registered kernels produce the same results.
+    - The graph's structured I/O contract (the recorded ``Signature``) is
+      unchanged: ``run`` validates flat inputs against it and returns the
+      graph's flat outputs (the final segment's module outputs).
+    """
+
+    backend_name = "iree"
+
+    # Run-stage option validation table — mirrors ``IreeBackend.KNOWN_OPTIONS``
+    # (the iree run stage has NO known options in v1).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = IreeBackend.KNOWN_OPTIONS
+
+    def __init__(
+        self,
+        artifact: CompiledArtifact,
+        signature: Signature | None,
+        device: core.Device | None,
+        segments: list[_IreeSegmentExecutable],
+        plan: list[dict],
+        runtime_device: Any,
+    ) -> None:
+        super().__init__(
+            artifact=artifact,
+            signature=signature,
+            device=device,
+            native_module=None,  # segments are held per-segment
+            entry_functions=(),
+        )
+        self.runtime_device = runtime_device
+        self._core_device: Device = (
+            device if device is not None else Device("cpu", 0)
+        )
+        self._segments = tuple(segments)
+        self._plan = tuple(plan)
+        self._input_specs = (
+            tuple(signature.input_specs) if signature is not None else ()
+        )
+        self._output_specs = (
+            tuple(signature.output_specs) if signature is not None else ()
+        )
+        if not plan:
+            raise core.BackendError(
+                "corrupt: the external-call plan records no segments"
+            )
+        self._final_module_outputs = plan[-1]["module_outputs"]
+
+    # ------------------------------------------------------------------ run
+
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
+        """Execute the split graph: per-segment device runs + host dispatch.
+
+        1. Validate flat inputs against the recorded ``Signature`` (the
+           original graph's I/O contract — count/dtype/shape, same rules as
+           ``IreeExecutable.run``).
+        2. For each segment in plan order: build its flat input list from
+           (graph inputs) ∪ (carried values from earlier segment outputs —
+           device-resident tensors pass through with no host round-trip) and
+           run it on the device. If the segment ends in an ``external_call``:
+           stage the operand tensors to host numpy arrays, dispatch the
+           registered kernel (missing => ``core.BackendError`` naming the
+           kernel and pointing at ``register_external_kernel``; outputs are
+           validated against the declared result specs — count/dtype/shape,
+           never silent coercion), and store the validated host tensors at
+           the plan's result slots.
+        3. Return the final segment's module outputs (the graph's outputs),
+           validated against the signature output specs.
+        """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
+        from ..external_split import dispatch_external_kernel  # lazy
+
+        input_specs = self._input_specs
+        if len(flat_input_tensors) != len(input_specs):
+            raise core.BackendError(
+                f"program expects {len(input_specs)} input tensor(s), got "
+                f"{len(flat_input_tensors)}"
+            )
+        for i, tensor in enumerate(flat_input_tensors):
+            if not isinstance(tensor, core.Tensor):
+                raise core.BackendError(
+                    f"input {i} must be a core.Tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+            spec = input_specs[i]
+            if tensor.dtype != spec.dtype:
+                raise core.BackendError(
+                    f"input {i}: expected dtype {spec.dtype}, got "
+                    f"{tensor.dtype} — never silently coerce"
+                )
+            _validate_input_shape(i, spec.shape, tensor.shape)
+
+        # segment_outputs[j] = the run-time output slot list of segment j:
+        # slots [0, module_outputs) are the module's return values
+        # (device-resident Tensors); slots [module_outputs, ...) are the
+        # kernel results (host Tensors produced at dispatch time).
+        segment_outputs: list[list[core.Tensor]] = []
+        for segment_index, (segment, plan_segment) in enumerate(
+            zip(self._segments, self._plan)
+        ):
+            seg_inputs = []
+            for entry in plan_segment["inputs"]:
+                kind = entry["kind"]
+                if kind == "graph":
+                    seg_inputs.append(flat_input_tensors[entry["index"]])
+                elif kind in ("carry", "kernel"):
+                    seg_inputs.append(
+                        segment_outputs[entry["segment"]][entry["output"]]
+                    )
+                else:
+                    raise core.BackendError(
+                        f"corrupt: external-call plan segment "
+                        f"{segment_index} has an unknown input kind "
+                        f"{kind!r}"
+                    )
+            outputs = segment.run(seg_inputs)
+            out_slots: list[core.Tensor] = list(outputs)
+            call = plan_segment.get("call")
+            if call is not None:
+                name = call["name"]
+                label = f"op 'external_call' (kernel {name!r})"
+                operand_arrays = [
+                    outputs[slot].numpy()
+                    for slot in call["operand_outputs"]
+                ]
+                results = dispatch_external_kernel(
+                    name, operand_arrays, call["result_specs"], label
+                )
+                out_slots.extend([None] * len(call["result_specs"]))
+                for slot, tensor in zip(call["result_outputs"], results):
+                    out_slots[slot] = tensor
+            segment_outputs.append(out_slots)
+
+        final = segment_outputs[-1]
+        outputs = final[: self._final_module_outputs]
+        if self.signature is not None:
+            if len(outputs) != len(self._output_specs):
+                raise core.BackendError(
+                    f"program produced {len(outputs)} output tensor(s), "
+                    f"expected {len(self._output_specs)}"
+                )
+            for i, (tensor, spec) in enumerate(zip(outputs, self._output_specs)):
+                if tensor.dtype != spec.dtype:
+                    raise core.BackendError(
+                        f"output {i}: expected dtype {spec.dtype}, got "
+                        f"{tensor.dtype} — never silently coerce"
+                    )
+        return outputs
 
 
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
