@@ -318,14 +318,20 @@ class _Client(_Handle):
             "utf-8", "replace"
         )
 
-    def compile(self, mlir_text: str) -> "_LoadedExecutable":
+    def compile(
+        self, mlir_text: str, compile_options: bytes | None = None
+    ) -> "_LoadedExecutable":
         """Compile StableHLO MLIR text (``PJRT_Client_Compile``).
 
-        Real plugins (jax_cuda12_pjrt 0.4.38's xla_cuda_plugin.so et al.)
-        CHECK-crash on NULL ``compile_options`` — the serialized
-        ``xla.CompileOptionsProto`` below (the jax-default single-replica
-        form, probe-validated) must be passed instead.
-        """
+        ``compile_options``: an optional SERIALIZED ``xla.CompileOptionsProto``
+        (raw bytes) handed to the plugin through
+        ``PJRT_Client_Compile_Args.compile_options``/``compile_options_size``
+        — the plugin validates the payload (an invalid proto surfaces as a
+        plugin error). Real plugins (jax_cuda12_pjrt 0.4.38's
+        xla_cuda_plugin.so et al.) CHECK-crash on NULL — callers MUST pass
+        the probe-validated single-replica proto bytes (the iree adapter's
+        default ``xla_compile_options``) unless they know the plugin accepts
+        NULL."""
         code_buf = ctypes.create_string_buffer(mlir_text.encode("utf-8"))
         fmt_buf = ctypes.create_string_buffer(b"mlir")
         program = pjrt.PJRT_Program(
@@ -335,17 +341,23 @@ class _Client(_Handle):
             format=ctypes.cast(fmt_buf, ctypes.c_void_p),
             format_size=4,  # len("mlir")
         )
-        # xla.CompileOptionsProto: {executable_build_options {
-        #   num_replicas: 1, num_partitions: 1 }} — serialized wire bytes
-        # (probe-validated against the real CUDA plugin).
-        opts_bytes = bytes.fromhex("1a0420012801")
-        opts_buf = ctypes.create_string_buffer(opts_bytes)
+        compile_opts_buf = (
+            ctypes.create_string_buffer(compile_options)
+            if compile_options is not None
+            else None
+        )
         args = pjrt.PJRT_Client_Compile_Args(
             struct_size=pjrt.sizeof(pjrt.PJRT_Client_Compile_Args),
             client=self.ptr,
             program=ctypes.pointer(program),
-            compile_options=ctypes.cast(opts_buf, ctypes.c_void_p),
-            compile_options_size=len(opts_bytes),
+            compile_options=(
+                ctypes.cast(compile_opts_buf, ctypes.c_void_p)
+                if compile_opts_buf is not None
+                else None
+            ),
+            compile_options_size=(
+                len(compile_options) if compile_options is not None else 0
+            ),
             executable=None,
         )
         try:

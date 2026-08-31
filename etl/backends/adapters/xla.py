@@ -100,6 +100,20 @@ class XlaBackend(CompilerBackend):
     """
 
     name: ClassVar[str] = "xla"
+    #: Options-override contract (see ../options.py): the compile options
+    #: ``plugin_path`` (plugin discovery — existing) and
+    #: ``xla_compile_options`` (a serialized ``xla.CompileOptionsProto`` as
+    #: bytes, passed to the plugin via PJRT_Client_Compile_Args —
+    #: arbitrary compile-option fields pass through, the plugin validates
+    #: them); ``plugin_path`` is also honored at load (plugin re-discovery
+    #: for deserialization). No run options in v1 (a non-empty run options
+    #: dict raises BackendError).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = {
+        "lower": frozenset({"rng_bit_generator"}),
+        "compile": frozenset({"plugin_path", "xla_compile_options"}),
+        "load": frozenset({"plugin_path"}),
+        "run": frozenset(),
+    }
     capabilities: ClassVar[Capabilities] = Capabilities(
         dynamic_shapes=False,  # static-shape gate in compile()
         dtypes=frozenset(
@@ -224,11 +238,32 @@ class XlaBackend(CompilerBackend):
             signature.output_specs, "output"
         )
 
-        # Compile through the plugin (step 3) — errors raise BackendError.
+        # Options contract (step 3): unknown keys raise BackendError;
+        # ``xla_compile_options`` = a serialized ``xla.CompileOptionsProto``
+        # (bytes) passed to the plugin — arbitrary compile-option fields pass
+        # through, the plugin validates the payload.
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
+        compile_options = (options or {}).get("xla_compile_options")
+        if compile_options is None:
+            # Real PJRT plugins (jax_cuda12_pjrt 0.4.38's xla_cuda_plugin.so)
+            # CHECK-crash on NULL compile_options — default to the
+            # probe-validated jax-default single-replica proto
+            # {executable_build_options { num_replicas: 1, num_partitions: 1 }}.
+            compile_options = bytes.fromhex("1a0420012801")
+        if not isinstance(compile_options, bytes):
+            raise core.BackendError(
+                f"the {self.name} 'xla_compile_options' compile option must "
+                f"be bytes (a serialized xla.CompileOptionsProto), got "
+                f"{type(compile_options).__name__}"
+            )
+
+        # Compile through the plugin (step 4) — errors raise BackendError.
         plugin = _load_plugin(options)
         client = plugin.create_client()
         try:
-            loaded = client.compile(payload["mlir_text"])
+            loaded = client.compile(payload["mlir_text"], compile_options)
             try:
                 serialized = loaded.serialize()
             finally:
@@ -288,7 +323,10 @@ class XlaBackend(CompilerBackend):
     # ------------------------------------------------------------------- load
 
     def load(
-        self, artifact: CompiledArtifact, device: core.Device | None = None
+        self,
+        artifact: CompiledArtifact,
+        device: core.Device | None = None,
+        options: dict | None = None,
     ) -> "XlaExecutable":
         """Reconstruct an ``XlaExecutable`` from a serialized artifact.
 
@@ -298,7 +336,10 @@ class XlaBackend(CompilerBackend):
         ``core.DeviceError``; non-cpu kind -> ``core.BackendError``), and
         the payload format. The base64 executable is deserialized with
         ``PJRT_Executable_DeserializeAndLoad`` on a fresh client from the
-        (re-discovered) plugin. NEVER re-traces, re-lowers, or
+        (re-discovered) plugin — the ``plugin_path`` load option is honored
+        for discovery (falls back to ``ETL_PJRT_PLUGIN`` / well-known
+        paths). Options are validated against ``KNOWN_OPTIONS`` (unknown
+        keys => ``core.BackendError``). NEVER re-traces, re-lowers, or
         re-compiles; a deserialization failure (environment/ABI mismatch)
         raises ``core.PersistenceError`` — no silent recompilation.
         """
@@ -307,6 +348,9 @@ class XlaBackend(CompilerBackend):
                 f"artifact was produced by backend {artifact.backend!r}; "
                 "the xla backend cannot load it"
             )
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
         self.check_available()
         if device is not None:
             if not isinstance(device, core.Device):
@@ -335,7 +379,7 @@ class XlaBackend(CompilerBackend):
                 "executable_base64 field"
             )
 
-        plugin = _load_plugin()
+        plugin = _load_plugin(options)  # plugin_path load option honored
         client = plugin.create_client()
         try:
             serialized = base64.b64decode(payload["executable_base64"])
@@ -376,6 +420,11 @@ class XlaExecutable(CompilerExecutable):
 
     backend_name: ClassVar[str] = "xla"
 
+    # Run-stage option validation table — mirrors ``XlaBackend.KNOWN_OPTIONS``
+    # (single source of truth; the class attribute is defined here so the
+    # executable validates independently of the backend instance).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = XlaBackend.KNOWN_OPTIONS
+
     def __init__(
         self,
         artifact: CompiledArtifact | None = None,
@@ -411,7 +460,11 @@ class XlaExecutable(CompilerExecutable):
 
     # -------------------------------------------------------------------- run
 
-    def run(self, flat_input_tensors: list[core.Tensor]) -> list[core.Tensor]:
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
         """Execute the compiled program on flat input tensors.
 
         Validates inputs EXACTLY against ``signature.input_specs``:
@@ -423,7 +476,15 @@ class XlaExecutable(CompilerExecutable):
         the numpy interpreter. Output count/dtype/shape are validated
         against ``signature.output_specs``. A runtime failure raises
         ``core.BackendError`` naming the cause — never a silent fallback.
+
+        ``options``: per-run options, validated against ``KNOWN_OPTIONS`` —
+        the xla run stage has NO known options in v1, so any non-empty
+        options dict raises ``core.BackendError`` (loud; never silently
+        swallowed).
         """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
         if self.native_module is None or self._client is None:
             raise core.BackendError(
                 "this XlaExecutable has no live PJRT executable/client — "

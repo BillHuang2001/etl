@@ -19,7 +19,11 @@ imported at module top level, so ``import etl`` stays light):
   anything else is rejected with ``core.BackendError`` naming it, never a
   silent fallback). ``"cuda"`` emits default sm_60 PTX, JIT'd by the CUDA
   driver to newer archs at load (validated on 3.11.0 to sm_86 / RTX A6000 —
-  no arch flag needed). ``extra_args`` are fixed:
+  no arch flag needed). ``extra_args`` = etl's MINIMAL defaults — ALL
+  OVERRIDABLE via the ``iree_compile_args`` compile option (a user flag
+  overriding a default by name replaces it; the small documented deny list
+  ``_IREE_DENIED_COMPILE_FLAGS`` guards only the genuinely required flags;
+  every other flag passes through to the compiler, which validates it):
   ``--iree-input-demote-f64-to-f32=false`` (IREE demotes f64 to f32 by
   default for StableHLO input — silent dtype coercion, which etl's error
   strategy forbids; disabling it keeps f64 semantics exact) and, ONLY when
@@ -183,12 +187,98 @@ _STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
 _PINNED_DIRECT_MAX_BYTES = 4 * 1024
 _STAGED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
 
+# ---------------------------------------------------------------------------
+# Compile-flag policy (the options-override contract — see ../options.py)
+# ---------------------------------------------------------------------------
+# etl's compile flags are MINIMAL and every one of them is OVERRIDABLE by
+# the user via the ``iree_compile_args`` compile option (a user flag whose
+# NAME matches a default's name replaces the default — never both) or the
+# ``ETL_IREE_COMPILE_ARGS`` env var (resolved by the pipeline, precedence:
+# explicit option > env var > etl default). The design lesson behind this
+# policy: a hardcoded, non-overridable iree flag once disabled iree's
+# stream-ordered allocator (``--cuda_async_allocations=false``) and caused a
+# ~100x per-call regression users could not fix. etl never hardcodes flags
+# users cannot override.
+_IREE_DEFAULT_COMPILE_ARGS = ("--iree-input-demote-f64-to-f32=false",)
+# llvm-cpu-only defaults — added ONLY when "llvm-cpu" is among the requested
+# targets (meaningless for cuda):
+#   --iree-llvmcpu-target-cpu=generic   portable generic-CPU codegen (also
+#                                       silences IREE's generic-CPU warning)
+#   --iree-llvmcpu-link-embedded=false  the default embedded -nostdlib -static
+#                                       link cannot resolve libm symbols
+#                                       (log/cos/floor) that f64 math ops lower
+#                                       to; the dynamically-linked dylib
+#                                       resolves them from system libc/libm
+#                                       at load
+_IREE_DEFAULT_LLVMCPU_ARGS = (
+    "--iree-llvmcpu-target-cpu=generic",
+    "--iree-llvmcpu-link-embedded=false",
+)
+# Genuinely required flags — the small documented DENY list. Overriding these
+# would break etl's own machinery contract with ``iree.compiler.compile_str``
+# (targets/input format are passed as its parameters; the vmfb output format
+# is what the adapter loads), so they are rejected with an actionable message
+# — never silently overwritten, never passed through. EVERY other iree-compile
+# flag passes through unvalidated (the compiler validates flag values and its
+# diagnostics are surfaced as BackendError).
+_IREE_DENIED_COMPILE_FLAGS = {
+    "--iree-hal-target-backends": (
+        "use the 'target_backends' compile option instead"
+    ),
+    "--iree-input-type": (
+        "etl always feeds StableHLO; the input type is fixed by the adapter"
+    ),
+    "--iree-vm-bytecode-module-output-format": (
+        "the adapter requires the default VM flatbuffer output; changing it "
+        "would break artifact loading"
+    ),
+}
 
-def _configure_cuda_runtime_flags() -> None:
+
+def _flag_name(flag: str) -> str:
+    """The flag name part (the text before '=') — override/deny matching."""
+    return flag.partition("=")[0]
+
+
+def _resolve_iree_compile_args(
+    target_backends: tuple[str, ...], user_args: list[str] | None
+) -> list[str]:
+    """Final ``extra_args`` for ``iree.compiler.compile_str``.
+
+    = surviving etl defaults (a default whose name is overridden by a user
+    flag is dropped — the user wins) + the user's flags, deny-checked.
+    """
+    defaults = list(_IREE_DEFAULT_COMPILE_ARGS)
+    if "llvm-cpu" in target_backends:
+        defaults.extend(_IREE_DEFAULT_LLVMCPU_ARGS)
+    if not user_args:
+        return defaults
+    user_names = [_flag_name(flag) for flag in user_args]
+    for flag, name in zip(user_args, user_names):
+        reason = _IREE_DENIED_COMPILE_FLAGS.get(name)
+        if reason is not None:
+            raise core.BackendError(
+                f"the {IreeBackend.name} backend denies the iree-compile "
+                f"flag {flag!r}: {reason}"
+            )
+    return [
+        default
+        for default in defaults
+        if _flag_name(default) not in user_names
+    ] + list(user_args)
+
+
+def _configure_cuda_runtime_flags(user_args: tuple[str, ...] = ()) -> None:
     """Parse the process-global CUDA allocator flag ONCE (idempotent).
 
-    The user's explicit ``IREE_PY_RUNTIME_FLAGS`` setting wins; parse errors
-    are ignored (best-effort performance tuning, never correctness).
+    The etl default ``--cuda_async_allocations=false`` is OVERRIDABLE and
+    applied ONLY when neither the user's explicit ``iree_runtime_args`` load
+    option nor the ``IREE_PY_RUNTIME_FLAGS`` env var mentions
+    ``cuda_async_allocations`` (env is parsed at iree import; the explicit
+    option is parsed AFTER it and wins by last-wins flag semantics). Parse
+    errors of the DEFAULT are ignored (best-effort performance tuning, never
+    correctness) — user-provided runtime args are parsed separately with LOUD
+    errors (``_apply_iree_runtime_args``).
     """
     global _CUDA_FLAGS_CONFIGURED
     if _CUDA_FLAGS_CONFIGURED:
@@ -196,12 +286,42 @@ def _configure_cuda_runtime_flags() -> None:
     _CUDA_FLAGS_CONFIGURED = True
     if "cuda_async_allocations" in os.environ.get("IREE_PY_RUNTIME_FLAGS", ""):
         return
+    if any(
+        _flag_name(flag) == "--cuda_async_allocations" for flag in user_args
+    ):
+        return  # the user's explicit iree_runtime_args wins
     try:
         import iree.runtime as rt
 
         rt.flags.parse_flags("--cuda_async_allocations=false")
     except Exception:
         pass  # flag unavailable — the anchor alone still helps
+
+
+def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
+    """Parse user-provided iree runtime/loader flags (LOUD — never swallowed).
+
+    ``iree.runtime.flags.parse_flags`` may be called multiple times per
+    process (empirically verified) and parses AFTER ``IREE_PY_RUNTIME_FLAGS``
+    (parsed at iree import), so the explicit option wins by last-wins flag
+    semantics. A flag the runtime rejects raises ``core.BackendError`` naming
+    the option, the flags, and the iree error — per etl's error strategy, a
+    user's flag value is never silently dropped.
+    """
+    if not runtime_args:
+        return
+    import iree.runtime as rt
+
+    try:
+        rt.flags.parse_flags(*runtime_args)
+    except Exception as exc:
+        raise core.BackendError(
+            f"the {IreeBackend.name} backend could not parse the "
+            f"'iree_runtime_args' load option {runtime_args!r}: {exc} — the "
+            "iree runtime rejected the flags; remove or fix them. Note: "
+            "IREE_PY_RUNTIME_FLAGS is parsed at iree import time; explicit "
+            "iree_runtime_args are parsed after it and win on conflict"
+        ) from exc
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from etl.ir import Module  # noqa: F401
@@ -275,6 +395,25 @@ class IreeBackend(CompilerBackend):
     """
 
     name = "iree"
+
+    #: Options-override contract (see ../options.py): the compile option
+    #: ``iree_compile_args`` (arbitrary iree-compile flags — etl's minimal
+    #: defaults are overridable by name collision, a small documented deny
+    #: list guards the genuinely required flags) and ``target_backends``;
+    #: the load option ``iree_runtime_args`` (iree runtime/loader flags,
+    #: parsed loudly at load). No run options in v1 (a non-empty run options
+    #: dict raises BackendError). The reserved exporter lower options
+    #: ``sort_emission``/``while_init_rewrite`` are consumed by the shared
+    #: CompilerBackend (see ../compiler.py) and declared here so they pass
+    #: validation.
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = {
+        "lower": frozenset(
+            {"rng_bit_generator", "sort_emission", "while_init_rewrite"}
+        ),
+        "compile": frozenset({"target_backends", "iree_compile_args"}),
+        "load": frozenset({"iree_runtime_args"}),
+        "run": frozenset(),
+    }
     # "auto" sort emission: the iree-cuda HAL cannot bufferize multi-operand
     # `stablehlo.sort` whenever the sorted-axis extent is >= 32 (upstream
     # iree 3.11.0 bug) — the count-based composition (bit-exact vs numpy on
@@ -334,18 +473,25 @@ class IreeBackend(CompilerBackend):
            ``format == "stablehlo"`` and a ``mlir_text`` string; a malformed
            payload raises ``core.BackendError`` "corrupt").
         3. ``check_available``.
-        4. Resolve the compile ``target_backends`` option (default
-           ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda"}`` — a
-           non-list/tuple, an empty list, or an unknown target raises
-           ``core.BackendError`` naming the offending value, never a silent
-           fallback). ``iree.compiler.compile_str`` with those targets,
-           ``input_type="stablehlo"`` and ``extra_args`` fixed as
-           ``["--iree-input-demote-f64-to-f32=false"]`` plus
-           ``"--iree-llvmcpu-target-cpu=generic"`` only when ``llvm-cpu`` is
-           requested (f64 semantics preserved; portable generic-CPU codegen).
-           ``iree.compiler.CompilerToolError`` is re-raised as
-           ``core.BackendError`` CARRYING the compiler diagnostics — honest,
-           never silent.
+        4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
+           ``core.BackendError``; keys valid for other stages pass). Resolve
+           the compile ``target_backends`` option (default ``["llvm-cpu"]``;
+           v1 supported set ``{"llvm-cpu", "cuda"}`` — a non-list/tuple, an
+           empty list, or an unknown target raises ``core.BackendError``
+           naming the offending value, never a silent fallback) and the
+           ``iree_compile_args`` option (arbitrary iree-compile flags —
+           list/tuple of flag strings; the values are never validated by
+           etl, the compiler validates them). ``iree.compiler.compile_str``
+           with those targets, ``input_type="stablehlo"`` and
+           ``extra_args`` = etl's MINIMAL defaults (f64 semantics preserved;
+           portable generic-CPU codegen; dynamically-linked llvm-cpu link —
+           see the module constants) MINUS any default a user flag overrides
+           by name, PLUS the user's flags (deny-checked against the small
+           documented ``_IREE_DENIED_COMPILE_FLAGS`` list — genuinely
+           required flags fail with an actionable message; every other flag
+           passes through). ``iree.compiler.CompilerToolError`` is re-raised
+           as ``core.BackendError`` CARRYING the compiler diagnostics —
+           honest, never silent.
         5. Record a self-describing ``CompiledArtifact``: JSON-safe payload
            (``format == "iree-vmfb"``, the MLIR text, the base64 VM
            flatbuffer, the entry-function names, and the ``target_backends``
@@ -377,6 +523,10 @@ class IreeBackend(CompilerBackend):
                 "an 'mlir_text' string)"
             )
         self.check_available()
+
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
 
         import iree.compiler as iree_compiler
         import numpy as np
@@ -412,18 +562,26 @@ class IreeBackend(CompilerBackend):
                     f"{', '.join(sorted(supported_targets))}"
                 )
         target_backends = tuple(raw_targets)
-        extra_args = ["--iree-input-demote-f64-to-f32=false"]
-        if "llvm-cpu" in target_backends:
-            # llvm-cpu-specific (portable generic-CPU codegen; silences IREE's
-            # generic-CPU warning) — meaningless for cuda, so only passed when
-            # llvm-cpu is among the requested targets.
-            extra_args.append("--iree-llvmcpu-target-cpu=generic")
-            # The default embedded link (-nostdlib -static, no system libs)
-            # cannot resolve libm symbols (log/cos/floor) that f64 math ops
-            # lower to — iree-lld fails with "undefined symbol: log". A
-            # dynamically-linked dylib resolves them from the system libc/libm
-            # at load time (standard on Linux; validated on IREE 3.11.0).
-            extra_args.append("--iree-llvmcpu-link-embedded=false")
+        # ``iree_compile_args`` — arbitrary iree-compile flags (list/tuple of
+        # flag strings; values are NEVER validated here — the compiler
+        # validates them and its diagnostics surface as BackendError). etl's
+        # minimal defaults are dropped when a user flag overrides them by
+        # name; the small documented deny list guards the genuinely required
+        # flags (see module constants).
+        raw_extra = (options or {}).get("iree_compile_args")
+        if raw_extra is None:
+            user_args: list[str] = []
+        elif isinstance(raw_extra, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_extra
+        ):
+            user_args = list(raw_extra)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_compile_args' compile option must be "
+                f"a list/tuple of flag strings (e.g. "
+                f'["--iree-llvmcpu-target-cpu=native"]), got {raw_extra!r}'
+            )
+        extra_args = _resolve_iree_compile_args(target_backends, user_args)
         try:
             vmfb = iree_compiler.compile_str(
                 mlir_text,
@@ -470,7 +628,10 @@ class IreeBackend(CompilerBackend):
         )
 
     def load(
-        self, artifact: CompiledArtifact, device: Device | None = None
+        self,
+        artifact: CompiledArtifact,
+        device: Device | None = None,
+        options: dict | None = None,
     ) -> "IreeExecutable":
         """Reconstruct an ``IreeExecutable`` from an artifact. Never re-compiles.
 
@@ -480,18 +641,29 @@ class IreeBackend(CompilerBackend):
         2. Validate the payload (``format == "iree-vmfb"``, base64 vmfb,
            entry functions; malformed => ``core.BackendError`` "corrupt").
         3. ``check_available``.
-        4. Validate the device: ``None`` (CPU default) or a ``core.Device``
+        4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
+           ``core.BackendError``) and parse the ``iree_runtime_args`` load
+           option (list/tuple of iree runtime/loader flags, e.g.
+           ``["--cuda_async_allocations=false"]``) via
+           ``iree.runtime.flags.parse_flags`` — the explicit option is parsed
+           AFTER ``IREE_PY_RUNTIME_FLAGS`` (parsed at iree import) and wins
+           by last-wins semantics; a flag the runtime rejects raises
+           ``core.BackendError`` (never silent). etl's own default
+           ``--cuda_async_allocations=false`` (cuda only) is applied ONLY
+           when neither the explicit option nor the env mentions it — the
+           hardcoded-flag lesson: every etl default is overridable.
+        5. Validate the device: ``None`` (CPU default) or a ``core.Device``
            of kind ``"cpu"`` or ``"cuda"`` — a non-``Device`` object raises
            ``core.DeviceError``; another kind raises ``core.BackendError``
            naming it.
-        5. Artifact/device target compatibility — never silent: the artifact
+        6. Artifact/device target compatibility — never silent: the artifact
            payload's ``target_backends`` must include the driver matching the
            requested device kind (``"llvm-cpu"`` for cpu, ``"cuda"`` for
            cuda); absent ``target_backends`` (artifacts saved before CUDA
            support) is treated as ``["llvm-cpu"]``. A mismatch raises
            ``core.BackendError`` naming both the artifact's compile targets
            and the requested device.
-        6. Base64-decode the VM flatbuffer; acquire the runtime device. CPU:
+        7. Base64-decode the VM flatbuffer; acquire the runtime device. CPU:
            the reliable path (``rt.get_driver("local-task")`` +
            ``create_default_device()``) then ``load_vm_flatbuffer``. CUDA:
            ``rt.get_driver("cuda")`` + ``driver.create_device(device_id=
@@ -536,6 +708,26 @@ class IreeBackend(CompilerBackend):
                 "functions"
             )
         self.check_available()
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "load")
+        # ``iree_runtime_args`` — iree runtime/loader flags (list/tuple of
+        # flag strings; values are NEVER validated by etl — the runtime
+        # validates them and its rejection surfaces as BackendError below).
+        raw_runtime = (options or {}).get("iree_runtime_args")
+        if raw_runtime is None:
+            runtime_args: list[str] = []
+        elif isinstance(raw_runtime, (list, tuple)) and all(
+            isinstance(flag, str) for flag in raw_runtime
+        ):
+            runtime_args = list(raw_runtime)
+        else:
+            raise core.BackendError(
+                f"the {self.name} 'iree_runtime_args' load option must be a "
+                f"list/tuple of flag strings (e.g. "
+                f'["--cuda_async_allocations=false"]), got {raw_runtime!r}'
+            )
+        _apply_iree_runtime_args(runtime_args)
         device_kind = "cpu"  # device=None = default CPU device
         if device is not None:
             if not isinstance(device, Device):
@@ -579,7 +771,7 @@ class IreeBackend(CompilerBackend):
             # maps to device_id = index + 1 (verified empirically on 3.11.0:
             # device_id=4 -> physical GPU 3; device_id=0 raises ValueError
             # "Device id 0 not found" — never pass 0).
-            _configure_cuda_runtime_flags()
+            _configure_cuda_runtime_flags(tuple(runtime_args))
             driver = rt.get_driver("cuda")
             device_id = device.index + 1
             try:
@@ -678,6 +870,11 @@ class IreeExecutable(CompilerExecutable):
 
     backend_name = "iree"
 
+    # Run-stage option validation table — mirrors ``IreeBackend.KNOWN_OPTIONS``
+    # (single source of truth; the class attribute is defined here so the
+    # executable validates independently of the backend instance).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = IreeBackend.KNOWN_OPTIONS
+
     def __init__(
         self,
         artifact: CompiledArtifact,
@@ -731,14 +928,27 @@ class IreeExecutable(CompilerExecutable):
 
     # ------------------------------------------------------------------ run
 
-    def run(self, flat_input_tensors: list[core.Tensor]) -> list[core.Tensor]:
+    def run(
+        self,
+        flat_input_tensors: list[core.Tensor],
+        options: dict | None = None,
+    ) -> list[core.Tensor]:
         """Execute the compiled program on flat input tensors.
 
         See the class docstring for the exact validation/invocation model.
         Runtime IREE errors propagate as-is (they are explicit hardware/runtime
         failures, never silently swallowed); etl-level mismatches raise
         ``core.BackendError`` / ``core.ShapeError``.
+
+        ``options``: per-run options, validated against ``KNOWN_OPTIONS`` —
+        the iree run stage has NO known options in v1, so any non-empty
+        options dict raises ``core.BackendError`` (loud; never silently
+        swallowed). Runtime/loader flags are load-time options
+        (``iree_runtime_args``), not per-run.
         """
+        from ..options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
         import iree.runtime as rt
         import numpy as np
 

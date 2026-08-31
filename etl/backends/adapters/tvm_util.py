@@ -721,13 +721,40 @@ def translate(mlir_text: str) -> Any:
         ) from exc
 
 
-def build_vm_executable(relax_module: Any, target: str = "llvm") -> Any:
-    """Build a ``tvm.relax.vm_build.VMExecutable`` for the given target."""
+def build_vm_executable(
+    relax_module: Any, target: str = "llvm", pass_configs: dict | None = None
+) -> Any:
+    """Build a ``tvm.relax.vm_build.VMExecutable`` for the given target.
+
+    ``target``: the TVM target string (default ``"llvm"``; e.g. ``"llvm
+    -mcpu=native"``). ``pass_configs``: an optional dict of Relax pass
+    configurations forwarded to ``tvm.relax.vm_build.build`` (a non-None
+    value on a TVM build that does not accept ``pass_configs`` raises
+    ``core.BackendError`` — never silently dropped).
+    """
     import tvm
     from tvm import relax
 
     try:
-        return relax.vm_build.build(relax_module, target=tvm.target.Target(target))
+        build_kwargs = {}
+        if pass_configs is not None:
+            # pass_configs is only forwarded when explicitly given: the
+            # installed TVM 0.26 ``relax.vm_build.build`` does NOT accept the
+            # keyword, so a ``None`` value must not be passed.
+            build_kwargs["pass_configs"] = pass_configs
+        return relax.vm_build.build(
+            relax_module, target=tvm.target.Target(target), **build_kwargs
+        )
+    except TypeError as exc:
+        if pass_configs is not None and "pass_configs" in str(exc):
+            raise core.BackendError(
+                "the installed TVM build does not accept 'pass_configs' — "
+                f"drop the 'tvm_pass_configs' compile option (target "
+                f"{target!r}): {exc}"
+            ) from exc
+        raise core.BackendError(
+            f"tvm.relax.vm.build failed for target {target!r}: {exc}"
+        ) from exc
     except Exception as exc:
         raise core.BackendError(
             f"tvm.relax.vm.build failed for target {target!r}: {exc}"

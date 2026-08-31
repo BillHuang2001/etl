@@ -129,6 +129,22 @@ class CompilerBackend(Backend):
     #: composition when the extent >= 32, bit-exact vs numpy, else pair).
     default_sort_emission: ClassVar[str] = "pair"
 
+    #: Known per-stage option names (the options-override contract — see
+    #: ``../options.py``): each adapter OVERRIDES this class attribute with
+    #: its compile/load/run sets (e.g. iree declares ``iree_compile_args`` at
+    #: compile and ``iree_runtime_args`` at load). Stage methods validate the
+    #: caller's options dict against the UNION of these sets before doing
+    #: anything else — a key valid for no stage raises ``core.BackendError``
+    #: (loud, never silent); keys valid for other stages are accepted and
+    #: ignored at this stage (the build/evaluate sugar forwards one options
+    #: dict to every stage).
+    KNOWN_OPTIONS: dict[str, frozenset[str]] = {
+        "lower": frozenset({"rng_bit_generator"}),
+        "compile": frozenset(),
+        "load": frozenset(),
+        "run": frozenset(),
+    }
+
     @classmethod
     def check_available(cls) -> None:
         """Probe the compiler dependency; raise if unavailable (default: no-op).
@@ -219,7 +235,17 @@ class CompilerBackend(Backend):
         Explicit staging: ``lower`` NEVER compiles (no compiler is invoked
         here); raising ``core.VerificationError`` / ``core.BackendError`` —
         no silent fallbacks or partial semantics.
+
+        Options contract: ``options`` is validated against the UNION of this
+        backend's ``KNOWN_OPTIONS`` sets before anything else — a key valid
+        for no stage raises ``core.BackendError`` naming the known options
+        (see ``../options.py``); keys valid for other stages (e.g. the
+        ``compile`` option ``iree_compile_args``) are accepted and ignored
+        here, so ``build``/``evaluate`` can forward one options dict.
         """
+        from .options import validate_options
+
+        validate_options(options, self.KNOWN_OPTIONS, self.name, "lower")
         graph.verify()  # surfaces core.VerificationError as-is
 
         capabilities = self.capabilities
