@@ -148,7 +148,9 @@ A kernel-agnostic escape hatch for plugging custom (e.g. triton) kernels into `d
 
 **Persistence**: the registry is NEVER serialized — graph artifacts carry only the `name` string (JSON-safe attr; `result_specs` round-trips through the standard ValueType wire encoding). `Graph.save`/`load` work; any process that runs a saved graph must re-register its kernels first (else the run-time `BackendError` above).
 
-**Compiler backends (v1 deferral — round 2 builds on this interface)**: all compiler adapters reject `external_call` at `lower()` with an explicit `BackendError` naming the op AND the kernel name, stating that adapter host-dispatch for external kernels is not yet wired (`Capabilities.external_calls=False`; the stablehlo exporter additionally lists it in `DEFERRED_OPS`). Round 2 will add a host-dispatch path that embeds the kernel call in compiled artifacts (the same `name`-keyed registry is the dispatch table). Example:
+**Compiler backends (round 2 — iree host-dispatch)**: the iree adapter declares `Capabilities.external_calls=True` and executes external-call graphs through a SPLIT + host-dispatch model (implementation: `./backends/external_split.py` + `./backends/compiler.py` + the iree adapter): at `lower()` the graph is cut at every top-level `external_call` op (op order) into SEGMENT programs — plain graphs with no external calls inside — plus a JSON-safe kernel-call PLAN (payload `stablehlo-segments`); `compile()` produces one vmfb per segment (artifact `iree-vmfb-segments`); at `run()` the segments execute strictly in plan order on the HAL device and at each `external_call` boundary the kernel's operand tensors are staged to host numpy arrays, the kernel is dispatched through the SAME name-keyed registry (`etl.register_external_kernel` — kernels are never embedded in artifacts; unknown name at run time → `BackendError` naming the kernel and pointing at the registry), and its validated results (count/dtype/shape vs the declared specs — never silent coercion) are staged back into the following segment. Carried plain values that are NOT kernel operands stay device-resident across segments (zero extra host round-trips); per-boundary host staging is a v1 mechanism (a zero-copy follow-up would stage through device-resident staging buffers). Determinism contract: kernels are assumed PURE (same inputs → same outputs) and segments execute sequentially in plan order, so the graph's `callback` effect ordering is preserved.
+
+Restrictions (explicit `BackendError` at `lower()`, never silent): no `external_call` inside `cond`/`while_loop`/`scan` bodies (data-dependent control flow around a host call is not splittable); result dims must be STATIC integers (staging needs concrete shapes — symbolic/`None` dims are rejected); at least one tensor operand (a zero-operand call has no staging boundary — express the value via `etl.constant` or an explicit graph input); single-function graphs. The stablehlo exporter and the xla/tvm adapters still reject `external_call` with the round-1 `BackendError` (`Capabilities.external_calls=False`; the exporter additionally lists it in `DEFERRED_OPS`). Example (numpy backend + iree host-dispatch):
 
 ```python
 import etl
@@ -160,7 +162,8 @@ def model(x, w):
     h = etl.external_call("relu_custom", x, result=etl.TensorSpec((N, D), etl.float32))
     return etl.dot(h, w)          # downstream ops consume the kernel output
 
-y = etl.evaluate(model, x_np, w_np)  # numpy backend: dispatches my_numpy_or_triton_fn
+y = etl.evaluate(model, x_np, w_np)   # numpy backend: dispatches my_numpy_or_triton_fn
+y_iree = etl.evaluate(model, x_np, w_np, backend="iree")  # split + host-dispatch on llvm-cpu
 ```
 
 ## Design decisions (15-op batch)
