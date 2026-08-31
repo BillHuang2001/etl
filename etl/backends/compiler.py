@@ -41,6 +41,7 @@ from etl import core
 from etl.core import Device
 
 from .backend import Backend, Capabilities, Executable
+from .external_split import contains_external_call
 from .inline import inline_portables, iter_ops
 from .program import CompiledArtifact, LoweredProgram, Signature
 
@@ -57,7 +58,12 @@ class CompilerBackend(Backend):
     ``compile`` / ``load`` (and optionally override ``check_available`` —
     concrete, no-op by default). ``lower`` is shared: verify ->
     capability pre-check -> portable inlining -> verify -> StableHLO
-    export -> ``Signature`` recording -> MLIR-text payload.
+    export -> ``Signature`` recording -> MLIR-text payload. A backend
+    declaring ``Capabilities.external_calls`` (v1: the iree adapter)
+    additionally SPLITS graphs containing ``external_call`` ops into
+    per-segment programs at lower time (``_lower_external_segments`` —
+    adapter host-dispatch, see ``./external_split.py``); backends without
+    the capability reject the op explicitly.
 
     The lower-time contract (binding):
 
@@ -294,35 +300,55 @@ class CompilerBackend(Backend):
         inline_portables(graph.module, keep_backend_impls=None)
         graph.verify()  # defensive post-inline verification
 
+        # Adapter host-dispatch for external kernels (round 2): a backend
+        # declaring ``Capabilities.external_calls`` (v1: the iree adapter)
+        # splits the graph into compiled segments at ``external_call``
+        # boundaries instead of exporting the call op. Backends without the
+        # capability were already rejected above.
+        if capabilities.external_calls and contains_external_call(graph.module):
+            return self._lower_external_segments(graph, options)
+
         from .stablehlo import export
 
-        # The reserved per-call ``rng_bit_generator`` key (bool or collection
-        # of algorithm names) overrides the capability — the pipeline
-        # lower/build/evaluate sugar forwards it; compile() ignores unknown
-        # keys, so it is lower-only. ``sort_emission`` and
-        # ``while_init_rewrite`` are analogous reserved keys (see the stablehlo
-        # Writer): the latter defaults ON at export (the iree AffinityAnalysis
-        # SEGV workaround), the former to this adapter's class default.
-        rng_option = (options or {}).get(
-            "rng_bit_generator", self.capabilities.rng_bit_generator
-        )
-        sort_emission = (options or {}).get(
-            "sort_emission", self.default_sort_emission
-        )
-        while_init_rewrite = (options or {}).get("while_init_rewrite", True)
-        mlir_text = export(
-            graph,
-            options={
-                "rng_bit_generator": rng_option,
-                "sort_emission": sort_emission,
-                "while_init_rewrite": while_init_rewrite,
-            },
-        )
+        mlir_text = export(graph, options=self._exporter_options(options))
 
         from etl.backends.numpy.interpreter import entry_function
 
-        main_fn = entry_function(graph.module)
-        signature = Signature(
+        signature = self._record_signature(graph, entry_function(graph.module))
+        payload = {
+            "format": "stablehlo",
+            "format_version": 1,
+            "mlir_text": mlir_text,
+            "entry_functions": list(fn.name for fn in graph.module.functions),
+        }
+        return LoweredProgram(backend=self.name, signature=signature, payload=payload)
+
+    # ------------------------------------------- external-call splitting
+
+    def _exporter_options(self, options: dict | None) -> dict:
+        """The reserved exporter options for one export call.
+
+        ``rng_bit_generator`` (bool or collection of random algorithm names)
+        overrides the capability — the pipeline lower/build/evaluate sugar
+        forwards it; compile() ignores unknown keys, so it is lower-only.
+        ``sort_emission`` and ``while_init_rewrite`` are analogous reserved
+        keys (see the stablehlo Writer): the latter defaults ON at export
+        (the iree AffinityAnalysis SEGV workaround), the former to this
+        adapter's class default.
+        """
+        return {
+            "rng_bit_generator": (options or {}).get(
+                "rng_bit_generator", self.capabilities.rng_bit_generator
+            ),
+            "sort_emission": (options or {}).get(
+                "sort_emission", self.default_sort_emission
+            ),
+            "while_init_rewrite": (options or {}).get("while_init_rewrite", True),
+        }
+
+    def _record_signature(self, graph: "Graph", main_fn: Any) -> Signature:
+        """The program Signature, recorded EXACTLY like the single-graph path."""
+        return Signature(
             input_tree=graph.input_specs,
             output_tree=graph.output_tree,
             input_specs=tuple(graph.tensor_specs),
@@ -335,11 +361,46 @@ class CompilerBackend(Backend):
                 record.value for record in graph.output_static_values
             ),
         )
+
+    def _lower_external_segments(
+        self, graph: "Graph", options: dict | None
+    ) -> LoweredProgram:
+        """Lower a graph containing ``external_call`` ops by SPLITTING it.
+
+        The graph is cut at every top-level ``external_call`` op (op order);
+        each resulting segment is a normal graph with no ``external_call``
+        inside, exported as its own StableHLO entry function. The payload
+        records the per-segment MLIR texts plus the kernel-call PLAN (see
+        ``etl.backends.external_split`` for the split model and the v1
+        lower-time constraints — all raised here as ``core.BackendError``
+        with clear messages).
+
+        The recorded ``Signature`` is the ORIGINAL graph's I/O contract —
+        the executable exposes the same structured interface as the
+        unsplit program; the segments are an internal execution detail.
+        """
+        from .external_split import validate_and_split
+        from .stablehlo import export
+
+        segment_modules, plan = validate_and_split(graph)
+        exporter_options = self._exporter_options(options)
+        segments = []
+        for index, module in enumerate(segment_modules):
+            mlir_text = export(module, options=exporter_options)
+            segments.append(
+                {
+                    "mlir_text": mlir_text,
+                    "entry_functions": list(fn.name for fn in module.functions),
+                }
+            )
+        from etl.backends.numpy.interpreter import entry_function
+
+        signature = self._record_signature(graph, entry_function(graph.module))
         payload = {
-            "format": "stablehlo",
+            "format": "stablehlo-segments",
             "format_version": 1,
-            "mlir_text": mlir_text,
-            "entry_functions": list(fn.name for fn in graph.module.functions),
+            "segments": segments,
+            "plan": plan,
         }
         return LoweredProgram(backend=self.name, signature=signature, payload=payload)
 
