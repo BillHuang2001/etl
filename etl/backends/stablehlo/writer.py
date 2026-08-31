@@ -166,6 +166,20 @@ def _normalize_rng_bit_generator(value) -> frozenset:
     return frozenset(value)
 
 
+_SORT_EMISSION_MODES = ("pair", "count", "auto")
+
+
+def _normalize_sort_emission(value) -> str:
+    """Validate the ``sort_emission`` exporter option (see
+    ``Writer.__init__``): ``"pair"`` | ``"count"`` | ``"auto"``."""
+    if value not in _SORT_EMISSION_MODES:
+        raise BackendError(
+            f"stablehlo export: invalid sort_emission option {value!r} "
+            f"(expected one of {', '.join(_SORT_EMISSION_MODES)})"
+        )
+    return value
+
+
 class Writer:
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
@@ -202,6 +216,30 @@ class Writer:
         #: of algorithm names with native emission enabled.
         self._rng_bit_generator = _normalize_rng_bit_generator(
             (options or {}).get("rng_bit_generator", False)
+        )
+        #: sort_emission exporter option: ``"pair"`` (default — the
+        #: two-operand (key, iota) ``stablehlo.sort`` composition), ``"count"``
+        #: (the count-based O(n^2) composition with NO sort op, bit-exact vs
+        #: numpy on both llvm-cpu and cuda), or ``"auto"`` (per argsort:
+        #: ``"count"`` whenever the sorted-axis extent >= 32, else ``"pair"``).
+        #: The iree-cuda HAL cannot bufferize multi-operand sorts at sorted
+        #: axis >= 32 (upstream iree 3.11.0 bug) — the iree adapter passes
+        #: ``"auto"`` by default (see CompilerBackend.default_sort_emission).
+        self._sort_emission = _normalize_sort_emission(
+            (options or {}).get("sort_emission", "pair")
+        )
+        #: while_init_rewrite exporter option (bool, default True): replace
+        #: ALL-ZERO rank>=1 constant while-INIT operands with computed zeros
+        #: (``not``/``and`` + a dtype-changing ``convert`` + ``reduce`` over a
+        #: same-shaped non-constant pre-loop value, or an ``iota``-derived
+        #: value — never ``x - x`` / broadcast-of-scalar-0, which iree folds
+        #: back into constants). iree 3.11.0 SEGVs in
+        #: ``IREE::Stream::AffinityAnalysis::run()`` on dense rank>=1
+        #: constants used as while inits (upstream bug, see
+        #: ``stablehlo/CONTEXT.md`` Known Issues); computed zeros are
+        #: bit-exact and compile clean (10/10 validated on llvm-cpu + cuda).
+        self._while_init_rewrite = bool(
+            (options or {}).get("while_init_rewrite", True)
         )
 
     # ------------------------------------------------------------------
@@ -1727,7 +1765,19 @@ class Writer:
         comparator (iota order on equal keys — numpy stable semantics);
         returns the sorted-keys column name AND the iota-column name (both
         ``keys_shape``; the iota column is int64). Shared by the ``argsort``
-        op, the permutation expansion, and the ``eigh`` eigenvalue sort."""
+        op, the permutation expansion, and the ``eigh`` eigenvalue sort.
+
+        Emission mode (writer option ``sort_emission``): ``"pair"`` (this
+        two-operand sort — iree-cuda cannot bufferize multi-operand sorts
+        whenever the sorted-axis extent is >= 32, upstream iree 3.11.0
+        bug), ``"count"`` (the count-based O(n^2) composition with NO sort
+        op — bit-exact vs numpy on both llvm-cpu and cuda), or ``"auto"``
+        (per call: ``"count"`` when the sorted-axis extent >= 32, else
+        ``"pair"``). The iree adapter defaults to ``"auto"``."""
+        if self._count_argsort_active(keys_shape, axis):
+            return self._emit_count_argsort(
+                keys_name, keys_dtype, keys_shape, axis, lines
+            )
         key_elem = self._elem_type(keys_dtype)
         i64_type = self._type_str(np.dtype("int64"), keys_shape)
         iota = self._emit_iota(keys_shape, axis, lines)
@@ -1761,6 +1811,252 @@ class Writer:
         return sv, si
 
     # --- eigh (while-loop cyclic-Jacobi) ---
+    def _count_argsort_active(self, keys_shape: tuple, axis: int) -> bool:
+        """Whether the count-based argsort emission applies for this call
+        under the configured ``sort_emission`` mode."""
+        mode = self._sort_emission
+        if mode == "count":
+            return True
+        if mode == "pair":
+            return False
+        extent = keys_shape[axis]
+        return _is_static_dim(extent) and extent >= 32
+
+    def _emit_count_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
+                            axis: int, lines: list) -> tuple[str, str]:
+        """Count-based STABLE argsort — NO ``stablehlo.sort`` at all.
+
+        iree 3.11.0 cannot bufferize multi-operand ``stablehlo.sort`` on
+        cuda whenever the sorted-axis extent is >= 32 (upstream bug; every
+        iota dtype / is_stable / operand-order variant fails — llvm-cpu is
+        unaffected, 1-operand sorts are unaffected). This composition
+        computes the stable rank of every element by counting, then
+        inverts the rank permutation:
+
+          1. ``pos[j] = #{k: x[k] < x[j]} + #{k: x[k] == x[j] and k < j}``
+             (two broadcast comparisons + an iota ``k < j`` tie-break + a
+             reduce over k) — pos is the STABLE rank permutation;
+          2. ``idx[p] = min_j (j if pos[j] == p else n)`` (iota grids, an
+             EQ mask, a select with the sentinel ``n`` = sorted-axis
+             extent, a reduce-min over the e axis) — the argsort index
+             array, bit-exact vs ``np.argsort(kind="stable")``;
+          3. sorted keys (consumed by the ``eigh`` emission) via a masked
+             select of the values + a reduce-min over the same mask
+             (sentinel ``+inf`` / ``iinfo.max`` — pos is a bijection, so
+             exactly one element survives the mask).
+
+        Probe-validated bit-exact on llvm-cpu AND cuda at rank 1/2, axes
+        0/1, n<o and n>o, ascending and descending (descending = a
+        ``stablehlo.reverse`` of the index column, the numpy composition).
+        NO ``stablehlo.transpose`` of computed values anywhere (iree
+        llvm-cpu miscompiles that pattern in this context — measured).
+        """
+        rank = len(keys_shape)
+        n = int(keys_shape[axis])
+        i64 = np.dtype("int64")
+        keys_t = self._type_str(keys_dtype, keys_shape)
+        out_t = self._type_str(i64, keys_shape)
+        # mid space (k, d0..d_{R-1}): k at 0, the original dims shifted +1.
+        mid_shape = (n,) + tuple(keys_shape)
+        midk_t = self._type_str(keys_dtype, mid_shape)
+        mid_t = self._type_str(i64, mid_shape)
+        midb_t = self._type_str(np.dtype("bool"), mid_shape)
+        nn_t = self._type_str(i64, (n, n))
+        # xj[k, ...] = x[..., k as the sorted axis]; xk[k, ...] = x[...] —
+        # so compare(xj, xk) is x[k] < x[j] at every (k, j) pair.
+        xk_dims = list(range(1, rank + 1))
+        xj_dims = [0 if d == axis else d + 1 for d in range(rank)]
+        xk = self._new_name()
+        lines.append(
+            f"{xk} = stablehlo.broadcast_in_dim {keys_name}, dims = "
+            f"{self._list_attr(xk_dims)} : ({keys_t}) -> {midk_t}"
+        )
+        xj = self._new_name()
+        lines.append(
+            f"{xj} = stablehlo.broadcast_in_dim {keys_name}, dims = "
+            f"{self._list_attr(xj_dims)} : ({keys_t}) -> {midk_t}"
+        )
+        less = self._new_name()
+        lines.append(
+            f'{less} = "stablehlo.compare"({xj}, {xk}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : ({midk_t}, {midk_t}) -> {midb_t}"
+        )
+        eq = self._new_name()
+        lines.append(
+            f'{eq} = "stablehlo.compare"({xj}, {xk}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({midk_t}, {midk_t}) -> {midb_t}"
+        )
+        # Tie-break: k at mid dim 0, j at mid dim axis+1 (the sorted-axis
+        # position in the mid space).
+        ik = self._emit_iota((n, n), 0, lines)
+        ij = self._emit_iota((n, n), 1, lines)
+        ikb = self._new_name()
+        lines.append(
+            f"{ikb} = stablehlo.broadcast_in_dim {ik}, dims = "
+            f"{self._list_attr([0, axis + 1])} : ({nn_t}) -> {mid_t}"
+        )
+        ijb = self._new_name()
+        lines.append(
+            f"{ijb} = stablehlo.broadcast_in_dim {ij}, dims = "
+            f"{self._list_attr([0, axis + 1])} : ({nn_t}) -> {mid_t}"
+        )
+        kltj = self._new_name()
+        lines.append(
+            f'{kltj} = "stablehlo.compare"({ikb}, {ijb}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : ({mid_t}, {mid_t}) -> {midb_t}"
+        )
+        eqbef = self._new_name()
+        lines.append(f"{eqbef} = stablehlo.and {eq}, {kltj} : {midb_t}")
+        cl = self._new_name()
+        lines.append(f"{cl} = stablehlo.convert {less} : ({midb_t}) -> {mid_t}")
+        ce = self._new_name()
+        lines.append(f"{ce} = stablehlo.convert {eqbef} : ({midb_t}) -> {mid_t}")
+        zero = self._new_name()
+        lines.append(f"{zero} = stablehlo.constant dense<0> : tensor<i64>")
+        suml = self._emit_count_reduce(cl, mid_t, out_t, [0], zero, lines)
+        sume = self._emit_count_reduce(ce, mid_t, out_t, [0], zero, lines)
+        pos = self._new_name()
+        lines.append(f"{pos} = stablehlo.add {suml}, {sume} : {out_t}")
+        # Inverse space (d0..d_{axis-1}, p, d_{axis+1}..d_{R-1}, e): the
+        # sorted axis is replaced by the rank p; e is appended at the end.
+        inv_shape = keys_shape[:axis] + (n,) + keys_shape[axis + 1 :] + (n,)
+        inv_t = self._type_str(i64, inv_shape)
+        invb_t = self._type_str(np.dtype("bool"), inv_shape)
+        pos_dims = list(range(rank))
+        pos_dims[axis] = rank  # pos's sorted axis → the appended e slot
+        posb = self._new_name()
+        lines.append(
+            f"{posb} = stablehlo.broadcast_in_dim {pos}, dims = "
+            f"{self._list_attr(pos_dims)} : ({out_t}) -> {inv_t}"
+        )
+        ri = self._emit_iota((n, n), 0, lines)
+        ji = self._emit_iota((n, n), 1, lines)
+        rib = self._new_name()
+        lines.append(
+            f"{rib} = stablehlo.broadcast_in_dim {ri}, dims = "
+            f"{self._list_attr([axis, rank])} : ({nn_t}) -> {inv_t}"
+        )
+        jib = self._new_name()
+        lines.append(
+            f"{jib} = stablehlo.broadcast_in_dim {ji}, dims = "
+            f"{self._list_attr([axis, rank])} : ({nn_t}) -> {inv_t}"
+        )
+        pmask = self._new_name()
+        lines.append(
+            f'{pmask} = "stablehlo.compare"({posb}, {rib}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({inv_t}, {inv_t}) -> {invb_t}"
+        )
+        nc = self._new_name()
+        lines.append(f"{nc} = stablehlo.constant dense<{n}> : tensor<i64>")
+        nbig = self._new_name()
+        lines.append(
+            f"{nbig} = stablehlo.broadcast_in_dim {nc}, dims = "
+            f"{self._list_attr([])} : (tensor<i64>) -> {inv_t}"
+        )
+        jsel = self._new_name()
+        lines.append(
+            f"{jsel} = stablehlo.select {pmask}, {jib}, {nbig} : "
+            f"({invb_t}, {inv_t}, {inv_t}) -> {inv_t}"
+        )
+        idx = self._emit_count_reduce_min(
+            jsel, inv_t, out_t, [rank], nc, self._elem_type(i64), lines
+        )
+        # Sorted keys (consumed by the eigh emission; argsort/permutation
+        # ignore them): masked select of the values + reduce-min.
+        if keys_dtype.kind == "f":
+            sentinel = np.inf
+        elif keys_dtype.kind in "iu":
+            sentinel = np.iinfo(keys_dtype).max
+        else:  # complex/bool keys: the LT compare above is already invalid
+            # for complex (same failure as the pair emission); emit a
+            # placeholder so the composition stays well-formed.
+            sentinel = 0
+        invk_t = self._type_str(keys_dtype, inv_shape)
+        wb = self._new_name()
+        lines.append(
+            f"{wb} = stablehlo.broadcast_in_dim {keys_name}, dims = "
+            f"{self._list_attr(pos_dims)} : ({keys_t}) -> {invk_t}"
+        )
+        sent_const = self._count_sentinel_constant(sentinel, keys_dtype, lines)
+        sbig = self._new_name()
+        lines.append(
+            f"{sbig} = stablehlo.broadcast_in_dim {sent_const}, dims = "
+            f"{self._list_attr([])} : "
+            f"({self._elem_type(keys_dtype)}) -> {invk_t}"
+        )
+        wsel = self._new_name()
+        lines.append(
+            f"{wsel} = stablehlo.select {pmask}, {wb}, {sbig} : "
+            f"({invb_t}, {invk_t}, {invk_t}) -> {invk_t}"
+        )
+        sv = self._emit_count_reduce_min(
+            wsel,
+            invk_t,
+            keys_t,
+            [rank],
+            sent_const,
+            self._elem_type(keys_dtype),
+            lines,
+        )
+        return sv, idx
+
+    def _count_sentinel_constant(self, value, dtype, lines: list) -> str:
+        """A scalar constant of `value` in `dtype` (fresh name + line)."""
+        name = self._new_name()
+        lines.append(
+            f"{name} = stablehlo.constant "
+            f"{self._constant_text(np.asarray(value, dtype=dtype))} : "
+            f"{self._elem_type(dtype)}"
+        )
+        return name
+
+    def _emit_count_reduce(self, operand_name: str, operand_t: str, out_t: str,
+                           dims: list, init_name: str, lines: list) -> str:
+        """i64 add-reduce (the count composition's rank sum)."""
+        a1, a2 = self._new_name(), self._new_name()
+        s = self._new_name()
+        region = (
+            "({\n"
+            f"  ^bb0({a1}: tensor<i64>, {a2}: tensor<i64>):\n"
+            f"    {s} = stablehlo.add {a1}, {a2} : tensor<i64>\n"
+            f"    stablehlo.return {s} : tensor<i64>\n"
+            "  })"
+        )
+        r = self._new_name()
+        lines.append(
+            f'{r} = "stablehlo.reduce"({operand_name}, {init_name}) {region} '
+            f"{{dimensions = {self._i64_array(dims)}}} : "
+            f"({operand_t}, tensor<i64>) -> {out_t}"
+        )
+        return r
+
+    def _emit_count_reduce_min(self, operand_name: str, operand_t: str, out_t: str,
+                               dims: list, init_name: str, elem_t: str,
+                               lines: list) -> str:
+        """min-reduce (the inverse-permutation step); ``elem_t`` is the
+        scalar element type of the operand (``tensor<i64>`` for the index
+        column, the keys scalar type for the sorted-keys step)."""
+        a1, a2 = self._new_name(), self._new_name()
+        mn = self._new_name()
+        region = (
+            "({\n"
+            f"  ^bb0({a1}: {elem_t}, {a2}: {elem_t}):\n"
+            f"    {mn} = stablehlo.minimum {a1}, {a2} : {elem_t}\n"
+            f"    stablehlo.return {mn} : {elem_t}\n"
+            "  })"
+        )
+        r = self._new_name()
+        lines.append(
+            f'{r} = "stablehlo.reduce"({operand_name}, {init_name}) {region} '
+            f"{{dimensions = {self._i64_array(dims)}}} : "
+            f"({operand_t}, {elem_t}) -> {out_t}"
+        )
+        return r
+
 
     #: Adaptive cyclic-Jacobi sweep count for the ``eigh`` composition (see
     #: ``_eigh_sweeps``). Each sweep zeroes every off-diagonal (p, q) once;
@@ -3172,16 +3468,192 @@ class Writer:
         return "\n".join(out)
 
     def _emit_while(self, op: Op) -> str:
-        operand_names = ", ".join(self._name(v) for v in op.operands)
+        lines = []
+        operand_names = [
+            self._rewrite_while_init(op, v, lines) for v in op.operands
+        ]
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
         types = ", ".join(self._vt(v.type) for v in op.operands)
-        lines = [f'{lhs}"stablehlo.while"({operand_names}) ({{']
+        lines.append(f'{lhs}"stablehlo.while"({", ".join(operand_names)}) ({{')
         lines.append(self._emit_while_region(op.regions[0]))
         lines.append("  }, {")
         lines.append(self._emit_while_region(op.regions[1]))
         lines.append(f"  }}) : ({types}) -> ({types})")
         return "\n".join(lines)
+
+    # --- while-init constant rewrite (iree AffinityAnalysis SEGV) ---
+    #
+    # iree 3.11.0 SEGVs (SIGSEGV, "Error code: -11", during
+    # VerifyLoweringToAsyncPass) on dense rank>=1 `stablehlo.constant`
+    # values used as while-INIT operands — upstream
+    # `IREE::Stream::AffinityAnalysis::run()` infinite recursion via
+    # walkTransitiveUses ⇄ ValueConsumerAffinityPVS::updateValue (the real
+    # evox NSGA2 `non_dominate_rank` while_loop: ~9/10 llvm-cpu, ~3/5
+    # cuda; every pop/dim/probe fails; --mlir-disable-threading does not
+    # help). The validated workaround (10/10 clean compiles + bit-exact
+    # runs on llvm-cpu AND cuda) replaces an all-zero rank>=1 constant
+    # init with COMPUTED zeros: `not(x)`/`and(x, not(x))` over a
+    # same-shaped NON-constant pre-loop value + a dtype-changing `convert`
+    # (+ `reduce` when the source is one axis larger) — the "P15" pattern.
+    # Never `x - x` (subtract-derived) nor broadcast-of-scalar-0: iree's
+    # canonicalizer folds both back into constants.
+    #
+    # SAFETY ORDERING (measured, iree 3.11): the SEGV is a use-graph-
+    # topology effect, not a property of the zero expression. The REDUCE
+    # path (source one axis larger, input-derived, bool/int) is the ONLY
+    # class validated safe at real-graph scale (10/10 llvm-cpu AND cuda,
+    # n=32/n=128/full NSGA2 tell). Exact-shape sources and the `iota`
+    # fallback are small-graph-safe only — on the real non_dominate_rank
+    # loop an exact-shape rank-1-derived source SEGVs 0/10 deterministically
+    # and the iota fallback 0/10 (the exact-shape preference over the
+    # reduce path was the bug in the first writer iteration; see
+    # _find_while_zero_source). Non-zero constants and rank-0 (scalar)
+    # inits are left untouched (scalars are unaffected; non-zero constants
+    # have no valid replacement — such loops remain broken on iree, use
+    # the unrolled fixed-point workaround; see stablehlo/CONTEXT.md Known
+    # Issues).
+
+    def _rewrite_while_init(self, op: Op, value: Value, lines: list) -> str:
+        """Return the SSA name to use for one `while` init operand,
+        emitting the computed-zeros rewrite into `lines` when applicable
+        (see the class comment above for the trigger and the pattern)."""
+        if not self._while_init_rewrite:
+            return self._name(value)
+        def_op = value.defining_op
+        if def_op is None or def_op.name != "constant":
+            return self._name(value)  # not a literal constant
+        data = np.asarray(def_op.attributes["value"])
+        target_shape = tuple(value.type.shape)
+        if data.ndim < 1 or data.size == 0:
+            return self._name(value)
+        if not all(_is_static_dim(d) for d in target_shape):
+            return self._name(value)
+        if not bool(np.all(data == 0)):
+            return self._name(value)  # non-zero constants: no valid rewrite
+        target_dtype = np.dtype(value.type.dtype)
+        src = self._find_while_zero_source(op, target_shape)
+        # No usable source → the iota-derived fallback (always available
+        # for a static target shape). NOTE: validated safe on SMALL graphs
+        # only — at real-graph scale it also SEGVs (see the class comment).
+        return self._emit_while_zero_init(src, target_shape, target_dtype, lines)
+
+    def _find_while_zero_source(self, op: Op, target_shape: tuple):
+        """Find a NON-constant pre-loop value (same block, emitted before
+        the `while`) from which all-zero values of ``target_shape`` can be
+        derived, with the classes ordered by validated safety on iree 3.11
+        (the AffinityAnalysis SEGV is a use-graph-topology effect, NOT a
+        property of the zero expression — the ordering below is the
+        measured one):
+
+        1. REDUCE path (validated-safe class, 10/10 clean compiles + bit
+           exact runs on llvm-cpu AND cuda at real-graph scale): a value
+           ONE axis larger than the target (input-derived, kind bool/int)
+           reduced along the extra axis — the P15 dominance-matrix case:
+           (n, n) i1 → not/and → convert i1→i32 → reduce dim 0 → (n,) init.
+        2. EXACT-shape source (block args / non-constant derived values,
+           kind bool/int): not/and over the same-shaped value (+ convert).
+           Validated-safe on small graphs only — on the REAL
+           non_dominate_rank loop an exact-shape rank-1-derived source
+           SEGVs 0/10 deterministically (preferring it over the reduce
+           path was the bug in the first writer iteration).
+        3. IOTA fallback (in ``_emit_while_zero_init`` when no source):
+           small-graph-safe only; at real-graph scale it also SEGVs.
+
+        Returns ``(name, src_shape, src_dtype, reduce_axis|None)`` or None
+        (no usable source — the caller keeps the constant init)."""
+        block = op.parent
+        candidates = []
+        if block is not None:
+            # Block args first (function inputs / enclosing while carries
+            # in nested regions) — they are non-constant by construction.
+            candidates.extend(block.arguments)
+            for bop in block.ops:
+                if bop is op:
+                    break
+                if bop.name != "constant":
+                    candidates.extend(bop.results)
+        # 1. reduce path first — the only class validated safe at scale.
+        for cand in candidates:
+            c_shape = tuple(cand.type.shape)
+            dtype = np.dtype(cand.type.dtype)
+            if dtype.kind not in "biu":
+                continue
+            if len(c_shape) == len(target_shape) + 1 and all(
+                _is_static_dim(d) for d in c_shape
+            ):
+                for a in range(len(c_shape)):
+                    if c_shape[:a] + c_shape[a + 1 :] == target_shape:
+                        return (self._name(cand), c_shape, dtype, a)
+        # 2. exact-shape source (small-graph-safe only — see the docstring).
+        for cand in candidates:
+            c_shape = tuple(cand.type.shape)
+            if c_shape == target_shape:
+                dtype = np.dtype(cand.type.dtype)
+                if dtype.kind in "biu":
+                    return (self._name(cand), c_shape, dtype, None)
+        return None
+
+    def _emit_while_zero_init(self, src, target_shape: tuple, target_dtype,
+                              lines: list) -> str:
+        """Emit the computed-zeros pattern for a while-init rewrite and
+        return the result name. ``src`` is ``(name, shape, dtype,
+        reduce_axis|None)``; when the source kind is not bool/int (or no
+        source was found — caller passes None), an ``iota`` of the target
+        shape (int32) is derived instead."""
+        if src is None:
+            iota_name = self._new_name()
+            lines.append(
+                f"{iota_name} = stablehlo.iota dim = 0 : "
+                f"{self._type_str(np.dtype('int32'), target_shape)}"
+            )
+            src = (iota_name, target_shape, np.dtype("int32"), None)
+        src_name, src_shape, src_dtype, axis = src
+        n = self._new_name()
+        lines.append(
+            f"{n} = stablehlo.not {src_name} : "
+            f"{self._type_str(src_dtype, src_shape)}"
+        )
+        z = self._new_name()
+        lines.append(
+            f"{z} = stablehlo.and {src_name}, {n} : "
+            f"{self._type_str(src_dtype, src_shape)}"
+        )
+        cur = z
+        if src_dtype != target_dtype:
+            t = self._new_name()
+            lines.append(
+                f"{t} = stablehlo.convert {cur} : "
+                f"({self._type_str(src_dtype, src_shape)}) -> "
+                f"{self._type_str(target_dtype, src_shape)}"
+            )
+            cur = t
+        if axis is not None:
+            elem_t = self._elem_type(target_dtype)
+            zero = self._new_name()
+            lines.append(
+                f"{zero} = stablehlo.constant "
+                f"{self._constant_text(np.asarray(0, dtype=target_dtype))} : "
+                f"{elem_t}"
+            )
+            a1, a2 = self._new_name(), self._new_name()
+            s = self._new_name()
+            region = (
+                "({\n"
+                f"  ^bb0({a1}: {elem_t}, {a2}: {elem_t}):\n"
+                f"    {s} = stablehlo.add {a1}, {a2} : {elem_t}\n"
+                f"    stablehlo.return {s} : {elem_t}\n"
+                "  })"
+            )
+            r = self._new_name()
+            lines.append(
+                f'{r} = "stablehlo.reduce"({cur}, {zero}) {region} '
+                f"{{dimensions = {self._i64_array([axis])}}} : "
+                f"({self._type_str(target_dtype, src_shape)}, {elem_t}) -> "
+                f"{self._type_str(target_dtype, target_shape)}"
+            )
+            cur = r
+        return cur
 
     def _emit_while_region(self, region) -> str:
         """One `while` region (cond/body): block args bound positionally to
@@ -3422,6 +3894,14 @@ class Writer:
     @staticmethod
     def _int_list(values) -> str:
         return ", ".join(str(int(v)) for v in values)
+
+    @staticmethod
+    def _list_attr(values) -> str:
+        """Plain ``[a, b]`` list text for CUSTOM-form attributes (`dims =
+        [...]` on ``stablehlo.broadcast_in_dim``) — the custom form takes a
+        DenseI64ArrayAttr printed as a plain list, NOT the ``array<i64: ...>``
+        spelling (iree-compile rejects the latter in custom form)."""
+        return "[" + ", ".join(str(int(v)) for v in values) + "]"
 
     @staticmethod
     def _i64_array(values) -> str:

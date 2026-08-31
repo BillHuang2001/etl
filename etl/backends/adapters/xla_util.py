@@ -319,7 +319,13 @@ class _Client(_Handle):
         )
 
     def compile(self, mlir_text: str) -> "_LoadedExecutable":
-        """Compile StableHLO MLIR text (``PJRT_Client_Compile``)."""
+        """Compile StableHLO MLIR text (``PJRT_Client_Compile``).
+
+        Real plugins (jax_cuda12_pjrt 0.4.38's xla_cuda_plugin.so et al.)
+        CHECK-crash on NULL ``compile_options`` — the serialized
+        ``xla.CompileOptionsProto`` below (the jax-default single-replica
+        form, probe-validated) must be passed instead.
+        """
         code_buf = ctypes.create_string_buffer(mlir_text.encode("utf-8"))
         fmt_buf = ctypes.create_string_buffer(b"mlir")
         program = pjrt.PJRT_Program(
@@ -329,18 +335,31 @@ class _Client(_Handle):
             format=ctypes.cast(fmt_buf, ctypes.c_void_p),
             format_size=4,  # len("mlir")
         )
+        # xla.CompileOptionsProto: {executable_build_options {
+        #   num_replicas: 1, num_partitions: 1 }} — serialized wire bytes
+        # (probe-validated against the real CUDA plugin).
+        opts_bytes = bytes.fromhex("1a0420012801")
+        opts_buf = ctypes.create_string_buffer(opts_bytes)
         args = pjrt.PJRT_Client_Compile_Args(
             struct_size=pjrt.sizeof(pjrt.PJRT_Client_Compile_Args),
             client=self.ptr,
             program=ctypes.pointer(program),
-            compile_options=None,
-            compile_options_size=0,
+            compile_options=ctypes.cast(opts_buf, ctypes.c_void_p),
+            compile_options_size=len(opts_bytes),
             executable=None,
         )
-        self.plugin._check(
-            self.plugin.api.PJRT_Client_Compile(ctypes.byref(args)),
-            "PJRT_Client_Compile",
-        )
+        try:
+            self.plugin._check(
+                self.plugin.api.PJRT_Client_Compile(ctypes.byref(args)),
+                "PJRT_Client_Compile",
+            )
+        except core.BackendError as exc:
+            if "ptxas" in str(exc):
+                raise core.BackendError(
+                    f"{exc} — ensure ptxas (from the CUDA toolkit) is on "
+                    "PATH (the XLA CUDA plugin invokes it at compile time)"
+                ) from None
+            raise
         return _LoadedExecutable(self.plugin, args.executable)
 
     def deserialize(self, serialized: bytes) -> "_LoadedExecutable":
