@@ -86,7 +86,7 @@ Not public: `_register_block_impls` (documented no-op — block dispatch resolve
 | `./kernels/linalg.py` | dot/conv/solve |
 | `./kernels/control_flow.py` | if/while/call — recursive region execution (the `return` terminator is special-cased by the interpreter loop, never dispatched) |
 | `./kernels/collective.py` | dist collective ops dispatched through `dist.context.get_collective_executor()` (rank/world_size resolved from the per-run `RankContext`) |
-| `./kernels/random.py` | the 6 `random_*` kernels (etl.random family): SplitMix64-based, pure/deterministic — same key ⇒ bit-identical values across runs |
+| `./kernels/random.py` | the 6 `random_*` kernels (etl.random family): three algorithms — splitmix64 (v1 default, rank-0 int64 key), threefry2x32 (2×u32 key, 20 rounds), philox4x32_10 (4×u32 key, 10 rounds) — pure/deterministic (same key ⇒ bit-identical values across runs); the module docstring pins the WORD-STREAM CONTRACT (salt folded into the key, counter (p, 0), C-order element mapping, width-parametrized uniform scaling) that the StableHLO export must mirror exactly |
 | `./kernels/sorting.py` | sort/argsort — np-exact |
 | `./kernels/structural.py` | tile/flip/roll/diag + nan_to_num — np-exact |
 | `./kernels/custom.py` | `constant`, `runtime_call` (sync callback via `ctx.resolve_callback` — artifacts with `runtime_call` require the same callback registrations at load time), `block_call` (registered numpy impl dispatch) |
