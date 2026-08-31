@@ -26,9 +26,9 @@ SPEC_2X3 = etl.TensorSpec((2, 3), etl.float32)
 SHELL_SUBSTRINGS = ("module {", "func.func @main", "func.return")
 
 
-def _export(fn, *specs):
+def _export(fn, *specs, options=None):
     """Trace ``fn`` over ``specs`` and export the graph as StableHLO MLIR text."""
-    return etl.backends.stablehlo.export(etl.trace(fn, *specs))
+    return etl.backends.stablehlo.export(etl.trace(fn, *specs), options=options)
 
 
 def _export_error(fn, *specs):
@@ -876,3 +876,228 @@ def test_diag_dynamic_dims_deferred_naming_op():
     assert "op 'diag'" in msg
     assert "dynamic" in msg
     assert "not supported" in msg
+
+
+# --- 16. algorithm-aware random export --------------------------------------
+
+# Multi-algorithm RNG lowering (workstream B, commit 119854b): the
+# threefry2x32 / philox4x32_10 random ops carry a static ``algorithm``
+# attribute; the exporter lowers them as INLINE bit-exact i32/ui32
+# elementwise subgraphs by default, or — when the writer's
+# ``rng_bit_generator`` option is set — as a NATIVE
+# ``stablehlo.rng_bit_generator`` call with the verified state layout
+# ``[key0, key1, ctr...]`` (key words FIRST, counter words zero).
+# splitmix64 (the default, and the only pre-workstream-B layout) stays a
+# pure i64 inline expansion regardless of the option. These tests pin the
+# emission SHAPES (state layouts, enum spellings, salt folds, inline
+# composition markers); the bit-exact behavior pins live in
+# `test_iree_emitters_parity.py` / `tests/ops/test_random.py`. NOTE: the
+# native PHILOX emission is export-only — iree's legalization of PHILOX
+# fails, so that graph is never run on a compiler backend.
+
+from etl.backends.stablehlo import random_export as _random_export
+
+_THREEFRY_KEY_SPEC = etl.TensorSpec((2,), etl.int32)
+_PHILOX_KEY_SPEC = etl.TensorSpec((4,), etl.int32)
+_SPLITMIX_KEY_SPEC = etl.TensorSpec((), etl.int64)
+
+
+def _fn_uniform_threefry(k):
+    return etl.random.uniform(k, (4,))
+
+
+def _fn_uniform_philox(k):
+    return etl.random.uniform(k, (4,))
+
+
+def _fn_uniform_splitmix(k):
+    return etl.random.uniform(k, (4,))
+
+
+def _signed_i32(word):
+    """A 32-bit word as the exporter's two's-complement i32 literal."""
+    return int(np.uint32(word).view(np.int32))
+
+
+def test_threefry_native_rng_bit_generator_golden():
+    mlir = _export(
+        _fn_uniform_threefry, _THREEFRY_KEY_SPEC,
+        options={"rng_bit_generator": True},
+    )
+    # Salt-folded key: uniform's pi-hex salt [slo, shi] as a 2-word i32
+    # constant, xor'd with the (2,) i32 key (the key words come FIRST in
+    # the state; the counter words are zero).
+    slo, shi = _random_export._salt_words(_random_export._SALTS["uniform"])
+    salt_text = f"dense<[{_signed_i32(slo)}, {_signed_i32(shi)}]>"
+    salt_line = _line_containing(mlir, salt_text)
+    assert ": tensor<2xi32>" in salt_line
+    xor_line = _line_containing(mlir, "stablehlo.xor %arg0")
+    assert ": tensor<2xi32>" in xor_line
+    # The folded key converts bit-preservingly to ui32; the zero counter
+    # words are a scalar-constant broadcast to (2,).
+    assert "(tensor<2xi32>) -> tensor<2xui32>" in mlir
+    assert "dense<0> : tensor<ui32>" in mlir
+    assert "(tensor<ui32>) -> tensor<2xui32>" in mlir
+    # State = concatenate(key' (2,), zeros (2,)) → tensor<4xui32>.
+    concat_line = _line_containing(mlir, '"stablehlo.concatenate"')
+    assert "dimension = 0 : i64" in concat_line
+    assert "(tensor<2xui32>, tensor<2xui32>) -> tensor<4xui32>" in concat_line
+    # The native call: TWO results (state_out, words), enum WITHOUT the
+    # RNG_ALG_ prefix, no shape operand (the output length comes from the
+    # result type).
+    rng_line = _line_containing(mlir, "stablehlo.rng_bit_generator")
+    assert "algorithm = THREE_FRY" in rng_line
+    assert "(tensor<4xui32>) -> (tensor<4xui32>, tensor<4xui32>)" in rng_line
+    assert "shape" not in rng_line
+    assert "RNG_ALG_" not in mlir
+    # Final bit-preserving out convert: ui32 → i32.
+    assert "(tensor<4xui32>) -> tensor<4xi32>" in mlir
+
+
+def test_philox_native_rng_bit_generator_golden():
+    # EXPORT-ONLY golden: iree's legalization of PHILOX fails, so this
+    # emission is never run on a compiler backend — it pins the verified
+    # state layout [k0', k1', 0, 0, 0, 0] only.
+    mlir = _export(
+        _fn_uniform_philox, _PHILOX_KEY_SPEC,
+        options={"rng_bit_generator": True},
+    )
+    # Salt fold: the [lo, hi, lo, hi] pattern on the (4,) i32 key.
+    slo, shi = _random_export._salt_words(_random_export._SALTS["uniform"])
+    salt_text = (
+        f"dense<[{_signed_i32(slo)}, {_signed_i32(shi)}, "
+        f"{_signed_i32(slo)}, {_signed_i32(shi)}]>"
+    )
+    salt_line = _line_containing(mlir, salt_text)
+    assert ": tensor<4xi32>" in salt_line
+    xor_line = _line_containing(mlir, "stablehlo.xor %arg0")
+    assert ": tensor<4xi32>" in xor_line
+    # Only the FIRST TWO folded key words feed the cipher: the 4-word
+    # folded key is sliced down to (2,) before the state concat.
+    assert "(tensor<4xi32>) -> tensor<2xi32>" in mlir
+    assert "dense<0> : tensor<ui32>" in mlir
+    assert "(tensor<ui32>) -> tensor<4xui32>" in mlir
+    # State = concatenate(key' (2,), zeros (4,)) → tensor<6xui32>.
+    concat_line = _line_containing(mlir, '"stablehlo.concatenate"')
+    assert "(tensor<2xui32>, tensor<4xui32>) -> tensor<6xui32>" in concat_line
+    rng_line = _line_containing(mlir, "stablehlo.rng_bit_generator")
+    assert "algorithm = PHILOX" in rng_line
+    assert "(tensor<6xui32>) -> (tensor<6xui32>, tensor<4xui32>)" in rng_line
+    assert "shape" not in rng_line
+    assert "RNG_ALG_" not in mlir
+    assert "(tensor<4xui32>) -> tensor<4xi32>" in mlir
+
+
+def test_threefry_inline_default_emission():
+    # DEFAULT options (no options dict): no native call — the cipher is
+    # expanded as the bit-exact inline i32 elementwise subgraph.
+    mlir = _export(_fn_uniform_threefry, _THREEFRY_KEY_SPEC)
+    assert "rng_bit_generator" not in mlir
+    # Word-index counters: iota (M = ceil(4/2) = 2 blocks).
+    assert "stablehlo.iota dim = 0 : tensor<2xi32>" in mlir
+    # rotl = shift_left | shift_right_logical (bit-exact on the u32 bit
+    # pattern) — the inline cipher's rotation composition.
+    assert "stablehlo.shift_left" in mlir
+    assert "stablehlo.shift_right_logical" in mlir
+    assert "stablehlo.or" in mlir
+    # A pure i32 expansion — no ui32 anywhere (unlike the native path).
+    assert "ui32" not in mlir
+
+
+def test_philox_inline_default_emission():
+    mlir = _export(_fn_uniform_philox, _PHILOX_KEY_SPEC)
+    assert "rng_bit_generator" not in mlir
+    # iota (M = ceil(4/4) = 1 block), converted bit-preservingly to ui32.
+    assert "stablehlo.iota dim = 0 : tensor<1xi32>" in mlir
+    # The i64 mulhilo chain: ui32→i64 zero-extend convert, i64 multiply,
+    # LOGICAL shift of the i64 product (the exact uint64 high half — the
+    # emitter uses shift_right_logical, never shift_right_arithmetic),
+    # truncating convert back to ui32.
+    assert "(tensor<1xui32>) -> tensor<1xi64>" in mlir
+    assert "stablehlo.multiply" in mlir
+    assert "stablehlo.shift_right_logical" in mlir
+    assert "stablehlo.shift_right_arithmetic" not in mlir
+    # Key convert i32 → ui32 and the final word-stream convert ui32 → i32.
+    assert "(tensor<4xi32>) -> tensor<4xui32>" in mlir
+    assert "(tensor<4xui32>) -> tensor<4xi32>" in mlir
+
+
+def test_inline_random_exports_are_deterministic():
+    for fn, spec in [
+        (_fn_uniform_threefry, _THREEFRY_KEY_SPEC),
+        (_fn_uniform_philox, _PHILOX_KEY_SPEC),
+    ]:
+        graph = etl.trace(fn, spec)
+        assert (
+            etl.backends.stablehlo.export(graph)
+            == etl.backends.stablehlo.export(graph)
+        )
+
+
+def test_splitmix64_inline_golden_and_option_insensitive():
+    # splitmix64 (the default algorithm) is ALWAYS the classic i64 inline
+    # expansion — the native rng_bit_generator option does not apply to
+    # it (there is no stablehlo.rng_bit_generator mapping for splitmix64).
+    default_mlir = _export(_fn_uniform_splitmix, _SPLITMIX_KEY_SPEC)
+    assert "rng_bit_generator" not in default_mlir
+    # word_i = mix3(seed + (i + 1) * GOLDEN): iota word-index counters.
+    assert "stablehlo.iota dim = 0 : tensor<4xi64>" in default_mlir
+    # The mix3 chain (documented as bit-exact on the uint64 bit pattern):
+    # i64 multiply / xor / LOGICAL right shift — never arithmetic (the
+    # uint64 logical shift is emitted directly as shift_right_logical).
+    assert "stablehlo.multiply" in default_mlir
+    assert "stablehlo.shift_right_logical" in default_mlir
+    assert "stablehlo.shift_right_arithmetic" not in default_mlir
+    # Salt fold: uniform's pi-hex salt (as a two's-complement i64)
+    # xor'd with the rank-0 i64 key.
+    salt = _random_export._SALTS["uniform"] & ((1 << 64) - 1)
+    salt_signed = int(np.uint64(salt).view(np.int64))
+    salt_line = _line_containing(default_mlir, f"dense<{salt_signed}>")
+    assert ": tensor<i64>" in salt_line
+    xor_line = _line_containing(default_mlir, "stablehlo.xor %arg0")
+    assert ": tensor<i64>" in xor_line
+    # The option changes nothing for splitmix64: byte-identical export.
+    optioned = _export(
+        _fn_uniform_splitmix, _SPLITMIX_KEY_SPEC,
+        options={"rng_bit_generator": True},
+    )
+    assert optioned == default_mlir
+    assert "rng_bit_generator" not in optioned
+
+
+@pytest.mark.parametrize(
+    "key_spec,options",
+    [
+        (_SPLITMIX_KEY_SPEC, None),
+        (_THREEFRY_KEY_SPEC, None),
+        (_PHILOX_KEY_SPEC, None),
+        (_SPLITMIX_KEY_SPEC, {"rng_bit_generator": True}),
+        (_THREEFRY_KEY_SPEC, {"rng_bit_generator": True}),
+        (_PHILOX_KEY_SPEC, {"rng_bit_generator": True}),
+    ],
+    ids=[
+        "splitmix64-default",
+        "threefry2x32-default",
+        "philox4x32_10-default",
+        "splitmix64-native",
+        "threefry2x32-native",
+        "philox4x32_10-native",
+    ],
+)
+def test_random_multinomial_deferred_for_all_algorithms(key_spec, options):
+    # ``random_multinomial`` is the only random op still deferred in v1 —
+    # for ALL algorithms (the existing splitmix64-only pin lives in
+    # tests/ops/test_random.py; this covers the new key layouts AND the
+    # native-emission option, which must not silently enable it).
+    def f(key):
+        probs = etl.constant(
+            etl.tensor(np.array([0.25, 0.25, 0.5], dtype=np.float32))
+        )
+        return etl.random.multinomial(key, probs, 5)
+
+    graph = etl.trace(f, key_spec)
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.backends.stablehlo.export(graph, options=options)
+    msg = str(excinfo.value)
+    assert "op 'random_multinomial'" in msg
+    assert "not supported in v1" in msg
