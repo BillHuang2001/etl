@@ -282,6 +282,13 @@ class IreeBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
+        # False (empirically): iree 3.11 legalizes RNG_ALG_THREE_FRY
+        # bit-exactly (state layout [key0,key1,ctr0,ctr1]) but FAILS to
+        # legalize RNG_ALG_PHILOX — the bool capability cannot express
+        # per-algorithm support, so the exporter uses its bit-exact inline
+        # expansions for both algorithms on this target (see
+        # adapters/CONTEXT.md Known Issues).
+        rng_bit_generator=False,
     )
 
     @classmethod

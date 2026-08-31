@@ -191,8 +191,12 @@ class CompilerBackend(Backend):
            ``custom_blocks=False`` have already rejected ``block_call``
            at step 2).
         4. ``graph.verify()`` again (defensive, cheap).
-        5. ``stablehlo.export(graph)`` — the capability gate for ops:
-           deferred ops raise ``core.BackendError`` naming them.
+        5. ``stablehlo.export(graph, options={"rng_bit_generator":
+           self.capabilities.rng_bit_generator})`` — the capability gate for
+           ops: deferred ops raise ``core.BackendError`` naming them; the
+           flag selects the native ``stablehlo.rng_bit_generator`` emission
+           for the threefry2x32/philox4x32_10 random algorithms (False →
+           the exporter's bit-exact inline expansions, always available).
         6. Record the ``Signature`` EXACTLY like ``NumpyBackend.lower``
            (input/output TreeSpec + per-leaf specs + static values, from
            the Graph's LIVE attributes).
@@ -244,7 +248,9 @@ class CompilerBackend(Backend):
 
         from .stablehlo import export
 
-        mlir_text = export(graph)
+        mlir_text = export(
+            graph, options={"rng_bit_generator": self.capabilities.rng_bit_generator}
+        )
 
         from etl.backends.numpy.interpreter import entry_function
 

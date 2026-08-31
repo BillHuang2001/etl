@@ -155,11 +155,15 @@ class Writer:
     module is assumed verified (``export()`` runs ``module.verify()``
     first), the Writer only type-checks it defensively."""
 
-    def __init__(self, module: Module) -> None:
+    def __init__(self, module: Module, options: dict | None = None) -> None:
         """Store the verified module and initialize per-write state.
 
         State: SSA name counter (module-wide), per-value name map
-        (``id(Value) -> "%N"``).
+        (``id(Value) -> "%N"``), and the ``rng_bit_generator`` exporter
+        option (bool; selects the native ``stablehlo.rng_bit_generator``
+        emission for the threefry2x32/philox4x32_10 random algorithms —
+        default False = the bit-exact inline expansions; consumed by
+        ``random_export``).
         Raises TypeError if `module` is not an `etl.ir.Module` (export()
         pre-validates; this is a defensive check only).
         """
@@ -176,6 +180,8 @@ class Writer:
         #: used where the emitted program's types legitimately differ from
         #: the IR's symbolic types (all_gather/reduce_scatter axis dims).
         self._type_overrides: dict[int, str] = {}
+        #: rng_bit_generator exporter option (see random_export).
+        self._rng_bit_generator = bool((options or {}).get("rng_bit_generator", False))
 
     # ------------------------------------------------------------------
     # Public API

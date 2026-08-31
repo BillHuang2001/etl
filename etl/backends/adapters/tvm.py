@@ -131,6 +131,10 @@ class TvmBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
+        # False: the TVM StableHLO frontend has no rng_bit_generator
+        # support — the exporter's bit-exact inline expansions are used
+        # for the threefry2x32/philox4x32_10 random algorithms.
+        rng_bit_generator=False,
     )
 
     @classmethod

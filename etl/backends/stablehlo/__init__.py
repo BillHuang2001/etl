@@ -18,13 +18,21 @@ from etl.ir import Module, verify  # allowed: top-level imports are core/ir only
 __all__ = ["export"]
 
 
-def export(graph_or_module) -> str:
+def export(graph_or_module, options: dict | None = None) -> str:
     """Export a graph or module as StableHLO MLIR text.
 
     Args:
         graph_or_module: a `trace.Graph` (duck-typed — its `.module`
             attribute is used; no `etl.trace` import is needed here) or an
             `etl.ir.Module` directly.
+        options: optional dict of exporter options. ``rng_bit_generator``
+            (bool, default False) selects the NATIVE
+            ``stablehlo.rng_bit_generator`` emission for the
+            threefry2x32/philox4x32_10 random algorithms; when False (the
+            default) they are expanded as bit-exact inline i32/ui32
+            elementwise subgraphs, so bare exports always work. The
+            compiler adapters pass their ``Capabilities.rng_bit_generator``
+            flag through here from ``lower()``.
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external
@@ -63,4 +71,4 @@ def export(graph_or_module) -> str:
     verify(module)
     from .writer import Writer
 
-    return Writer(module).write()
+    return Writer(module, options=options).write()
