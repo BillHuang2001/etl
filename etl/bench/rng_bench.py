@@ -23,11 +23,16 @@ Matrix
   input (``etl.random.key(seed, algorithm)`` — a concrete tensor, never a
   graph Constant).
 - paths (compiler targets only): ``inline`` (the exporter's bit-exact inline
-  cipher expansions — ``rng_bit_generator=False``) and ``native``
-  (``stablehlo.rng_bit_generator`` — ``rng_bit_generator=True``, toggled by
-  monkeypatching ``IreeBackend.capabilities`` for the duration of the config
-  and RESTORED afterwards). splitmix64 has no native form → inline only.
-  numpy is the reference → path ``-``.
+  cipher expansions — the capability forced to the EMPTY set) and ``native``
+  (``stablehlo.rng_bit_generator`` — the capability forced to the full
+  native-capable set ``frozenset({"threefry2x32", "philox4x32_10"})``).
+  ``Capabilities.rng_bit_generator`` is a PER-ALGORITHM frozenset of algorithm
+  names (not a bool); the per-config path is toggled by monkeypatching
+  ``IreeBackend.capabilities`` for the duration of the config and RESTORED
+  afterwards. On iree, native THREE_FRY is now the ADAPTER DEFAULT for
+  threefry2x32 — the inline/native rows still measure BOTH paths via the
+  monkeypatch. splitmix64 has no native form → inline only. numpy is the
+  reference → path ``-``.
 
 Methodology (per config)
 ------------------------
@@ -70,6 +75,12 @@ Known exclusions (documented in the report header)
   config (the inline expansions are huge); 512 keeps the worst-case
   per-config compile ≈ 2 min while remaining a representative key-derivation
   workload. Override with ``--split-n``.
+
+Results
+-------
+Benchmark results and the default-algorithm decision are recorded in
+``etl/bench/rng_bench_results.md`` (sibling of this module); reproduce them
+with the usage line below.
 
 Usage::
 
@@ -219,15 +230,20 @@ def _asarray(out):
 # ---------------------------------------------------------------------------
 
 
-def _set_iree_native(flag: bool):
-    """Patch ``IreeBackend.capabilities.rng_bit_generator`` to ``flag``;
-    returns the ORIGINAL capabilities for restoration."""
+def _set_iree_native(path: str):
+    """Patch ``IreeBackend.capabilities.rng_bit_generator`` (a PER-ALGORITHM
+    frozenset of algorithm names, not a bool) for the given lowering
+    ``path``: ``"native"`` → ``frozenset(_NATIVE_CAPABLE)`` (both
+    native-capable ciphers); ``"inline"`` → ``frozenset()`` (forces the
+    exporter's bit-exact inline expansions for every algorithm). Returns the
+    ORIGINAL capabilities for restoration."""
     from etl.backends.adapters.iree import IreeBackend
 
     orig = IreeBackend.capabilities
-    if orig.rng_bit_generator != flag:
+    caps = frozenset(_NATIVE_CAPABLE) if path == "native" else frozenset()
+    if orig.rng_bit_generator != caps:
         IreeBackend.capabilities = dataclasses.replace(
-            orig, rng_bit_generator=flag
+            orig, rng_bit_generator=caps
         )
     return orig
 
@@ -416,7 +432,7 @@ def _measure_config(cfg: _Config, args, cuda_device, repeats) -> dict:
             artifact = etl.compile(lowered)
             exe = etl.load(artifact)
         else:
-            orig = _set_iree_native(cfg.path == "native")
+            orig = _set_iree_native(cfg.path)
             try:
                 lowered = etl.lower(graph, backend="iree")
                 target_backends = (
