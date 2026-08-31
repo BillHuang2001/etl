@@ -30,7 +30,7 @@ Must-expose names (re-exported from `etl/backends/__init__.py` and from `etl`):
 | `adapters` | `adapters/__init__.py` | subpackage marker, docstring-only (no heavy imports): documents the three IMPLEMENTED adapter modules `iree.py`/`xla.py`/`tvm.py` (singletons `iree_backend`/`xla_backend`/`tvm_backend`), each module's `register()` contract, the heavy-import rule, and the register-on-first-use flow via `registry.get` |
 | `numpy_backend` | `numpy/__init__.py` | `NumpyBackend` instance, registered at import; the DEFAULT backend |
 | `NumpyBackend`, `NumpyExecutable` | `numpy/__init__.py` | reference CPU interpreter |
-| `stablehlo` | `stablehlo/__init__.py` | submodule; `stablehlo.export(graph_or_module) -> str` (MLIR text) |
+| `stablehlo` | `stablehlo/__init__.py` | submodule; `stablehlo.export(graph_or_module, options=None) -> str` (MLIR text; `options["rng_bit_generator"]` bool selects native `stablehlo.rng_bit_generator` emission for threefry/philox — default False = inline expansions) |
 
 ## Constraints (binding)
 
