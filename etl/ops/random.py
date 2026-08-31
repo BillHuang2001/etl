@@ -29,9 +29,16 @@ Design (binding — see ``etl/CONTEXT.md``, section "etl.random"):
   runtime-dynamic ``None`` entries are rejected. ``low``/``high``/``mean``/
   ``std`` may be Python scalars or SYMBOLIC tensors broadcastable against
   ``shape`` (the result shape is the broadcast — matching the kernels).
-- **Backends**: numpy interpreter only in v1. Compiler backends
-  (stablehlo/iree/xla/tvm) reject every random op with an explicit
-  ``BackendError`` (no stablehlo writer) — never silent fallback. Transforms
+- **Backends**: the numpy interpreter is the reference backend for all 6
+  ops. 5 of the 6 ops (``random_key_mix``, ``random_uniform``,
+  ``random_normal``, ``random_randint``, ``random_permutation``) ALSO export
+  as v1 StableHLO — inline SplitMix64 i64 subgraph expansion in
+  ``etl/backends/stablehlo/random_export.py`` (never ``stablehlo.rng``),
+  bit-exact vs the numpy kernels (uniform/randint/permutation EXACT;
+  ``random_normal`` with f32 output uses a documented f32 Box–Muller fast
+  path, maxdiff ~1e-6 vs the f64 numpy kernel, same-key bit-identical across
+  runs). Only ``random_multinomial`` defers on compiler backends with an
+  explicit ``BackendError`` — never silent fallback. Transforms
   (``vmap``/``grad``/...) have no rules for random ops → ``TransformError``.
 """
 from __future__ import annotations
