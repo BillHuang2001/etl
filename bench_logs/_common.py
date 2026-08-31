@@ -118,7 +118,7 @@ def load_surg_mlir(graph: str) -> tuple[str, str]:
     orig = open(src).read()
     surg = surg_rank0_inputs(orig)
     out = os.path.join(HERE, GRAPHS[graph]["mlir"].replace(".mlir", "_key1.mlir"))
-    if open(out).read() != surg:
+    if not os.path.exists(out) or open(out).read() != surg:
         with open(out, "w") as f:
             f.write(surg)
     return orig, surg

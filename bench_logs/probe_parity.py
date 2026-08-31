@@ -88,9 +88,8 @@ def numpy_parity() -> dict:
         print(f"\n--- numpy parity: {graph} ---", flush=True)
         if graph == "de":
             algo = DE(pop_size=4096, dim=50, lb=lb, ub=ub)
-            state0 = StdWorkflow(algo, Sphere(), fused=True).init_step(
-                etl.random.key(41))
             wf = StdWorkflow(algo, Sphere(), fused=True)
+            state0 = wf.init_step(etl.random.key(41))
             state1 = wf.step(etl.random.key(42))
             ins = [
                 state0.pop, state0.fit, state0.trial_pop, np.array([42], np.int64)
@@ -111,7 +110,12 @@ def numpy_parity() -> dict:
               flush=True)
         _, surg = load_surg_mlir(graph)
         be = xla_compile(graph, surg)
-        xouts = be.run([core.Tensor(np.asarray(a)) for a in ins])
+        def _arr(a):
+            a = a.numpy() if hasattr(a, "numpy") else np.asarray(a)
+            if a.ndim == 0:  # surg'd signatures promote rank-0 scalars to (1,)
+                a = a.reshape((1,))
+            return a
+        xouts = be.run([core.Tensor(_arr(a)) for a in ins])
         per = []
         for i, xo in enumerate(xouts):
             ref = leaves[i].numpy() if i < len(leaves) else None

@@ -1,0 +1,294 @@
+{
+  "graphs": {
+    "de": {
+      "xla_vs_iree_real": [
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": false,
+          "max_abs": 0.000244140625,
+          "max_rel": 4.3562260271436445e-07
+        },
+        {
+          "bit_exact": false,
+          "max_abs": 0.000244140625,
+          "max_rel": 4.3562260271436445e-07
+        }
+      ],
+      "xla_vs_iree_zeros": [
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      ]
+    },
+    "pso": {
+      "xla_vs_iree_real": [
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": false,
+          "max_abs": 0.00030517578125,
+          "max_rel": 5.496518065735717e-07
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": false,
+          "max_abs": 0.00030517578125,
+          "max_rel": 5.496518065735717e-07
+        },
+        {
+          "bit_exact": false,
+          "max_abs": 0.00030517578125,
+          "max_rel": 5.496518065735717e-07
+        }
+      ],
+      "xla_vs_iree_zeros": [
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        {
+          "bit_exact": true,
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      ]
+    }
+  },
+  "numpy": {
+    "de": {
+      "n_leaves": 3,
+      "per_output": [
+        {
+          "output": 0,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 1,
+          "vs_state_leaf": {
+            "bit_exact": false,
+            "max_abs": 0.0001220703125,
+            "max_rel": 2.1750544742393072e-07
+          }
+        },
+        {
+          "output": 2,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 3,
+          "vs_state_leaf": "no matching state leaf"
+        },
+        {
+          "output": 4,
+          "vs_state_leaf": "no matching state leaf"
+        },
+        {
+          "output": 5,
+          "vs_state_leaf": "no matching state leaf"
+        }
+      ],
+      "all_finite": true
+    },
+    "pso": {
+      "n_leaves": 7,
+      "per_output": [
+        {
+          "output": 0,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 1,
+          "vs_state_leaf": {
+            "bit_exact": false,
+            "max_abs": 0.0001220703125,
+            "max_rel": 2.301468428916386e-07
+          }
+        },
+        {
+          "output": 2,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 3,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 4,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 5,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 6,
+          "vs_state_leaf": {
+            "bit_exact": true,
+            "max_abs": 0.0,
+            "max_rel": 0.0
+          }
+        },
+        {
+          "output": 7,
+          "vs_state_leaf": "no matching state leaf"
+        },
+        {
+          "output": 8,
+          "vs_state_leaf": "no matching state leaf"
+        },
+        {
+          "output": 9,
+          "vs_state_leaf": "no matching state leaf"
+        }
+      ],
+      "all_finite": true
+    }
+  }
+}

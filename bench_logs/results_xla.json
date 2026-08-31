@@ -1,0 +1,193 @@
+{
+  "env": {
+    "cuda_visible": "3",
+    "etl": "/mnt/hdd_pool/bchuang/tmp_pjrt_probe/etl_763a415/etl/__init__.py",
+    "plugin": "/mnt/hdd_pool/bchuang/tmp_pjrt_probe/x/jax_plugins/xla_cuda12/xla_cuda_plugin.so"
+  },
+  "graphs": {
+    "de": {
+      "compile_s": 1.32,
+      "platform": "cuda cuda 12030",
+      "rank0_buffer_shape": [
+        1
+      ],
+      "parity_runs": {
+        "real": {
+          "out_shapes": [
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096
+            ]
+          ],
+          "finite": true
+        },
+        "zeros": {
+          "out_shapes": [
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096
+            ]
+          ],
+          "finite": true
+        }
+      },
+      "run_batches_ms": [
+        {
+          "median": 7.8918,
+          "mean": 7.4652,
+          "p90": 9.5194,
+          "min": 3.7914
+        },
+        {
+          "median": 7.3811,
+          "mean": 7.3601,
+          "p90": 9.3651,
+          "min": 4.0094
+        }
+      ],
+      "execute_only_ms": {
+        "median": 0.1755,
+        "mean": 0.1882,
+        "p90": 0.2162,
+        "min": 0.1545
+      }
+    },
+    "pso": {
+      "compile_s": 0.3,
+      "platform": "cuda cuda 12030",
+      "rank0_buffer_shape": [
+        1
+      ],
+      "parity_runs": {
+        "real": {
+          "out_shapes": [
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              50
+            ],
+            [],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096
+            ]
+          ],
+          "finite": true
+        },
+        "zeros": {
+          "out_shapes": [
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              50
+            ],
+            [],
+            [
+              4096,
+              50
+            ],
+            [
+              4096
+            ],
+            [
+              4096
+            ]
+          ],
+          "finite": true
+        }
+      },
+      "run_batches_ms": [
+        {
+          "median": 14.792,
+          "mean": 14.4079,
+          "p90": 16.2966,
+          "min": 5.2256
+        },
+        {
+          "median": 15.4137,
+          "mean": 15.3098,
+          "p90": 16.7658,
+          "min": 9.4022
+        }
+      ],
+      "execute_only_ms": {
+        "median": 0.1811,
+        "mean": 0.2052,
+        "p90": 0.2653,
+        "min": 0.1567
+      }
+    }
+  }
+}

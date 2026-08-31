@@ -34,10 +34,10 @@ def compile_vmfb(mlir_path: str, out_vmfb: str) -> float:
         return 0.0
     t0 = time.time()
     proc = subprocess.run(
-        ["ulimit", "-n", "65536", "&&", COMPILE, mlir_path,
+        [COMPILE, mlir_path,
          "--iree-input-demote-f64-to-f32=false",
          "--iree-hal-target-backends=cuda", "-o", out_vmfb],
-        shell=True, capture_output=True, text=True, timeout=1200,
+        capture_output=True, text=True, timeout=1200,
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -70,7 +70,7 @@ def main():
               "iree-compile: cached", flush=True)
 
         mod = rt.VmModule.from_flatbuffer(rt.VmInstance(), open(vmfb_path, "rb").read())
-        vm = rt.load_vm_module(mod, device=dev)
+        vm = rt.load_vm_module(mod, config=rt.Config(device=dev))
         f = vm.main
 
         def norm(res):
@@ -113,7 +113,7 @@ def main():
         orig_stats = None
         if os.path.exists(orig_vmfb):
             mod0 = rt.VmModule.from_flatbuffer(rt.VmInstance(), open(orig_vmfb, "rb").read())
-            vm0 = rt.load_vm_module(mod0, device=dev)
+            vm0 = rt.load_vm_module(mod0, config=rt.Config(device=dev))
             f0 = vm0.main
             ins0 = make_inputs(graph, zeros=False)
             # restore rank-0 scalars for the ORIGINAL signature
