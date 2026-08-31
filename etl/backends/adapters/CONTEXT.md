@@ -18,6 +18,24 @@ Each adapter module (`iree.py`, `xla.py`, `tvm.py`) exposes the same shape:
 - `_pjrt_c_api.py`: vendored ctypes translation of the Apache-2.0 PJRT C API header (header URL + commit recorded; ABI/offsets verified against a plugin compiled from the real header); `_mlir_bindings.py`: the MLIR binding-provider seam (jaxlib → standalone swap).
 - `__init__.py`: documentation only, imports nothing heavy.
 
+## Options override (per adapter — quick reference)
+
+All keys pass through `lower`/`compile`/`load`/`run` + `build`/`evaluate` as `**options`; option NAMES validated per backend (union of stages, see `../CONTEXT.md` "Backend options override"), VALUES never validated by etl. Precedence: explicit kwarg > env var > etl default (env table in `etl/pipeline_options.py`).
+
+| Backend | Stage | Option key | Type | Env var | Notes |
+|---|---|---|---|---|---|
+| iree | compile | `target_backends` | list[str] | `ETL_TARGET_BACKENDS` (existing) | `{"llvm-cpu","cuda"}`; drives `--iree-hal-target-backends` (the flag itself is DENIED) |
+| iree | compile | `iree_compile_args` | list/tuple of flag strings | `ETL_IREE_COMPILE_ARGS` | arbitrary iree-compile flags appended after the minimal defaults; same-NAME flag drops the default; DENY list (`--iree-hal-target-backends`, `--iree-input-type`, `--iree-vm-bytecode-module-output-format`) with reasons |
+| iree | load | `iree_runtime_args` | list/tuple of flag strings | `ETL_IREE_RUNTIME_ARGS` | loader/HAL flags via `rt.flags.parse_flags` (loud errors); etl's `--cuda_async_allocations=false` default suppressed when the user names it (args or `IREE_PY_RUNTIME_FLAGS`) |
+| xla | compile | `plugin_path` | str | `ETL_PJRT_PLUGIN` (existing) | plugin discovery |
+| xla | compile | `xla_compile_options` | bytes | `ETL_XLA_COMPILE_OPTIONS` (base64) | raw serialized `xla.CompileOptionsProto` into `PJRT_Client_Compile_Args.compile_options`; NULL when unset |
+| xla | load | `plugin_path` | str | `ETL_PJRT_PLUGIN` | honored at load (re-discovery gap fix) |
+| tvm | compile | `tvm_target` | str | `ETL_TVM_TARGET` | default `"llvm"` |
+| tvm | compile | `tvm_pass_configs` | dict | `ETL_TVM_PASS_CONFIGS` (JSON) | forwarded only when non-None; TVM 0.26 lacks the param → loud `BackendError` |
+| all | lower | `rng_bit_generator` | bool \| collection | — (existing) | reserved StableHLO-export override |
+| numpy | run | `rank_context` | `dist.RankContext` | — | documented-ignore for unknown keys (reference backend) |
+| iree/xla/tvm | run | — | (none in v1) | — | non-empty run options → loud `BackendError` (by design) |
+
 ## Adapter designs (validated end-to-end, numpy-backend parity)
 
 ### IREE (`iree.py`) — CPU (llvm-cpu) AND CUDA GPU
