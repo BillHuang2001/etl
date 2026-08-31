@@ -883,14 +883,17 @@ def test_diag_dynamic_dims_deferred_naming_op():
 # Multi-algorithm RNG lowering (workstream B, commit 119854b): the
 # threefry2x32 / philox4x32_10 random ops carry a static ``algorithm``
 # attribute; the exporter lowers them as INLINE bit-exact i32/ui32
-# elementwise subgraphs by default, or — when the writer's
-# ``rng_bit_generator`` option is set — as a NATIVE
-# ``stablehlo.rng_bit_generator`` call with the verified state layout
-# ``[key0, key1, ctr...]`` (key words FIRST, counter words zero).
-# splitmix64 (the default, and the only pre-workstream-B layout) stays a
-# pure i64 inline expansion regardless of the option. These tests pin the
-# emission SHAPES (state layouts, enum spellings, salt folds, inline
-# composition markers); the bit-exact behavior pins live in
+# elementwise subgraphs by default, or — when the algorithm is in the
+# writer's ``rng_bit_generator`` option (a bool — ``True`` → both ciphers,
+# backward compat — or a collection of algorithm names; the native
+# emission is selected PER-ALGORITHM iff the name is in the set, so a
+# mixed module can keep one cipher inline while the other goes native) —
+# as a NATIVE ``stablehlo.rng_bit_generator`` call with the verified
+# state layout ``[key0, key1, ctr...]`` (key words FIRST, counter words
+# zero). splitmix64 (the default, and the only pre-workstream-B layout)
+# stays a pure i64 inline expansion regardless of the option. These tests
+# pin the emission SHAPES (state layouts, enum spellings, salt folds,
+# inline composition markers); the bit-exact behavior pins live in
 # `test_iree_emitters_parity.py` / `tests/ops/test_random.py`. NOTE: the
 # native PHILOX emission is export-only — iree's legalization of PHILOX
 # fails, so that graph is never run on a compiler backend.
@@ -988,6 +991,48 @@ def test_philox_native_rng_bit_generator_golden():
     assert "(tensor<4xui32>) -> tensor<4xi32>" in mlir
 
 
+def _fn_uniform_mixed(tk, pk):
+    """Threefry + philox uniform in ONE graph (two key inputs)."""
+    a = etl.random.uniform(tk, (4,))
+    b = etl.random.uniform(pk, (4,))
+    return a, b
+
+
+def test_mixed_module_set_option_native_threefry_inline_philox():
+    # The per-algorithm SET form of the ``rng_bit_generator`` option: with
+    # only ``threefry2x32`` in the set, the mixed module emits the native
+    # call for the threefry op and the INLINE expansion for the philox op.
+    mlir = _export(
+        _fn_uniform_mixed, _THREEFRY_KEY_SPEC, _PHILOX_KEY_SPEC,
+        options={"rng_bit_generator": {"threefry2x32"}},
+    )
+    assert mlir.count("stablehlo.rng_bit_generator") == 1
+    rng_line = _line_containing(mlir, "stablehlo.rng_bit_generator")
+    assert "algorithm = THREE_FRY" in rng_line
+    # The native threefry state concat marker [k0', k1', 0, 0] → (4,).
+    assert "(tensor<2xui32>, tensor<2xui32>) -> tensor<4xui32>" in mlir
+    # The philox half stays inline: the i64 mulhilo chain marker.
+    assert "(tensor<1xui32>) -> tensor<1xi64>" in mlir
+
+
+def test_mixed_module_set_option_native_philox_inline_threefry():
+    # The reverse selection: only ``philox4x32_10`` in the set — the philox
+    # op goes native, the threefry op stays on the inline expansion.
+    mlir = _export(
+        _fn_uniform_mixed, _THREEFRY_KEY_SPEC, _PHILOX_KEY_SPEC,
+        options={"rng_bit_generator": {"philox4x32_10"}},
+    )
+    assert mlir.count("stablehlo.rng_bit_generator") == 1
+    rng_line = _line_containing(mlir, "stablehlo.rng_bit_generator")
+    assert "algorithm = PHILOX" in rng_line
+    # The native philox state concat marker [k0', k1', 0, 0, 0, 0] → (6,).
+    assert "(tensor<2xui32>, tensor<4xui32>) -> tensor<6xui32>" in mlir
+    # The threefry half stays inline: the rotl composition markers
+    # (shift_left | shift_right_logical, or'd) — absent from philox.
+    assert "stablehlo.shift_left" in mlir
+    assert "stablehlo.or" in mlir
+
+
 def test_threefry_inline_default_emission():
     # DEFAULT options (no options dict): no native call — the cipher is
     # expanded as the bit-exact inline i32 elementwise subgraph.
@@ -1056,13 +1101,20 @@ def test_splitmix64_inline_golden_and_option_insensitive():
     assert ": tensor<i64>" in salt_line
     xor_line = _line_containing(default_mlir, "stablehlo.xor %arg0")
     assert ": tensor<i64>" in xor_line
-    # The option changes nothing for splitmix64: byte-identical export.
+    # The option changes nothing for splitmix64: byte-identical export —
+    # in BOTH the legacy bool form and the per-algorithm SET form.
     optioned = _export(
         _fn_uniform_splitmix, _SPLITMIX_KEY_SPEC,
         options={"rng_bit_generator": True},
     )
     assert optioned == default_mlir
     assert "rng_bit_generator" not in optioned
+    optioned_set = _export(
+        _fn_uniform_splitmix, _SPLITMIX_KEY_SPEC,
+        options={"rng_bit_generator": {"threefry2x32", "philox4x32_10"}},
+    )
+    assert optioned_set == default_mlir
+    assert "rng_bit_generator" not in optioned_set
 
 
 @pytest.mark.parametrize(
