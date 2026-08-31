@@ -150,7 +150,8 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
 | Path | Area |
 |---|---|
 | `./backend.py` | `Capabilities`, `Backend` ABC, `Executable` protocol |
-| `./compiler.py` | shared pluggable-compiler framework: `CompilerBackend` (shared `lower` with dtype/shape/op capability pre-check — incl. sparse ops (category "sparse") vs `Capabilities.sparse_ops`; concrete default `check_available`; abstract `compile`/`load`), `CompilerExecutable` (shared save/load; abstract `run`) |
+| `./options.py` | per-stage option validation: `STAGES`, `validate_options(options, known_by_stage, backend_name, stage)` (union-of-stages semantics, loud `core.BackendError` with per-stage listing) |
+| `./compiler.py` | shared pluggable-compiler framework: `CompilerBackend` (shared `lower` with dtype/shape/op capability pre-check — incl. sparse ops (category "sparse") vs `Capabilities.sparse_ops`; `KNOWN_OPTIONS` class attr + option validation; concrete default `check_available`; abstract `compile`/`load`), `CompilerExecutable` (shared save/load; abstract `run`) |
 | `./inline.py` | SHARED block-inlining machinery: `iter_block_ops`/`iter_ops` (regions-first bottom-up walk), `clone_ops_into`/`drop_op_uses` (portable splicing + use bookkeeping), `inline_portables` (fixpoint driver) |
 | `./program.py` | `Signature`, `LoweredProgram`, `CompiledArtifact` (owned by backends; `text()` renders str / stablehlo-dict (`mlir_text`) / serialized-module payloads) |
 | `./registry.py` | `register`/`get` + `OPTIONAL_ADAPTERS` (first-use auto-activation of optional adapters) |
