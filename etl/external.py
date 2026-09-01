@@ -8,7 +8,8 @@ kernel written against this interface (in a DIFFERENT repo) will plug in via
 the same ``register_external_kernel`` call.
 
 The registry is PER-BACKEND: each name maps to a dict of backend slots
-(``{backend_or_None: callable}``), where ``None`` is the DEFAULT slot.
+(``{backend_or_None: (callable, device_resident)}``), where ``None`` is the
+DEFAULT slot.
 Resolution at dispatch time is ``get_external_kernel(name, backend)``: the
 exact backend slot first, then the default slot, then ``None``. A kernel
 registered with the plain two-argument form lives in the default slot and is
@@ -27,36 +28,52 @@ Binding rules (see ``etl/CONTEXT.md``, "External kernels"):
   declared by the ``external_call`` op that invoked the kernel — the numpy
   backend validates count/dtype/shape at run time (``BackendError`` /
   ``ShapeError`` — never a silent coercion).
+- DEVICE-RESIDENT mode (explicit opt-in, no magic): ``device_resident=True``
+  registers a kernel that receives and returns DEVICE tensors — never host
+  numpy arrays. It REQUIRES an explicit per-backend slot (``backend`` must be
+  a string; ``device_resident=True`` with ``backend=None`` raises
+  ``TypeError`` — a device kernel in the default slot would receive host
+  numpy arrays from the numpy backend). Any non-None backend string is
+  accepted as today (backend-neutral); in v1 only the iree adapter consumes
+  the flag: it passes the boundary's device-resident ``core.Tensor``
+  operands DIRECTLY to the kernel (never ``.numpy()``-staged) and validates
+  device-payload results METADATA-ONLY (count/dtype/shape — never a host
+  copy). Host-mode kernels (the default, and every pre-existing
+  registration) keep the exact numpy-in/numpy-out contract.
 - Registration is process-global and REPLACES any previous registration in
   the same backend slot (last registration wins — documented overwrite
   semantics; this makes hot-reloading kernels and adapter re-registration
-  safe).
+  safe). The device-resident mode is stored per slot and is replaced along
+  with the callable on re-registration.
 - The registry is NOT serialized: graph artifacts carry only the kernel name;
   any process that runs a graph must re-register its kernels first
   (``BackendError`` naming the kernel otherwise).
-- Errors are loud: registering a non-callable / bad name / bad backend raises
-  ``TypeError``; unregistering a name that was never registered (neither
-  kernel slots nor a portable) raises ``KeyError``; resolving an unknown name
-  returns ``None`` (the numpy backend turns that into ``BackendError``).
+- Errors are loud: registering a non-callable / bad name / bad backend /
+  non-bool ``device_resident`` raises ``TypeError``; unregistering a name
+  that was never registered (neither kernel slots nor a portable) raises
+  ``KeyError``; resolving an unknown name returns ``None`` (the numpy
+  backend turns that into ``BackendError``).
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 __all__ = [
     "ExternalKernel",
     "get_external_kernel",
+    "get_external_kernel_entry",
     "get_portable",
     "register_external_kernel",
     "register_portable",
     "unregister_external_kernel",
 ]
 
-#: name -> {backend_or_None: callable}. Process-global; the numpy backend and
-#: the compiler-adapter host-dispatch resolve through :func:`get_external_kernel`
-#: with their backend name (``None`` = the default slot, used by every backend
-#: when no exact backend slot is registered).
-_REGISTRY: Dict[str, Dict[Optional[str], Callable]] = {}
+#: name -> {backend_or_None: (callable, device_resident)}. Process-global;
+#: the numpy backend and the compiler-adapter dispatch resolve through
+#: :func:`get_external_kernel` / :func:`get_external_kernel_entry` with their
+#: backend name (``None`` = the default slot, used by every backend when no
+#: exact backend slot is registered).
+_REGISTRY: Dict[str, Dict[Optional[str], Tuple[Callable, bool]]] = {}
 
 #: name -> etl.defn function. The optional graph decomposition, traced LAZILY
 #: by the fallback transform rules (and potentially by backends) when needed.
@@ -64,22 +81,34 @@ _PORTABLES: Dict[str, Callable] = {}
 
 
 def register_external_kernel(
-    name: str, callable_, backend: Optional[str] = None
+    name: str,
+    callable_,
+    backend: Optional[str] = None,
+    device_resident: bool = False,
 ) -> "ExternalKernel":
     """Register ``callable_`` as the external kernel named ``name``.
 
     Registers into the ``backend`` slot of the name's slot dict (``None`` =
     the DEFAULT slot, used by every backend that has no exact backend slot).
     Overwrites any previous registration in the same slot (last wins —
-    documented; there is no error on re-registration).
+    documented; there is no error on re-registration) — including its
+    device-resident mode.
 
     Args:
         name: Non-empty kernel name (the same string passed to
             ``etl.external_call`` in traced graphs).
-        callable_: ``fn(*np_arrays) -> ndarray | Tensor | tuple/list of them``.
+        callable_: ``fn(*np_arrays) -> ndarray | Tensor | tuple/list of them``
+            (host mode, the default) or, with ``device_resident=True``, a
+            device kernel receiving/returning device tensors (v1: only the
+            iree adapter dispatches device kernels).
         backend: Optional backend name (``"numpy"``, ``"iree"``, ...) — any
             string is accepted (backend-neutral; there is no registry check).
             ``None`` registers the default slot.
+        device_resident: If True, the kernel is a DEVICE kernel: the iree
+            adapter passes the boundary's device-resident ``core.Tensor``
+            operands directly (never host numpy arrays) and validates its
+            results metadata-only (count/dtype/shape). Requires an explicit
+            per-backend registration (see Raises).
 
     Returns:
         An :class:`ExternalKernel` handle for ``name`` (decorator-style
@@ -88,7 +117,11 @@ def register_external_kernel(
 
     Raises:
         TypeError: ``name`` is not a non-empty str, ``backend`` is neither
-            None nor a str, or ``callable_`` is not callable.
+            None nor a str, ``callable_`` is not callable,
+            ``device_resident`` is not a bool, or ``device_resident=True``
+            with ``backend=None`` (a device kernel in the default slot would
+            receive host numpy arrays from the numpy backend — register it
+            under an explicit per-backend slot instead).
     """
     if not isinstance(name, str) or not name:
         raise TypeError(
@@ -100,12 +133,25 @@ def register_external_kernel(
             f"register_external_kernel: backend must be None or a str, got "
             f"{type(backend).__name__}"
         )
+    if not isinstance(device_resident, bool):
+        raise TypeError(
+            f"register_external_kernel: device_resident must be a bool, got "
+            f"{type(device_resident).__name__}"
+        )
+    if device_resident and backend is None:
+        raise TypeError(
+            "register_external_kernel: device_resident=True requires an "
+            "explicit backend — the default (backend=None) slot is also "
+            "dispatched by the numpy backend, which passes host numpy "
+            "arrays, never device tensors; register the device kernel under "
+            "a per-backend slot instead, e.g. backend='iree'"
+        )
     if not callable(callable_):
         raise TypeError(
             f"register_external_kernel: kernel for {name!r} must be "
             f"callable, got {type(callable_).__name__}"
         )
-    _REGISTRY.setdefault(name, {})[backend] = callable_
+    _REGISTRY.setdefault(name, {})[backend] = (callable_, device_resident)
     return ExternalKernel(name)
 
 
@@ -138,6 +184,27 @@ def unregister_external_kernel(name: str) -> None:
         del _PORTABLES[name]
 
 
+def get_external_kernel_entry(
+    name: str, backend: Optional[str] = None
+) -> Optional[Tuple[Callable, bool]]:
+    """The ``(callable, device_resident)`` entry for ``name`` at ``backend``.
+
+    The MODE-AWARE lookup behind dispatch: same resolution as
+    :func:`get_external_kernel` — the exact ``backend`` slot first, then the
+    default (``None``) slot, then ``None`` — but returning the full slot
+    entry (callable + its registered device-resident mode) instead of just
+    the callable. Used by the iree adapter's boundary dispatch to decide
+    between host-mode (numpy in/out) and device-mode (device tensors
+    in/out) kernel invocation. ``None`` when the name is unknown.
+    """
+    slots = _REGISTRY.get(name)
+    if slots is None:
+        return None
+    if backend in slots:
+        return slots[backend]
+    return slots.get(None)
+
+
 def get_external_kernel(
     name: str, backend: Optional[str] = None
 ) -> Optional[Callable]:
@@ -150,15 +217,12 @@ def get_external_kernel(
 
     Internal-use contract: backends resolve the ``external_call`` op's
     ``name`` attribute through this lookup at run time (numpy passes its
-    backend name; the iree host-dispatch does the same) and turn ``None``
-    into ``core.BackendError`` naming the kernel. Public for diagnostics.
+    backend name; the iree dispatch uses the mode-aware
+    :func:`get_external_kernel_entry` instead) and turn ``None`` into
+    ``core.BackendError`` naming the kernel. Public for diagnostics.
     """
-    slots = _REGISTRY.get(name)
-    if slots is None:
-        return None
-    if backend in slots:
-        return slots[backend]
-    return slots.get(None)
+    entry = get_external_kernel_entry(name, backend)
+    return entry[0] if entry is not None else None
 
 
 def register_portable(name: str, fn) -> None:
@@ -237,14 +301,25 @@ class ExternalKernel:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def impl(self, backend: str, fn: Optional[Callable] = None):
+    def impl(
+        self,
+        backend: str,
+        fn: Optional[Callable] = None,
+        device_resident: bool = False,
+    ):
         """Register a per-backend kernel implementation for this handle.
 
         Both forms work::
 
-            handle.impl("numpy", my_kernel)          # direct registration
-            @handle.impl("iree")                     # decorator form
+            handle.impl("numpy", my_kernel)              # direct registration
+            @handle.impl("iree")                         # decorator form
             def iree_kernel(*arrays): ...
+
+        ``device_resident=True`` registers a DEVICE kernel (see
+        :func:`register_external_kernel`): the iree adapter then passes the
+        boundary's device-resident tensors directly and validates its
+        results metadata-only. A device kernel requires an explicit backend
+        slot, so pass a backend string.
 
         ``backend`` is any string (backend-neutral — no registry check);
         registration itself goes through :func:`register_external_kernel`.
@@ -253,11 +328,18 @@ class ExternalKernel:
         if fn is None:
 
             def decorator(f: Callable) -> Callable:
-                register_external_kernel(self.name, f, backend=backend)
+                register_external_kernel(
+                    self.name,
+                    f,
+                    backend=backend,
+                    device_resident=device_resident,
+                )
                 return f
 
             return decorator
-        register_external_kernel(self.name, fn, backend=backend)
+        register_external_kernel(
+            self.name, fn, backend=backend, device_resident=device_resident
+        )
         return fn
 
     def portable(self, fn: Callable) -> Callable:
