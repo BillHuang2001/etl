@@ -324,10 +324,10 @@ def test_env_opt_level_malformed(monkeypatch):
 
 
 def test_env_opt_level_numpy_unaffected(monkeypatch):
-    _require_env_opt_level("numpy")
+    # No guard needed: numpy has NO table entry by design (and never will),
+    # so the env var is always a no-op for it — the assert below is true
+    # with or without the sibling wiring.
     monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
-    # numpy has no table entry — the env var is a no-op (works even before
-    # the sibling wiring lands, hence the same guard for consistency).
     assert apply_env_options("numpy", {}, "compile") == {}
 
 
