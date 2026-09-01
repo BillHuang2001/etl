@@ -29,6 +29,7 @@ All keys pass through `lower`/`compile`/`load`/`run` + `build`/`evaluate` as `**
 | iree | load | `iree_runtime_args` | list/tuple of flag strings | `ETL_IREE_RUNTIME_ARGS` | loader/HAL flags via `rt.flags.parse_flags` (loud errors); etl's `--cuda_async_allocations=false` default suppressed when the user names it (args or `IREE_PY_RUNTIME_FLAGS`) |
 | xla | compile | `plugin_path` | str | `ETL_PJRT_PLUGIN` (existing) | plugin discovery |
 | xla | compile | `xla_compile_options` | bytes | `ETL_XLA_COMPILE_OPTIONS` (base64) | raw serialized `xla.CompileOptionsProto` into `PJRT_Client_Compile_Args.compile_options`; NULL when unset |
+| xla | compile | `opt_level` | str \| int | — | XLA optimization level `"O0"`..`"O3"` (case-insensitive) or 0..3 — normalized via the shared `options.normalize_opt_level` and injected into the compile options' `executable_build_options` (wire-format field 24) by `xla_util.set_opt_level`; an explicit optimization level already present in `xla_compile_options` wins unchanged (the conflict rule — never both, never override); unset -> bytes untouched |
 | xla | load | `plugin_path` | str | `ETL_PJRT_PLUGIN` | honored at load (re-discovery gap fix) |
 | tvm | compile | `tvm_target` | str | `ETL_TVM_TARGET` | default `"llvm"` |
 | tvm | compile | `tvm_pass_configs` | dict | `ETL_TVM_PASS_CONFIGS` (JSON) | forwarded only when non-None; TVM 0.26 lacks the param → loud `BackendError` |
