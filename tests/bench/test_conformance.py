@@ -57,7 +57,7 @@ EXAMPLE_RESULT_FIELDS = {
 def test_conformance_numpy_only_all_examples():
     report = conformance(use_torch=False)
     assert isinstance(report, ConformanceReport)
-    assert len(report.results) == 97
+    assert len(report.results) == 98
     assert report.use_torch == "disabled"
     assert report.overall_pass is True
     for result in report.results:
@@ -66,7 +66,7 @@ def test_conformance_numpy_only_all_examples():
         assert result.numpy_pass is True
         assert result.torch_pass is None
         # Every example's max_abs_error is far below the 1e-3 global bound.
-        # Measured on the full 97-example numpy run: worst is conv2d_large at
+        # Measured on the full 98-example numpy run: worst is conv2d_large at
         # ~1.1e-4 (fp32 accumulation order; covered by its atol=2e-4
         # override), next-worst conv_block_stride2 ~3.1e-5, grad/vmap/custom
         # examples ~1e-6..1e-5, micro/vectorize/basic exact (shared kernels).
@@ -83,7 +83,7 @@ def test_conformance_to_dict_to_json_roundtrip():
     assert data["overall_pass"] is True
     assert json.loads(report.to_json()) == data
     # ExampleResult dicts inside the report carry the documented fields.
-    assert len(data["results"]) == 97
+    assert len(data["results"]) == 98
     for result_dict in data["results"]:
         assert set(result_dict) == EXAMPLE_RESULT_FIELDS
 
@@ -208,7 +208,7 @@ def test_conformance_with_torch_enabled_all_examples():
     report = conformance(use_torch=True)
     assert report.use_torch == "enabled"
     assert report.torch_available is True
-    assert len(report.results) == 97
+    assert len(report.results) == 98
     assert report.overall_pass is True
     # Registry-driven: examples without a torch_ref are skipped for the torch
     # comparison (torch_pass None) — never an error. Future example additions

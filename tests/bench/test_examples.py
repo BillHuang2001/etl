@@ -1,6 +1,6 @@
 """etl.bench example registry contract.
 
-``list_examples()`` returns exactly the 97 documented example names in
+``list_examples()`` returns exactly the 98 documented example names in
 registry order (op → block → e2e); ``get_example(name)`` returns a frozen
 ``Example`` dataclass with the 13 documented fields (``name``, ``description``,
 ``specs`` tuple of ``etl.TensorSpec``, ``graph`` and ``numpy_ref`` callables,
@@ -41,7 +41,7 @@ from etl.bench.examples import expand_names
 # print(etl.bench.list_examples())"` and update this list (and CONTEXT.md) when
 # examples are added/removed.
 EXPECTED_NAMES = [
-    # op (73): legacy micro/grad/vectorize/large (24)
+    # op (74): legacy micro/grad/vectorize/large (24)
     "matmul",
     "conv2d",
     "conv2d_same",
@@ -116,6 +116,8 @@ EXPECTED_NAMES = [
     "custom_l2norm_vmap",
     "custom_relu2",
     "custom_relu2_grad",
+    # op: op_external (1)
+    "op_external",
     # op: xla_* (5)
     "xla_elementwise_chain",
     "xla_softmax",
