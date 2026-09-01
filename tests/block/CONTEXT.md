@@ -14,6 +14,7 @@ pytest suite for the `etl.block` subsystem (sibling `../etl/block/` — read-onl
 | `test_errors.py` | ETLError hierarchy, lower-time verification errors (unknown block, output-spec mismatch, non-tensor portable return) | 21 |
 | `test_portable.py` | portable inlining numerics, block_call removal at lower, spec derivation, non-defn portable errors | 9 |
 | `test_rules.py` | batching/jvp/vjp rule registration + fallbacks (vmap/grad/jvp), TransformError paths, non-callable rules | 13 |
+| `test_portable_vjp_regression.py` | regression for the fixed portable-decomposition vjp fallback (commit 1a88219: post-inline seeding): correct NONZERO input cotangents via grad/vjp on portable-only blocks (two-input `x*w`, matmul, nested chain), non-ones cotangents, all-zero short-circuit, mixed multi-output cotangents, jvp derived from the vjp fallback, output-count guard; + 1 BUG(etl) (constant op inside a portable fails the local sweep) | 11 |
 
 ## Constraints
 
