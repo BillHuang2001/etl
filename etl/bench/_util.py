@@ -7,8 +7,10 @@ callable(inputs) -> outputs`` is an optional runner FACTORY for multi-run
 end-to-end procedures (e.g. a Python-level training loop). It receives the
 resolved backend name, the resolved :class:`~etl.core.Device`, and the
 resolved backend options dict (with the device-derived ``target_backends``
-default already injected, exactly what ``stage_example``'s single-run path
-passes to ``etl.build``), and returns a RUN-CALLABLE taking the SAME inputs
+default and the ``opt_level`` harness default (``"O3"`` for compiler
+backends; env-aware, explicit always wins) already injected, exactly what
+``stage_example``'s single-run path passes to ``etl.build``), and returns a
+RUN-CALLABLE taking the SAME inputs
 list the single-run path uses (``example.generate_inputs(seed)``, a list of
 numpy arrays) and returning the same outputs structure as ``numpy_ref``
 (single ndarray or tuple). The runner builds its executables ONCE (its own
@@ -23,6 +25,7 @@ infinitely.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import numpy as np
@@ -131,12 +134,26 @@ def resolve_backend_options(backend, device, backend_options) -> dict:
     device-derived default is injected: ``["cuda"]`` for a cuda device,
     ``["llvm-cpu"]`` otherwise. An explicit option always wins — never
     overridden.
+
+    For every non-numpy backend, when ``opt_level`` is absent from the
+    options AND the ``ETL_OPT_LEVEL`` env var is unset/blank, the harness
+    default ``"O3"`` is injected (high optimization for compiler backends).
+    An explicit ``opt_level`` always wins; ``ETL_OPT_LEVEL`` wins over the
+    harness default (injection is skipped when the env var is set, so the
+    pipeline's env machinery applies it at compile). numpy is never
+    affected — it is the reference interpreter.
     """
     options = dict(backend_options or {})
-    if backend != "numpy" and "target_backends" not in options:
-        options["target_backends"] = (
-            ["cuda"] if device.kind == "cuda" else ["llvm-cpu"]
-        )
+    if backend != "numpy":
+        if "target_backends" not in options:
+            options["target_backends"] = (
+                ["cuda"] if device.kind == "cuda" else ["llvm-cpu"]
+            )
+        if (
+            "opt_level" not in options
+            and not (os.environ.get("ETL_OPT_LEVEL") or "").strip()
+        ):
+            options["opt_level"] = "O3"
     return options
 
 
