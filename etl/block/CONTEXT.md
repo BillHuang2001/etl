@@ -204,9 +204,13 @@ Fallback semantics (implemented in `rules.py`):
 - **VJP fallback** short-circuits to all-`ZeroTangent` when every cotangent
   is None/ZeroTangent; otherwise traces the portable over the primals and
   runs a LOCAL reverse sweep over ONLY the inlined ops (reverse creation
-  order): per-result cotangents accumulate (`etl.ops.add`), rules are looked
-  up from the PUBLIC registries (`transforms.autodiff.require_vjp_rule`),
-  and nested `block_call`s resolve via their own `block:<name>` keys.
+  order), seeding cotangents on the decomposition's OUTPUTS (the post-inline
+  values — the block_call's own result ids are never inserted into the
+  builder); per-result cotangents accumulate (`etl.ops.add`), rules are
+  looked up from the PUBLIC registries
+  (`transforms.autodiff.require_vjp_rule`), and nested `block_call`s /
+  `external_call`s resolve via their own `block:<name>` / `external:<name>`
+  keys.
 
 ## Error behavior
 
@@ -268,10 +272,8 @@ escalate test writes to root). Planned coverage:
 - `BlockOp.__call__` positional statics bind in SCHEMA order; a positional
   whose next schema-ordered slot was already supplied by keyword raises
   `BlockError` (no double-fill).
-- Remaining coordination with siblings: ir could optionally add a
-  `batching_policy` attr to the `block_call` opdef (transforms supports an
-  attribute channel; the rule channel already covers in-process dispatch) and
-  op-level `effects` (currently fixed at `read`); backends need the numpy
-  impl signature for `block_call` lowering; persist must encode `static_args`
+- Remaining coordination with siblings: ir could optionally add op-level
+  `effects` (currently fixed at `read`); backends need the numpy impl
+  signature for `block_call` lowering; persist must encode `static_args`
   payloads through its envelope codec (currently handled by ir's generic
   attribute encoding).

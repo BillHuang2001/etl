@@ -110,9 +110,10 @@ def require_jvp_rule(op_name: str) -> JVPRule:
     rule = jvp_rules.get(op_name)
     if rule is None:
         raise TransformError(
-            f"jvp: no JVP rule for op '{op_name}' (and no VJP rule to derive "
-            f"one from). Register one with register_jvp_rule('{op_name}', fn) "
-            f"(custom blocks: BlockOp.jvp_rule); there is no silent fallback."
+            f"jvp: no JVP rule for {_rule_display(op_name)} (and no VJP rule "
+            f"to derive one from). "
+            f"{_rule_hint(op_name, 'register_jvp_rule', 'jvp_rule').capitalize()}; "
+            f"there is no silent fallback."
         )
     return rule
 
@@ -126,11 +127,28 @@ def require_jvp_or_vjp_rule(op_name: str) -> Optional[JVPRule]:
     """
     if op_name in jvp_rules or op_name in vjp_rules:
         return jvp_rules.get(op_name)
+    if op_name.startswith("external:"):
+        name = op_name[len("external:"):]
+        hint = (
+            f"Register one via the external-kernel handle returned by "
+            f"etl.register_external_kernel('{name}', fn) "
+            f"(.batching_rule/.vjp_rule/.jvp_rule) or register a portable "
+            f"decomposition"
+        )
+    elif op_name.startswith("block:"):
+        hint = (
+            f"Register one with register_jvp_rule('{op_name}', fn) or "
+            f"register_vjp_rule('{op_name}', fn) (custom blocks: "
+            f"BlockOp.jvp_rule/vjp_rule)"
+        )
+    else:
+        hint = (
+            f"Register one with register_jvp_rule('{op_name}', fn) or "
+            f"register_vjp_rule('{op_name}', fn)"
+        )
     raise TransformError(
-        f"jvp: no JVP rule for op '{op_name}' (and no VJP rule to derive one "
-        f"from). Register one with register_jvp_rule('{op_name}', fn) or "
-        f"register_vjp_rule('{op_name}', fn) (custom blocks: "
-        f"BlockOp.jvp_rule/vjp_rule); there is no silent fallback."
+        f"jvp: no JVP rule for {_rule_display(op_name)} (and no VJP rule to "
+        f"derive one from). {hint}; there is no silent fallback."
     )
 
 
@@ -139,9 +157,9 @@ def require_vjp_rule(op_name: str) -> VJPRule:
     rule = vjp_rules.get(op_name)
     if rule is None:
         raise TransformError(
-            f"grad/vjp: no VJP rule for op '{op_name}'. Register one with "
-            f"register_vjp_rule('{op_name}', fn) (custom blocks: "
-            f"BlockOp.vjp_rule); there is no silent fallback."
+            f"grad/vjp: no VJP rule for {_rule_display(op_name)}. "
+            f"{_rule_hint(op_name, 'register_vjp_rule', 'vjp_rule').capitalize()}; "
+            f"there is no silent fallback."
         )
     return rule
 
@@ -163,10 +181,49 @@ def require_vjp_rule(op_name: str) -> VJPRule:
 
 
 def _rule_name(op: ir.Op) -> str:
-    """Registry key for `op` (block calls are keyed ``block:<block_name>``)."""
+    """Registry key for `op` (block calls are keyed ``block:<block_name>``,
+    external calls keyed ``external:<name>``)."""
     if op.name == "block_call":
         return f"block:{op.attributes['block_name']}"
+    if op.name == "external_call":
+        return f"external:{op.attributes['name']}"
     return op.name
+
+
+def _rule_display(key: str) -> str:
+    """Message display for a missing rule keyed `key`.
+
+    External-call keys name the `external_call` op (UX/tests pin the op
+    name) with the key in parentheses; block keys and plain op names keep
+    the key itself (which names the block / the op).
+    """
+    if key.startswith("external:"):
+        return f"op 'external_call' (key '{key}')"
+    return f"op '{key}'"
+
+
+def _rule_hint(key: str, register_fn: str, block_method: str) -> str:
+    """Registration-advice clause for a missing rule keyed `key`.
+
+    Adaptive to the namespaced key prefixes: an `external:<name>` key points
+    at the external-kernel handle (`etl.register_external_kernel`) and a
+    `block:<name>` key at the `BlockOp` decorators; plain op-name keys keep
+    the generic registry hint (`register_fn`).
+    """
+    if key.startswith("external:"):
+        name = key[len("external:"):]
+        return (
+            f"register one via the external-kernel handle returned by "
+            f"etl.register_external_kernel('{name}', fn) "
+            f"(.batching_rule/.vjp_rule/.jvp_rule) or register a portable "
+            f"decomposition"
+        )
+    if key.startswith("block:"):
+        return (
+            f"register one with {register_fn}('{key}', fn) "
+            f"(custom blocks: BlockOp.{block_method})"
+        )
+    return f"register one with {register_fn}('{key}', fn)"
 
 
 def _sym(value: ir.Value) -> "core.SymbolicTensor":
@@ -227,67 +284,6 @@ def _combine(entries) -> Optional[ir.Value]:
     return total.value
 
 
-def _repair_portable_vjp(proxy: ir.Op, emitted, seeds) -> Tuple[Optional[ir.Value], ...]:
-    """Recompute a buggy portable-fallback VJP with correct post-inline seeding.
-
-    `etl/block`'s pre-registered portable-decomposition vjp fallback inlines
-    the decomposition into the active builder but seeds its local reverse
-    sweep on the block_call's own result values (the PRE-inline values) —
-    the inlined decomposition produces NEW values, so the fallback's sweep
-    finds no seeds and returns all-`ZeroTangent` (repo bug: grad-via-portable
-    yields all zeros). This mirrors that fallback's local sweep but seeds the
-    accumulator on the decomposition's OUTPUTS (identified among `emitted`)
-    with `seeds` (aligned with `proxy.results`) — the post-inline values the
-    fallback SHOULD have seeded.
-
-    Returns the repaired input cotangents aligned with `proxy.operands`
-    (missing → `ZeroTangent()`). Nested `block_call` ops inside the
-    decomposition resolve via their own `block:<name>` rules.
-
-    Raises:
-        TransformError: The number of decomposition outputs does not match
-            `len(proxy.results)` — never guess an alignment.
-    """
-    emitted_ids = {op.id for op in emitted}
-    outputs = []
-    for op in emitted:
-        for result in op.results:
-            if all(use.owner.id not in emitted_ids for use in result.uses):
-                outputs.append(result)
-    if len(outputs) != len(proxy.results):
-        raise TransformError(
-            f"cannot repair the portable-decomposition vjp rule for op "
-            f"'{_rule_name(proxy)}': found {len(outputs)} decomposition "
-            f"outputs for {len(proxy.results)} block results — never guessing"
-        )
-
-    # Seed the accumulator on the decomposition outputs (skip zero seeds).
-    acc: Dict[int, list] = {}
-    for out_value, seed in zip(outputs, seeds):
-        if _is_real(seed):
-            acc.setdefault(out_value.id, []).append(seed)
-
-    # Local reverse sweep over ONLY the inlined ops.
-    for inlined in reversed(emitted):
-        if not any(acc.get(result.id) for result in inlined.results):
-            continue  # dead for backprop: no result carries a cotangent
-        per_result = tuple(
-            _combine(acc.get(result.id)) for result in inlined.results
-        )
-        vjp_fn = require_vjp_rule(_rule_name(inlined))
-        input_cotangents = vjp_fn(inlined, per_result, inlined.operands)
-        for operand_value, in_ct in zip(inlined.operands, input_cotangents):
-            if _is_real(in_ct):
-                acc.setdefault(operand_value.id, []).append(in_ct)
-
-    # Finalize: aligned with proxy.operands (missing -> ZeroTangent).
-    repaired = []
-    for primal in proxy.operands:
-        entries = acc.get(primal.id)
-        repaired.append(_combine(entries) if entries else ZeroTangent())
-    return tuple(repaired)
-
-
 def _jvp_from_vjp(proxy: ir.Op, tangents, builder: ir.Builder):
     """Derive the JVP of `proxy` from its registered VJP rule (adjoint trick).
 
@@ -295,8 +291,7 @@ def _jvp_from_vjp(proxy: ir.Op, tangents, builder: ir.Builder):
     c = the op's (rebuilt) primal results — any well-typed c works, since the
     adjoint of L is independent of the concrete c — then apply L's transpose
     (J) to the tangents with a SECOND reverse sweep over the ops L emitted
-    (the rule's emissions plus, for the buggy portable fallback fingerprint,
-    the repair's emissions). Cotangents only propagate along paths that reach
+    (the rule's emissions). Cotangents only propagate along paths that reach
     a ct slot (a `proxy.results` value): paths to primals are second-order
     terms and are dropped, which also keeps the graph free of dead
     second-order ops (the decomposition's own vjp rules never run).
@@ -328,18 +323,6 @@ def _jvp_from_vjp(proxy: ir.Op, tangents, builder: ir.Builder):
                 f"vjp rule for op '{key}' returned an invalid cotangent entry "
                 f"{entry!r}: entries must be ir.Value | None | ZeroTangent"
             )
-
-    if (
-        proxy.name == "block_call"
-        and emitted
-        and all(ct is None or isinstance(ct, ZeroTangent) for ct in l_outputs)
-    ):
-        # Buggy portable-fallback fingerprint: all-zero return WITH emissions.
-        # Repair with the correct post-inline seeding; the repaired extraction
-        # yields L's real outputs (entries that stay zero are structurally
-        # zero columns of Jᵀ — kept as such).
-        l_outputs = _repair_portable_vjp(proxy, emitted, tuple(proxy.results))
-        emitted = [op for op in builder.current_block.ops if op.id not in before]
 
     # Second reverse sweep = the adjoint application J·v (transpose of L):
     # seed the tangents on L's outputs, then sweep back. Keep cotangents only
@@ -571,29 +554,7 @@ def _sweep(graph: Graph, extra_specs, mode: str) -> Graph:
                     dual_env.get(id(result), ZeroTangent())
                     for result in proxy.results
                 )
-                before = {op.id for op in builder.current_block.ops}
                 in_cotangents = vjp_rules[name](proxy, cotangents, proxy.operands)
-                emitted = [
-                    op for op in builder.current_block.ops if op.id not in before
-                ]
-                if (
-                    proxy.name == "block_call"
-                    and emitted
-                    and all(
-                        ct is None or isinstance(ct, ZeroTangent)
-                        for ct in in_cotangents
-                    )
-                    and any(_is_real(ct) for ct in cotangents)
-                ):
-                    # Buggy portable-fallback fingerprint (all-zero return
-                    # WITH inlined emissions AND a real incoming cotangent —
-                    # the fallback short-circuits without inlining when all
-                    # incoming cotangents are zero, and an all-zero result is
-                    # then correct): recompute with the correct post-inline
-                    # seeding (seeds on the decomposition's outputs).
-                    in_cotangents = _repair_portable_vjp(
-                        proxy, emitted, cotangents
-                    )
                 if not isinstance(in_cotangents, (tuple, list)):
                     raise TransformError(
                         f"vjp rule for op '{name}' did not return a tuple of "
