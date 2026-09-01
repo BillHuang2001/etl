@@ -31,9 +31,25 @@ exact ``"iree"`` slot wins over the default slot (pinned by differentiated
 outputs), and the host-dispatch staging ``UserWarning`` fires at the FIRST
 external-call boundary of an executable and never again for that executable
 (pinned by record counts; plain graphs without external calls never warn).
+
+Round 4 (device-resident kernels): a kernel registered under the exact
+``"iree"`` slot with ``device_resident=True`` receives the boundary
+operands DIRECTLY — ``core.Tensor`` s whose ``.data`` is the public
+``etl.backends.adapters.iree.IreeDevicePayload`` (never host-staged numpy)
+— and may return device tensors / duck-typed payloads / raw
+``DeviceArray`` s / numpy arrays / tuple-list mixes; results are validated
+METADATA-ONLY (never a forced host copy), a device kernel may compile +
+run a SECOND tiny vmfb on the operand's HAL device, fully device-resident
+boundaries emit ZERO staging warnings (host-array results stage back and
+warn once per executable), and on iree-cuda the operands stay on the GPU.
+The numpy backend is unchanged: it resolves the default slot only, so each
+device-mode test also registers a default-slot HOST kernel (identical math)
+as the ``_run_numpy`` reference — pinning that device mode is consumed by
+iree alone.
 """
 
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -42,6 +58,7 @@ pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
 import etl
+from etl.backends.adapters.iree import IreeDevicePayload
 
 # ---------------------------------------------------------------------------
 # kernels (plain numpy stand-ins; deterministic + exactly representable fp32)
@@ -127,6 +144,34 @@ def _build_exe(builder, specs, device=None, target_backends=None):
 def _run_numpy(builder, *arrays):
     """The pure-graph numpy run (reference for the iree results)."""
     return etl.evaluate(builder, *arrays)
+
+
+@contextmanager
+def _device_kernel(name, host_fn, device_fn):
+    """Register a DEVICE kernel under the exact "iree" slot plus an
+    optional default-slot HOST kernel (the numpy-backend reference — the
+    numpy backend resolves the default slot only, so device mode is
+    consumed by iree alone); unregister everything on exit."""
+    if host_fn is not None:
+        etl.register_external_kernel(name, host_fn)
+    etl.register_external_kernel(
+        name, device_fn, backend="iree", device_resident=True
+    )
+    try:
+        yield
+    finally:
+        etl.unregister_external_kernel(name)
+
+
+def _assert_device_operand(x, device):
+    """The device-mode operand contract: a ``core.Tensor`` wrapping the
+    public ``IreeDevicePayload`` (never a host ndarray), on ``device``."""
+    assert isinstance(x, etl.Tensor), type(x)
+    assert isinstance(x.data, IreeDevicePayload), type(x.data)
+    assert not isinstance(x, np.ndarray)
+    assert x.data.shape == (3,)
+    assert x.data.dtype == np.dtype(np.float32)
+    assert x.data.device == device
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +573,426 @@ def test_no_staging_warning_without_external_calls():
 
 
 # ---------------------------------------------------------------------------
+# device-resident kernels (round 4): device tensors in, device tensors out
+# ---------------------------------------------------------------------------
+
+
+_DEVICE_SECOND_VMFB_MLIR = """
+module {
+  func.func public @main(%arg: tensor<3xf32>) -> tensor<3xf32> {
+    %c = stablehlo.constant dense<2.0> : tensor<f32>
+    %b = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<f32>) -> tensor<3xf32>
+    %0 = stablehlo.add %arg, %b : tensor<3xf32>
+    return %0 : tensor<3xf32>
+  }
+}
+"""
+
+_SECOND_VMFB_CACHE: dict = {}  # compiled flatbuffer bytes (lazy, once)
+
+
+def _run_second_vmfb(payload):
+    """Compile (once, cached) + run a tiny hand-written vmfb on the SAME
+    HAL device as ``payload`` — the device-kernel interop pattern: a
+    device kernel may run further iree modules on the operand's device and
+    return their raw ``DeviceArray`` (x + 2)."""
+    import iree.compiler as ic
+    import iree.runtime as rt
+
+    fb = _SECOND_VMFB_CACHE.get("llvm-cpu")
+    if fb is None:
+        fb = ic.compile_str(
+            _DEVICE_SECOND_VMFB_MLIR,
+            target_backends=["llvm-cpu"],
+            input_type="stablehlo",
+            extra_args=["--iree-llvmcpu-target-cpu=generic"],
+        )
+        _SECOND_VMFB_CACHE["llvm-cpu"] = fb
+    hal_device = payload.device_array._device
+    config = rt.Config(device=hal_device)
+    ctx = rt.SystemContext(config=config)
+    ctx.add_vm_module(rt.VmModule.copy_buffer(config.vm_instance, fb))
+    return ctx.modules.module["main"](payload.device_array)
+
+
+def _t_dev_second_vmfb(x):
+    """Device kernel: run a SECOND vmfb on the operand's HAL device and
+    return its raw DeviceArray (x + 2)."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return _run_second_vmfb(x.data)
+
+
+def _t_dev_numpy(x):
+    """Device kernel returning a HOST numpy array (explicit to_host inside
+    the kernel; the boundary stages it back — the adapter never forces)."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return x.data.to_host() * 2.0
+
+
+def _t_dev_mixed(x):
+    """Device kernel returning a (device_array, host_array) mix."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return (_run_second_vmfb(x.data), x.data.to_host() + 1.0)
+
+
+def _t_dev_core_tensor(x):
+    """Device kernel returning a ``core.Tensor`` wrapping a device payload."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return etl.core.Tensor(
+        IreeDevicePayload(_run_second_vmfb(x.data), x.data.device)
+    )
+
+
+def _t_dev_duck_payload(x):
+    """Device kernel returning a duck-typed payload (a raw
+    ``IreeDevicePayload`` — shape + dtype) the adapter wraps itself."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return IreeDevicePayload(_run_second_vmfb(x.data), x.data.device)
+
+
+def _t_dev_double(x):
+    """Device kernel for the placement tests (x + 2 via the second vmfb)."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return _run_second_vmfb(x.data)
+
+
+def _t_dev_inc(x):
+    """Second sequential device kernel: the operand is the FIRST kernel's
+    device result (device-to-device carry, asserted inside); returns a
+    DeviceArray via asdevicearray (x + 1)."""
+    import iree.runtime as rt
+
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return rt.asdevicearray(
+        x.data.device_array._device, x.data.to_host() + 1.0
+    )
+
+
+def _t_dev_multi(x):
+    """Device kernel with two device outputs (both via the second vmfb)."""
+    _assert_device_operand(x, etl.core.Device("cpu", 0))
+    return (_run_second_vmfb(x.data), _run_second_vmfb(x.data))
+
+
+def _t_dev_wrong_shape(x):
+    import iree.runtime as rt
+
+    return rt.asdevicearray(
+        x.data.device_array._device, np.zeros(2, np.float32)
+    )
+
+
+def _t_dev_wrong_dtype(x):
+    import iree.runtime as rt
+
+    return rt.asdevicearray(
+        x.data.device_array._device, np.zeros(3, np.float64)
+    )
+
+
+def _t_dev_wrong_count(x):
+    import iree.runtime as rt
+
+    device = x.data.device_array._device
+    return (
+        rt.asdevicearray(device, np.zeros(3, np.float32)),
+        rt.asdevicearray(device, np.zeros(3, np.float32)),
+    )
+
+
+def _t_dev_garbage(x):
+    del x
+    return "not a tensor"
+
+
+def _dev_second_vmfb_graph(x):
+    y = etl.external_call(
+        "t_dev_second_vmfb", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y + 1.0
+
+
+def _dev_numpy_warn_graph(x):
+    y = etl.external_call(
+        "t_dev_numpy", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y * 2.0
+
+
+def _dev_mixed_graph(x):
+    a, b = etl.external_call(
+        "t_dev_mixed",
+        x,
+        result=[
+            etl.TensorSpec((3,), etl.float32),
+            etl.TensorSpec((3,), etl.float32),
+        ],
+    )
+    return a + b
+
+
+def _dev_tensor_duck_graph(x):
+    a = etl.external_call(
+        "t_dev_core_tensor", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    b = etl.external_call(
+        "t_dev_duck_payload", a, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return b + 1.0
+
+
+def _dev_multi_graph(x):
+    a, b = etl.external_call(
+        "t_dev_multi",
+        x,
+        result=[
+            etl.TensorSpec((3,), etl.float32),
+            etl.TensorSpec((3,), etl.float32),
+        ],
+    )
+    return a + b
+
+
+def _dev_sequential_graph(x):
+    a = etl.external_call(
+        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    b = etl.external_call(
+        "t_dev_inc", a, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return b + 1.0
+
+
+def _dev_start_graph(x):
+    y = etl.external_call(
+        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y + 1.0
+
+
+def _dev_end_graph(x):
+    return etl.external_call(
+        "t_dev_double", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+
+
+def _dev_no_warn_graph(x):
+    """One-call graph used ONLY by the fully-device-resident no-warning
+    test (fresh executable — the once-per-executable warning state must
+    not be consumed by another test's run of the same builder)."""
+    y = etl.external_call(
+        "t_dev_no_warn", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y * 2.0
+
+
+def _dev_garbage_graph(x):
+    return etl.external_call(
+        "t_dev_garbage", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+
+
+def _dev_unregistered_graph(x):
+    return etl.external_call(
+        "t_dev_unregistered", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+
+
+def _dev_cuda_graph(x):
+    y = etl.external_call(
+        "t_dev_cuda_relay", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y + 1.0
+
+
+def test_llvm_cpu_device_kernel_receives_device_payload_and_runs_second_vmfb():
+    """A device kernel receives each operand DIRECTLY — a core.Tensor
+    whose .data is the public IreeDevicePayload (never a host ndarray) —
+    and may compile + run a SECOND vmfb on the operand's HAL device,
+    returning its raw DeviceArray (wrapped by the adapter)."""
+    with _device_kernel(
+        "t_dev_second_vmfb", lambda x: x + 2.0, _t_dev_second_vmfb
+    ):
+        exe = _build_exe(_dev_second_vmfb_graph, _specs(SPEC))
+        _assert_bit_exact(
+            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_second_vmfb_graph, X)
+        )
+
+
+def test_llvm_cpu_device_kernel_returning_numpy_and_mixed():
+    """(a) A device kernel returning HOST numpy arrays gives correct
+    results and the staging warning fires exactly once per executable;
+    (b) a 2-output device kernel returning a (device_array, np_array) mix
+    gives correct results and the warning fires."""
+    with _device_kernel("t_dev_numpy", lambda x: x * 2.0, _t_dev_numpy):
+        exe = _build_exe(_dev_numpy_warn_graph, _specs(SPEC))
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            first = etl.run(exe, etl.Tensor(X))
+        staged = [
+            r for r in records
+            if r.category is UserWarning and "host-dispatch" in str(r.message)
+        ]
+        assert len(staged) == 1
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            second = etl.run(exe, etl.Tensor(X))
+        assert not [
+            r for r in records
+            if r.category is UserWarning and "host-dispatch" in str(r.message)
+        ]
+        _assert_bit_exact(first, _run_numpy(_dev_numpy_warn_graph, X))
+        _assert_bit_exact(second, first)
+
+    with _device_kernel(
+        "t_dev_mixed", lambda x: (x + 2.0, x + 1.0), _t_dev_mixed
+    ):
+        exe = _build_exe(_dev_mixed_graph, _specs(SPEC))
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            out = etl.run(exe, etl.Tensor(X))
+        staged = [
+            r for r in records
+            if r.category is UserWarning and "host-dispatch" in str(r.message)
+        ]
+        assert len(staged) == 1
+        _assert_bit_exact(out, _run_numpy(_dev_mixed_graph, X))
+
+
+def test_llvm_cpu_device_kernel_returning_core_tensor_and_duck_payload():
+    """A device kernel may return a core.Tensor wrapping a device payload,
+    and another may return a duck-typed payload (shape + dtype, e.g. a raw
+    IreeDevicePayload instance) the adapter wraps itself — both bit-exact
+    (the second call's operand is the first call's device result)."""
+    with _device_kernel(
+        "t_dev_core_tensor", lambda x: x + 2.0, _t_dev_core_tensor
+    ):
+        with _device_kernel(
+            "t_dev_duck_payload", lambda x: x + 2.0, _t_dev_duck_payload
+        ):
+            exe = _build_exe(_dev_tensor_duck_graph, _specs(SPEC))
+            _assert_bit_exact(
+                etl.run(exe, etl.Tensor(X)),
+                _run_numpy(_dev_tensor_duck_graph, X),
+            )
+
+
+def test_llvm_cpu_device_multi_output_kernel():
+    """Device-mode variant of the multi-output placement coverage: two
+    device results occupy the plan's result slots and recombine."""
+    with _device_kernel(
+        "t_dev_multi", lambda x: (x + 2.0, x + 2.0), _t_dev_multi
+    ):
+        exe = _build_exe(_dev_multi_graph, _specs(SPEC))
+        _assert_bit_exact(
+            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_multi_graph, X)
+        )
+
+
+def test_llvm_cpu_device_sequential_calls():
+    """Two sequential DEVICE calls: the first kernel's device result is
+    passed device-to-device into the second kernel (asserted inside)."""
+    with _device_kernel("t_dev_double", lambda x: x + 2.0, _t_dev_double):
+        with _device_kernel("t_dev_inc", lambda x: x + 1.0, _t_dev_inc):
+            exe = _build_exe(_dev_sequential_graph, _specs(SPEC))
+            _assert_bit_exact(
+                etl.run(exe, etl.Tensor(X)),
+                _run_numpy(_dev_sequential_graph, X),
+            )
+
+
+def test_llvm_cpu_device_kernel_at_start():
+    """Device-mode variant of the graph-start placement coverage."""
+    with _device_kernel("t_dev_double", lambda x: x + 2.0, _t_dev_double):
+        exe = _build_exe(_dev_start_graph, _specs(SPEC))
+        _assert_bit_exact(
+            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_start_graph, X)
+        )
+
+
+def test_llvm_cpu_device_kernel_at_end():
+    """Device-mode variant of the graph-end placement coverage: the kernel
+    outputs are the graph outputs (device results occupy the final result
+    slots directly)."""
+    with _device_kernel("t_dev_double", lambda x: x + 2.0, _t_dev_double):
+        exe = _build_exe(_dev_end_graph, _specs(SPEC))
+        _assert_bit_exact(
+            etl.run(exe, etl.Tensor(X)), _run_numpy(_dev_end_graph, X)
+        )
+
+
+def test_no_staging_warning_for_fully_device_resident_boundary():
+    """A FULLY device-resident boundary (device kernel, device results)
+    never stages tensors host<->device — ZERO host-dispatch warnings."""
+    with _device_kernel("t_dev_no_warn", lambda x: x + 2.0, _t_dev_second_vmfb):
+        exe = _build_exe(_dev_no_warn_graph, _specs(SPEC))
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            out = etl.run(exe, etl.Tensor(X))
+        assert not [
+            r for r in records
+            if r.category is UserWarning and "host-dispatch" in str(r.message)
+        ]
+        _assert_bit_exact(out, _run_numpy(_dev_no_warn_graph, X))
+
+
+def test_device_wrong_shape_result_raises_shape_error():
+    """Metadata-only validation still checks shape: a device array of
+    shape (2,) when (3,) is declared -> ShapeError."""
+    with _device_kernel("t_dev_garbage", None, _t_dev_wrong_shape):
+        exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
+        with pytest.raises(etl.ShapeError, match="callback returned shape"):
+            etl.run(exe, etl.Tensor(X))
+
+
+def test_device_wrong_dtype_result_raises_backend_error():
+    """Metadata-only validation still checks dtype: an f64 device array
+    when f32 is declared -> BackendError (never silent coercion)."""
+    with _device_kernel("t_dev_garbage", None, _t_dev_wrong_dtype):
+        exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
+        with pytest.raises(etl.BackendError, match="no silent dtype coercion"):
+            etl.run(exe, etl.Tensor(X))
+
+
+def test_device_wrong_count_result_raises_backend_error():
+    """Two device results against one declared spec -> BackendError with
+    the canonical count wording."""
+    with _device_kernel("t_dev_garbage", None, _t_dev_wrong_count):
+        exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
+        with pytest.raises(
+            etl.BackendError, match=r"produced 2 output\(s\), expected 1"
+        ):
+            etl.run(exe, etl.Tensor(X))
+
+
+def test_device_garbage_return_raises_backend_error():
+    """A garbage non-payload return (a string) -> BackendError naming the
+    call — the dispatch path never guesses."""
+    with _device_kernel("t_dev_garbage", None, _t_dev_garbage):
+        exe = _build_exe(_dev_garbage_graph, _specs(SPEC))
+        with pytest.raises(etl.BackendError, match="callback returned str"):
+            etl.run(exe, etl.Tensor(X))
+
+
+def test_device_unregistered_kernel_raises_naming_registry():
+    """Device-mode flavor of the run-time registry error: a name that WAS
+    registered (device kernel) and then unregistered raises BackendError
+    naming the kernel + register_external_kernel."""
+    name = "t_dev_unregistered"
+    etl.register_external_kernel(
+        name, _t_dev_double, backend="iree", device_resident=True
+    )
+    etl.unregister_external_kernel(name)
+    exe = _build_exe(_dev_unregistered_graph, _specs(SPEC))
+    with pytest.raises(etl.BackendError, match="t_dev_unregistered"):
+        etl.run(exe, etl.Tensor(X))
+    try:
+        etl.run(exe, etl.Tensor(X))
+    except etl.BackendError as exc:
+        assert "register_external_kernel" in str(exc)
+
+
+# ---------------------------------------------------------------------------
 # iree-cuda (GPU-guarded): same host-dispatch semantics on a real device
 # ---------------------------------------------------------------------------
 
@@ -592,3 +1057,41 @@ def test_cuda_sequential_calls_bit_exact(cuda_device):
     _assert_bit_exact(
         etl.run(exe, etl.Tensor(X)), _run_numpy(_sequential, X)
     )
+
+
+def _make_cuda_relay_kernel(device):
+    """Device kernel for the cuda test: operands must live on ``device``
+    (asserted); the kernel computes on the operand's device and returns a
+    device DeviceArray (host math + asdevicearray upload inside the
+    kernel — the adapter itself never stages the boundary)."""
+
+    def kernel(x):
+        import iree.runtime as rt
+
+        _assert_device_operand(x, device)
+        return rt.asdevicearray(
+            x.data.device_array._device, x.data.to_host() * 2.0
+        )
+
+    return kernel
+
+
+def test_cuda_device_kernel_bit_exact_and_operands_device_resident(cuda_device):
+    """Device-resident mode on a real GPU: operands arrive as device
+    payloads living on the cuda device (asserted inside the kernel), a
+    device result comes back, and the graph output — still on the cuda
+    device — is bit-exact vs the numpy reference."""
+    name = "t_dev_cuda_relay"
+    with _device_kernel(
+        name, lambda x: x * 2.0, _make_cuda_relay_kernel(cuda_device)
+    ):
+        exe = _build_exe(
+            _dev_cuda_graph,
+            _specs(SPEC),
+            device=cuda_device,
+            target_backends=["cuda"],
+        )
+        out = etl.run(exe, etl.Tensor(X))
+        assert isinstance(out, etl.Tensor)
+        assert out.data.device == cuda_device
+        _assert_bit_exact(out, _run_numpy(_dev_cuda_graph, X))
