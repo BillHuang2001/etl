@@ -13,6 +13,16 @@ kernels") and ``etl/ops/external.py``:
   (count/dtype/shape — never silent coercion) and flow into downstream ops.
 - Registry: register/get/unregister semantics (overwrite allowed,
   ``KeyError`` on unknown unregister, ``TypeError`` on bad arguments).
+- Device-resident registration mode: ``register_external_kernel(name, fn,
+  backend, device_resident=True)`` stores a ``(callable, True)`` slot entry
+  — ``device_resident`` must be an actual bool and requires an explicit
+  per-backend slot; ``etl.external.get_external_kernel_entry`` is the
+  mode-aware lookup (exact backend slot -> default slot -> ``None``,
+  returning ``(callable, mode)`` tuples) while ``get_external_kernel``
+  still returns the bare callable; re-registration replaces both the
+  callable and the mode; ``ExternalKernel.impl`` takes direct/decorator
+  forms; any non-``None`` backend string is accepted (backend-neutral —
+  only the iree adapter consumes the mode in v1).
 - Errors: unknown name at run time -> ``BackendError`` naming the kernel;
   spec mismatches -> ``BackendError``/``ShapeError``; vmap/grad/jvp/vjp ->
   ``TransformError``; the stablehlo exporter and the xla/tvm adapters ->
@@ -81,6 +91,210 @@ def test_register_rejects_bad_arguments():
 def test_unregister_rejects_bad_name():
     with pytest.raises(TypeError, match="name must be a non-empty str"):
         etl.unregister_external_kernel(None)
+
+
+def test_register_device_resident_requires_backend():
+    """A device-resident kernel must live in an explicit per-backend slot:
+    the default (``backend=None``) slot is also dispatched by the numpy
+    backend, which passes host numpy arrays — never device tensors."""
+
+    def k(x):
+        return x
+
+    with pytest.raises(TypeError, match="requires an explicit backend"):
+        etl.register_external_kernel("dr_no_backend", k, device_resident=True)
+
+    handle = etl.register_external_kernel("dr_no_backend_impl", k)
+    try:
+        with pytest.raises(TypeError, match="requires an explicit backend"):
+            # Validation lives inside register_external_kernel.
+            handle.impl(None, k, device_resident=True)
+    finally:
+        etl.unregister_external_kernel("dr_no_backend_impl")
+
+
+def test_register_device_resident_rejects_non_bool():
+    """``device_resident`` must be an actual bool — ``1``, ``"yes"`` and
+    ``None`` are rejected loudly (``1`` is not a bool instance)."""
+
+    def k(x):
+        return x
+
+    for bad in (1, "yes", None):
+        with pytest.raises(TypeError, match="device_resident must be a bool"):
+            etl.register_external_kernel(
+                "dr_nonbool", k, backend="iree", device_resident=bad
+            )
+
+    # True/False are the only accepted values.
+    etl.register_external_kernel("dr_bool_ok", k, backend="iree", device_resident=True)
+    try:
+        assert etl.external.get_external_kernel_entry("dr_bool_ok", "iree") == (k, True)
+    finally:
+        etl.unregister_external_kernel("dr_bool_ok")
+
+
+def test_get_external_kernel_entry_tuple_semantics():
+    """``get_external_kernel_entry`` is the mode-aware lookup — same slot
+    resolution as ``get_external_kernel`` (exact backend slot, then the
+    default slot, then ``None``) — returning ``(callable, device_resident)``
+    tuples instead of the bare callable."""
+
+    def host_fn(x):
+        return x + 1
+
+    def dev_fn(x):
+        return x + 2
+
+    # A plain default registration yields (fn, False) — also when looked up
+    # under a backend string (default-slot fallback).
+    etl.register_external_kernel("dr_entry_default", host_fn)
+    try:
+        assert etl.external.get_external_kernel_entry("dr_entry_default") == (host_fn, False)
+        assert etl.external.get_external_kernel_entry("dr_entry_default", "iree") == (
+            host_fn,
+            False,
+        )
+    finally:
+        etl.unregister_external_kernel("dr_entry_default")
+
+    # A device registration yields (fn, True) in its backend slot.
+    etl.register_external_kernel(
+        "dr_entry_device", dev_fn, backend="iree", device_resident=True
+    )
+    try:
+        assert etl.external.get_external_kernel_entry("dr_entry_device", "iree") == (
+            dev_fn,
+            True,
+        )
+    finally:
+        etl.unregister_external_kernel("dr_entry_device")
+
+    # An exact backend slot wins over the default slot.
+    etl.register_external_kernel("dr_entry_both", host_fn)
+    etl.register_external_kernel(
+        "dr_entry_both", dev_fn, backend="iree", device_resident=True
+    )
+    try:
+        assert etl.external.get_external_kernel_entry("dr_entry_both") == (host_fn, False)
+        assert etl.external.get_external_kernel_entry("dr_entry_both", "iree") == (
+            dev_fn,
+            True,
+        )
+    finally:
+        etl.unregister_external_kernel("dr_entry_both")
+
+    # Unknown names resolve to None (never an error at lookup time).
+    assert etl.external.get_external_kernel_entry("dr_entry_ghost") is None
+
+
+def test_reregistration_overwrites_callable_and_mode():
+    """Re-registering the same backend slot replaces BOTH the callable and
+    the device-resident mode (last wins, no error) — in per-backend slots
+    and the default slot alike."""
+
+    def fn1(x):
+        return x
+
+    def fn2(x):
+        return x + 1
+
+    def fn3(x):
+        return x + 2
+
+    etl.register_external_kernel("dr_rereg", fn1, backend="iree")
+    try:
+        assert etl.external.get_external_kernel_entry("dr_rereg", "iree") == (fn1, False)
+        etl.register_external_kernel("dr_rereg", fn2, backend="iree", device_resident=True)
+        assert etl.external.get_external_kernel_entry("dr_rereg", "iree") == (fn2, True)
+        etl.register_external_kernel("dr_rereg", fn3, backend="iree")  # host-mode again
+        assert etl.external.get_external_kernel_entry("dr_rereg", "iree") == (fn3, False)
+    finally:
+        etl.unregister_external_kernel("dr_rereg")
+
+    etl.register_external_kernel("dr_rereg_default", fn1)
+    try:
+        etl.register_external_kernel("dr_rereg_default", fn2)
+        assert etl.external.get_external_kernel_entry("dr_rereg_default") == (fn2, False)
+    finally:
+        etl.unregister_external_kernel("dr_rereg_default")
+
+
+def test_impl_direct_and_decorator_device_resident_forms():
+    """The ``ExternalKernel.impl`` handle registers device kernels in both
+    forms: the direct call returns ``fn``; the decorator registers on
+    decoration and returns ``fn``."""
+
+    def default_fn(x):
+        return x
+
+    def direct_fn(x):
+        return x + 1
+
+    handle = etl.register_external_kernel("dr_impl_forms", default_fn)
+    try:
+        returned = handle.impl("iree", direct_fn, device_resident=True)
+        assert returned is direct_fn
+        assert etl.external.get_external_kernel_entry("dr_impl_forms", "iree") == (
+            direct_fn,
+            True,
+        )
+
+        @handle.impl("iree", device_resident=True)
+        def decorated_fn(x):
+            return x + 2
+
+        assert etl.external.get_external_kernel_entry("dr_impl_forms", "iree") == (
+            decorated_fn,
+            True,
+        )
+        assert etl.get_external_kernel("dr_impl_forms", "iree") is decorated_fn
+        # The default slot is untouched by per-backend impl registration.
+        assert etl.get_external_kernel("dr_impl_forms") is default_fn
+    finally:
+        etl.unregister_external_kernel("dr_impl_forms")
+
+
+def test_device_resident_under_non_iree_backend_allowed():
+    """Device registration is backend-neutral — any non-None backend string
+    is accepted (only the iree adapter consumes the mode in v1)."""
+
+    def k(x):
+        return x
+
+    for backend in ("numpy", "xla", "tvm"):
+        name = f"dr_neutral_{backend}"
+        etl.register_external_kernel(name, k, backend=backend, device_resident=True)
+        try:
+            assert etl.external.get_external_kernel_entry(name, backend) == (k, True)
+        finally:
+            etl.unregister_external_kernel(name)
+
+
+def test_get_external_kernel_unchanged_for_device_registrations():
+    """``get_external_kernel`` still returns the bare callable — never the
+    entry tuple — with unchanged slot resolution (exact slot -> default
+    slot -> ``None``), for device registrations too."""
+
+    def default_fn(x):
+        return x
+
+    def dev_fn(x):
+        return x + 1
+
+    etl.register_external_kernel("dr_get_default", default_fn)
+    etl.register_external_kernel(
+        "dr_get_device", dev_fn, backend="iree", device_resident=True
+    )
+    try:
+        assert etl.get_external_kernel("dr_get_default") is default_fn
+        assert etl.get_external_kernel("dr_get_default", "iree") is default_fn  # fallback
+        assert etl.get_external_kernel("dr_get_device", "iree") is dev_fn  # not a tuple
+        assert etl.get_external_kernel("dr_get_device") is None  # no default slot
+    finally:
+        etl.unregister_external_kernel("dr_get_default")
+        etl.unregister_external_kernel("dr_get_device")
+    assert etl.get_external_kernel("dr_get_ghost") is None
 
 
 # ---------------------------------------------------------------------------
