@@ -402,6 +402,9 @@ def _portable_vjp_rule(name: str) -> Callable:
                 _accumulate(acc.get(result.id)) for result in inlined.results
             )
             key = inlined.name
+            if key == "constant":
+                continue  # zero operands — nothing to propagate backward
+                          # (mirrors the main sweep in autodiff.py)
             if key == "block_call":
                 key = f"block:{inlined.attributes['block_name']}"
             elif key == "external_call":

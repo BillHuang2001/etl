@@ -206,11 +206,12 @@ Fallback semantics (implemented in `rules.py`):
   runs a LOCAL reverse sweep over ONLY the inlined ops (reverse creation
   order), seeding cotangents on the decomposition's OUTPUTS (the post-inline
   values — the block_call's own result ids are never inserted into the
-  builder); per-result cotangents accumulate (`etl.ops.add`), rules are
-  looked up from the PUBLIC registries
-  (`transforms.autodiff.require_vjp_rule`), and nested `block_call`s /
-  `external_call`s resolve via their own `block:<name>` / `external:<name>`
-  keys.
+  builder); per-result cotangents accumulate (`etl.ops.add`), `constant`
+  ops are skipped (zero operands — nothing to propagate, mirroring
+  `autodiff.py`'s main sweep), rules are looked up from the PUBLIC
+  registries (`transforms.autodiff.require_vjp_rule`), and nested
+  `block_call`s / `external_call`s resolve via their own `block:<name>` /
+  `external:<name>` keys.
 
 ## Error behavior
 
