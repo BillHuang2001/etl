@@ -394,5 +394,6 @@ extracted `_tree.py` (shared walker + static helpers), introduced
 `_TraceSession`, unified region execution (`_run_in_region`) and block
 termination (`_return_terminator`), deduped `cond` operand flattening and
 output unflattening. Public API unchanged; error messages byte-identical;
-full suite 5665 passed / 0 failed (skips environmental: torch/xla/GPU);
-`etl.bench` conformance 97/97.
+full suite 5873 passed / 20 skipped / 0 failed (5893 collected — skips
+environmental: torch absent / xla plugin absent / GPU-guarded);
+`etl.bench` conformance 98/98.
