@@ -78,6 +78,7 @@ from .xla_util import (
     _StaticShapeError,
     _load_plugin,
     _resolve_static_shape,
+    set_opt_level,
 )
 
 __all__ = ["XlaBackend", "XlaExecutable", "xla_backend", "register"]
@@ -101,16 +102,23 @@ class XlaBackend(CompilerBackend):
 
     name: ClassVar[str] = "xla"
     #: Options-override contract (see ../options.py): the compile options
-    #: ``plugin_path`` (plugin discovery — existing) and
+    #: ``plugin_path`` (plugin discovery — existing),
     #: ``xla_compile_options`` (a serialized ``xla.CompileOptionsProto`` as
     #: bytes, passed to the plugin via PJRT_Client_Compile_Args —
     #: arbitrary compile-option fields pass through, the plugin validates
-    #: them); ``plugin_path`` is also honored at load (plugin re-discovery
-    #: for deserialization). No run options in v1 (a non-empty run options
-    #: dict raises BackendError).
+    #: them) and ``opt_level`` (the XLA optimization level, "O0".."O3" or
+    #: 0..3 — normalized via ``options.normalize_opt_level`` and injected
+    #: into the compile options' ``executable_build_options`` wire-format
+    #: field 24 by ``xla_util.set_opt_level``; an explicit optimization
+    #: level already present in ``xla_compile_options`` wins unchanged —
+    #: the conflict rule, never both); ``plugin_path`` is also honored at
+    #: load (plugin re-discovery for deserialization). No run options in
+    #: v1 (a non-empty run options dict raises BackendError).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset({"rng_bit_generator"}),
-        "compile": frozenset({"plugin_path", "xla_compile_options"}),
+        "compile": frozenset(
+            {"plugin_path", "xla_compile_options", "opt_level"}
+        ),
         "load": frozenset({"plugin_path"}),
         "run": frozenset(),
     }
@@ -241,8 +249,13 @@ class XlaBackend(CompilerBackend):
         # Options contract (step 3): unknown keys raise BackendError;
         # ``xla_compile_options`` = a serialized ``xla.CompileOptionsProto``
         # (bytes) passed to the plugin — arbitrary compile-option fields pass
-        # through, the plugin validates the payload.
-        from ..options import validate_options
+        # through, the plugin validates the payload; ``opt_level``
+        # ("O0".."O3"/0..3) is normalized and injected into the compile
+        # options' ``executable_build_options`` (wire-format field 24) via
+        # ``xla_util.set_opt_level`` — an optimization level already present
+        # in ``xla_compile_options`` wins unchanged (the conflict rule,
+        # never both).
+        from ..options import normalize_opt_level, validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
         compile_options = (options or {}).get("xla_compile_options")
@@ -257,6 +270,18 @@ class XlaBackend(CompilerBackend):
                 f"the {self.name} 'xla_compile_options' compile option must "
                 f"be bytes (a serialized xla.CompileOptionsProto), got "
                 f"{type(compile_options).__name__}"
+            )
+
+        # ``opt_level`` (optional): normalized 0..3 and injected into the
+        # compile options' executable_build_options; an explicit level
+        # already present in ``xla_compile_options`` wins (set_opt_level
+        # returns the input unchanged — the conflict rule). Unset -> bytes
+        # untouched, the default path is byte-identical. A malformed value
+        # raises core.BackendError naming the option (never silent).
+        opt_level = (options or {}).get("opt_level")
+        if opt_level is not None:
+            compile_options = set_opt_level(
+                compile_options, normalize_opt_level(opt_level)
             )
 
         # Compile through the plugin (step 4) — errors raise BackendError.

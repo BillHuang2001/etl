@@ -71,6 +71,7 @@ __all__ = [
     "_find_plugin_path",
     "_load_plugin",
     "_DEFAULT_PLUGIN_PATHS",
+    "set_opt_level",
 ]
 
 #: Well-known locations probed when no explicit plugin path is configured.
@@ -118,6 +119,200 @@ _DTYPE_NAME_TO_PJRT = {
 }
 
 _PJRT_TO_DTYPE_NAME = {v: k for k, v in _DTYPE_NAME_TO_PJRT.items()}
+
+
+# ---------------------------------------------------------------------------
+# xla.CompileOptionsProto wire-format editing (pure python — no protobuf
+# runtime; stdlib + etl.core only, matching this module's import discipline)
+# ---------------------------------------------------------------------------
+
+#: ``CompileOptionsProto.executable_build_options`` = field 3, wiretype 2
+#: (length-delimited). Tag bytes: (3 << 3) | 2 = 26 -> varint ``1A``.
+_EBO_TAG = bytes((0x1A,))
+
+#: ``ExecutableBuildOptionsProto.optimization_level`` = field 24, wiretype 0
+#: (varint). Tag bytes: (24 << 3) | 0 = 192 -> varint ``C0 01`` (empirically
+#: verified against jaxlib 0.10.2's own serializer — see ``set_opt_level``).
+_OPT_LEVEL_TAG = bytes((0xC0, 0x01))
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    """Decode a base-128 varint starting at ``pos``; return (value, next_pos)."""
+    value = 0
+    shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _encode_varint(value: int) -> bytes:
+    """Encode a non-negative int as a base-128 varint (minimal form)."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def set_opt_level(compile_options: bytes, level: int) -> bytes:
+    """Inject ``ExecutableBuildOptionsProto.optimization_level`` into a
+    serialized ``xla.CompileOptionsProto`` — pure-python wire-format editor.
+
+    Parses the outer message into ``(key, wiretype, payload)`` segments
+    (multi-byte varint keys and lengths handled), locates the LAST field-3
+    wiretype-2 segment = the ``executable_build_options`` (EBO) submessage
+    (protobuf last-wins), appends a field-24 varint ``c0 01 <level>`` to
+    that payload, rebuilds the field-3 segment with the new length (proper
+    multi-byte varint length encoding), and reassembles the outer message
+    preserving every other segment byte-for-byte.
+
+    Wire-format facts (VERIFIED EMPIRICALLY against jaxlib 0.10.2's own
+    ``CompileOptions.SerializeAsString()``): the outer proto decodes as a
+    single field-3 wiretype-2 submessage = ``executable_build_options``
+    (the adapter's default ``bytes.fromhex("1a0420012801")``: ``1a 04`` =
+    key 3 wt 2, length 4; inner ``20 01`` = num_replicas field 4 varint 1;
+    ``28 01`` = num_partitions field 5 varint 1); setting
+    ``optimization_level`` appends exactly ``c0 01 <N>`` (key 24 wt 0
+    varint) inside the EBO payload — jaxlib's serializer omits the field
+    when 0 (XLA treats unset as default).
+
+    Conflict rule (binding): an explicit optimization level ALREADY present
+    in the user's ``xla_compile_options`` (a field-24 varint in the EBO)
+    WINS — the input bytes are returned UNCHANGED (never both, never
+    override, never corrupt). Level 0 is injected EXPLICITLY (``c0 01 00``
+    is present in the output — no silent skip; XLA reads it as the default,
+    wire-valid). An outer message with NO field-3 segment gets a new
+    field-3 segment containing only the level field (wire-format-valid;
+    protobuf merge semantics make it correct).
+
+    ``level`` must be an int 0..3 (the caller normalizes via
+    ``etl.backends.options.normalize_opt_level``). Malformed input
+    (truncated segments, unsupported wiretypes, deprecated group
+    wiretypes) raises ``core.BackendError`` — never silent corruption.
+    """
+    if not isinstance(compile_options, bytes):
+        raise core.BackendError(
+            "set_opt_level expects serialized xla.CompileOptionsProto bytes, "
+            f"got {type(compile_options).__name__}"
+        )
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 3:
+        raise core.BackendError(
+            f"opt_level must be an int 0..3, got {level!r}"
+        )
+
+    # --- Parse the outer message into (key, wiretype, raw, payload) segments.
+    data = compile_options
+    n = len(data)
+    segments: list[tuple[int, int, bytes, bytes | None]] = []
+    ebo_index: int | None = None  # index of the LAST field-3 wt2 segment
+    pos = 0
+    while pos < n:
+        start = pos
+        tag, pos = _read_varint(data, pos)
+        key = tag >> 3
+        wiretype = tag & 0x07
+        if wiretype == 0:  # varint
+            _, pos = _read_varint(data, pos)
+            payload = None
+        elif wiretype == 1:  # 64-bit
+            if pos + 8 > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 64-bit field"
+                )
+            pos += 8
+            payload = None
+        elif wiretype == 2:  # length-delimited
+            length, pos = _read_varint(data, pos)
+            end = pos + length
+            if end > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated "
+                    "length-delimited field"
+                )
+            payload = data[pos:end]
+            pos = end
+        elif wiretype == 5:  # 32-bit
+            if pos + 4 > n:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 32-bit field"
+                )
+            pos += 4
+            payload = None
+        else:
+            raise core.BackendError(
+                "malformed xla_compile_options: unsupported wiretype "
+                f"{wiretype} (deprecated group wiretypes are not supported)"
+            )
+        segments.append((key, wiretype, data[start:pos], payload))
+        if key == 3 and wiretype == 2:
+            ebo_index = len(segments) - 1  # last field-3 segment wins
+
+    # --- No EBO submessage: append a fresh field-3 segment with only the
+    # --- level field (protobuf merge semantics make it correct).
+    if ebo_index is None:
+        level_field = _OPT_LEVEL_TAG + _encode_varint(level)
+        new_segment = _EBO_TAG + _encode_varint(len(level_field)) + level_field
+        return data + new_segment
+
+    # --- Parse the EBO payload; a field-24 varint = user's explicit level.
+    ebo_key, ebo_wt, ebo_raw, ebo_payload = segments[ebo_index]
+    p = 0
+    m = len(ebo_payload)
+    while p < m:
+        ftag, p = _read_varint(ebo_payload, p)
+        fkey = ftag >> 3
+        fwt = ftag & 0x07
+        if fkey == 24:
+            if fwt == 0:
+                return compile_options  # conflict: user's level wins, unchanged
+            raise core.BackendError(
+                "malformed xla_compile_options: field 24 "
+                "(optimization_level) has wiretype "
+                f"{fwt}, expected varint (0)"
+            )
+        if fwt == 0:
+            _, p = _read_varint(ebo_payload, p)
+        elif fwt == 1:
+            if p + 8 > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 64-bit field "
+                    "inside executable_build_options"
+                )
+            p += 8
+        elif fwt == 2:
+            flen, p = _read_varint(ebo_payload, p)
+            if p + flen > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated "
+                    "length-delimited field inside executable_build_options"
+                )
+            p += flen
+        elif fwt == 5:
+            if p + 4 > m:
+                raise core.BackendError(
+                    "malformed xla_compile_options: truncated 32-bit field "
+                    "inside executable_build_options"
+                )
+            p += 4
+        else:
+            raise core.BackendError(
+                "malformed xla_compile_options: unsupported wiretype "
+                f"{fwt} inside executable_build_options"
+            )
+
+    # --- Append the level field and rebuild the field-3 segment.
+    new_payload = ebo_payload + _OPT_LEVEL_TAG + _encode_varint(level)
+    new_segment = _EBO_TAG + _encode_varint(len(new_payload)) + new_payload
+    segments[ebo_index] = (ebo_key, ebo_wt, new_segment, new_payload)
+    return b"".join(raw for _, _, raw, _ in segments)
 
 
 class _StaticShapeError(Exception):

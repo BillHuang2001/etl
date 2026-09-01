@@ -34,16 +34,28 @@ Contract (binding, see also ../CONTEXT.md "Backend options contract"):
   ``target_backends`` with a numpy backend; strict validation is the
   compiler adapters' job).
 
+``opt_level`` is the FIRST etl-defined + etl-validated common option: unlike
+raw compiler flags (pass-through, validated by the compiler), etl defines
+what ``opt_level`` means and translates its value per backend, so its VALUE
+is validated here — ``normalize_opt_level`` is the shared entry point, also
+consumed by the pipeline env-var resolution for ``ETL_OPT_LEVEL``. The
+per-backend translation (mapping the normalized int to each compiler's own
+optimization setting) happens in the adapters.
+
 Import acyclicity: this module imports ``etl.core`` ONLY.
 """
 from __future__ import annotations
 
 from etl.core import BackendError
 
-__all__ = ["STAGES", "validate_options"]
+__all__ = ["STAGES", "validate_options", "normalize_opt_level", "OPT_LEVEL"]
 
 #: The canonical pipeline stage names (option scope keys).
 STAGES = ("lower", "compile", "load", "run")
+
+#: The canonical option key for the optimization level — the family-architecture
+#: anchor: future common (etl-defined) options slot in next to it.
+OPT_LEVEL = "opt_level"
 
 
 def validate_options(
@@ -76,4 +88,36 @@ def validate_options(
         f"{', '.join(repr(key) for key in unknown)} — known options by "
         f"stage: {'; '.join(listing)}; options valid for other stages are "
         "accepted and ignored at this stage"
+    )
+
+
+def normalize_opt_level(value) -> int:
+    """Normalize an ``opt_level`` value to an int 0..3 (etl-validated).
+
+    ``opt_level`` is the one option etl validates because etl defines and
+    translates its value (the per-backend translation happens in the
+    adapters) — raw compiler flags remain pass-through. Accepted forms:
+
+    - ``"O0"``..``"O3"`` strings, case-insensitive, whitespace-stripped
+      (so ``"o3"`` and ``" O2 "`` work);
+    - digit strings ``"0"``..``"3"``;
+    - ints 0..3 (but NOT bool — ``True``/``False`` are rejected explicitly,
+      since bool is an int subclass).
+
+    ANY other value (``None``, floats, ``"O4"``, ``"4"``, ``-1``, ``3.5``,
+    ``"banana"``, ``"O"``, lists, ...) raises ``core.BackendError`` naming
+    the option and the accepted forms — never a silent fallback.
+    """
+    if isinstance(value, str):
+        stripped = value.strip().upper()
+        if stripped in {"O0", "O1", "O2", "O3"}:
+            return int(stripped[1])
+        if stripped in {"0", "1", "2", "3"}:
+            return int(stripped)
+    elif type(value) is int:  # `type is int`, not isinstance: bool is excluded
+        if 0 <= value <= 3:
+            return value
+    raise BackendError(
+        f"invalid {OPT_LEVEL!r} value {value!r} — accepted forms: "
+        "'O0'..'O3' (case-insensitive), '0'..'3', or an int 0..3"
     )

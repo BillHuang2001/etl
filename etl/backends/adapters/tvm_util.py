@@ -722,7 +722,10 @@ def translate(mlir_text: str) -> Any:
 
 
 def build_vm_executable(
-    relax_module: Any, target: str = "llvm", pass_configs: dict | None = None
+    relax_module: Any,
+    target: str = "llvm",
+    pass_configs: dict | None = None,
+    opt_level: int | None = None,
 ) -> Any:
     """Build a ``tvm.relax.vm_build.VMExecutable`` for the given target.
 
@@ -730,7 +733,17 @@ def build_vm_executable(
     -mcpu=native"``). ``pass_configs``: an optional dict of Relax pass
     configurations forwarded to ``tvm.relax.vm_build.build`` (a non-None
     value on a TVM build that does not accept ``pass_configs`` raises
-    ``core.BackendError`` — never silently dropped).
+    ``core.BackendError`` — never silently dropped). ``opt_level``: an
+    optional int 0-3 forwarded to ``tvm.relax.vm_build.build`` as
+    ``opt_level=``; a non-None value on a TVM build WITHOUT the parameter
+    raises ``core.BackendError`` naming the option, the installed TVM
+    version and the mechanism limitation — never silently dropped. The
+    installed TVM 0.26 ``relax.vm_build.build`` accepts neither keyword —
+    probe evidence: ``tvm.transform.PassContext(opt_level=N)`` around the
+    build does NOT reach the LLVM codegen (byte-identical host-module
+    source at N=0 and N=3, while the target's ``opt-level`` attr does
+    change the output), so the level can only be applied through the
+    build's own ``opt_level`` parameter on a TVM version that has one.
     """
     import tvm
     from tvm import relax
@@ -742,6 +755,11 @@ def build_vm_executable(
             # installed TVM 0.26 ``relax.vm_build.build`` does NOT accept the
             # keyword, so a ``None`` value must not be passed.
             build_kwargs["pass_configs"] = pass_configs
+        if opt_level is not None:
+            # opt_level is only forwarded when explicitly given — same
+            # reason as pass_configs: the installed TVM 0.26 build has no
+            # such parameter (a None value must not be passed).
+            build_kwargs["opt_level"] = opt_level
         return relax.vm_build.build(
             relax_module, target=tvm.target.Target(target), **build_kwargs
         )
@@ -750,6 +768,14 @@ def build_vm_executable(
             raise core.BackendError(
                 "the installed TVM build does not accept 'pass_configs' — "
                 f"drop the 'tvm_pass_configs' compile option (target "
+                f"{target!r}): {exc}"
+            ) from exc
+        if opt_level is not None and "opt_level" in str(exc):
+            raise core.BackendError(
+                f"the installed TVM build (version {tvm_version()}) does not "
+                "accept 'opt_level' — the 'opt_level' compile option cannot "
+                "be applied on this TVM version: the installed "
+                f"relax.vm_build.build has no opt_level parameter (target "
                 f"{target!r}): {exc}"
             ) from exc
         raise core.BackendError(
