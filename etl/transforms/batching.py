@@ -234,46 +234,44 @@ def block_call_pass_through_rule() -> BatchingRule:
 
 
 def _rule_key(op: ir.Op) -> str:
-    """Registry key for `op` (block calls are keyed ``block:<block_name>``)."""
+    """Registry key for `op` (block calls are keyed ``block:<block_name>``,
+    external calls keyed ``external:<name>``)."""
     if op.name == "block_call":
         return f"block:{op.attributes['block_name']}"
+    if op.name == "external_call":
+        return f"external:{op.attributes['name']}"
     return op.name
-
-
-#: Batching policies whose block calls are safe to vectorize WITHOUT a
-#: registered rule: the block acts per-element on all dims (`elementwise`) or
-#: maps over its leading batch dims internally (`map_over_batch`) — batch dims
-#: pass through untouched. Every other policy (`opaque_batched`,
-#: `unsupported`, `batching_rule`, `broadcast_batch`) or a missing policy
-#: attribute requires an explicitly registered rule — never a silent
-#: pass-through.
-_PASS_THROUGH_POLICIES = ("elementwise", "map_over_batch")
 
 
 def _resolve_batching_rule(op: ir.Op) -> BatchingRule:
     """The rule vectorizing `op`.
 
-    Lookup order: the registry first — block calls under the namespaced key
-    `block:<block_name>` (exactly like autodiff's `_rule_name`; an explicitly
-    registered rule always wins over the policy) — then, for block calls with
-    no registered rule, the built-in pass-through when the op carries an
-    `elementwise`/`map_over_batch` `batching_policy` attribute (the attribute
-    is optional; today `etl/block` does not emit it). No rule + no safe
-    policy ⇒ `TransformError` naming the op/block.
+    Lookup: the registry first — block calls under the namespaced key
+    `block:<block_name>`, external calls under `external:<name>` (exactly
+    like autodiff's `_rule_name`; an explicitly registered rule always
+    wins). No registered rule ⇒ `TransformError` naming the op/block/kernel
+    with an adaptive registration hint — never a silent fallback.
     """
-    rule = batching_rules.get(_rule_key(op))
+    key = _rule_key(op)
+    rule = batching_rules.get(key)
     if rule is not None:
         return rule
-    if op.name == "block_call":
+    if key.startswith("block:"):
         block_name = op.attributes["block_name"]
-        policy = op.attributes.get("batching_policy")
-        if policy in _PASS_THROUGH_POLICIES:
-            return block_call_pass_through_rule()
         raise TransformError(
             f"vectorize: no batching rule for block '{block_name}' — "
-            f"register one with register_batching_rule('block:{block_name}', fn) "
+            f"register one with register_batching_rule('{key}', fn) "
             f"(custom blocks: BlockOp.batching_rule); there is no silent "
             f"Python-loop fallback."
+        )
+    if key.startswith("external:"):
+        name = op.attributes["name"]
+        raise TransformError(
+            f"vectorize: no batching rule for op 'external_call' (key "
+            f"'{key}') — register one via the external-kernel handle "
+            f"returned by etl.register_external_kernel('{name}', fn) "
+            f"(.batching_rule/.vjp_rule/.jvp_rule) or register a portable "
+            f"decomposition; there is no silent Python-loop fallback."
         )
     return require_batching_rule(op.name)
 

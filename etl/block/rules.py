@@ -24,9 +24,12 @@ Rule callback contracts (owned by etl.transforms, binding):
 The fallback wrappers inline the portable decomposition: batching re-traces
 the portable over the (batched) operand values, which makes batching safe
 automatically on every backend; vjp re-traces the portable and runs a LOCAL
-reverse sweep over only the inlined ops (nested block_calls inside the
-decomposition resolve via their own `block:<name>` keys). For blocks declared
-with an `elementwise`/`map_over_batch` policy, decl additionally installs
+reverse sweep over only the inlined ops, seeding cotangents on the
+decomposition's outputs (the POST-inline values — the block_call's own
+result ids were never inserted into the builder). Nested block_calls /
+external_calls inside the decomposition resolve via their own
+`block:<name>` / `external:<name>` keys. For blocks declared with an
+`elementwise`/`map_over_batch` policy, decl additionally installs
 transforms' built-in pass-through rule (`batching.block_call_pass_through_rule`)
 under `block:<name>` — see `register_policy_pass_through`.
 """
@@ -338,16 +341,21 @@ def _portable_vjp_rule(name: str) -> Callable:
     At rule time this traces `registry.get_portable(name)` into ordinary ops
     (replacing the block_call) and runs a LOCAL reverse sweep over ONLY the
     inlined ops (reverse creation order), so the derivative is computed over
-    the decomposition without needing a block_call vjp rule. Cotangents
-    accumulate per value; nested block_calls inside the decomposition resolve
-    through their own `block:<name>` keys via the public registries
-    (transforms.autodiff). All-zero cotangents short-circuit to zero
-    cotangents without inlining.
+    the decomposition without needing a block_call vjp rule. Cotangents are
+    seeded on the decomposition's OUTPUTS — the post-inline values (the
+    block_call's own result ids are never inserted into the builder, so
+    seeding on them would find nothing in the sweep) — and accumulate per
+    value; nested block_calls / external_calls inside the decomposition
+    resolve through their own `block:<name>` / `external:<name>` keys via the
+    public registries (transforms.autodiff). All-zero cotangents
+    short-circuit to zero cotangents without inlining.
 
     Raises:
         TransformError: No portable decomposition is registered, or an op in
             the decomposition has no vjp rule (canonical `require_vjp_rule`
-            message) — never a silent fallback.
+            message), or the decomposition's output count does not match the
+            block's declared results (never guessing) — never a silent
+            fallback.
     """
 
     def rule(op: Any, cotangents: Any, primals: Any) -> Any:
@@ -370,14 +378,21 @@ def _portable_vjp_rule(name: str) -> Callable:
 
         builder = current_builder()
         before = len(builder.current_block.ops)
-        _inline_portable(name, portable, tuple(primals))
+        outputs = _inline_portable(name, portable, tuple(primals))
         inlined_ops = builder.current_block.ops[before:]
+        if len(outputs) != len(op.results):
+            raise core.TransformError(
+                f"grad/vjp: not differentiable: portable decomposition for "
+                f"block '{name}' returned {len(outputs)} outputs for "
+                f"{len(op.results)} declared results — never guessing"
+            )
 
-        # Seed cotangents from the block's results (skip None/ZeroTangent).
+        # Seed cotangents from the decomposition's outputs (skip
+        # None/ZeroTangent): the inlined values the sweep below sees.
         acc: dict = {}
-        for result_value, ct in zip(op.results, cotangents):
+        for out_value, ct in zip(outputs, cotangents):
             if not _zero(ct):
-                acc.setdefault(result_value.id, []).append(ct)
+                acc.setdefault(out_value.value.id, []).append(ct)
 
         # Local reverse sweep over ONLY the inlined ops.
         for inlined in reversed(inlined_ops):
@@ -389,6 +404,8 @@ def _portable_vjp_rule(name: str) -> Callable:
             key = inlined.name
             if key == "block_call":
                 key = f"block:{inlined.attributes['block_name']}"
+            elif key == "external_call":
+                key = f"external:{inlined.attributes['name']}"
             # Public registry lookup: canonical TransformError when absent.
             vjp_fn = require_vjp_rule(key)
             input_cotangents = vjp_fn(inlined, per_result, inlined.operands)
