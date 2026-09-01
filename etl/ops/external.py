@@ -48,9 +48,11 @@ def external_call(name, *operands, result) -> Union[
     kernel name and the declared result specs as op attributes. The kernel is
     NOT looked up at trace time — registration is a run-time concern. The
     numpy backend resolves the name through ``etl.external.get_external_kernel``
-    and executes the callable with the operand tensors as numpy arrays;
-    compiler backends reject the op with ``BackendError`` in v1 (adapter
-    host-dispatch is not yet wired).
+    (per-backend registry: the exact backend slot, then the default slot) and
+    executes the callable with the operand tensors as numpy arrays; the iree
+    adapter host-dispatches via segment-split at ``lower()``/``run()``
+    (``etl/backends/external_split.py``); xla/tvm reject the op with an
+    explicit ``BackendError``.
 
     Args:
         name: The registered kernel name (non-empty str). Same name at trace
