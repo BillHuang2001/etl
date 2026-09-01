@@ -49,7 +49,7 @@ for two reasons:
    the validated set is ``SUPPORTED_STABLEHLO_OPS`` below, which the
    compile-time pre-check enforces — anything outside it raises
    ``core.BackendError`` naming the op BEFORE the translator is invoked
-   (the vendored translator fails with bare ``assert``\s for unknown ops).
+   (the vendored translator fails with bare ``assert``\\s for unknown ops).
 
 Validated translator/build/run/persistence APIs (TVM 0.26.0,
 ``tvm_ffi`` 0.1.13.post3, jaxlib 0.10.2 — jaxlib ONLY for its bundled MLIR

@@ -3,7 +3,7 @@
 A tensor is always a *local* physical tensor. ``Device`` identifies a
 physical device; ``devices()`` enumerates what is actually available;
 ``split_tensor``/``replicate_tensor`` are *explicit* data-preparation
-utilities that produce ordinary local ``Tensor``\s — they do no graph
+utilities that produce ordinary local ``Tensor``\\s — they do no graph
 rewriting, no implicit communication, and never shard inside the graph
 (collectives are the explicit in-graph communication mechanism, owned by
 ``etl.dist``).
@@ -74,7 +74,7 @@ def devices(kind: Optional[str] = None) -> List[Device]:
         kind: Optional filter; only devices of this kind are returned.
 
     Returns:
-        The list of :class:`Device`\s.
+        The list of :class:`Device`\\s.
 
     Raises:
         DeviceError: If ``kind`` is not a recognized device kind.
@@ -120,7 +120,7 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
         devices: Target devices (one result tensor each).
 
     Returns:
-        A list of :class:`Tensor`\s, one per device, each a contiguous chunk.
+        A list of :class:`Tensor`\\s, one per device, each a contiguous chunk.
 
     Raises:
         DeviceError: If ``devices`` is empty, if ``tensor`` is not a
@@ -183,7 +183,7 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
         devices: Target devices (one result tensor each).
 
     Returns:
-        A list of :class:`Tensor`\s, one per device, all sharing the data.
+        A list of :class:`Tensor`\\s, one per device, all sharing the data.
 
     Raises:
         DeviceError: If ``devices`` is empty or ``tensor`` is not a

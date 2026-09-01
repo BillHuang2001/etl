@@ -945,7 +945,7 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
     """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
     in block-arg (tensor-leaf) order.
 
-    ``bound`` maps flat leaf indices to already-validated ``core.Tensor``\s
+    ``bound`` maps flat leaf indices to already-validated ``core.Tensor``\\s
     (empty dict for a plain ``Executable``). For bound executables the user
     arguments must match the *reduced* input tree (bound leaf positions
     removed) — anything else raises ``core.TraceError`` with both specs in
@@ -1029,7 +1029,7 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
     """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
     in block-arg (tensor-leaf) order.
 
-    ``bound`` maps flat leaf indices to already-validated ``core.Tensor``\s
+    ``bound`` maps flat leaf indices to already-validated ``core.Tensor``\\s
     (empty dict for a plain ``Executable``). For bound executables the user
     arguments must match the *reduced* input tree (bound leaf positions
     removed) — anything else raises ``core.TraceError`` with both specs in
@@ -1118,7 +1118,7 @@ def _normalize_leaf_types(spec: "core.TreeSpec") -> "core.TreeSpec":
 
 
 def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
-    """Wrap flat backend results as ``core.Tensor``\s and rebuild the
+    """Wrap flat backend results as ``core.Tensor``\\s and rebuild the
     structured output per ``signature.output_tree``.
 
     Tensor leaves (per ``_is_tensor_leaf_spec``) consume the backend outputs

@@ -60,7 +60,7 @@ class TreeSpec:
     Attributes:
         type: The container type: ``tuple``, ``list``, ``dict``, a namedtuple
             type, a dataclass type, or a registered custom type.
-        children: Child ``TreeSpec``\s (empty tuple for a leaf).
+        children: Child ``TreeSpec``\\s (empty tuple for a leaf).
         context: Optional metadata supplied by a registered type's
             ``flatten_fn`` (used by its ``unflatten_fn``).
         node_data: Optional per-type data needed to rebuild the container:
