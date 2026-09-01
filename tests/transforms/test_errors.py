@@ -322,3 +322,83 @@ class TestZeroGradientContract:
         result = run_graph(graph, x)
         assert result.dtype == etl.float32
         assert np.allclose(result.numpy(), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# external_call with no rule and no portable: the external:<name> key format
+# ---------------------------------------------------------------------------
+
+
+def _ext_none_graph():
+    """A scalar-loss graph over an external_call with NO registered rule and
+    NO portable decomposition (the kernel is never even registered)."""
+    @etl.defn
+    def f(x):
+        return etl.sum(
+            etl.external_call(
+                "tx_ext_nerr", x, result=etl.TensorSpec((4, 3), etl.float32)
+            )
+        )
+
+    return etl.trace(f, SPEC)
+
+
+class TestExternalCallRuleErrors:
+    """external_call with neither an explicit rule nor a portable
+    decomposition raises `TransformError` naming the op AND the
+    `external:<name>` key (the namespaced message format), hinting at the
+    external-kernel handle — never a silent fallback."""
+
+    def test_grad_external_call_names_op_and_key(self):
+        with pytest.raises(
+            etl.TransformError,
+            match=(
+                r"no VJP rule for op 'external_call' "
+                r"\(key 'external:tx_ext_nerr'\)"
+            ),
+        ) as exc:
+            etl.grad(_ext_none_graph())
+        assert "etl.register_external_kernel('tx_ext_nerr', fn)" in str(exc.value)
+
+    def test_vjp_external_call_names_op_and_key(self):
+        with pytest.raises(
+            etl.TransformError,
+            match=(
+                r"no VJP rule for op 'external_call' "
+                r"\(key 'external:tx_ext_nerr'\)"
+            ),
+        ):
+            etl.vjp(_ext_none_graph())
+
+    def test_jvp_external_call_names_op_and_key(self):
+        with pytest.raises(
+            etl.TransformError,
+            match=(
+                r"no JVP rule for op 'external_call' "
+                r"\(key 'external:tx_ext_nerr'\)"
+            ),
+        ):
+            etl.jvp(
+                _ext_none_graph(),
+                tangents=(etl.TensorSpec((4, 3), etl.float32),),
+            )
+
+    def test_vmap_external_call_names_op_and_key(self):
+        with pytest.raises(
+            etl.TransformError,
+            match=(
+                r"no batching rule for op 'external_call' "
+                r"\(key 'external:tx_ext_nerr'\)"
+            ),
+        ):
+            etl.vmap(_ext_none_graph(), in_axes=0)
+
+    def test_vectorize_external_call_names_op_and_key(self):
+        with pytest.raises(
+            etl.TransformError,
+            match=(
+                r"no batching rule for op 'external_call' "
+                r"\(key 'external:tx_ext_nerr'\)"
+            ),
+        ):
+            etl.vectorize(_ext_none_graph(), 0)
