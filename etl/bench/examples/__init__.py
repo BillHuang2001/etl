@@ -40,7 +40,7 @@ from . import base  # noqa: F401  (registry + shared infra; import first)
 from . import micro, grad, vectorize, op_large  # noqa: F401  (op category)
 from . import (  # noqa: F401  (op category, filled by a later phase)
     op_basic, op_matmul, op_control_flow, op_grad2,
-    op_vmap2, op_custom, op_xla,
+    op_vmap2, op_custom, op_external, op_xla,
 )
 from . import (  # noqa: F401  (block category)
     block_transformer, block_rnn, block_conv, block_mlp, block_opt,
