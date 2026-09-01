@@ -40,8 +40,14 @@ class Capabilities:
         collectives: supports ``etl.dist`` collective ops (numpy: single-process simulation).
         runtime_calls: supports ``runtime_call`` (executing Python callbacks).
         external_calls: supports ``external_call`` ops (named external
-            kernels; v1: numpy-backend-only — compiler-backend host-dispatch
-            is not wired yet, see ``etl/CONTEXT.md`` "External kernels").
+            kernels; resolved at run time through the ``etl.external``
+            per-backend registry — ``get_external_kernel(name, backend)``
+            with default-slot fallback). numpy: True (direct interpreter
+            dispatch); iree: True (segment-split + host-dispatch at
+            ``lower()``/``run()`` via ``etl/backends/external_split.py``);
+            xla/tvm: False (explicit ``BackendError`` at ``lower()``;
+            registered portables may enable a compiler-side inline path in
+            a later package).
         custom_blocks: supports ``block_call`` ops (registered backend impls).
         async_collectives: collective execution may be asynchronous (numpy: False).
         sparse_ops: supports etl.sparse sparse-tensor ops (numpy: True).
