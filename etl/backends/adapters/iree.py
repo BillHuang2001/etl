@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import base64
 import os
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from etl import core
@@ -1600,6 +1601,10 @@ class IreeExternalExecutable(CompilerExecutable):
       never reordered against the compiled ops around it).
     - Kernels are assumed PURE (same inputs -> same outputs): the same
       inputs + the same registered kernels produce the same results.
+    - A ``UserWarning`` is emitted once per executable when the FIRST
+      external-call boundary executes, explaining the per-boundary
+      device->host->device staging cost and the v1 lower-time restrictions
+      (see ``run``).
     - The graph's structured I/O contract (the recorded ``Signature``) is
       unchanged: ``run`` validates flat inputs against it and returns the
       graph's flat outputs (the final segment's module outputs).
@@ -1644,6 +1649,7 @@ class IreeExternalExecutable(CompilerExecutable):
                 "corrupt: the external-call plan records no segments"
             )
         self._final_module_outputs = plan[-1]["module_outputs"]
+        self._staging_warned = False  # once-per-executable staging warning
 
     # ------------------------------------------------------------------ run
 
@@ -1722,6 +1728,19 @@ class IreeExternalExecutable(CompilerExecutable):
             out_slots: list[core.Tensor] = list(outputs)
             call = plan_segment.get("call")
             if call is not None:
+                if not self._staging_warned:
+                    self._staging_warned = True
+                    warnings.warn(
+                        "iree host-dispatch: external_call boundaries "
+                        "stage tensors device -> host -> device at every "
+                        "kernel call (per-boundary host round-trips, v1 "
+                        "mechanism); lower-time restrictions: no "
+                        "control-flow bodies around calls, static result "
+                        "dims, at least one tensor operand, kernels "
+                        "assumed pure",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                 name = call["name"]
                 label = f"op 'external_call' (kernel {name!r})"
                 operand_arrays = [

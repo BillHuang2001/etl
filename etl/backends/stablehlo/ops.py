@@ -223,8 +223,13 @@ COLLECTIVE_MAP: dict[str, str] = {
 # all five defer explicitly (`eigh` is v1 via the while-loop cyclic-Jacobi
 # composition in `_emit_eigh`). `random_multinomial` defers because its
 # cumulative-search decomposition is not wired in v1. `external_call`
-# (named external kernels) defers because adapter host-dispatch is not wired
-# in v1 — round 2. The 16 `sparse_*`/`dense_dot_sparse` ops (etl.sparse
+# (named external kernels) defers in the exporter itself: the exporter is
+# a pure export utility — the iree adapter host-dispatches external-call
+# graphs by SPLITTING them into segments at lower() BEFORE export (see
+# `etl/backends/external_split.py`), and the xla/tvm adapters inline a
+# registered portable decomposition (with a warning) or reject explicitly
+# when none exists — so only DIRECT export of a graph still containing the
+# op sees this deferral. The 16 `sparse_*`/`dense_dot_sparse` ops (etl.sparse
 # family) are numpy-backend-only in v1 — densify via `etl.sparse.to_dense`
 # to export.
 DEFERRED_OPS: frozenset[str] = frozenset(

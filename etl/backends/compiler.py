@@ -42,7 +42,7 @@ from etl.core import Device
 
 from .backend import Backend, Capabilities, Executable
 from .external_split import contains_external_call
-from .inline import inline_portables, iter_ops
+from .inline import get_external_portable, inline_portables, iter_ops
 from .program import CompiledArtifact, LoweredProgram, Signature
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -63,7 +63,9 @@ class CompilerBackend(Backend):
     additionally SPLITS graphs containing ``external_call`` ops into
     per-segment programs at lower time (``_lower_external_segments`` —
     adapter host-dispatch, see ``./external_split.py``); backends without
-    the capability reject the op explicitly.
+    the capability fall back to a registered portable decomposition
+    (inlined with a ``UserWarning``) or reject the op explicitly when no
+    portable exists.
 
     The lower-time contract (binding):
 
@@ -74,16 +76,23 @@ class CompilerBackend(Backend):
       ``runtime_call`` requires ``capabilities.runtime_calls``;
       ``collective``-effect ops require ``capabilities.collectives``;
       ``block_call`` requires ``capabilities.custom_blocks``; ops in the
-      ``"sparse"`` category require ``capabilities.sparse_ops``; every
-      value dtype must be declared in ``capabilities.dtypes``; when
-      ``capabilities.dynamic_shapes`` is False, symbolic /
-      runtime-dynamic (``None``) dimensions are rejected — all raise
-      ``core.BackendError`` naming the feature.
+      ``"sparse"`` category require ``capabilities.sparse_ops``;
+      ``external_call`` requires ``capabilities.external_calls`` OR a
+      registered portable decomposition (``etl.external.get_portable`` —
+      such ops are skipped here and inlined by the portable-inline step
+      below with a warning); every value dtype must be declared in
+      ``capabilities.dtypes``; when ``capabilities.dynamic_shapes`` is
+      False, symbolic / runtime-dynamic (``None``) dimensions are
+      rejected — all raise ``core.BackendError`` naming the feature.
     - Portable inlining: with ``custom_blocks=True`` every remaining
       ``block_call`` is inlined by ``inline_portables(module,
       keep_backend_impls=None)`` (a compiler adapter has no per-backend
       block impls) — a block without a portable decomposition raises
-      ``core.BackendError`` naming it.
+      ``core.BackendError`` naming it. With
+      ``inline_external_portables=not capabilities.external_calls``,
+      ``external_call`` ops with a registered portable decomposition are
+      inlined through the same splicing machinery (``UserWarning`` per
+      kernel name); ops without one were already rejected at the pre-check.
     - The StableHLO export is the capability gate for ops: deferred ops
       raise ``core.BackendError`` naming them (see ``stablehlo/`` v1 scope).
     - The ``Signature`` is recorded from the Graph's LIVE attributes
@@ -210,16 +219,25 @@ class CompilerBackend(Backend):
            ``inline.iter_ops`` — the module is mutated by inlining in
            step 3): ``runtime_call`` / ``collective``-effect ops /
            ``block_call`` / sparse ops (category "sparse" vs
-           ``capabilities.sparse_ops``) / dtypes / dynamic shapes are
-           checked against ``Capabilities`` here (mirrors the numpy
-           backend's flag pattern). Every rejection names the missing
-           feature.
-        3. ``inline_portables(graph.module, keep_backend_impls=None)`` — for
-           adapters declaring ``custom_blocks=True`` every remaining
-           ``block_call`` MUST have a portable decomposition, else
-           ``core.BackendError`` naming the block (adapters with
-           ``custom_blocks=False`` have already rejected ``block_call``
-           at step 2).
+           ``capabilities.sparse_ops``) / ``external_call`` / dtypes /
+           dynamic shapes are checked against ``Capabilities`` here
+           (mirrors the numpy backend's flag pattern). Every rejection
+           names the missing feature. ``external_call`` ops with a
+           registered portable decomposition
+           (``etl.external.get_portable``) are SKIPPED here — the
+           portable-inline fallback (step 3) handles them with a warning;
+           ops without one raise a ``BackendError`` naming the op and the
+           backend and listing the options (iree/numpy backends, or
+           register a portable via the external-kernel handle).
+        3. ``inline_portables(graph.module, keep_backend_impls=None,
+           inline_external_portables=not capabilities.external_calls,
+           backend_name=self.name)`` — for adapters declaring
+           ``custom_blocks=True`` every remaining ``block_call`` MUST have
+           a portable decomposition, else ``core.BackendError`` naming the
+           block (adapters with ``custom_blocks=False`` have already
+           rejected ``block_call`` at step 2); backends without host-dispatch
+           additionally inline ``external_call`` ops that have a registered
+           portable (with a ``UserWarning`` per kernel name).
         4. ``graph.verify()`` again (defensive, cheap).
         5. ``stablehlo.export(graph, options={"rng_bit_generator": ...})`` —
            the capability gate for ops: deferred ops raise
@@ -268,12 +286,23 @@ class CompilerBackend(Backend):
                     "execute runtime_call"
                 )
             if op.name == "external_call" and not capabilities.external_calls:
+                name = op.attributes["name"]
+                if get_external_portable(name) is not None:
+                    # The portable-inline fallback below (with a warning)
+                    # handles this op — skip it here.
+                    continue
                 raise core.BackendError(
                     f"capability drift: the {self.name} backend cannot "
-                    f"execute external_call op '{op.attributes['name']}' — "
-                    "adapter host-dispatch for external kernels is not yet "
-                    "wired (v1); use the numpy backend or remove the "
-                    "external call from the graph"
+                    f"execute external_call op '{name}' — adapter "
+                    "host-dispatch for external kernels is not yet wired "
+                    f"for this backend. Options: (1) use the iree backend "
+                    "(host-dispatch: the graph is split into segments at "
+                    "lower() and kernels run on the host) or the numpy "
+                    "backend (direct kernel dispatch); (2) register a "
+                    "portable decomposition via the external-kernel "
+                    f"handle: etl.register_external_kernel({name!r}, "
+                    "fn).portable(decomp) — it will be inlined at lower() "
+                    "with a warning"
                 )
             if op.effect == "collective" and not capabilities.collectives:
                 raise core.BackendError(
@@ -297,7 +326,17 @@ class CompilerBackend(Backend):
                 self._check_value_dtype(result.type.dtype, f"op '{op.name}'")
                 self._check_static_shape(result.type.shape, f"op '{op.name}'")
 
-        inline_portables(graph.module, keep_backend_impls=None)
+        inline_portables(
+            graph.module,
+            keep_backend_impls=None,
+            # v1 rule: backends without host-dispatch get the
+            # portable-inline fallback for external kernels (with a
+            # warning); iree (external_calls=True) splits the graph into
+            # segments instead, and the numpy backend dispatches kernels
+            # directly — both keep their own paths.
+            inline_external_portables=not capabilities.external_calls,
+            backend_name=self.name,
+        )
         graph.verify()  # defensive post-inline verification
 
         # Adapter host-dispatch for external kernels (round 2): a backend

@@ -19,16 +19,25 @@ expansion logic as the numpy reference interpreter. Contains:
 - ``inline_portables`` — the shared fixpoint driver: inline every
   ``block_call`` whose block has a portable (``etl.defn``) decomposition
   (and, when ``keep_backend_impls`` is set, no impl registered for that
-  backend).
+  backend). With ``inline_external_portables=True``, ``external_call``
+  ops whose kernel name has a registered portable decomposition
+  (``etl.external.get_portable`` — the external-kernel handle contract)
+  are inlined through the SAME splicing machinery, with a ``UserWarning``
+  per kernel name; ``external_call`` ops WITHOUT a registered portable
+  are left untouched (the caller's capability pre-check rejects them
+  before inlining). ``backend_name`` names the backend in the fallback
+  warning (``None`` → "compiler").
 
 Import acyclicity (binding, see ``../CONTEXT.md``): top-level imports
-restricted to ``etl.core`` / ``etl.ir``. ``etl.block`` / ``etl.trace`` are
-imported INSIDE function bodies, and ``etl.backends.numpy.shapes`` (the
-dim-expression evaluator) is imported lazily inside ``_dim_compatible`` so
-this module never triggers the numpy subpackage at import time.
+restricted to ``etl.core`` / ``etl.ir``. ``etl.block`` / ``etl.trace`` /
+``etl.external`` are imported INSIDE function bodies, and
+``etl.backends.numpy.shapes`` (the dim-expression evaluator) is imported
+lazily inside ``_dim_compatible`` so this module never triggers the numpy
+subpackage at import time.
 """
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
 from etl import core
@@ -42,8 +51,34 @@ __all__ = [
     "iter_ops",
     "clone_ops_into",
     "drop_op_uses",
+    "get_external_portable",
     "inline_portables",
 ]
+
+
+def get_external_portable(name: str) -> Any:
+    """The registered portable decomposition for an external kernel name.
+
+    Resolves through ``etl.external.get_portable(name)`` (the
+    external-kernel handle contract — the portable is an ``@etl.defn``
+    decomposition registered via ``register_external_kernel(...).portable``
+    or ``etl.external.register_portable``). Returns ``None`` when no
+    portable is registered.
+
+    ``etl.external`` is imported lazily (backends may only import
+    ``etl.core`` / ``etl.ir`` at module level; ``etl.external`` itself is
+    stdlib-only). Defensive ``getattr``: the portable registry is provided
+    by the external-kernel handle contract; when the function is not
+    present (an older ``etl.external``), no portable can be resolved and
+    callers degrade to the explicit ``core.BackendError`` path — never a
+    silent guess.
+    """
+    from etl import external as external_registry
+
+    get_portable = getattr(external_registry, "get_portable", None)
+    if get_portable is None:
+        return None
+    return get_portable(name)
 
 
 def iter_block_ops(block: ir.Block) -> Iterator[ir.Op]:
@@ -222,53 +257,101 @@ def clone_ops_into(
         target.replace_all_uses_with(value_map[source.id])
 
 
-def inline_portables(module: "Module", keep_backend_impls: str | None = None) -> int:
+def inline_portables(
+    module: "Module",
+    keep_backend_impls: str | None = None,
+    inline_external_portables: bool = False,
+    backend_name: str | None = None,
+) -> int:
     """Fixpoint: inline every block_call whose block has a portable
     decomposition (and, when keep_backend_impls is set, no impl registered
-    for that backend). Returns the number of expansions performed.
+    for that backend) and — when ``inline_external_portables`` is True —
+    every ``external_call`` op whose kernel name has a registered portable
+    decomposition. Returns the number of expansions performed.
 
-    A portable trace may itself emit block calls, so inlining repeats until
-    no expandable ``block_call`` remains (cap: 1000 expansions =>
-    ``core.BackendError`` "did not converge ... (recursive portable?)").
+    A portable trace may itself emit block calls or external calls, so
+    inlining repeats until no expandable op remains (cap: 1000 expansions
+    => ``core.BackendError`` "did not converge ... (recursive portable?)").
 
-    Per-block_call resolution (``etl.block.registry``, imported lazily):
+    ``backend_name`` is used only for the external-portable fallback
+    warning message (``None`` → "compiler").
 
-    - unknown block => ``core.BackendError`` ("declare it first with
-      etl.block(...)");
-    - ``keep_backend_impls`` set AND an impl registered for that backend =>
-      the op is KEPT (op id remembered so the fixpoint does not revisit it;
-      e.g. the numpy interpreter dispatches it at run time);
-    - else the portable (``etl.defn``) implementation is traced with the
-      operand types as specs (the op's non-empty dict ``static_args`` attr
-      re-specializes the trace as keyword arguments) and its entry block is
-      spliced in place of the op (``clone_ops_into``);
-    - neither impl nor portable => ``core.BackendError`` naming the block —
-      with ``keep_backend_impls`` set: "... has neither a portable
-      decomposition nor a registered <backend> impl ..."; with
-      ``keep_backend_impls=None`` (compiler adapters): "... has no portable
-      decomposition — compiler backends require BlockOp.portable(...)".
+    Per-op resolution:
+
+    - ``block_call`` (``etl.block.registry``, imported lazily):
+
+      - unknown block => ``core.BackendError`` ("declare it first with
+        etl.block(...)");
+      - ``keep_backend_impls`` set AND an impl registered for that backend =>
+        the op is KEPT (op id remembered so the fixpoint does not revisit it;
+        e.g. the numpy interpreter dispatches it at run time);
+      - else the portable (``etl.defn``) implementation is traced with the
+        operand types as specs (the op's non-empty dict ``static_args`` attr
+        re-specializes the trace as keyword arguments) and its entry block is
+        spliced in place of the op (``clone_ops_into``);
+      - neither impl nor portable => ``core.BackendError`` naming the block —
+        with ``keep_backend_impls`` set: "... has neither a portable
+        decomposition nor a registered <backend> impl ..."; with
+        ``keep_backend_impls=None`` (compiler adapters): "... has no portable
+        decomposition — compiler backends require BlockOp.portable(...)".
+
+    - ``external_call`` (only when ``inline_external_portables`` is True;
+      ``etl.external`` imported lazily):
+
+      - a registered portable (``get_external_portable``) => the portable
+        (``etl.defn``) decomposition is traced with the operand types as
+        specs, its traced outputs are validated against the op's declared
+        ``result_specs`` (count/dtype/shape — ``core.BackendError`` on
+        mismatch, never a silent guess), and its entry block is spliced in
+        place of the op (``clone_ops_into``); a ``UserWarning`` is emitted
+        once per kernel name (Python's default once-per-location filter
+        dedupes) noting the backend cannot execute external kernels and
+        that the original call's effect/callback ordering is replaced by
+        the inlined graph's op order;
+      - no portable => the op is LEFT UNTOUCHED (the caller's capability
+        pre-check rejects it before inlining).
     """
     kept: set[int] = set()
     expansions = 0
     while True:
-        target = next(
-            (
-                op
-                for op in iter_ops(module)
-                if op.name == "block_call" and op.id not in kept
-            ),
-            None,
-        )
+        target = _next_inline_target(module, kept, inline_external_portables)
         if target is None:
             return expansions
         expansions += 1
         if expansions > 1000:
             raise core.BackendError(
-                "block_call portable decomposition did not converge "
-                "after 1000 expansions (recursive portable?)"
+                "portable decomposition did not converge after 1000 "
+                "expansions (recursive portable?)"
             )
-        if not _expand_block_call(target, module, keep_backend_impls):
+        if target.name == "external_call":
+            _expand_external_call(target, module, backend_name)
+        elif not _expand_block_call(target, module, keep_backend_impls):
             kept.add(target.id)  # has a backend impl — keep, don't revisit
+
+
+def _next_inline_target(
+    module: "Module", kept: set[int], inline_external_portables: bool
+) -> ir.Op | None:
+    """The next expandable op in regions-first walk order.
+
+    Either a ``block_call`` not in ``kept``, or — when
+    ``inline_external_portables`` is True — an ``external_call`` (not in
+    ``kept``) whose kernel name has a registered portable decomposition.
+    ``external_call`` ops WITHOUT a portable are never candidates: they are
+    left untouched (the caller's capability pre-check rejects them), and
+    re-selecting them every iteration would spin the fixpoint forever.
+    """
+    for op in iter_ops(module):
+        if op.name == "block_call" and op.id not in kept:
+            return op
+        if (
+            inline_external_portables
+            and op.name == "external_call"
+            and op.id not in kept
+            and get_external_portable(op.attributes["name"]) is not None
+        ):
+            return op
+    return None
 
 
 def _expand_block_call(
@@ -344,3 +427,74 @@ def _expand_block_call(
     drop_op_uses(op)
     target_block.erase(op)
     return True
+
+
+def _expand_external_call(
+    op: ir.Op, module: "Module", backend_name: str | None
+) -> None:
+    """Inline ONE external_call op via its registered portable decomposition.
+
+    The portable (``etl.external.get_portable(name)`` — an ``@etl.defn``
+    decomposition registered through the external-kernel handle contract)
+    is traced with the op's operand types as specs and spliced in place of
+    the op — the SAME portable-splicing machinery as block portables
+    (``clone_ops_into``: fresh ids, ``Use`` records, output-type guards),
+    with the portable's traced outputs validated against the op's declared
+    ``result_specs`` attribute (count/dtype/shape — ``core.BackendError``
+    on mismatch, never a silent guess). Ops without a registered portable
+    are left untouched (the caller's capability pre-check rejects them
+    before inlining — this function is only reached for portable-backed
+    ops, but re-checks defensively).
+
+    Emits a ``UserWarning`` per kernel name explaining the fallback:
+    the backend cannot execute external kernels (no host-dispatch), and the
+    original call's effect/callback ordering is replaced by the inlined
+    graph's op order. Python's default once-per-location warning filter
+    dedupes repeated calls with the same name.
+    """
+    name = op.attributes["name"]
+    portable = get_external_portable(name)
+    if portable is None:
+        return  # no portable — leave untouched
+    warnings.warn(
+        f"external_call '{name}': the {backend_name or 'compiler'} backend "
+        "cannot execute external kernels (no host-dispatch); falling back "
+        "to the registered portable decomposition. Note: the original "
+        "call's effect/callback ordering is replaced by the inlined "
+        "graph's op order.",
+        UserWarning,
+        stacklevel=5,
+    )
+    from etl.trace import trace
+
+    specs = tuple(
+        core.TensorSpec(shape=value.type.shape, dtype=value.type.dtype)
+        for value in op.operands
+    )
+    traced = trace(portable, *specs)
+    source_block = traced.module.main.entry_block
+    terminator = source_block.terminator
+    if terminator is None or terminator.name != "return":
+        raise core.BackendError(
+            "portable decomposition entry block has no 'return' terminator"
+        )
+    result_specs = op.attributes["result_specs"]
+    if len(terminator.operands) != len(result_specs):
+        raise core.BackendError(
+            f"external_call '{name}' portable decomposition produces "
+            f"{len(terminator.operands)} result(s), but the op declares "
+            f"{len(result_specs)} result spec(s)"
+        )
+    for portable_value, declared in zip(terminator.operands, result_specs):
+        _check_output_types(portable_value.type, declared)
+    target_block = op.parent
+    clone_ops_into(
+        target_block=target_block,
+        index=target_block.ops.index(op),
+        source_entry_block=source_block,
+        operand_values=tuple(op.operands),
+        result_values=tuple(op.results),
+        module=module,
+    )
+    drop_op_uses(op)
+    target_block.erase(op)
