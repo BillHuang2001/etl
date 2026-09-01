@@ -757,7 +757,10 @@ class IreeBackend(CompilerBackend):
             from ..options import normalize_opt_level
 
             level = normalize_opt_level(raw_opt_level)
-            opt_level_args = (f"--iree-opt-level={level}",)
+            # iree-compile accepts ONLY the "O" form (verified empirically on
+            # iree-base-compiler 3.11.0: '--iree-opt-level=3' fails with
+            # "'3' value not a valid optimization level, use O0/O1/O2/O3").
+            opt_level_args = (f"--iree-opt-level=O{level}",)
         extra_args = _resolve_iree_compile_args(
             target_backends, user_args, opt_level_args=opt_level_args
         )
