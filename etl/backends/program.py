@@ -348,11 +348,18 @@ def _validate_runtime_dependencies(runtime_dependencies: dict) -> None:
 
 
 def _validate_required_custom_ops(required_custom_ops: tuple[str, ...], backend: str) -> None:
-    """Verify every required custom op resolves in this environment.
+    """Verify every required custom BLOCK op resolves in this environment.
 
-    An op must have either an implementation registered for the artifact's
-    backend or a portable decomposition; anything else raises
-    ``core.PersistenceError`` naming the op. If ``etl.block`` is
+    A name registered as a block (a ``block_call`` backend impl or a
+    portable decomposition) passes. A name that is NOT a registered block is
+    an ``external_call`` KERNEL name: external kernels are recorded in
+    ``required_custom_ops`` for SELF-DESCRIPTION only and resolve LAZILY at
+    run time through ``etl.external`` — they must never be required at load
+    time (kernels are re-registered in the process before RUN, not before
+    load; a missing registration fails loudly at run time with a
+    ``core.BackendError`` naming the kernel). Backend ``load()`` methods
+    additionally re-validate declared blocks from the module itself (e.g.
+    the numpy backend scans for ``block_call`` ops). If ``etl.block`` is
     unimportable (minimal deployments / parallel implementation), the check
     degrades gracefully by skipping — this is where the validation lives.
     """
@@ -367,8 +374,6 @@ def _validate_required_custom_ops(required_custom_ops: tuple[str, ...], backend:
         has_impl = block_registry.get_impl(op_name, backend) is not None
         has_portable = block_registry.get_portable(op_name) is not None
         if not has_impl and not has_portable:
-            raise PersistenceError(
-                f"artifact requires custom op {op_name!r}, which has neither a "
-                f"registered {backend!r} implementation nor a portable "
-                f"decomposition — never silently recompile"
-            )
+            # Not a registered block — an external-kernel name: lazy
+            # run-time resolution, never a load-time requirement.
+            continue

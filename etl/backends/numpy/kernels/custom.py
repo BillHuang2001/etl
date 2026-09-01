@@ -24,10 +24,12 @@ Implemented kernels:
   registry (``etl.register_external_kernel`` — kernel-agnostic; the same
   registry serves round-2 compiler-adapter host-dispatch). The op's ``name``
   attribute is the stable user-chosen string; the registry is resolved LAZILY
-  at run time (import acyclicity) and an unknown name raises
-  ``core.BackendError`` naming the kernel. Outputs are validated against the
-  op's declared ``result_specs`` exactly like ``runtime_call``/``block_call``
-  (shared helpers below).
+  at run time (import acyclicity) through
+  ``etl.external.get_external_kernel(name, "numpy")`` — the per-backend
+  "numpy" slot, with automatic fallback to the default (``None``) slot —
+  and an unknown name raises ``core.BackendError`` naming the kernel.
+  Outputs are validated against the op's declared ``result_specs`` exactly
+  like ``runtime_call``/``block_call`` (shared helpers below).
 
 - ``block_call``: dispatches a registered numpy block impl.
 
@@ -42,27 +44,32 @@ Implemented kernels:
   block reaching here => ``core.BackendError`` naming the block (safety net,
   never a fallback path).
 
-Shared output validation (``runtime_call`` and ``block_call``): callback/impl
-outputs are normalized (ndarray -> [arr]; core.Tensor -> [t]; tuple/list ->
-list; anything else => ``core.BackendError`` naming the op), the count must
-match ``len(op.results)``, and each output is checked against the op's
-declared ``result_specs``: entries may be ``ir.ValueType`` objects (the
-in-memory trace form, restored after an ``ir`` serialization round-trip) OR
-plain ``{"dtype": ..., "shape": ...}`` dicts — both forms are handled
+Shared output validation (``runtime_call``, ``block_call`` and
+``external_call``): callback/impl/kernel outputs are normalized (ndarray ->
+[arr]; core.Tensor -> [t]; tuple/list -> list; anything else =>
+``core.BackendError`` naming the op), the count must match the declared
+``result_specs``, and each output is checked against the op's declared
+``result_specs``: entries may be ``ir.ValueType`` objects (the in-memory
+trace form, restored after an ``ir`` serialization round-trip) OR plain
+``{"dtype": ..., "shape": ...}`` dicts — both forms are handled
 defensively. dtype must match exactly (``core.BackendError`` naming the op);
 the declared shape is evaluated against ``ctx.bindings`` via
 ``ctx.evaluate_shape`` (``Dim``/``DimExpr`` dims; ``None`` dims unchecked —
 runtime-dynamic) and compared to the actual output shape (mismatch =>
 ``core.ShapeError``). Outputs are wrapped in ``core.Tensor`` (default CPU
-device).
+device). The shared implementation lives in
+``etl/backends/external_validate.py`` (also used by the iree adapter's
+host-dispatch path); this module keeps thin local wrappers only.
 """
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 from etl import core
+from etl.backends.external_validate import (
+    normalize_results as _shared_normalize,
+    validate_outputs as _shared_validate,
+)
 
 __all__ = ["register_kernels"]
 
@@ -77,175 +84,31 @@ def _constant(ctx: Any, op: Any, operands: tuple) -> core.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Output normalization + validation shared by runtime_call / block_call
+# Output normalization + validation shared by runtime_call / block_call /
+# external_call (thin wrappers over etl.backends.external_validate — the
+# canonical wording lives there, shared with the iree host-dispatch path)
 # ---------------------------------------------------------------------------
 
 
 def _normalize_results(result: Any, label: str) -> list:
-    """Normalize a callback/impl return into a list of output entries.
-
-    ``ndarray`` -> ``[arr]``; ``core.Tensor`` -> ``[tensor]``; tuple/list ->
-    ``list(...)``. Anything else => ``core.BackendError`` naming the op (the
-    interpreter never guesses how to interpret a return value).
-    """
-    if isinstance(result, np.ndarray) or isinstance(result, core.Tensor):
-        return [result]
-    if isinstance(result, (tuple, list)):
-        return list(result)
-    raise core.BackendError(
-        f"{label}: callback returned {type(result).__name__}, expected an "
-        "ndarray, a core.Tensor, or a tuple/list of them"
-    )
-
-
-def _as_ndarray(entry: Any, label: str, index: int) -> np.ndarray:
-    """One output entry -> numpy array (``core.Tensor`` unwrapped, no copy)."""
-    if isinstance(entry, core.Tensor):
-        entry = entry.numpy()
-    if not isinstance(entry, np.ndarray):
-        raise core.BackendError(
-            f"{label}: callback output {index} is "
-            f"{type(entry).__name__}, expected an ndarray or a core.Tensor"
-        )
-    return entry
-
-
-def _decode_dim_entry(dim: Any, where: str) -> Any:
-    """Defensively normalize one declared-shape dim entry.
-
-    ``None`` / ``int`` / ``core.Dim`` / ``core.DimExpr`` pass through;
-    wire-encoded dim dicts (``{"int": n}``, ``{"dim": name, "size": s?}``,
-    ``{"expr": {"op", "args"}}`` — the ``ir`` serialization wire forms) are
-    decoded back to objects so ``ctx.evaluate_shape`` can evaluate them.
-    Anything else => ``core.BackendError`` naming the op (never a guess).
-    """
-    if dim is None or isinstance(dim, (core.Dim, core.DimExpr)):
-        return dim
-    if isinstance(dim, int) and not isinstance(dim, bool):
-        return dim
-    if isinstance(dim, dict):
-        if "int" in dim:
-            value = dim["int"]
-            if isinstance(value, int) and not isinstance(value, bool):
-                return value
-        elif "dim" in dim:
-            name = dim["dim"]
-            if isinstance(name, str):
-                size = dim.get("size")
-                return core.Dim(name, size=size)
-        elif "expr" in dim:
-            expr = dim["expr"]
-            if isinstance(expr, dict) and isinstance(expr.get("op"), str):
-                args = expr.get("args")
-                if isinstance(args, (tuple, list)) and len(args) == 2:
-                    return core.DimExpr(
-                        expr["op"],
-                        _decode_dim_entry(args[0], where),
-                        _decode_dim_entry(args[1], where),
-                    )
-    raise core.BackendError(
-        f"{where}: cannot interpret declared shape dim {dim!r} — expected "
-        "an int, a Dim, a DimExpr, or their wire encodings"
-    )
-
-
-def _evaluate_declared_shape(
-    ctx: Any, shape: Any, where: str
-) -> tuple:
-    """Evaluate a declared result shape against ``ctx.bindings``.
-
-    Per-dim evaluation via ``ctx.evaluate_shape`` (``Dim``/``DimExpr``
-    entries resolve against the runtime dim bindings); ``None`` dims stay
-    ``None`` — runtime-dynamic, unchecked.
-    """
-    evaluated = []
-    for dim in tuple(shape):
-        if dim is None:
-            evaluated.append(None)
-            continue
-        evaluated.append(ctx.evaluate_shape((_decode_dim_entry(dim, where),))[0])
-    return tuple(evaluated)
-
-
-def _extract_spec(spec: Any, where: str) -> tuple:
-    """Normalize one declared result spec to ``(np.dtype, shape_tuple)``.
-
-    Accepts ``ir.ValueType`` objects (in-memory trace form; restored after
-    an ``ir`` serialization round-trip) and plain
-    ``{"dtype": ..., "shape": ...}`` dicts (hand-built attrs — defensive).
-    Anything else => ``core.BackendError`` naming the op.
-    """
-    if isinstance(spec, dict):
-        try:
-            spec_dtype = core.dtype(spec["dtype"])
-            shape = tuple(spec["shape"])
-        except (KeyError, TypeError, core.DTypeError) as exc:
-            raise core.BackendError(
-                f"{where}: result spec must be a "
-                "{'dtype': ..., 'shape': ...} dict, got {spec!r}"
-            ) from exc
-        return spec_dtype, shape
-    try:
-        return spec.dtype, tuple(spec.shape)
-    except AttributeError as exc:
-        raise core.BackendError(
-            f"{where}: cannot interpret result spec {spec!r} — expected an "
-            "ir.ValueType or a {'dtype': ..., 'shape': ...} dict"
-        ) from exc
+    """Normalize a callback/impl return — see ``external_validate.normalize_results``."""
+    return _shared_normalize(result, label)
 
 
 def _validate_outputs(
     ctx: Any, op: Any, arrays: list, declared_specs: Any, label: str | None = None
 ) -> list:
-    """Validate callback/impl outputs against the op's declared result_specs.
-
-    Count must match ``len(op.results)`` and ``len(declared_specs)``
-    (``BackendError`` naming the op); per output: dtype must match exactly
-    (``BackendError`` — no silent coercion), the declared shape is evaluated
-    against ``ctx.bindings`` (``None`` dims unchecked) and compared to the
-    actual output shape (``ShapeError``). Valid outputs are wrapped in
-    ``core.Tensor`` (default CPU device).
+    """Validate callback/impl outputs — see ``external_validate.validate_outputs``.
 
     ``label`` names the operation in error messages (defaults to
-    ``"op '<name>'"``); block_call passes a label that also names the block.
+    ``"op '<name>'"``); block_call/external_call pass a label that also
+    names the block/kernel.
     """
     op_name = label if label is not None else f"op '{op.name}'"
-    if len(arrays) != len(op.results):
-        raise core.BackendError(
-            f"{op_name}: callback produced {len(arrays)} "
-            f"output(s), expected {len(op.results)}"
-        )
-    if len(arrays) != len(declared_specs):
-        raise core.BackendError(
-            f"{op_name}: {len(arrays)} callback output(s) but "
-            f"{len(declared_specs)} declared result_specs"
-        )
-    outputs = []
-    for i, (entry, spec) in enumerate(zip(arrays, declared_specs)):
-        where = f"{op_name} output {i}"
-        arr = _as_ndarray(entry, op_name, i)
-        spec_dtype, spec_shape = _extract_spec(spec, where)
-        if arr.dtype != spec_dtype:
-            raise core.BackendError(
-                f"{where}: callback returned dtype {arr.dtype}, declared "
-                f"result dtype {spec_dtype} — no silent dtype coercion"
-            )
-        expected = _evaluate_declared_shape(ctx, spec_shape, where)
-        actual = tuple(int(d) for d in arr.shape)
-        if len(expected) != len(actual):
-            raise core.ShapeError(
-                f"{where}: callback returned shape {actual} (rank "
-                f"{len(actual)}), declared rank {len(expected)}"
-            )
-        for dim_i, (exp, act) in enumerate(zip(expected, actual)):
-            if exp is not None and exp != act:
-                raise core.ShapeError(
-                    f"{where}: callback returned shape {actual}, declared "
-                    f"shape {expected} — mismatch at dim {dim_i} "
-                    f"({act} != {exp})"
-                )
-        outputs.append(core.Tensor(arr))
-    return outputs
+    evaluate_shape = None
+    if ctx is not None and hasattr(ctx, "evaluate_shape"):
+        evaluate_shape = lambda dim: ctx.evaluate_shape((dim,))[0]
+    return _shared_validate(arrays, declared_specs, op_name, evaluate_shape=evaluate_shape)
 
 
 def _finish(op_name: str, outputs: list):
@@ -280,8 +143,10 @@ def _runtime_call(ctx: Any, op: Any, operands: tuple):
 def _external_call(ctx: Any, op: Any, operands: tuple):
     """``external_call``: dispatch the named kernel from ``etl.external``.
 
-    Kernel resolution goes through ``etl.external.get_external_kernel``
-    (lazy import — import acyclicity): an unknown name raises
+    Kernel resolution goes through
+    ``etl.external.get_external_kernel(name, "numpy")`` (lazy import —
+    import acyclicity; the per-backend "numpy" slot, with automatic
+    fallback to the default ``None`` slot): an unknown name raises
     ``core.BackendError`` naming the kernel and pointing at
     ``etl.register_external_kernel`` (the registry is never serialized —
     graphs require the same kernel registrations in the process at run
@@ -292,7 +157,7 @@ def _external_call(ctx: Any, op: Any, operands: tuple):
     from etl.external import get_external_kernel
 
     name = op.attributes["name"]
-    kernel = get_external_kernel(name)
+    kernel = get_external_kernel(name, "numpy")
     if kernel is None:
         raise core.BackendError(
             f"op 'external_call': no external kernel registered under name "

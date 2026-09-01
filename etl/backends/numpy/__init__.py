@@ -108,6 +108,7 @@ class NumpyBackend(Backend):
         dtypes=_all_numpy_dtypes(),
         collectives=True,  # single-process simulation via the CollectiveExecutor hook
         runtime_calls=True,  # Python callbacks execute synchronously at the op position
+        external_calls=True,  # external_call dispatch via etl.external.get_external_kernel(name, "numpy")
         custom_blocks=True,  # registered numpy block impls
         async_collectives=False,  # simulation is synchronous
         sparse_ops=True,  # the ONLY backend with sparse-tensor support in v1
@@ -168,10 +169,12 @@ class NumpyBackend(Backend):
 
         1. Validate ``lowered.backend == "numpy"`` — mismatch =>
            ``core.BackendError`` (never cross-backend compilation).
-        2. Deserialize + scan the module for ``block_call`` ops to record
-           ``required_custom_ops`` (block names, sorted, deduplicated);
-           record ``runtime_dependencies`` (self-describing per the
-           serialization contract).
+        2. Deserialize + scan the module for ``block_call`` ops (recorded
+           ``required_custom_ops`` BLOCK names) and ``external_call`` ops
+           (recorded EXTERNAL KERNEL names — self-description only; kernels
+           resolve lazily at run time) — sorted, deduplicated; record
+           ``runtime_dependencies`` (self-describing per the serialization
+           contract).
         3. ``target = "cpu"``; ``payload`` = the serialized ``ir.Module``.
            There is NO machine code — the artifact IS serialized IR.
 
@@ -188,7 +191,12 @@ class NumpyBackend(Backend):
             for op in iter_ops(module)
             if op.name == "block_call"
         }
-        required_custom_ops = tuple(sorted(block_names))
+        external_names = {
+            op.attributes["name"]
+            for op in iter_ops(module)
+            if op.name == "external_call"
+        }
+        required_custom_ops = tuple(sorted(block_names | external_names))
         runtime_dependencies = {"numpy": np.__version__}
         return CompiledArtifact(
             backend="numpy",
@@ -207,11 +215,14 @@ class NumpyBackend(Backend):
         2. Validate device: ``None`` or a CPU device (``kind == "cpu"``) —
            else ``core.BackendError`` naming the kind (v1 CPU only);
            non-``Device`` objects => ``core.DeviceError``.
-        3. Validate required custom ops availability (declared block +
-           registered numpy impl — missing => ``core.PersistenceError``
-           naming the block, never a silent re-lower).
-        4. ``ir.deserialize_module(artifact.payload)`` and build a
-           ``NumpyExecutable``.
+        3. Validate required custom BLOCK availability: every ``block_call``
+           in the module must be registered with a numpy impl — missing =>
+           ``core.PersistenceError`` naming the block, never a silent
+           re-lower. ``external_call`` kernel names are recorded in
+           ``required_custom_ops`` for self-description only — they resolve
+           LAZILY at run time (kernels must be re-registered in the process
+           before RUN, not before load).
+        4. Build a ``NumpyExecutable``.
 
         NEVER re-traces / re-lowers / re-compiles — load-time mismatches fail
         clearly (see the root error strategy).
@@ -232,10 +243,16 @@ class NumpyBackend(Backend):
                     f"the numpy backend v1 supports CPU devices only, got "
                     f"device kind {device.kind!r}"
                 )
+        module = ir.deserialize_module(artifact.payload)
+        block_names = {
+            op.attributes["block_name"]
+            for op in iter_ops(module)
+            if op.name == "block_call"
+        }
         from etl.block import registry as block_registry
         from etl.block.errors import BlockError
 
-        for block_name in artifact.required_custom_ops:
+        for block_name in block_names:
             try:
                 block_registry.get_block(block_name)
             except BlockError as exc:
@@ -248,7 +265,6 @@ class NumpyBackend(Backend):
                     f"artifact requires custom block {block_name!r}, but no "
                     "numpy impl is registered in this process"
                 )
-        module = ir.deserialize_module(artifact.payload)
         return NumpyExecutable(
             module=module,
             signature=artifact.signature,
