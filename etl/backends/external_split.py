@@ -42,9 +42,14 @@ v1 lower-time constraints (explicit ``core.BackendError``, never silent):
 
 - ``external_call`` inside ``cond``/``while_loop``/``scan`` bodies
   (data-dependent control flow around a host call is not splittable).
-- Symbolic / runtime-dynamic result dims (staging needs static shapes).
+- Single-function graphs (host-dispatch supports single-function graphs in
+  v1).
 - Zero-operand calls (no staging boundary — express the value via
   ``etl.constant`` or an explicit graph input instead).
+- Symbolic / runtime-dynamic result dims (staging needs STATIC integer
+  dims).
+- Single-block regions when cloning (the region-cloning path supports
+  single-block regions in v1).
 
 Determinism: kernels are assumed PURE (same inputs -> same outputs); segment
 execution is strictly sequential in plan order, so the graph's effect
@@ -54,10 +59,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-
 from etl import core
 from etl import ir
+
+from .external_validate import normalize_results, validate_outputs
 
 __all__ = [
     "contains_external_call",
@@ -648,19 +653,22 @@ def dispatch_external_kernel(
 
     Mirrors the numpy backend's round-1 dispatch semantics (see
     ``etl/backends/numpy/kernels/custom.py``): the kernel is resolved through
-    ``etl.external.get_external_kernel`` (unknown name => ``BackendError``
-    naming the kernel and pointing at ``register_external_kernel``), called
-    with the operand numpy arrays, and its return is normalized and validated
-    against the declared ``result_types`` — count (``BackendError``), dtype
+    ``etl.external.get_external_kernel(name, "iree")`` — the per-backend
+    "iree" slot, with automatic fallback to the default (``None``) slot —
+    (unknown name => ``BackendError`` naming the kernel and pointing at
+    ``register_external_kernel``), called with the operand numpy arrays, and
+    its return is normalized and validated against the declared
+    ``result_types`` with the SHARED canonical wording
+    (``etl/backends/external_validate.py`` — count (``BackendError``), dtype
     exact (``BackendError`` — no silent coercion), shape exact
-    (``ShapeError``). Validated results are returned as host ``core.Tensor``
+    (``ShapeError``)). Validated results are returned as host ``core.Tensor``
     s (staged back to the device by the caller's next segment run).
 
     ``label`` names the call in error messages (e.g. the op + kernel name).
     """
     from etl.external import get_external_kernel  # lazy: import acyclicity
 
-    kernel = get_external_kernel(name)
+    kernel = get_external_kernel(name, "iree")
     if kernel is None:
         raise core.BackendError(
             f"{label}: no external kernel registered under name {name!r} — "
@@ -669,71 +677,5 @@ def dispatch_external_kernel(
             "are never embedded in artifacts)"
         )
     result = kernel(*operand_arrays)
-    arrays = _normalize_results(result, label)
-    return _validate_static_outputs(arrays, result_types, label)
-
-
-def _normalize_results(result: Any, label: str) -> list:
-    """Normalize a kernel return into a list of output entries.
-
-    Same contract as the numpy backend's helper: ``ndarray`` -> ``[arr]``;
-    ``core.Tensor`` -> ``[tensor]``; tuple/list -> ``list(...)``. Anything
-    else => ``core.BackendError`` naming the call (never a guess).
-    """
-    if isinstance(result, np.ndarray) or isinstance(result, core.Tensor):
-        return [result]
-    if isinstance(result, (tuple, list)):
-        return list(result)
-    raise core.BackendError(
-        f"{label}: kernel returned {type(result).__name__}, expected an "
-        "ndarray, a core.Tensor, or a tuple/list of them"
-    )
-
-
-def _validate_static_outputs(
-    arrays: list, result_types: Sequence[ir.ValueType], label: str
-) -> List[core.Tensor]:
-    """Validate kernel outputs against STATIC declared specs (adapter path).
-
-    Count must match (``BackendError``); per output: dtype must match exactly
-    (``BackendError`` — no silent coercion) and the shape must equal the
-    declared shape (``ShapeError``; a defensive ``None`` dim is skipped —
-    lower() rejects runtime-dynamic dims, so this never triggers in v1).
-    Valid outputs are wrapped in host ``core.Tensor`` s.
-    """
-    if len(arrays) != len(result_types):
-        raise core.BackendError(
-            f"{label}: kernel produced {len(arrays)} output(s), expected "
-            f"{len(result_types)} (declared result specs)"
-        )
-    outputs: List[core.Tensor] = []
-    for index, (entry, spec) in enumerate(zip(arrays, result_types)):
-        where = f"{label} output {index}"
-        if isinstance(entry, core.Tensor):
-            entry = entry.numpy()
-        if not isinstance(entry, np.ndarray):
-            raise core.BackendError(
-                f"{where}: kernel returned {type(entry).__name__}, expected "
-                "an ndarray or a core.Tensor"
-            )
-        if entry.dtype != spec.dtype:
-            raise core.BackendError(
-                f"{where}: kernel returned dtype {entry.dtype}, declared "
-                f"result dtype {spec.dtype} — no silent dtype coercion"
-            )
-        expected = tuple(spec.shape)
-        actual = tuple(int(d) for d in entry.shape)
-        if len(actual) != len(expected):
-            raise core.ShapeError(
-                f"{where}: kernel returned shape {actual} (rank "
-                f"{len(actual)}), declared rank {len(expected)}"
-            )
-        for dim_index, (exp, act) in enumerate(zip(expected, actual)):
-            if exp is not None and exp != act:
-                raise core.ShapeError(
-                    f"{where}: kernel returned shape {actual}, declared "
-                    f"shape {expected} — mismatch at dim {dim_index} "
-                    f"({act} != {exp})"
-                )
-        outputs.append(core.Tensor(entry))
-    return outputs
+    arrays = normalize_results(result, label)
+    return validate_outputs(arrays, result_types, label)

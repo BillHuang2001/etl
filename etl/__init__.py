@@ -240,8 +240,11 @@ from .block import BlockOp, block, get_block  # noqa: F401
 # --- External kernels (etl.external) ----------------------------------------
 from . import external  # noqa: F401  (submodule; the kernel registry)
 from .external import (  # noqa: F401
+    ExternalKernel,
     get_external_kernel,
+    get_portable,
     register_external_kernel,
+    register_portable,
     unregister_external_kernel,
 )
 
