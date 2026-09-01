@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import etl
+from etl.transforms.autodiff import ZeroTangent
 from tests.transforms._fd_utils import (
     central_directional,
     central_grad,
@@ -443,3 +444,246 @@ def test_transformed_graphs_contain_only_ordinary_ops():
         graph.verify()
         op_names = {op.name for op in graph.module.main.entry_block.ops}
         assert not op_names & {"jvp", "vjp", "vectorize", "vmap"}
+
+
+# ---------------------------------------------------------------------------
+# external-kernel rule channel: AD (external:<name> vjp/jvp keys)
+# ---------------------------------------------------------------------------
+#
+# `external_call` ops resolve derivative rules under the namespaced
+# `external:<name>` key (mirroring `block:<name>` for block calls), registered
+# through the handle returned by `etl.register_external_kernel`. Without an
+# explicit rule, a registered portable decomposition (`@handle.portable`) is
+# the fallback: grad/vjp inline it and run a LOCAL reverse sweep seeded on the
+# decomposition's outputs (the post-inline seeding pattern); jvp derives from
+# the vjp rule via the adjoint. Names are `tx_`-prefixed to stay unique in the
+# process-wide registries.
+
+
+def _sym(value):
+    """Wrap an ir.Value as a SymbolicTensor so etl.ops can build on it."""
+    return etl.SymbolicTensor(
+        value=value, dtype=value.type.dtype, shape=value.type.shape
+    )
+
+
+EXT_DIM = 4
+
+
+def _ext_sq(x):
+    """The registered kernel: y = x*x (elementwise)."""
+    return x * x
+
+
+ext_sq = etl.register_external_kernel("tx_ext_sq", _ext_sq)
+
+
+@ext_sq.vjp_rule
+def _ext_sq_vjp(op, cotangents, primals):
+    """Explicit vjp rule for y = x²: input cotangent = 2 * ct * primal."""
+    (ct,) = cotangents
+    if ct is None or isinstance(ct, ZeroTangent):
+        return (ZeroTangent(),)
+    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+
+
+@etl.defn
+def _ext_sq_vec(x):
+    """Vector-output kernel call: y = x*x, shape (EXT_DIM,)."""
+    return etl.external_call(
+        "tx_ext_sq", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+@etl.defn
+def _ext_sq_loss(x):
+    return etl.sum(
+        etl.external_call(
+            "tx_ext_sq", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+        )
+    )
+
+
+def _ext_sq2(x):
+    """Second square kernel: gets BOTH an explicit vjp and jvp rule."""
+    return x * x
+
+
+ext_sq2 = etl.register_external_kernel("tx_ext_sq2", _ext_sq2)
+
+
+@ext_sq2.vjp_rule
+def _ext_sq2_vjp(op, cotangents, primals):
+    (ct,) = cotangents
+    if ct is None or isinstance(ct, ZeroTangent):
+        return (ZeroTangent(),)
+    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+
+
+@ext_sq2.jvp_rule
+def _ext_sq2_jvp(op, tangents):
+    """Explicit jvp rule for y = x²: output tangent = 2 * x * t."""
+    (t,) = tangents
+    if t is None or isinstance(t, ZeroTangent):
+        return (ZeroTangent(),)
+    return (etl.multiply(etl.multiply(_sym(t), 2), _sym(op.operands[0])).value,)
+
+
+@etl.defn
+def _ext_sq2_vec(x):
+    return etl.external_call(
+        "tx_ext_sq2", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+def _ext_swish(x):
+    """The registered kernel: the swish activation."""
+    s = 1.0 / (1.0 + np.exp(-x))
+    return s * x
+
+
+def _ext_swish_deriv(x):
+    s = 1.0 / (1.0 + np.exp(-x))
+    return s * (1.0 + x * (1.0 - s))
+
+
+ext_swish = etl.register_external_kernel("tx_ext_swish", _ext_swish)
+
+
+@ext_swish.portable
+@etl.defn
+def _ext_swish_portable(
+    x: etl.TensorSpec((EXT_DIM,), etl.float32),
+) -> etl.TensorSpec((EXT_DIM,), etl.float32):
+    return etl.sigmoid(x) * x
+
+
+@etl.defn
+def _ext_swish_vec(x):
+    return etl.external_call(
+        "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+@etl.defn
+def _ext_swish_loss(x):
+    return etl.sum(
+        etl.external_call(
+            "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+        )
+    )
+
+
+def _ext_x():
+    return np.array([0.5, 1.0, 2.0, 3.0], dtype=np.float32)
+
+
+# --- explicit rules ----------------------------------------------------------
+
+
+def test_grad_external_call_explicit_vjp_rule():
+    """grad over external_call with an explicit vjp rule under
+    external:<name>: d/dx sum(x²) == 2x."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    grad = run_grad(_ext_sq_loss, 0, (spec,), _ext_x())
+    np.testing.assert_allclose(grad, 2 * _ext_x(), rtol=1e-5, atol=1e-6)
+
+
+def test_vjp_external_call_explicit_vjp_rule():
+    """vjp over the vector output with an explicit cotangent: input
+    cotangent == ct * 2x."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    ct = np.array([1.0, 0.5, 2.0, -1.0], dtype=np.float32)
+    graph, primal, in_cts = run_vjp(_ext_sq_vec, spec, (spec,), (_ext_x(),), (ct,))
+    np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
+    np.testing.assert_allclose(in_cts[0], ct * 2 * _ext_x(), rtol=1e-5, atol=1e-6)
+
+
+def test_jvp_external_call_derived_from_vjp_rule():
+    """No explicit jvp rule: jvp derives from the explicit vjp rule via the
+    adjoint — output tangent == 2x·dx on the vector output."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    dx = np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float32)
+    graph, primal, tangent = run_jvp(_ext_sq_vec, spec, (spec,), (_ext_x(),), (dx,))
+    np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
+    np.testing.assert_allclose(tangent[0], 2 * _ext_x() * dx, rtol=1e-5, atol=1e-6)
+
+
+def test_jvp_external_call_explicit_jvp_rule():
+    """An explicitly registered jvp rule (external:<name>) drives forward
+    mode directly."""
+    from etl import transforms
+
+    assert transforms.jvp_rules["external:tx_ext_sq2"] is _ext_sq2_jvp
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    dx = np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float32)
+    graph, primal, tangent = run_jvp(_ext_sq2_vec, spec, (spec,), (_ext_x(),), (dx,))
+    np.testing.assert_allclose(primal, _ext_x() * _ext_x(), rtol=1e-6)
+    np.testing.assert_allclose(tangent[0], 2 * _ext_x() * dx, rtol=1e-5, atol=1e-6)
+
+
+# --- portable-decomposition fallbacks ----------------------------------------
+
+
+def test_grad_external_call_portable_fallback():
+    """No explicit rule: grad inlines the portable decomposition and
+    differentiates it — d/dx sum(swish(x)) == swish'(x)."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    grad = run_grad(_ext_swish_loss, 0, (spec,), _ext_x())
+    np.testing.assert_allclose(grad, _ext_swish_deriv(_ext_x()), rtol=1e-5, atol=1e-5)
+
+
+def test_vjp_external_call_portable_fallback_real_cotangent():
+    """vjp through the portable fallback with an explicit (non-scalar)
+    cotangent: the reverse sweep seeds on the INLINED decomposition outputs
+    (the post-inline seeding pattern) — input cotangent == swish'(x) * ct."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    ct = np.array([1.0, 0.5, 2.0, -1.0], dtype=np.float32)
+    graph, primal, in_cts = run_vjp(_ext_swish_vec, spec, (spec,), (_ext_x(),), (ct,))
+    np.testing.assert_allclose(primal, _ext_swish(_ext_x()), rtol=1e-6)
+    np.testing.assert_allclose(
+        in_cts[0], _ext_swish_deriv(_ext_x()) * ct, rtol=1e-5, atol=1e-5
+    )
+
+
+# --- nested external_call inside a block portable -----------------------------
+
+
+def _ext_inner(x):
+    """The kernel called INSIDE the block's portable decomposition."""
+    return x * x
+
+
+ext_inner = etl.register_external_kernel("tx_ext_inner", _ext_inner)
+
+
+@ext_inner.vjp_rule
+def _ext_inner_vjp(op, cotangents, primals):
+    (ct,) = cotangents
+    if ct is None or isinstance(ct, ZeroTangent):
+        return (ZeroTangent(),)
+    return (etl.multiply(etl.multiply(_sym(ct), 2), _sym(primals[0])).value,)
+
+
+@etl.block
+@etl.defn
+def tx_ext_nested(
+    x: etl.TensorSpec((EXT_DIM,), etl.float32),
+) -> etl.TensorSpec((EXT_DIM,), etl.float32):
+    return etl.external_call(
+        "tx_ext_inner", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+@etl.defn
+def _ext_nested_loss(x):
+    return etl.sum(tx_ext_nested(x))
+
+
+def test_grad_block_portable_with_nested_external_call():
+    """grad through a block portable whose body contains an external_call:
+    the block vjp fallback sweep resolves the nested op's OWN
+    external:<name> rule — d/dx sum(x²) == 2x."""
+    spec = etl.TensorSpec((EXT_DIM,), np.float32)
+    grad = run_grad(_ext_nested_loss, 0, (spec,), _ext_x())
+    np.testing.assert_allclose(grad, 2 * _ext_x(), rtol=1e-5, atol=1e-6)

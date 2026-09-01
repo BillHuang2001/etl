@@ -393,3 +393,161 @@ def test_vmap_of_cond_raises_transformerror():
         match=r"cannot batch op 'if'.*region-bearing control-flow",
     ):
         tf(etl.TensorSpec((4, 3), etl.float32))
+
+
+# ---------------------------------------------------------------------------
+# external-kernel rule channel: batching (external:<name> keys)
+# ---------------------------------------------------------------------------
+#
+# `external_call` ops resolve batching rules under the namespaced
+# `external:<name>` key (mirroring `block:<name>` for block calls), registered
+# through the handle returned by `etl.register_external_kernel`. Without an
+# explicit rule, a registered portable decomposition (`@handle.portable`) is
+# the fallback: vmap/vectorize re-trace it over the batched operands. Names
+# are `tx_`-prefixed to stay unique in the process-wide registries.
+
+
+def _sym(value):
+    """Wrap an ir.Value as a SymbolicTensor so etl.ops can build on it."""
+    return etl.SymbolicTensor(
+        value=value, dtype=value.type.dtype, shape=value.type.shape
+    )
+
+
+EXT_DIM = 4
+EXT_BATCH = 8
+
+
+def _ext_double(x):
+    """The registered kernel: y = 2x (elementwise)."""
+    return 2 * x
+
+
+ext_double = etl.register_external_kernel("tx_ext_double", _ext_double)
+
+
+@ext_double.batching_rule
+def _ext_double_batch(op, operands, axes):
+    """Explicit batching rule: batched rows of 2x."""
+    y = etl.multiply(_sym(operands[0]), 2)
+    return (y.value,), (axes[0],)
+
+
+@etl.defn
+def _ext_double_fn(x):
+    return etl.external_call(
+        "tx_ext_double", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+def _batched_ext_rows():
+    return np.linspace(-1, 1, EXT_BATCH * EXT_DIM, dtype=np.float32).reshape(
+        EXT_BATCH, EXT_DIM
+    )
+
+
+def test_vmap_external_call_explicit_batching_rule():
+    """vmap over a graph containing external_call with an explicit rule
+    (external:<name> key) == 2x on every row; the rule replaces the op."""
+    graph = etl.vmap(_ext_double_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    graph.verify()
+    x = _batched_ext_rows()
+    out = np.asarray(to_np(run_graph(graph, x)))
+    np.testing.assert_allclose(out, 2 * x, rtol=1e-6)
+    assert "external_call" not in all_op_names(graph)
+
+
+def test_vectorize_external_call_graph_form_explicit_rule():
+    """vectorize on the traced graph (not the callable) uses the same
+    external:<name> rule channel."""
+    graph = etl.trace(_ext_double_fn, etl.TensorSpec((EXT_DIM,), etl.float32))
+    vec = etl.vectorize(graph, 0)
+    x = _batched_ext_rows()
+    out = np.asarray(to_np(run_graph(vec, x)))
+    np.testing.assert_allclose(out, 2 * x, rtol=1e-6)
+
+
+def _ext_swish(x):
+    """The registered kernel: the swish activation."""
+    s = 1.0 / (1.0 + np.exp(-x))
+    return s * x
+
+
+ext_swish = etl.register_external_kernel("tx_ext_swish", _ext_swish)
+
+
+@ext_swish.portable
+@etl.defn
+def _ext_swish_portable(
+    x: etl.TensorSpec((EXT_DIM,), etl.float32),
+) -> etl.TensorSpec((EXT_DIM,), etl.float32):
+    return etl.sigmoid(x) * x
+
+
+@etl.defn
+def _ext_swish_fn(x):
+    return etl.external_call(
+        "tx_ext_swish", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+def test_vmap_external_call_portable_fallback():
+    """No explicit rule: vmap falls back to inlining the registered portable
+    decomposition over the batched operands — equals the per-row kernel."""
+    graph = etl.vmap(_ext_swish_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    graph.verify()
+    x = _batched_ext_rows()
+    out = np.asarray(to_np(run_graph(graph, x)))
+    np.testing.assert_allclose(out, _ext_swish(x), rtol=1e-6)
+    assert "external_call" not in all_op_names(graph)
+
+
+def _ext_win(x):
+    """The registered kernel (identity; only the rule/portable semantics are
+    under test here)."""
+    return x
+
+
+ext_win = etl.register_external_kernel("tx_ext_win", _ext_win)
+
+
+@ext_win.portable
+@etl.defn
+def _ext_win_portable(
+    x: etl.TensorSpec((EXT_DIM,), etl.float32),
+) -> etl.TensorSpec((EXT_DIM,), etl.float32):
+    return etl.multiply(x, 2)
+
+
+@ext_win.batching_rule
+def _ext_win_batch(op, operands, axes):
+    """Registered AFTER the portable: must overwrite the fallback (3x)."""
+    y = etl.multiply(_sym(operands[0]), 3)
+    return (y.value,), (axes[0],)
+
+
+@etl.defn
+def _ext_win_fn(x):
+    return etl.external_call(
+        "tx_ext_win", x, result=etl.TensorSpec((EXT_DIM,), etl.float32)
+    )
+
+
+def test_external_explicit_batching_rule_wins_over_portable():
+    """A rule registered AFTER the portable decomposition overwrites the
+    fallback: the registry lookup returns the explicit rule and vmap uses it
+    (3x) instead of the portable's 2x."""
+    from etl import transforms
+
+    assert transforms.batching_rules["external:tx_ext_win"] is _ext_win_batch
+    # The portable itself computes 2x (the fallback semantics it replaced).
+    x4 = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    port_out = run_graph(
+        etl.trace(_ext_win_portable, etl.TensorSpec((EXT_DIM,), etl.float32)), x4
+    )
+    np.testing.assert_allclose(to_np(port_out), 2 * x4, rtol=1e-6)
+
+    x = _batched_ext_rows()
+    graph = etl.vmap(_ext_win_fn)(etl.TensorSpec((EXT_BATCH, EXT_DIM), etl.float32))
+    out = np.asarray(to_np(run_graph(graph, x)))
+    np.testing.assert_allclose(out, 3 * x, rtol=1e-6)
