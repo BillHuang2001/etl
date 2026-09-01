@@ -126,14 +126,19 @@ class TvmBackend(CompilerBackend):
     name: ClassVar[str] = "tvm"
     #: Options-override contract (see ../options.py): the compile options
     #: ``tvm_target`` (TVM target string, default "llvm" — e.g. "llvm
-    #: -mcpu=native") and ``tvm_pass_configs`` (dict forwarded to the Relax
+    #: -mcpu=native"), ``tvm_pass_configs`` (dict forwarded to the Relax
     #: build when the installed TVM accepts it; a non-None value on a TVM
     #: build without the parameter raises BackendError — never silently
-    #: dropped). No load/run options in v1 (a non-empty options dict at
-    #: those stages raises BackendError).
+    #: dropped) and ``opt_level`` ("O0"-"O3" / "0"-"3" / int 0-3, normalized
+    #: via the shared ``options.normalize_opt_level``; forwarded to the
+    #: Relax build as ``opt_level=`` when the installed TVM accepts it — a
+    #: build without the parameter raises BackendError naming the option,
+    #: the installed TVM version and the mechanism limitation, never
+    #: silently dropped). No load/run options in v1 (a non-empty options
+    #: dict at those stages raises BackendError).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset({"rng_bit_generator"}),
-        "compile": frozenset({"tvm_target", "tvm_pass_configs"}),
+        "compile": frozenset({"tvm_target", "tvm_pass_configs", "opt_level"}),
         "load": frozenset(),
         "run": frozenset(),
     }
@@ -207,9 +212,10 @@ class TvmBackend(CompilerBackend):
         tvm_util.ensure_compat()
 
         # Options contract: unknown keys raise BackendError; ``tvm_target``
-        # (str, default "llvm") and ``tvm_pass_configs`` (dict | None) are
-        # forwarded to the Relax VM build — arbitrary values pass through,
-        # the build validates them.
+        # (str, default "llvm"), ``tvm_pass_configs`` (dict | None) and
+        # ``opt_level`` ("O0"-"O3" / "0"-"3" / int 0-3, normalized via the
+        # shared ``normalize_opt_level``) are forwarded to the Relax VM
+        # build — arbitrary values pass through, the build validates them.
         from ..options import validate_options
 
         validate_options(options, self.KNOWN_OPTIONS, self.name, "compile")
@@ -229,12 +235,24 @@ class TvmBackend(CompilerBackend):
                 f"the {self.name} 'tvm_pass_configs' compile option must be "
                 f"a dict, got {tvm_pass_configs!r}"
             )
+        tvm_opt_level = opts.get("opt_level")
+        if tvm_opt_level is not None:
+            # A malformed value raises core.BackendError from
+            # normalize_opt_level naming the option — loud, never silent
+            # (lazy import: the unset path imports nothing new).
+            from ..options import normalize_opt_level
+
+            tvm_opt_level = normalize_opt_level(tvm_opt_level)
 
         mlir_module = tvm_util.parse_stablehlo(mlir_text)
         tvm_util.precheck_module(mlir_module)
         relax_module = tvm_util.translate(mlir_text)
         executable = tvm_util.build_vm_executable(
-            relax_module, target=tvm_target, pass_configs=tvm_pass_configs
+            relax_module,
+            target=tvm_target,
+            pass_configs=tvm_pass_configs,
+            # None -> the unset path, byte-for-byte identical to before.
+            opt_level=tvm_opt_level,
         )
         library_base64 = tvm_util.export_library_base64(executable)
 

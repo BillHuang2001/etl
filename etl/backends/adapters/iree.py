@@ -200,6 +200,13 @@ _STAGED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
 # stream-ordered allocator (``--cuda_async_allocations=false``) and caused a
 # ~100x per-call regression users could not fix. etl never hardcodes flags
 # users cannot override.
+# The etl-defined ``opt_level`` compile option (``"O0"``-``"O3"`` / 0-3,
+# validated via ``..options.normalize_opt_level``) translates to the DERIVED
+# flag ``--iree-opt-level=N``, which participates in the same name-based
+# default-drop machinery as the other defaults: a user ``--iree-opt-level=N``
+# in ``iree_compile_args`` (or ``ETL_IREE_COMPILE_ARGS``) replaces the
+# derived flag — never both. ``--iree-opt-level`` is deliberately NOT in
+# ``_IREE_DENIED_COMPILE_FLAGS`` — it is a legitimately overridable flag.
 _IREE_DEFAULT_COMPILE_ARGS = ("--iree-input-demote-f64-to-f32=false",)
 # llvm-cpu-only defaults — added ONLY when "llvm-cpu" is among the requested
 # targets (meaningless for cuda):
@@ -242,14 +249,22 @@ def _flag_name(flag: str) -> str:
 
 
 def _resolve_iree_compile_args(
-    target_backends: tuple[str, ...], user_args: list[str] | None
+    target_backends: tuple[str, ...],
+    user_args: list[str] | None,
+    opt_level_args: tuple[str, ...] = (),
 ) -> list[str]:
     """Final ``extra_args`` for ``iree.compiler.compile_str``.
 
     = surviving etl defaults (a default whose name is overridden by a user
     flag is dropped — the user wins) + the user's flags, deny-checked.
+
+    ``opt_level_args`` carries the DERIVED flag for the etl ``opt_level``
+    compile option (``("--iree-opt-level=N",)``, or ``()`` when unset). It
+    joins ``defaults``, so the same name-collision machinery applies: a user
+    ``--iree-opt-level=N`` in ``iree_compile_args``/``ETL_IREE_COMPILE_ARGS``
+    replaces the derived flag — never both.
     """
-    defaults = list(_IREE_DEFAULT_COMPILE_ARGS)
+    defaults = list(_IREE_DEFAULT_COMPILE_ARGS) + list(opt_level_args)
     if "llvm-cpu" in target_backends:
         defaults.extend(_IREE_DEFAULT_LLVMCPU_ARGS)
     if not user_args:
@@ -504,7 +519,11 @@ class IreeBackend(CompilerBackend):
     #: Options-override contract (see ../options.py): the compile option
     #: ``iree_compile_args`` (arbitrary iree-compile flags — etl's minimal
     #: defaults are overridable by name collision, a small documented deny
-    #: list guards the genuinely required flags) and ``target_backends``;
+    #: list guards the genuinely required flags), ``target_backends``, and
+    #: ``opt_level`` (etl-defined: ``"O0"``-``"O3"`` / 0-3, value validated
+    #: via ``..options.normalize_opt_level``; translated to the derived flag
+    #: ``--iree-opt-level=N``, which is overridable by name collision like
+    #: every other default — a user ``--iree-opt-level=N`` wins, never both);
     #: the load option ``iree_runtime_args`` (iree runtime/loader flags,
     #: parsed loudly at load). No run options in v1 (a non-empty run options
     #: dict raises BackendError). The reserved exporter lower options
@@ -515,7 +534,9 @@ class IreeBackend(CompilerBackend):
         "lower": frozenset(
             {"rng_bit_generator", "sort_emission", "while_init_rewrite"}
         ),
-        "compile": frozenset({"target_backends", "iree_compile_args"}),
+        "compile": frozenset(
+            {"target_backends", "iree_compile_args", "opt_level"}
+        ),
         "load": frozenset({"iree_runtime_args"}),
         "run": frozenset(),
     }
@@ -689,7 +710,13 @@ class IreeBackend(CompilerBackend):
         diagnostics surface as BackendError). etl's minimal defaults are
         dropped when a user flag overrides them by name; the small
         documented deny list guards the genuinely required flags (see module
-        constants). Returns ``(target_backends, extra_args)``.
+        constants). The ``opt_level`` compile option (``"O0"``-``"O3"`` /
+        0-3; UNSET = ``None`` — the derived flag must NOT appear, byte-for-
+        byte current behavior) is validated via ``..options.normalize_opt_level``
+        and translated to the derived flag ``--iree-opt-level=N``; the
+        derived flag joins ``defaults``, so the same conflict rule applies: a
+        user ``--iree-opt-level=N`` in ``iree_compile_args`` replaces it —
+        never both. Returns ``(target_backends, extra_args)``.
         """
         raw_targets = (options or {}).get("target_backends", ["llvm-cpu"])
         if (
@@ -723,7 +750,17 @@ class IreeBackend(CompilerBackend):
                 f"a list/tuple of flag strings (e.g. "
                 f'["--iree-llvmcpu-target-cpu=native"]), got {raw_extra!r}'
             )
-        extra_args = _resolve_iree_compile_args(target_backends, user_args)
+        raw_opt_level = (options or {}).get("opt_level")
+        if raw_opt_level is None:
+            opt_level_args: tuple[str, ...] = ()
+        else:
+            from ..options import normalize_opt_level
+
+            level = normalize_opt_level(raw_opt_level)
+            opt_level_args = (f"--iree-opt-level={level}",)
+        extra_args = _resolve_iree_compile_args(
+            target_backends, user_args, opt_level_args=opt_level_args
+        )
         return target_backends, extra_args
 
     def _compile_mlir(
