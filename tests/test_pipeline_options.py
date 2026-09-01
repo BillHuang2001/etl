@@ -128,10 +128,21 @@ def test_env_option_table_entries():
 def test_env_option_table_keys_and_parsers():
     """The documented env var -> option key mapping (parsers are functions)."""
     iree_compile = ENV_OPTION_TABLE[("iree", "compile")]
-    assert len(iree_compile) == 1
-    var, key, parser = iree_compile[0]
-    assert (var, key) == ("ETL_IREE_COMPILE_ARGS", "iree_compile_args")
-    assert callable(parser)
+    assert len(iree_compile) == 2
+    assert {entry[1] for entry in iree_compile} == {
+        "iree_compile_args",
+        "opt_level",
+    }
+    args_entry = next(
+        entry for entry in iree_compile if entry[1] == "iree_compile_args"
+    )
+    assert args_entry[:2] == ("ETL_IREE_COMPILE_ARGS", "iree_compile_args")
+    assert callable(args_entry[2])
+    opt_level_entry = next(
+        entry for entry in iree_compile if entry[1] == "opt_level"
+    )
+    assert opt_level_entry[:2] == ("ETL_OPT_LEVEL", "opt_level")
+    assert callable(opt_level_entry[2])
 
     iree_load = ENV_OPTION_TABLE[("iree", "load")]
     assert len(iree_load) == 1
@@ -143,16 +154,20 @@ def test_env_option_table_keys_and_parsers():
     assert {entry[1] for entry in compile_entries} == {
         "tvm_target",
         "tvm_pass_configs",
+        "opt_level",
     }
     assert {entry[0] for entry in compile_entries} == {
         "ETL_TVM_TARGET",
         "ETL_TVM_PASS_CONFIGS",
+        "ETL_OPT_LEVEL",
     }
     assert all(callable(entry[2]) for entry in compile_entries)
     assert ENV_OPTION_TABLE[("xla", "compile")][0][:2] == (
         "ETL_XLA_COMPILE_OPTIONS",
         "xla_compile_options",
     )
+    xla_keys = {entry[1] for entry in ENV_OPTION_TABLE[("xla", "compile")]}
+    assert xla_keys == {"xla_compile_options", "opt_level"}
 
 
 def test_env_option_table_stages_are_canonical():
@@ -305,6 +320,77 @@ def test_malformed_env_values_raise_backend_error(monkeypatch, var, value, fragm
     assert fragment in message
 
 
+# ---------------------------------------------------------------------------
+# ETL_OPT_LEVEL — the first etl-defined + etl-validated option
+# ---------------------------------------------------------------------------
+
+
+def test_opt_level_env_applied_at_compile(monkeypatch):
+    """ETL_OPT_LEVEL applies at the compile stage of every compiler backend,
+    normalized to an int 0..3 by the shared validator."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    for backend in ("iree", "xla", "tvm"):
+        assert apply_env_options(backend, {}, "compile") == {"opt_level": 2}
+    # Other accepted forms normalize the same way.
+    monkeypatch.setenv("ETL_OPT_LEVEL", "o3")
+    assert apply_env_options("iree", {}, "compile") == {"opt_level": 3}
+    monkeypatch.setenv("ETL_OPT_LEVEL", "1")
+    assert apply_env_options("xla", {}, "compile") == {"opt_level": 1}
+
+
+def test_opt_level_explicit_wins_env(monkeypatch):
+    """An explicit opt_level key always wins over ETL_OPT_LEVEL; the env is
+    never applied for that key."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    assert apply_env_options("iree", {"opt_level": "O1"}, "compile") == {
+        "opt_level": "O1"
+    }
+    # Other keys are still env-supplied alongside an explicit opt_level.
+    monkeypatch.setenv("ETL_IREE_COMPILE_ARGS", "--flag-from-env")
+    assert apply_env_options(
+        "iree", {"opt_level": 0}, "compile"
+    ) == {"opt_level": 0, "iree_compile_args": ["--flag-from-env"]}
+
+
+def test_opt_level_env_stage_scoped(monkeypatch):
+    """ETL_OPT_LEVEL applies at the compile stage only — never at lower, load
+    or run (the env table declares the compile rows)."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O3")
+    for stage in ("lower", "load", "run"):
+        assert apply_env_options("iree", {}, stage) == {}
+        assert apply_env_options("xla", {}, stage) == {}
+        assert apply_env_options("tvm", {}, stage) == {}
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t \n"])
+def test_opt_level_blank_env_is_unset(monkeypatch, value):
+    """An empty/whitespace ETL_OPT_LEVEL is treated as unset (no key)."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", value)
+    for backend in ("iree", "xla", "tvm"):
+        assert apply_env_options(backend, {}, "compile") == {}
+
+
+@pytest.mark.parametrize("value", ["banana", "O4", "4", "-1", "O"])
+def test_opt_level_malformed_env_raises_backend_error(monkeypatch, value):
+    """A malformed ETL_OPT_LEVEL raises core.BackendError naming the variable
+    and the value — the option is etl-defined, so its value is validated here
+    (never passed through to the compiler)."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", value)
+    with pytest.raises(core.BackendError) as excinfo:
+        apply_env_options("iree", {}, "compile")
+    message = str(excinfo.value)
+    assert "ETL_OPT_LEVEL" in message
+    assert value in message
+    assert "opt_level" in message
+
+
+def test_opt_level_env_numpy_noop(monkeypatch):
+    """The numpy backend has no env table entry by design: ETL_OPT_LEVEL is
+    always a no-op for it."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    assert apply_env_options("numpy", {}, "compile") == {}
+
+
 def test_unknown_backend_noop(monkeypatch):
     """An unknown backend name (or None) is a no-op — no error, no keys."""
     monkeypatch.setenv("ETL_IREE_COMPILE_ARGS", "--flag")
@@ -454,6 +540,32 @@ def test_full_path_explicit_compile_kwarg_beats_env(monkeypatch, iree_stub_regis
     assert _RecordingIreeStub.recorded_compile_options[-1][
         "iree_compile_args"
     ] == ["--flag-explicit"]
+    assert exe.device == core.Device("cpu", 0)
+    _assert_no_new_iree_import()
+
+
+def test_full_path_env_opt_level_reaches_compile(monkeypatch, iree_stub_registered):
+    """ETL_OPT_LEVEL reaches the compile stage through ``etl.build``,
+    normalized to the int 0..3 form."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    exe = etl.build(_linear, *_LINEAR_SPECS, backend="iree")
+    compile_recorded = _RecordingIreeStub.recorded_compile_options[-1]
+    assert compile_recorded["opt_level"] == 2
+    assert compile_recorded["target_backends"] == ["llvm-cpu"]
+    assert exe.device == core.Device("cpu", 0)
+    _assert_no_new_iree_import()
+
+
+def test_full_path_explicit_opt_level_beats_env(monkeypatch, iree_stub_registered):
+    """An explicit opt_level kwarg beats ETL_OPT_LEVEL end to end (passed
+    through unnormalized — the adapter validates it)."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    exe = etl.build(
+        _linear, *_LINEAR_SPECS, backend="iree", opt_level="O0",
+    )
+    assert _RecordingIreeStub.recorded_compile_options[-1][
+        "opt_level"
+    ] == "O0"
     assert exe.device == core.Device("cpu", 0)
     _assert_no_new_iree_import()
 

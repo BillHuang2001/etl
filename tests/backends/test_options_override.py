@@ -124,7 +124,7 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
     message = str(excinfo.value)
     assert "the iree backend does not recognize the compile option 'bogus'" in message
     assert "lower: rng_bit_generator, sort_emission, while_init_rewrite" in message
-    assert "compile: iree_compile_args, target_backends" in message
+    assert "compile: iree_compile_args, opt_level, target_backends" in message
     assert "load: iree_runtime_args" in message
     assert "run: (none)" in message
 
@@ -136,7 +136,7 @@ def test_validate_options_unknown_key_xla_tvm():
         )
     message = str(excinfo.value)
     assert "does not recognize the run option" in message
-    assert "compile: plugin_path, xla_compile_options" in message
+    assert "compile: opt_level, plugin_path, xla_compile_options" in message
     assert "load: plugin_path" in message
 
     with pytest.raises(core.BackendError, match="tvm backend does not recognize"):
@@ -152,19 +152,25 @@ def test_adapter_known_options_declarations():
         "lower": frozenset(
             {"rng_bit_generator", "sort_emission", "while_init_rewrite"}
         ),
-        "compile": frozenset({"target_backends", "iree_compile_args"}),
+        "compile": frozenset(
+            {"target_backends", "iree_compile_args", "opt_level"}
+        ),
         "load": frozenset({"iree_runtime_args"}),
         "run": frozenset(),
     }
     assert xla_adapt.XlaBackend.KNOWN_OPTIONS == {
         "lower": frozenset({"rng_bit_generator"}),
-        "compile": frozenset({"plugin_path", "xla_compile_options"}),
+        "compile": frozenset(
+            {"plugin_path", "xla_compile_options", "opt_level"}
+        ),
         "load": frozenset({"plugin_path"}),
         "run": frozenset(),
     }
     assert tvm_adapt.TvmBackend.KNOWN_OPTIONS == {
         "lower": frozenset({"rng_bit_generator"}),
-        "compile": frozenset({"tvm_target", "tvm_pass_configs"}),
+        "compile": frozenset(
+            {"tvm_target", "tvm_pass_configs", "opt_level"}
+        ),
         "load": frozenset(),
         "run": frozenset(),
     }
