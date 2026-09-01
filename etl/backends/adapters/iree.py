@@ -65,7 +65,7 @@ imported at module top level, so ``import etl`` stays light):
   device buffers, see ``IreeExecutable.run`` / ``_staged_input``).
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
   handle, already resident on the device. Run outputs are wrapped into
-  ``core.Tensor(_IreeDevicePayload(...))`` — device-resident tensors whose
+  ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
   ``.numpy()`` materializes a LAZY host copy (``DeviceArray.to_host()``) on
   demand, so the hot run() path performs no host round-trip. Same-device
   DeviceArray inputs are handed to the invoke directly (no copy).
@@ -1133,7 +1133,7 @@ class IreeExecutable(CompilerExecutable):
        as before.
     3. Invoke the entry function; handle single/multiple results (the
        invoker returns the value or a tuple).
-    4. Wrap each result in ``core.Tensor(_IreeDevicePayload(...))`` — a
+    4. Wrap each result in ``core.Tensor(IreeDevicePayload(...))`` — a
        DEVICE-RESIDENT tensor: ``.data`` is the payload (the DeviceArray
        already on the device), ``.device`` is this executable's
        ``core.Device`` (``Device("cpu", 0)`` for the default CPU device),
@@ -1267,11 +1267,11 @@ class IreeExecutable(CompilerExecutable):
         elif not isinstance(results, tuple):
             results = (results,)
         # Device-resident outputs: wrap the returned DeviceArrays (already on
-        # the device) in core.Tensor with the lazy _IreeDevicePayload — the
+        # the device) in core.Tensor with the lazy IreeDevicePayload — the
         # D2H copy happens only if/when .numpy() is called.
         core_device = self._core_device
         outputs = [
-            core.Tensor(_IreeDevicePayload(result, core_device))
+            core.Tensor(IreeDevicePayload(result, core_device))
             for result in results
         ]
 
@@ -1463,7 +1463,7 @@ def _build_buffers(
 
     Shared by ``IreeExecutable.run`` and the per-segment executor: an input
     tensor already living on THIS device (payload-backed with a matching
-    ``core.Device`` — our own ``_IreeDevicePayload`` (run outputs of this or
+    ``core.Device`` — our own ``IreeDevicePayload`` (run outputs of this or
     another iree executable, unwrapped to the underlying DeviceArray) or a
     raw iree ``DeviceArray``) is handed to the invoke as-is — no host
     round-trip, no re-upload; the caller's validation loop already proved
@@ -1478,7 +1478,7 @@ def _build_buffers(
     buffers = []
     for i, tensor in enumerate(flat_input_tensors):
         data = tensor.data
-        if isinstance(data, _IreeDevicePayload) and tensor.device == core_device:
+        if isinstance(data, IreeDevicePayload) and tensor.device == core_device:
             buffers.append(data.device_array)
         elif (
             not isinstance(data, np.ndarray)
@@ -1574,26 +1574,40 @@ class _IreeSegmentExecutable:
         elif not isinstance(results, tuple):
             results = (results,)
         return [
-            core.Tensor(_IreeDevicePayload(result, self.core_device))
+            core.Tensor(IreeDevicePayload(result, self.core_device))
             for result in results
         ]
 
 
 class IreeExternalExecutable(CompilerExecutable):
-    """IREE executable for a SPLIT external-call graph (round 2 host-dispatch).
+    """IREE executable for a SPLIT external-call graph (round 2+ dispatch).
 
     Runs the graph's compiled segments strictly in plan order on the IREE
     HAL device; at each ``external_call`` boundary the kernel's operand
-    tensors are staged to HOST numpy arrays (lazy ``.numpy()`` on the
-    device-resident outputs of the producing segment), the registered
-    kernel is dispatched through ``etl.external.get_external_kernel`` (the
-    SAME name-keyed registry the numpy backend uses; an unregistered name
-    raises ``core.BackendError`` pointing at
-    ``etl.register_external_kernel``), and its validated results are staged
-    BACK as host tensors into the following segment's inputs (the existing
-    host-input staging machinery uploads them). Carried plain values that
-    are NOT kernel operands stay device-resident across segment runs —
-    zero extra host round-trips for them.
+    tensors (the DEVICE-RESIDENT outputs of the producing segment — never
+    pre-staged) are dispatched through the SAME name-keyed registry the
+    numpy backend uses (``etl.external``; an unregistered name raises
+    ``core.BackendError`` pointing at ``etl.register_external_kernel``).
+    Two kernel modes:
+
+    - HOST mode (default registration, ``device_resident=False``): the
+      dispatcher stages the operands to host numpy arrays (lazy
+      ``.numpy()``), calls the kernel, and its validated host results are
+      staged BACK into the following segment's inputs (the existing
+      host-input staging machinery uploads them).
+    - DEVICE mode (``device_resident=True`` registration): the dispatcher
+      passes the device tensors DIRECTLY (zero host staging on the way in);
+      the kernel may return ``core.Tensor`` s, duck-typed device payloads
+      (e.g. ``IreeDevicePayload``), raw iree ``DeviceArray`` s (wrapped with
+      the run's ``core.Device``), numpy arrays, or tuple/list mixes of them;
+      results are validated METADATA-ONLY (count/dtype/shape — never a
+      forced host copy) and occupy the plan's result slots, where the next
+      segment's same-device pass-through consumes device results with ZERO
+      host round-trips (host-array results are staged back by the segment
+      input machinery).
+
+    Carried plain values that are NOT kernel operands stay device-resident
+    across segment runs — zero extra host round-trips for them.
 
     Execution model / determinism:
     - Segments execute strictly sequentially in plan order; the ``callback``
@@ -1602,8 +1616,10 @@ class IreeExternalExecutable(CompilerExecutable):
     - Kernels are assumed PURE (same inputs -> same outputs): the same
       inputs + the same registered kernels produce the same results.
     - A ``UserWarning`` is emitted once per executable when the FIRST
-      external-call boundary executes, explaining the per-boundary
-      device->host->device staging cost and the v1 lower-time restrictions
+      boundary that actually stages tensors host<->device executes (a
+      host-mode kernel, or device-mode results that are host-backed) —
+      fully device-resident boundaries never warn; the message notes that
+      ``device_resident=True`` registrations skip per-boundary host staging
       (see ``run``).
     - The graph's structured I/O contract (the recorded ``Signature``) is
       unchanged: ``run`` validates flat inputs against it and returns the
@@ -1658,7 +1674,7 @@ class IreeExternalExecutable(CompilerExecutable):
         flat_input_tensors: list[core.Tensor],
         options: dict | None = None,
     ) -> list[core.Tensor]:
-        """Execute the split graph: per-segment device runs + host dispatch.
+        """Execute the split graph: per-segment device runs + kernel dispatch.
 
         1. Validate flat inputs against the recorded ``Signature`` (the
            original graph's I/O contract — count/dtype/shape, same rules as
@@ -1667,12 +1683,22 @@ class IreeExternalExecutable(CompilerExecutable):
            (graph inputs) ∪ (carried values from earlier segment outputs —
            device-resident tensors pass through with no host round-trip) and
            run it on the device. If the segment ends in an ``external_call``:
-           stage the operand tensors to host numpy arrays, dispatch the
-           registered kernel (missing => ``core.BackendError`` naming the
-           kernel and pointing at ``register_external_kernel``; outputs are
-           validated against the declared result specs — count/dtype/shape,
-           never silent coercion), and store the validated host tensors at
-           the plan's result slots.
+           dispatch the registered kernel with the segment's device-resident
+           operand tensors — a HOST-mode kernel (``device_resident=False``)
+           receives host numpy arrays (staged here), a DEVICE-mode kernel
+           (``device_resident=True``) receives the device tensors DIRECTLY
+           and may return device tensors / duck payloads (wrapped via
+           ``_wrap_device_result``) / host arrays; outputs are validated
+           METADATA-ONLY against the declared result specs — count/dtype/
+           shape, never silent coercion, never a forced host copy — and
+           stored at the plan's result slots. Missing kernel =>
+           ``core.BackendError`` naming the kernel and pointing at
+           ``register_external_kernel``. The once-per-executable
+           "host-dispatch" staging ``UserWarning`` fires ONLY when a
+           boundary actually stages tensors host<->device (a host-mode
+           kernel, or device-mode results that are host-backed numpy —
+           ``device_resident=True`` registrations with fully device-resident
+           results never warn).
         3. Return the final segment's module outputs (the graph's outputs),
            validated against the signature output specs.
         """
@@ -1704,7 +1730,9 @@ class IreeExternalExecutable(CompilerExecutable):
         # segment_outputs[j] = the run-time output slot list of segment j:
         # slots [0, module_outputs) are the module's return values
         # (device-resident Tensors); slots [module_outputs, ...) are the
-        # kernel results (host Tensors produced at dispatch time).
+        # kernel results (device-resident for device-mode kernels, host
+        # Tensors for host-mode kernels — staged back by the next segment's
+        # input machinery at dispatch time).
         segment_outputs: list[list[core.Tensor]] = []
         for segment_index, (segment, plan_segment) in enumerate(
             zip(self._segments, self._plan)
@@ -1728,28 +1756,33 @@ class IreeExternalExecutable(CompilerExecutable):
             out_slots: list[core.Tensor] = list(outputs)
             call = plan_segment.get("call")
             if call is not None:
-                if not self._staging_warned:
+                name = call["name"]
+                label = f"op 'external_call' (kernel {name!r})"
+                operand_tensors = [
+                    outputs[slot]
+                    for slot in call["operand_outputs"]
+                ]
+                results, staged = dispatch_external_kernel(
+                    name,
+                    operand_tensors,
+                    call["result_specs"],
+                    label,
+                    wrap_device_result=self._wrap_device_result,
+                )
+                if staged and not self._staging_warned:
                     self._staging_warned = True
                     warnings.warn(
-                        "iree host-dispatch: external_call boundaries "
-                        "stage tensors device -> host -> device at every "
-                        "kernel call (per-boundary host round-trips, v1 "
-                        "mechanism); lower-time restrictions: no "
-                        "control-flow bodies around calls, static result "
-                        "dims, at least one tensor operand, kernels "
-                        "assumed pure",
+                        "iree host-dispatch: this external_call boundary "
+                        "staged tensors device -> host -> device "
+                        "(per-boundary host round-trips, v1 mechanism; "
+                        "device_resident=True registrations skip "
+                        "per-boundary host staging). Lower-time "
+                        "restrictions: no control-flow bodies around calls, "
+                        "static result dims, at least one tensor operand, "
+                        "kernels assumed pure",
                         UserWarning,
                         stacklevel=2,
                     )
-                name = call["name"]
-                label = f"op 'external_call' (kernel {name!r})"
-                operand_arrays = [
-                    outputs[slot].numpy()
-                    for slot in call["operand_outputs"]
-                ]
-                results = dispatch_external_kernel(
-                    name, operand_arrays, call["result_specs"], label
-                )
                 out_slots.extend([None] * len(call["result_specs"]))
                 for slot, tensor in zip(call["result_outputs"], results):
                     out_slots[slot] = tensor
@@ -1770,6 +1803,25 @@ class IreeExternalExecutable(CompilerExecutable):
                         f"{tensor.dtype} — never silently coerce"
                     )
         return outputs
+
+    def _wrap_device_result(self, entry: Any) -> core.Tensor:
+        """Wrap one raw DEVICE-kernel result entry into a ``core.Tensor``.
+
+        Passed to ``dispatch_external_kernel`` as ``wrap_device_result``: a
+        raw iree runtime ``DeviceArray`` is wrapped in
+        ``core.Tensor(IreeDevicePayload(entry, self._core_device))`` — the
+        result lives on THIS executable's device (``DeviceArray`` handles
+        returned by device kernels are HAL buffers on the run's device);
+        any other entry (a duck-typed device payload carrying its own
+        ``core.Device``) wraps as ``core.Tensor(entry)`` directly. Never
+        materializes a host copy. ``iree.runtime`` is imported lazily
+        inside the function body (import acyclicity).
+        """
+        import iree.runtime as rt
+
+        if isinstance(entry, rt.DeviceArray):
+            return core.Tensor(IreeDevicePayload(entry, self._core_device))
+        return core.Tensor(entry)
 
 
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
@@ -1796,14 +1848,33 @@ def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[i
             )
 
 
-class _IreeDevicePayload:
-    """Duck-typed device payload for ``core.Tensor`` (the payload protocol).
+class IreeDevicePayload:
+    """Public duck-typed device payload for ``core.Tensor`` (the payload protocol).
 
     Wraps an IREE runtime ``DeviceArray`` — a HAL buffer-view handle that is
     ALREADY resident on the executable's device — plus the ``core.Device`` it
     lives on. Host materialization (``to_host``) is LAZY: the D2H copy happens
     only when the wrapping tensor's ``.numpy()`` is called, so the hot
     ``IreeExecutable.run`` path never touches host memory.
+
+    PUBLIC interop contract (device-resident external kernels): kernel authors
+    may isinstance-check ``etl.backends.adapters.iree.IreeDevicePayload`` (the
+    ``.data`` of the ``core.Tensor`` operands a device kernel receives) and
+    use:
+
+    - ``.device_array`` — the wrapped iree runtime ``DeviceArray`` (the HAL
+      buffer handle, already on the executable's device; also gives access to
+      the underlying HAL device for running further modules on the SAME
+      device);
+    - ``.shape`` / ``.dtype`` — metadata (tuple of ints / numpy dtype);
+    - ``.to_host()`` — an EXPLICIT materialization to a host numpy array (a
+      device kernel may deliberately materialize; the adapter itself NEVER
+      forces host copies of device results);
+    - ``.device`` — the ``core.Device`` the tensor lives on.
+
+    A device-resident kernel runs on the executable's device and may e.g.
+    compile/run additional vmfb modules on the SAME HAL device via
+    ``iree.runtime`` and return their ``DeviceArray`` s (raw or wrapped).
 
     Payload protocol (see ``etl/core/tensor.py``): ``.shape`` (tuple of
     ints), ``.dtype`` (numpy-normalizable — DeviceArray is override-aware,
@@ -1850,6 +1921,12 @@ class _IreeDevicePayload:
         fresh host copy per call, like ``to_host``).
         """
         return self._array.to_host().__array__(dtype)
+
+
+# Backward-compat alias: the payload was private (``_IreeDevicePayload``)
+# before the device-resident external-kernel round; old isinstance checks
+# keep working.
+_IreeDevicePayload = IreeDevicePayload
 
 
 # ---------------------------------------------------------------------------

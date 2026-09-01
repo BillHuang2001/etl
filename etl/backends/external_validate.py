@@ -25,10 +25,35 @@ Canonical API:
   path, dims used as-is after decoding); ``None`` dims stay ``None``
   (runtime-dynamic, unchecked) on BOTH paths. Valid outputs are wrapped in
   ``core.Tensor`` (default CPU device).
+- ``normalize_device_results(result, label) -> list`` — the device-kernel
+  counterpart of ``normalize_results``: ``np.ndarray`` / ``core.Tensor`` ->
+  ``[x]``; payload-ish objects (both ``shape`` and ``dtype`` attributes —
+  covers raw iree ``DeviceArray`` and duck payloads) -> ``[x]``;
+  tuple/list -> ``list(...)``; anything else => ``core.BackendError``
+  naming the call (never a guess).
+- ``validate_device_outputs(entries, declared_specs, label,
+  wrap_device_result=None) -> list[core.Tensor]`` — METADATA-ONLY
+  validation for device-resident kernels: NEVER materializes a host copy
+  (never calls ``.numpy()``/``to_host()``). Count must match
+  ``len(declared_specs)`` (``core.BackendError`` — same canonical wording
+  as ``validate_outputs``); per output: ``core.Tensor`` entries pass
+  through, ``np.ndarray`` entries wrap in ``core.Tensor`` (host result —
+  the caller stages it back), anything else goes through
+  ``wrap_device_result`` when provided (else ``core.Tensor(entry)``); a
+  failed wrap (``TypeError``/``core.DeviceError``) re-raises as
+  ``core.BackendError`` naming the call and output index — explicit, never
+  a guess. Then dtype must match exactly (``core.BackendError`` — no
+  silent coercion) and the declared shape must match the actual shape
+  (``core.ShapeError``) — the SAME canonical wording as
+  ``validate_outputs`` via the shared ``_validate_entry_spec`` helper
+  (static-int dims are guaranteed by lower-time, so no ``evaluate_shape``
+  here, but wire-form dict specs still decode).
 
 Import acyclicity: this module imports ONLY ``etl.core`` (plus ``numpy``
-and ``typing``) — never ``etl.ir`` (specs are duck-typed via attributes) —
-so both consumers can import it at module level without cycles.
+and ``typing``) — never ``etl.ir`` (specs are duck-typed via attributes)
+and never iree (not even lazily — device entries are duck-typed via
+``shape``/``dtype``) — so both consumers can import it at module level
+without cycles.
 """
 from __future__ import annotations
 
@@ -38,7 +63,12 @@ import numpy as np
 
 from etl import core
 
-__all__ = ["normalize_results", "validate_outputs"]
+__all__ = [
+    "normalize_results",
+    "normalize_device_results",
+    "validate_outputs",
+    "validate_device_outputs",
+]
 
 
 def normalize_results(result: Any, label: str) -> list:
@@ -55,6 +85,29 @@ def normalize_results(result: Any, label: str) -> list:
     raise core.BackendError(
         f"{label}: callback returned {type(result).__name__}, expected an "
         "ndarray, a core.Tensor, or a tuple/list of them"
+    )
+
+
+def normalize_device_results(result: Any, label: str) -> list:
+    """Normalize a DEVICE kernel return into a list of output entries.
+
+    The device-mode counterpart of :func:`normalize_results`: ``ndarray`` /
+    ``core.Tensor`` -> ``[x]``; payload-ish objects (anything with BOTH
+    ``shape`` and ``dtype`` attributes — covers raw iree ``DeviceArray``
+    handles and duck-typed device payloads) -> ``[x]``; tuple/list ->
+    ``list(...)``. Anything else => ``core.BackendError`` naming the call
+    (the dispatch path never guesses how to interpret a return value).
+    """
+    if isinstance(result, np.ndarray) or isinstance(result, core.Tensor):
+        return [result]
+    if isinstance(result, (tuple, list)):
+        return list(result)
+    if hasattr(result, "shape") and hasattr(result, "dtype"):
+        return [result]
+    raise core.BackendError(
+        f"{label}: callback returned {type(result).__name__}, expected an "
+        "ndarray, a core.Tensor, a device payload (shape + dtype "
+        "attributes), or a tuple/list of them"
     )
 
 
@@ -124,6 +177,53 @@ def _extract_spec(spec: Any, where: str) -> tuple:
         ) from exc
 
 
+def _validate_entry_spec(
+    dtype: np.dtype,
+    shape: tuple,
+    spec: Any,
+    where: str,
+    evaluate_shape: Optional[Callable[[Any], int]] = None,
+) -> None:
+    """Shared per-output check: dtype EXACT, then shape EXACT vs ``spec``.
+
+    Used by BOTH :func:`validate_outputs` (host mode) and
+    :func:`validate_device_outputs` (device mode) so the canonical message
+    wording never drifts. dtype mismatch => ``core.BackendError`` ("no
+    silent dtype coercion"); shape rank/dim mismatches => ``core.ShapeError``.
+    ``evaluate_shape`` resolves symbolic dims against runtime bindings
+    (host mode); ``None`` dims stay ``None`` (runtime-dynamic, unchecked).
+    """
+    spec_dtype, spec_shape = _extract_spec(spec, where)
+    if dtype != spec_dtype:
+        raise core.BackendError(
+            f"{where}: callback returned dtype {dtype}, declared "
+            f"result dtype {spec_dtype} — no silent dtype coercion"
+        )
+    expected_list = []
+    for dim in tuple(spec_shape):
+        if dim is None:
+            expected_list.append(None)
+            continue
+        decoded = _decode_dim_entry(dim, where)
+        expected_list.append(
+            evaluate_shape(decoded) if evaluate_shape is not None else decoded
+        )
+    expected = tuple(expected_list)
+    actual = tuple(int(d) for d in shape)
+    if len(expected) != len(actual):
+        raise core.ShapeError(
+            f"{where}: callback returned shape {actual} (rank "
+            f"{len(actual)}), declared rank {len(expected)}"
+        )
+    for dim_i, (exp, act) in enumerate(zip(expected, actual)):
+        if exp is not None and exp != act:
+            raise core.ShapeError(
+                f"{where}: callback returned shape {actual}, declared "
+                f"shape {expected} — mismatch at dim {dim_i} "
+                f"({act} != {exp})"
+            )
+
+
 def validate_outputs(
     arrays: list,
     declared_specs: Any,
@@ -159,34 +259,67 @@ def validate_outputs(
                 f"{label}: callback output {i} is "
                 f"{type(entry).__name__}, expected an ndarray or a core.Tensor"
             )
-        spec_dtype, spec_shape = _extract_spec(spec, where)
-        if entry.dtype != spec_dtype:
-            raise core.BackendError(
-                f"{where}: callback returned dtype {entry.dtype}, declared "
-                f"result dtype {spec_dtype} — no silent dtype coercion"
-            )
-        expected_list = []
-        for dim in tuple(spec_shape):
-            if dim is None:
-                expected_list.append(None)
-                continue
-            decoded = _decode_dim_entry(dim, where)
-            expected_list.append(
-                evaluate_shape(decoded) if evaluate_shape is not None else decoded
-            )
-        expected = tuple(expected_list)
-        actual = tuple(int(d) for d in entry.shape)
-        if len(expected) != len(actual):
-            raise core.ShapeError(
-                f"{where}: callback returned shape {actual} (rank "
-                f"{len(actual)}), declared rank {len(expected)}"
-            )
-        for dim_i, (exp, act) in enumerate(zip(expected, actual)):
-            if exp is not None and exp != act:
-                raise core.ShapeError(
-                    f"{where}: callback returned shape {actual}, declared "
-                    f"shape {expected} — mismatch at dim {dim_i} "
-                    f"({act} != {exp})"
-                )
+        _validate_entry_spec(entry.dtype, entry.shape, spec, where, evaluate_shape)
         outputs.append(core.Tensor(entry))
+    return outputs
+
+
+def validate_device_outputs(
+    entries: list,
+    declared_specs: Any,
+    label: str,
+    wrap_device_result: Optional[Callable[[Any], Any]] = None,
+) -> List[core.Tensor]:
+    """Validate DEVICE-kernel outputs against the declared result specs.
+
+    METADATA-ONLY validation: NEVER materializes a host copy of a device
+    result (never calls ``.numpy()``/``to_host()``) — the adapter itself
+    never forces device->host staging. Count must match
+    ``len(declared_specs)`` (``core.BackendError`` — the same canonical
+    wording as :func:`validate_outputs`); per output: ``core.Tensor``
+    entries pass through untouched, ``np.ndarray`` entries wrap in
+    ``core.Tensor`` (a host result — the caller stages it back into the
+    next segment's inputs), and any other entry goes through
+    ``wrap_device_result`` when provided (else ``core.Tensor(entry)`` — a
+    duck-typed device payload); a failed wrap (``TypeError`` /
+    ``core.DeviceError`` raised by the wrap callback) re-raises as
+    ``core.BackendError`` naming the call and output index — explicit,
+    never a guess. Then dtype must match exactly (``core.BackendError`` —
+    no silent coercion) and the declared shape must match the actual shape
+    (``core.ShapeError``) — the SAME canonical wording as
+    :func:`validate_outputs` via the shared ``_validate_entry_spec``
+    helper. Static-int dims are guaranteed by lower-time (no symbolic dims
+    in the plan), so there is no ``evaluate_shape`` here; wire-form dict
+    specs still decode defensively.
+
+    ``label`` names the call in error messages (e.g. the op + kernel name);
+    ``wrap_device_result`` is the caller's payload-wrapping callback
+    (e.g. the iree adapter wraps raw ``DeviceArray`` results with the run's
+    ``core.Device``).
+    """
+    if len(entries) != len(declared_specs):
+        raise core.BackendError(
+            f"{label}: callback produced {len(entries)} "
+            f"output(s), expected {len(declared_specs)}"
+        )
+    outputs: List[core.Tensor] = []
+    for i, (entry, spec) in enumerate(zip(entries, declared_specs)):
+        where = f"{label} output {i}"
+        if not isinstance(entry, (core.Tensor, np.ndarray)):
+            try:
+                if wrap_device_result is not None:
+                    entry = wrap_device_result(entry)
+                else:
+                    entry = core.Tensor(entry)
+            except (TypeError, core.DeviceError) as exc:
+                raise core.BackendError(
+                    f"{label}: callback output {i} is "
+                    f"{type(entry).__name__}, which is not a valid device "
+                    "payload (expected a core.Tensor, an ndarray, or a "
+                    "payload with shape + dtype the wrap accepts)"
+                ) from exc
+        if isinstance(entry, np.ndarray):
+            entry = core.Tensor(entry)
+        _validate_entry_spec(entry.dtype, entry.shape, spec, where)
+        outputs.append(entry)
     return outputs

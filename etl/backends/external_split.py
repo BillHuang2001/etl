@@ -5,9 +5,13 @@ Round 1 delivered the ``external_call`` op and the numpy-backend dispatch
 host-dispatch path: a graph containing ``external_call`` ops is split at
 ``lower()`` time into an ordered list of SEGMENT GRAPHS (plain graphs with no
 ``external_call`` inside) plus a kernel-call PLAN. Segments run on the device;
-at each ``external_call`` boundary the segment outputs are staged to host
-numpy arrays, the registered kernel is dispatched, and its results are staged
-back as inputs of the following segment.
+at each ``external_call`` boundary the registered kernel is dispatched with
+the segment's DEVICE-RESIDENT output tensors — a HOST-mode kernel (default
+registration) receives host numpy arrays (staged via lazy ``.numpy()`` at the
+boundary), while a DEVICE-mode kernel (``device_resident=True`` registration)
+receives the device tensors DIRECTLY (never host-staged) and may return
+device tensors / duck payloads / host arrays — and its validated results
+occupy the plan slots consumed by the following segment.
 
 Pure graph transformation: operates on ``etl.ir`` / ``trace.Graph`` structures
 only — the numpy interpreter is never required here. The numpy backend keeps
@@ -36,7 +40,8 @@ Split model (binding — mirrors the numpy backend's block-op-order semantics):
   they are validated against the declared specs at dispatch time and occupy
   segment-output slots ``module_outputs .. module_outputs + R - 1`` (R =
   declared result count), so later segments reference them like any other
-  carried value.
+  carried value. A DEVICE-mode kernel's results occupy the SAME slots — only
+  the dispatch mode differs (device tensors in, metadata-only validation).
 
 v1 lower-time constraints (explicit ``core.BackendError``, never silent):
 
@@ -59,10 +64,17 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from etl import core
 from etl import ir
 
-from .external_validate import normalize_results, validate_outputs
+from .external_validate import (
+    normalize_device_results,
+    normalize_results,
+    validate_device_outputs,
+    validate_outputs,
+)
 
 __all__ = [
     "contains_external_call",
@@ -645,37 +657,62 @@ def decode_plan(plan: dict) -> List[dict]:
 
 def dispatch_external_kernel(
     name: str,
-    operand_arrays: Sequence[Any],
+    operand_tensors: Sequence[core.Tensor],
     result_types: Sequence[ir.ValueType],
     label: str,
-) -> List[core.Tensor]:
-    """Resolve kernel ``name``, call it with host numpy operands, validate.
+    wrap_device_result: Optional[Callable[[Any], Any]] = None,
+) -> Tuple[List[core.Tensor], bool]:
+    """Resolve kernel ``name``, call it, validate; return ``(outputs, staged)``.
 
-    Mirrors the numpy backend's round-1 dispatch semantics (see
-    ``etl/backends/numpy/kernels/custom.py``): the kernel is resolved through
-    ``etl.external.get_external_kernel(name, "iree")`` — the per-backend
-    "iree" slot, with automatic fallback to the default (``None``) slot —
-    (unknown name => ``BackendError`` naming the kernel and pointing at
-    ``register_external_kernel``), called with the operand numpy arrays, and
-    its return is normalized and validated against the declared
-    ``result_types`` with the SHARED canonical wording
-    (``etl/backends/external_validate.py`` — count (``BackendError``), dtype
-    exact (``BackendError`` — no silent coercion), shape exact
-    (``ShapeError``)). Validated results are returned as host ``core.Tensor``
-    s (staged back to the device by the caller's next segment run).
+    The kernel is resolved through ``etl.external.get_external_kernel_entry(
+    name, "iree")`` — the per-backend "iree" slot, with automatic fallback to
+    the default (``None``) slot — (unknown name => ``BackendError`` naming the
+    kernel and pointing at ``register_external_kernel``). The resolved entry
+    is a ``(kernel, device_resident)`` pair selecting the dispatch mode:
+
+    - HOST mode (``device_resident=False`` — the default registration, the
+      exact round-2 semantics): the operand tensors are staged to host numpy
+      arrays (``.numpy()``), the kernel is called with them, and its return is
+      normalized and validated against the declared ``result_types`` with the
+      SHARED canonical wording (``etl/backends/external_validate.py`` — count
+      (``BackendError``), dtype exact (``BackendError`` — no silent
+      coercion), shape exact (``ShapeError``)). Returns ``(outputs, True)``
+      (host staging happened at this boundary).
+    - DEVICE mode (``device_resident=True``): the operand tensors are passed
+      to the kernel DIRECTLY (never ``.numpy()``-staged), the return is
+      normalized via ``normalize_device_results`` and validated via
+      ``validate_device_outputs`` (METADATA-ONLY — never materializes a host
+      copy; ``wrap_device_result`` wraps raw device entries, e.g. the iree
+      adapter wraps raw ``DeviceArray`` results with the run's
+      ``core.Device``). Returns ``(outputs, staged)`` where ``staged`` is
+      True only when some kernel result is host-backed (numpy/host Tensor)
+      and will be staged back by the next segment — a fully device-resident
+      boundary returns False.
+
+    Validated results are returned as ``core.Tensor`` s occupying the plan's
+    result slots (host tensors are staged back to the device by the caller's
+    next segment run; device tensors pass through with no host round-trip).
 
     ``label`` names the call in error messages (e.g. the op + kernel name).
     """
-    from etl.external import get_external_kernel  # lazy: import acyclicity
+    from etl.external import get_external_kernel_entry  # lazy: import acyclicity
 
-    kernel = get_external_kernel(name, "iree")
-    if kernel is None:
+    entry = get_external_kernel_entry(name, "iree")
+    if entry is None:
         raise core.BackendError(
             f"{label}: no external kernel registered under name {name!r} — "
             "register it with etl.register_external_kernel(name, callable) "
             "in this process before running graphs that call it (kernels "
             "are never embedded in artifacts)"
         )
-    result = kernel(*operand_arrays)
-    arrays = normalize_results(result, label)
-    return validate_outputs(arrays, result_types, label)
+    kernel, device_resident = entry
+    if not device_resident:
+        host_arrays = [t.numpy() for t in operand_tensors]
+        result = kernel(*host_arrays)
+        arrays = normalize_results(result, label)
+        return validate_outputs(arrays, result_types, label), True
+    result = kernel(*operand_tensors)
+    entries = normalize_device_results(result, label)
+    outputs = validate_device_outputs(entries, result_types, label, wrap_device_result)
+    staged = any(isinstance(t.data, np.ndarray) for t in outputs)
+    return outputs, staged
