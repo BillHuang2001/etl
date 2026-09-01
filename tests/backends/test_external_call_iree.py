@@ -24,7 +24,16 @@ kernels") and ``etl/backends/adapters/CONTEXT.md``:
   runs (the JSON-safe plan carries the kernel-call records).
 
 Stand-in kernels are plain Python/numpy functions — NO triton anywhere.
+
+Round 3 (per-backend dispatch + staging warning): the run path resolves
+kernels through ``etl.external.get_external_kernel(name, "iree")`` — the
+exact ``"iree"`` slot wins over the default slot (pinned by differentiated
+outputs), and the host-dispatch staging ``UserWarning`` fires at the FIRST
+external-call boundary of an executable and never again for that executable
+(pinned by record counts; plain graphs without external calls never warn).
 """
+
+import warnings
 
 import numpy as np
 import pytest
@@ -184,6 +193,30 @@ def _two_inputs(x, w):
         "t_kernel_add", x, w, result=etl.TensorSpec((3,), etl.float32)
     )
     return y * 2.0
+
+
+def _slot_graph(x):
+    """Single call to a kernel registered per-backend (round 3): the run
+    path must prefer the exact "iree" slot over the default slot."""
+    return etl.external_call(
+        "t_slot_kernel", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+
+
+def _staging_warn_graph(x):
+    """One-call graph used ONLY by the staging-warning test (fresh
+    executable — the once-per-executable warning must not be consumed by
+    another test's run of the same builder)."""
+    y = etl.external_call(
+        "t_kernel_double", x, result=etl.TensorSpec((3,), etl.float32)
+    )
+    return y + 1.0
+
+
+def _plain_graph(x):
+    """Plain graph (no external calls) — the negative control for the
+    staging warning."""
+    return x + 1.0
 
 
 def _ghost(x):
@@ -429,6 +462,69 @@ def test_xla_tvm_still_reject_with_round1_message(backend):
         pytest.skip(f"{backend} adapter not available in this env: {message}")
     assert "not yet wired" in message
     assert backend in message
+
+
+# ---------------------------------------------------------------------------
+# per-backend kernel resolution + staging warning (round 3)
+# ---------------------------------------------------------------------------
+
+
+def test_run_prefers_exact_iree_slot_over_default():
+    """Per-backend resolution: a kernel registered under backend="iree" wins
+    over the default slot at iree run time (differentiated by output)."""
+    name = "t_slot_kernel"
+    etl.register_external_kernel(name, lambda x: x * 2.0)  # default slot
+    etl.register_external_kernel(name, lambda x: x * 5.0, backend="iree")
+    try:
+        exe = _build_exe(_slot_graph, _specs(SPEC))
+        _assert_bit_exact(etl.run(exe, etl.Tensor(X)), X * 5.0)
+    finally:
+        etl.unregister_external_kernel(name)
+
+
+def test_run_default_slot_only_kernel_still_works():
+    """Without an exact "iree" slot, the default-slot kernel is used (the
+    shared executable resolves kernels at run time, so the cached build
+    serves both tests)."""
+    name = "t_slot_kernel"
+    etl.register_external_kernel(name, lambda x: x * 2.0)  # default slot only
+    try:
+        exe = _build_exe(_slot_graph, _specs(SPEC))
+        _assert_bit_exact(etl.run(exe, etl.Tensor(X)), X * 2.0)
+    finally:
+        etl.unregister_external_kernel(name)
+
+
+def test_staging_warning_once_per_executable():
+    """The host-dispatch staging warning fires at the FIRST external-call
+    boundary of an executable (pytest.warns) and never again for that
+    executable (record count across a second run is zero)."""
+    exe = _build_exe(_staging_warn_graph, _specs(SPEC))
+    with pytest.warns(UserWarning, match="host-dispatch"):
+        first = etl.run(exe, etl.Tensor(X))
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        second = etl.run(exe, etl.Tensor(X))
+    assert not [
+        r for r in records
+        if r.category is UserWarning and "host-dispatch" in str(r.message)
+    ]
+    _assert_bit_exact(first, _run_numpy(_staging_warn_graph, X))
+    _assert_bit_exact(second, first)
+
+
+def test_no_staging_warning_without_external_calls():
+    """A plain iree graph (no external calls) never emits the staging
+    warning — it exists only for the split host-dispatch path."""
+    exe = _build_exe(_plain_graph, _specs(SPEC))
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        out = etl.run(exe, etl.Tensor(X))
+    assert not [
+        r for r in records
+        if r.category is UserWarning and "host-dispatch" in str(r.message)
+    ]
+    _assert_bit_exact(out, X + 1.0)
 
 
 # ---------------------------------------------------------------------------
