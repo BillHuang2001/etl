@@ -18,6 +18,7 @@ The env-option table (backend, stage) -> (env var, option key, parser):
 | ``ETL_XLA_COMPILE_OPTIONS`` | xla     | compile | ``xla_compile_options`` | base64 of a serialized CompileOptionsProto  |
 | ``ETL_TVM_TARGET``          | tvm     | compile | ``tvm_target``        | TVM target string                             |
 | ``ETL_TVM_PASS_CONFIGS``    | tvm     | compile | ``tvm_pass_configs``  | JSON object (must parse to a dict)            |
+| ``ETL_OPT_LEVEL``           | iree/tvm/xla | compile | ``opt_level``      | 'O0'..'O3' (case-insensitive), '0'..'3', or 0..3 (validated — etl-defined value) |
 
 Naming convention: ``ETL_<BACKEND>_COMPILE_ARGS`` / ``ETL_<BACKEND>_RUNTIME_ARGS``
 for flag lists; backend-specific names for non-list options. The env vars are
@@ -26,13 +27,20 @@ option keys absent from the caller's dict. An empty/whitespace value is
 treated as unset. A malformed value raises ``core.BackendError`` naming the
 variable, the value, and the parse error — never a raw shlex/base64/json
 exception, never silent. Option VALUES are never validated here — the
-compiler validates them.
+compiler validates them (the single exception is ``opt_level``, an
+etl-defined option whose value is normalized and validated by
+``etl.backends.options.normalize_opt_level`` via the ``_parse_opt_level``
+parser; precedence explicit > env > default, malformed → ``BackendError``
+naming the variable and value).
 
 The staging-level env vars ``ETL_BACKEND`` / ``ETL_DEVICE`` /
 ``ETL_TARGET_BACKENDS`` are resolved separately by
 ``etl.pipeline._resolve_backend_device`` (build/evaluate only, unchanged).
-This module never imports ``etl.backends`` (env resolution must not trigger
-adapter imports).
+This module never imports ``etl.backends`` at module level (env resolution
+must not trigger adapter imports); the one exception is the ``opt_level``
+parser's lazy function-body import of ``etl.backends.options`` — by the time
+``apply_env_options`` runs, ``etl`` is fully imported, and that module pulls
+only core/ir/numpy, never the optional adapters.
 """
 from __future__ import annotations
 
@@ -90,21 +98,42 @@ def _parse_json_object(var: str, value: str) -> dict:
     return decoded
 
 
+def _parse_opt_level(var: str, value: str) -> int:
+    """Parse a backend-agnostic optimization level to a normalized int 0..3.
+
+    Accepts 'O0'..'O3' (case-insensitive), '0'..'3', or the ints 0..3 — the
+    one etl-defined option, so its value is validated here (unlike raw
+    compiler flags). ``normalize_opt_level`` is imported lazily inside the
+    body: this module must not import ``etl.backends`` at module level (env
+    resolution must not trigger adapter imports), and by the time
+    ``apply_env_options`` runs ``etl`` is fully imported.
+    """
+    from etl.backends.options import normalize_opt_level
+
+    try:
+        return normalize_opt_level(value)
+    except BackendError as exc:
+        raise BackendError(f"invalid {var}={value!r}: {exc}") from None
+
+
 #: (backend name, stage) -> tuple of (env var, option key, parser) entries
 #: (a stage may have several env-var options, e.g. tvm compile).
 ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
     ("iree", "compile"): (
         ("ETL_IREE_COMPILE_ARGS", "iree_compile_args", _parse_flag_list),
+        ("ETL_OPT_LEVEL", "opt_level", _parse_opt_level),
     ),
     ("iree", "load"): (
         ("ETL_IREE_RUNTIME_ARGS", "iree_runtime_args", _parse_flag_list),
     ),
     ("xla", "compile"): (
         ("ETL_XLA_COMPILE_OPTIONS", "xla_compile_options", _parse_base64_bytes),
+        ("ETL_OPT_LEVEL", "opt_level", _parse_opt_level),
     ),
     ("tvm", "compile"): (
         ("ETL_TVM_TARGET", "tvm_target", lambda var, value: value.strip()),
         ("ETL_TVM_PASS_CONFIGS", "tvm_pass_configs", _parse_json_object),
+        ("ETL_OPT_LEVEL", "opt_level", _parse_opt_level),
     ),
 }
 
