@@ -106,7 +106,7 @@ import numpy as np
 
 import etl
 from etl import core
-from etl.bench._util import best_time_ms
+from etl.bench._util import best_time_ms, place_input, to_host
 from etl.ir.op_defs.random import algorithm_key_type
 
 __all__ = ["main", "run_benchmark", "ALGORITHMS", "OPS", "TARGETS"]
@@ -214,9 +214,13 @@ def _numpy_reference_out(op: str, size: int, algorithm: str, seed: int) -> np.nd
 
 
 def _asarray(out):
-    """Normalize a single-tensor run output to a numpy ndarray."""
+    """Normalize a single-tensor run output to a numpy ndarray, with an
+    EXPLICIT host readback of device-resident outputs (``.to(cpu)`` first —
+    the explicit device-placement contract: ``.numpy()`` on a non-cpu device
+    tensor raises; on cpu tensors ``to_host`` is a no-op, so the cpu paths
+    are byte-identical to a plain ``.numpy()``)."""
     if isinstance(out, core.Tensor):
-        return out.numpy()
+        return to_host(out).numpy()
     if isinstance(out, np.ndarray):
         return out
     raise TypeError(
@@ -445,7 +449,18 @@ def _measure_config(cfg: _Config, args, cuda_device, repeats) -> dict:
                 _restore_iree(orig)
         row["compile_ms"] = (time.perf_counter() - t0) * 1000.0
 
-        run_fn = lambda: etl.run(exe, key_tensor, cfg.size)  # noqa: E731
+        # Explicit device placement: the (immutable, reused) host key tensor
+        # is placed ONCE on the run device, before the timed loop — no
+        # implicit host->device staging inside the loop (cpu targets — numpy
+        # and iree llvm-cpu — keep the host key as-is; the run returns
+        # device-resident tensors on cuda, read back explicitly in the
+        # verification step below via _asarray, never in the timed loop).
+        run_key = (
+            place_input(key_tensor, cuda_device)
+            if cfg.target == "cuda"
+            else key_tensor
+        )
+        run_fn = lambda: etl.run(exe, run_key, cfg.size)  # noqa: E731
         row["best_ms"] = best_time_ms(run_fn, args.warmup, repeats)
 
         if cfg.target != "numpy":

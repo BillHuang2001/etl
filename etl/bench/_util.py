@@ -197,27 +197,78 @@ def resolve_examples(examples):
     return expand_names(names)
 
 
+def place_input(value, device):
+    """Explicitly place a host input value on ``device`` before feeding it to
+    an executable (the explicit device-placement contract: no implicit
+    host→device transfers at run time).
+
+    On a NON-cpu device: a host numpy array is wrapped with ``etl.tensor``
+    and explicitly moved via ``Tensor.to(device)``; a ``core.Tensor`` passes
+    through ``.to(device)`` — a no-op returning the same tensor when it
+    already lives on ``device`` (the same-device loop pattern). On a cpu
+    device (the numpy backend and iree llvm-cpu runs) this is a NO-OP
+    returning ``value`` unchanged: host inputs behave exactly as before, with
+    no copies or overhead on the default path.
+
+    Raises:
+        TypeError: ``value`` is neither a numpy ndarray nor a ``core.Tensor``
+            (explicit — never silently dropped).
+    """
+    if device.kind == "cpu":
+        return value
+    if isinstance(value, core.Tensor):
+        return value.to(device)
+    if isinstance(value, np.ndarray):
+        return etl.tensor(value).to(device)
+    raise TypeError(
+        f"cannot place a {type(value).__name__} input on {device}: expected "
+        "a numpy ndarray or an etl.Tensor"
+    )
+
+
+def to_host(tensor):
+    """Explicitly read back a run-output ``core.Tensor`` to the host.
+
+    The explicit device-placement contract: ``.numpy()`` on a device-resident
+    NON-cpu tensor raises :class:`~etl.core.DeviceError`, so readbacks go
+    through an explicit ``.to(core.Device('cpu', 0))`` first. On a cpu tensor
+    (host-resident — the numpy backend and iree llvm-cpu runs) this is a
+    NO-OP returning the same tensor: the cpu behavior is byte-identical to
+    plain ``.numpy()`` and no copy is introduced.
+    """
+    if tensor.device.kind != "cpu":
+        return tensor.to(core.Device("cpu", 0))
+    return tensor
+
+
 def stage_example(example, backend, device, opts) -> callable:
     """Stage an example's graph and return a RUN-CALLABLE ``run(inputs)``.
 
     The returned callable takes the SAME inputs list the single-run path
     uses (``example.generate_inputs(seed)``, a list of numpy arrays) and
     returns the same outputs structure as ``example.numpy_ref`` (single
-    ndarray or tuple). Routing (documented):
+    ndarray or tuple). Under the explicit device-placement contract the
+    callable places every host input on the target device before running
+    (``place_input`` — a no-op on cpu devices, where host inputs are fed
+    exactly as before) and returns the RAW ``etl.run`` outputs: on a non-cpu
+    device these stay device-resident — readbacks are explicit and on-demand
+    (``flatten_outputs``/``to_host`` transfer for comparisons, never inside a
+    timed run). Routing (documented):
 
     - ``example.runner`` set → ``return example.runner(backend, device, opts)``
       (the runner factory builds its own executables ONCE — see the runner
       contract in this module's docstring; a runner must NEVER call
       ``stage_example``, that would recurse infinitely).
     - ``@etl.defn`` graphs → ``etl.build(..., backend=backend,
-      device=device, **opts)`` then ``lambda inputs: etl.run(executable,
-      *inputs)``.
+      device=device, **opts)``.
     - Transform-produced graphs (``etl.grad``/``etl.vmap`` TransformCallables
       — ``example.graph`` lacks the ``__etl_defn__`` marker) are materialized
       with ``example.graph(*example.specs) -> Graph`` and staged through the
       explicit pipeline ``etl.lower`` → ``etl.compile`` → ``etl.load``
-      (options go to BOTH lower and compile, exactly like build does), then
-      the same run lambda.
+      (options go to BOTH lower and compile, exactly like build does).
+    Both staging paths then wrap the executable in a run callable that
+    explicitly places every host input on the target device
+    (``place_input`` — a no-op on cpu devices) before ``etl.run``.
     """
     if example.runner is not None:
         return example.runner(backend, device, opts)
@@ -231,7 +282,15 @@ def stage_example(example, backend, device, opts) -> callable:
         lp = etl.lower(graph, backend=backend, **opts)
         ca = etl.compile(lp, **opts)
         executable = etl.load(ca, device=device)
-    return lambda inputs: etl.run(executable, *inputs)
+
+    def run(inputs):
+        # Explicit input placement on non-cpu devices (no implicit
+        # host→device transfers); cpu devices feed the host inputs as-is.
+        return etl.run(
+            executable, *(place_input(value, device) for value in inputs)
+        )
+
+    return run
 
 
 def resolve_torch_mode(use_torch):
@@ -273,12 +332,15 @@ def best_time_ms(fn, warmup: int, repeats: int) -> float:
 def flatten_outputs(outputs):
     """Flatten structured outputs to a list of numpy ndarrays.
 
-    Handles ``etl.Tensor`` (→ ``.numpy()``), ``numpy.ndarray``, tuples /
-    lists / namedtuples (recursed), and dicts (key order). Anything else
-    raises ``TypeError`` — explicit, never silently dropped.
+    Handles ``etl.Tensor`` (→ ``.numpy()``, with an explicit ``.to(cpu)``
+    host readback first when the tensor is device-resident on a non-cpu
+    device — see :func:`to_host`; the cpu path is byte-identical to a plain
+    ``.numpy()``), ``numpy.ndarray``, tuples / lists / namedtuples
+    (recursed), and dicts (key order). Anything else raises ``TypeError`` —
+    explicit, never silently dropped.
     """
     if isinstance(outputs, core.Tensor):
-        return [outputs.numpy()]
+        return [to_host(outputs).numpy()]
     if isinstance(outputs, np.ndarray):
         return [outputs]
     if isinstance(outputs, (tuple, list)):

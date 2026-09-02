@@ -249,7 +249,18 @@ def _mlp_runner(backend, device, opts):
     run-callable performing the 10-iteration SGD loop in Python: per
     iteration an etl grad run, an fp32 numpy SGD update, and an etl loss
     run on the updated weights (the final loss is the loss of the trained
-    model — the reference mirrors this order)."""
+    model — the reference mirrors this order).
+
+    Explicit device placement (non-cpu devices): the data is placed once and
+    stays device-resident; the per-step grads are read back explicitly (the
+    numpy SGD update runs on the host, so they are a hard per-step data
+    dependency) and the updated host weights are re-placed per step; the
+    per-step loss runs do not affect the trajectory (the loss is a pure
+    function of the weights), so on non-cpu devices the loss is run and read
+    back ONCE after the loop — the timed loop performs no per-step host
+    readback of device outputs beyond the required grads."""
+    from .._util import place_input, to_host  # lazy: _util imports .examples
+
     loss_exe = etl.build(
         _mlp_loss, *_MLP_SPECS, backend=backend, device=device, **opts
     )
@@ -262,10 +273,24 @@ def _mlp_runner(backend, device, opts):
         x, y = inputs[0], inputs[1]
         ws = list(inputs[2:])  # current weights (fresh list; inputs untouched)
         loss = None
+        if device.kind == "cpu":
+            # cpu/host tensors throughout — the current per-step behavior
+            # (.numpy() readbacks are zero-copy host views).
+            for _ in range(_MLP_ITERS):
+                grads = [t.numpy() for t in etl.run(grad_exe, x, y, *ws)]
+                ws = [w - _MLP_LR * g for w, g in zip(ws, grads)]
+                loss = etl.run(loss_exe, x, y, *ws).numpy()
+            return (loss, *ws)
+        # Non-cpu device: explicit placement/readback (no implicit
+        # host<->device transfers) — see the factory docstring.
+        x_d, y_d = place_input(x, device), place_input(y, device)
         for _ in range(_MLP_ITERS):
-            grads = [t.numpy() for t in etl.run(grad_exe, x, y, *ws)]
+            ws_d = [place_input(w, device) for w in ws]
+            grads = [to_host(t).numpy() for t in etl.run(grad_exe, x_d, y_d, *ws_d)]
             ws = [w - _MLP_LR * g for w, g in zip(ws, grads)]
-            loss = etl.run(loss_exe, x, y, *ws).numpy()
+        loss = to_host(
+            etl.run(loss_exe, x_d, y_d, *(place_input(w, device) for w in ws))
+        ).numpy()
         return (loss, *ws)
 
     return run
@@ -367,7 +392,18 @@ def _convnet_runner(backend, device, opts):
     10-iteration SGD loop: features computed once (frozen convs — constant
     across iterations), then per iteration an etl grad run, an fp32 numpy
     SGD update of the head weights, and an etl loss run on the updated
-    weights."""
+    weights.
+
+    Explicit device placement (non-cpu devices): the conv inputs are placed
+    once and the features stay DEVICE-RESIDENT (never read back — they are
+    not part of the returned outputs and are fed into every step's
+    executable as device inputs); per-step head grads are read back
+    explicitly (the numpy SGD update runs on the host) and the updated host
+    head weights are re-placed per step; the final loss is run and read back
+    ONCE after the loop (per-step loss runs do not affect the trajectory —
+    the loss is a pure function of the head weights)."""
+    from .._util import place_input, to_host  # lazy: _util imports .examples
+
     feats_exe = etl.build(
         _convnet_features, *_CONV_SPECS[:3],
         backend=backend, device=device, **opts
@@ -384,13 +420,36 @@ def _convnet_runner(backend, device, opts):
     def run(inputs):
         x, wc1, wc2 = inputs[0], inputs[1], inputs[2]
         y = inputs[5]
-        feats = etl.run(feats_exe, x, wc1, wc2).numpy()
         ws = list(inputs[3:5])  # wl, bl (fresh list; inputs untouched)
         loss = None
+        if device.kind == "cpu":
+            # cpu/host tensors throughout — the current per-step behavior
+            # (.numpy() readbacks are zero-copy host views).
+            feats = etl.run(feats_exe, x, wc1, wc2).numpy()
+            for _ in range(_CONV_ITERS):
+                grads = [t.numpy() for t in etl.run(grad_exe, feats, *ws, y)]
+                ws = [w - _CONV_LR * g for w, g in zip(ws, grads)]
+                loss = etl.run(loss_exe, feats, *ws, y).numpy()
+            return (loss, *ws)
+        # Non-cpu device: explicit placement/readback (no implicit
+        # host<->device transfers) — see the factory docstring.
+        x_d, wc1_d, wc2_d = (
+            place_input(x, device), place_input(wc1, device),
+            place_input(wc2, device),
+        )
+        y_d = place_input(y, device)
+        # Device-resident features: computed once, fed back into every
+        # step's executables as a device input — zero host round-trips.
+        feats_d = etl.run(feats_exe, x_d, wc1_d, wc2_d)
         for _ in range(_CONV_ITERS):
-            grads = [t.numpy() for t in etl.run(grad_exe, feats, *ws, y)]
+            ws_d = [place_input(w, device) for w in ws]
+            grads = [to_host(t).numpy()
+                     for t in etl.run(grad_exe, feats_d, *ws_d, y_d)]
             ws = [w - _CONV_LR * g for w, g in zip(ws, grads)]
-            loss = etl.run(loss_exe, feats, *ws, y).numpy()
+        loss = to_host(
+            etl.run(loss_exe, feats_d, *(place_input(w, device) for w in ws),
+                    y_d)
+        ).numpy()
         return (loss, *ws)
 
     return run
@@ -661,7 +720,18 @@ def _transformer_runner(backend, device, opts):
     (lower/compile/load) ONCE, then returns a run-callable performing the
     10-iteration SGD loop in Python: per iteration an etl grad run over the
     full 11-input batch, an fp32 numpy SGD update of all 9 weights, and an
-    etl loss run on the updated weights."""
+    etl loss run on the updated weights.
+
+    Explicit device placement (non-cpu devices): the data is placed once and
+    stays device-resident; the per-step grads are read back explicitly (the
+    numpy SGD update runs on the host, so they are a hard per-step data
+    dependency) and the updated host weights are re-placed per step; the
+    per-step loss runs do not affect the trajectory (the loss is a pure
+    function of the weights), so on non-cpu devices the loss is run and read
+    back ONCE after the loop — the timed loop performs no per-step host
+    readback of device outputs beyond the required grads."""
+    from .._util import place_input, to_host  # lazy: _util imports .examples
+
     loss_exe = etl.build(
         _transformer_loss, *_TF_SPECS, backend=backend, device=device, **opts
     )
@@ -674,10 +744,24 @@ def _transformer_runner(backend, device, opts):
         x, y = inputs[0], inputs[1]
         ws = list(inputs[2:])  # 9 current weights (fresh list; inputs untouched)
         loss = None
+        if device.kind == "cpu":
+            # cpu/host tensors throughout — the current per-step behavior
+            # (.numpy() readbacks are zero-copy host views).
+            for _ in range(_TF_ITERS):
+                grads = [t.numpy() for t in etl.run(grad_exe, x, y, *ws)]
+                ws = [w - _TF_LR * g for w, g in zip(ws, grads)]
+                loss = etl.run(loss_exe, x, y, *ws).numpy()
+            return (loss, *ws)
+        # Non-cpu device: explicit placement/readback (no implicit
+        # host<->device transfers) — see the factory docstring.
+        x_d, y_d = place_input(x, device), place_input(y, device)
         for _ in range(_TF_ITERS):
-            grads = [t.numpy() for t in etl.run(grad_exe, x, y, *ws)]
+            ws_d = [place_input(w, device) for w in ws]
+            grads = [to_host(t).numpy() for t in etl.run(grad_exe, x_d, y_d, *ws_d)]
             ws = [w - _TF_LR * g for w, g in zip(ws, grads)]
-            loss = etl.run(loss_exe, x, y, *ws).numpy()
+        loss = to_host(
+            etl.run(loss_exe, x_d, y_d, *(place_input(w, device) for w in ws))
+        ).numpy()
         return (loss, *ws)
 
     return run

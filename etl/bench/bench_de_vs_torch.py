@@ -113,6 +113,7 @@ import numpy as np
 
 import etl
 from etl import core
+from etl.bench._util import place_input, to_host
 
 __all__ = [
     "main", "run_benchmark", "de_step", "GPU_CELLS", "CPU_CELLS",
@@ -321,29 +322,39 @@ def _pick_free_gpu(min_free_mib=2048):
 # ---------------------------------------------------------------------------
 
 
-def _etl_device_trace(exe, steps, key0, state0):
+def _etl_device_trace(exe, steps, key0, state0, device):
     """steps same-device iterations feeding device outputs back in; returns
-    (bests, final_state, final_key) with per-step best read back (untimed)."""
-    key = np.array(key0)
-    state = np.asarray(state0)
+    (bests, final_state, final_key) with per-step best read back (untimed —
+    the determinism/monotonicity sanity readbacks). Host inputs are placed
+    explicitly on the executable's device ONCE up front (a no-op on cpu
+    devices); readbacks of device outputs are explicit (``to_host``)."""
+    key = place_input(np.array(key0), device)
+    state = place_input(np.asarray(state0), device)
     bests = []
     for _ in range(steps):
         state, best, key = etl.run(exe, key, state)
-        bests.append(float(np.asarray(best.numpy())))
-    return np.array(bests), np.asarray(state.numpy()), np.asarray(key.numpy())
+        bests.append(float(np.asarray(to_host(best).numpy())))
+    return (
+        np.array(bests),
+        np.asarray(to_host(state).numpy()),
+        np.asarray(to_host(key).numpy()),
+    )
 
 
-def _etl_host_trace(exe, steps, key0, state0):
-    """steps HOST-RESTAGING iterations (fresh host numpy inputs, outputs read
-    back via .numpy() every step); returns (bests, final_state, final_key)."""
+def _etl_host_trace(exe, steps, key0, state0, device):
+    """steps HOST-RESTAGING iterations (fresh host numpy inputs placed
+    explicitly per step, outputs read back every step — untimed); returns
+    (bests, final_state, final_key)."""
     key = np.array(key0)
     state = np.array(state0, copy=True)
     bests = []
     for _ in range(steps):
-        state_t, best, key_t = etl.run(exe, key, state)
-        bests.append(float(np.asarray(best.numpy())))
-        state = np.asarray(state_t.numpy())
-        key = np.asarray(key_t.numpy())
+        state_t, best, key_t = etl.run(
+            exe, place_input(key, device), place_input(state, device)
+        )
+        bests.append(float(np.asarray(to_host(best).numpy())))
+        state = np.asarray(to_host(state_t).numpy())
+        key = np.asarray(to_host(key_t).numpy())
     return np.array(bests), state, key
 
 
@@ -360,10 +371,14 @@ def _torch_trace(state0_np, gen_seed, steps):
     return np.array(bests)
 
 
-def _etl_device_pass(exe, key0, state0, warmup, timed):
-    """One timed pass of the same-device pattern; returns per-step ms."""
-    key = np.array(key0)
-    state = np.asarray(state0)
+def _etl_device_pass(exe, key0, state0, warmup, timed, device):
+    """One timed pass of the same-device pattern; returns per-step ms. The
+    host key/state are placed explicitly on the executable's device ONCE up
+    front (a no-op on cpu devices); timed steps then feed the previous
+    step's device-resident outputs back in — no per-step host readback (the
+    timed loop measures pure run time)."""
+    key = place_input(np.array(key0), device)
+    state = place_input(np.asarray(state0), device)
     for _ in range(warmup):  # untimed (step 1 stages the host state once)
         state, _best, key = etl.run(exe, key, state)
     times = []
@@ -374,20 +389,29 @@ def _etl_device_pass(exe, key0, state0, warmup, timed):
     return times
 
 
-def _etl_host_pass(exe, key0, state0, warmup, timed):
-    """One timed pass of the FINAL-5 host-restaging pattern; per-step ms."""
+def _etl_host_pass(exe, key0, state0, warmup, timed, device):
+    """One timed pass of the FINAL-5 host-restaging pattern; per-step ms.
+    Every step explicitly places the fresh host inputs on the executable's
+    device and reads the outputs back to host (``to_host``) — the per-step
+    host round-trip IS the pattern under measurement (on cpu devices both
+    are no-ops, so the cpu path is byte-identical to the previous implicit
+    behavior)."""
     key = np.array(key0)
     state = np.array(state0, copy=True)
     for _ in range(warmup):
-        state_t, _best, key_t = etl.run(exe, key, state)
-        state = np.asarray(state_t.numpy())
-        key = np.asarray(key_t.numpy())
+        state_t, _best, key_t = etl.run(
+            exe, place_input(key, device), place_input(state, device)
+        )
+        state = np.asarray(to_host(state_t).numpy())
+        key = np.asarray(to_host(key_t).numpy())
     times = []
-    for _ in range(timed):  # every step: host in, .numpy() readback out
+    for _ in range(timed):  # every step: host in, explicit readback out
         t0 = time.perf_counter()
-        state_t, _best, key_t = etl.run(exe, key, state)
-        state = np.asarray(state_t.numpy())
-        key = np.asarray(key_t.numpy())
+        state_t, _best, key_t = etl.run(
+            exe, place_input(key, device), place_input(state, device)
+        )
+        state = np.asarray(to_host(state_t).numpy())
+        key = np.asarray(to_host(key_t).numpy())
         times.append((time.perf_counter() - t0) * 1e3)
     return times
 
@@ -459,21 +483,21 @@ class SideResult:
         return 1000.0 / self.median_ms
 
 
-def _trace_etl(exe, pattern, steps, key0, state0):
+def _trace_etl(exe, pattern, steps, key0, state0, device):
     """One untimed 50-step trace of an etl pattern; returns
     ``(bests, final_state)`` with per-step best read back."""
     trace = _etl_device_trace if pattern == "device" else _etl_host_trace
-    bests, state, _key = trace(exe, steps, key0, state0)
+    bests, state, _key = trace(exe, steps, key0, state0, device)
     return bests, state
 
 
-def _sanity_etl(exe, pattern, p, d, key0, state0, steps, label):
+def _sanity_etl(exe, pattern, p, d, key0, state0, steps, label, device):
     """etl same-key determinism + monotone-decrease sanity for one pattern:
     two trajectories from the same initial key/state must be BIT-IDENTICAL in
     best_fit and final state; best_fit must be monotone non-increasing and
     strictly improve over the run. Returns the first trajectory's bests."""
-    bests1, state1 = _trace_etl(exe, pattern, steps, key0, state0)
-    bests2, state2 = _trace_etl(exe, pattern, steps, key0, state0)
+    bests1, state1 = _trace_etl(exe, pattern, steps, key0, state0, device)
+    bests2, state2 = _trace_etl(exe, pattern, steps, key0, state0, device)
     _check_monotone_decreasing(bests1, label)
     if not np.array_equal(bests1, bests2):
         raise AssertionError(
@@ -514,9 +538,9 @@ def _gpu_cell(p, d, device, args):
 
     # sanity + determinism (untimed; also warms the device pools)
     dev_bests = _sanity_etl(exe, "device", p, d, key0, state0, args.steps,
-                            f"same-device ({p}x{d})")
+                            f"same-device ({p}x{d})", device)
     host_bests = _sanity_etl(exe, "host", p, d, key0, state0, args.steps,
-                             f"host-restaging ({p}x{d})")
+                             f"host-restaging ({p}x{d})", device)
     # the two GPU patterns run the SAME compiled exe from the SAME initial
     # state — host round-trips are exact f32 bit copies, so the trajectories
     # must agree bitwise
@@ -537,9 +561,11 @@ def _gpu_cell(p, d, device, args):
     for pass_i in range(args.passes):
         for side_i in PASS_ORDER[pass_i]:
             if side_i == 0:
-                t = _etl_device_pass(exe, key0, state0, args.warmup, args.steps)
+                t = _etl_device_pass(exe, key0, state0, args.warmup,
+                                     args.steps, device)
             elif side_i == 1:
-                t = _etl_host_pass(exe, key0, state0, args.warmup, args.steps)
+                t = _etl_host_pass(exe, key0, state0, args.warmup,
+                                   args.steps, device)
             else:
                 t = _torch_pass(state0, torch_gen_seed, args.warmup,
                                 args.steps, sync_each_step=True)
@@ -578,6 +604,7 @@ def _cpu_cell(p, d, args):
     _require_torch()  # loud early error when torch is missing
     global _TORCH_DEVICE
     _TORCH_DEVICE = "cpu"
+    cpu_device = core.Device("cpu", 0)
     specs = _specs(p, d)
     key0 = _new_key()
     state0 = _new_state(p, d, args.seed)
@@ -586,7 +613,7 @@ def _cpu_cell(p, d, args):
     exe = etl.build(de_step, *specs, backend="numpy")
     # etl numpy sanity + determinism
     bests = _sanity_etl(exe, "host", p, d, key0, state0, args.steps,
-                        f"etl-numpy ({p}x{d})")
+                        f"etl-numpy ({p}x{d})", cpu_device)
     # torch CPU sanity
     torch_gen_seed = KEY_SEED + args.seed
     torch_bests = _torch_trace(state0, torch_gen_seed, args.steps)
@@ -597,7 +624,8 @@ def _cpu_cell(p, d, args):
     for pass_i in range(args.passes):
         for side_i in CPU_ORDER[pass_i]:
             if side_i == 0:
-                t = _etl_host_pass(exe, key0, state0, args.warmup, args.steps)
+                t = _etl_host_pass(exe, key0, state0, args.warmup,
+                                   args.steps, cpu_device)
                 etl_times.append(t)
             else:
                 t = _torch_pass(state0, torch_gen_seed, args.warmup,
