@@ -2,16 +2,24 @@
 evox-style iterative stateful workloads (DE/PSO), validated at DE scale
 (state f32 (4096, 50), ~8 iree dispatches per step).
 
-Pattern (measured; see etl/backends/adapters/CONTEXT.md "Iterative
-stateful workloads"): build the step graph ONCE (target_backends=["cuda"],
-opt_level="O3"), then run N steps feeding each step's device-resident
-outputs (new state + split key) back as inputs. The FIRST call stages the
-host state once (unavoidable — there is no upload-only API); from the
-second call on every input is an iree-produced device tensor, so the
-pass-through rule applies: zero ``iree.runtime.asdevicearray`` calls and
-zero host round-trips. Measured on a shared 8-GPU box: same-device
-med ~0.15 ms (min 0.146, p90 ~0.16, quiet) vs ~1.05 ms quiet /
-1.5-2.8 ms noisy for fresh-host-state steps — 5-10x in-window.
+Pattern (explicit-placement model — see etl/core/tensor.py ``Tensor.to`` /
+``.numpy`` and the run-boundary contract in etl/pipeline.py; measured
+numbers in etl/backends/adapters/CONTEXT.md "Iterative stateful
+workloads"): build the step graph ONCE (target_backends=["cuda"],
+opt_level="O3"), place the INITIAL host state + key on the device ONCE via
+the explicit transfer API (``Tensor.to(cuda_device)`` — the iree
+``upload_tensor`` placement provider, one host->device copy), then run N
+steps feeding each step's device-resident outputs (new state + split key)
+back as inputs. The run boundary performs NO implicit device<->host
+transfer, so every input of every call — INCLUDING the first — is an
+already-placed device tensor: the pass-through rule applies from the first
+call on, with zero ``iree.runtime.asdevicearray`` calls and zero host
+round-trips across the whole loop. Re-staging state every step is only
+possible as an explicit per-step host->device ``.to(...)`` upload (the
+pattern this suite benchmarks against). Measured on a shared 8-GPU box:
+same-device med ~0.15 ms (min 0.146, p90 ~0.16, quiet) vs ~1.05 ms quiet /
+1.5-2.8 ms noisy for per-step uploads of fresh host state (~800 KB) —
+5-10x in-window.
 
 Structural pins (robust on a shared box; absolutes move +/-3x):
 * correctness: two loops started from the same initial key are
@@ -19,15 +27,16 @@ Structural pins (robust on a shared box; absolutes move +/-3x):
   device-resident Tensor with the declared shape/dtype on the
   executable's device; a first-step cross-check vs the numpy backend
   (the reference) agrees to fp32 tolerance.
-* zero-asdevicearray: from step 2 on the monkeypatched
-  ``iree.runtime.asdevicearray`` must never fire (only the fallback path
-  for >16 MB / unmappable / non-cuda inputs uses it).
+* zero-asdevicearray: with the initial key/state placed via ``.to(...)``
+  up front, the monkeypatched ``iree.runtime.asdevicearray`` must never
+  fire — from the FIRST call on every input is device-resident (only the
+  fallback path for >16 MB / unmappable / non-cuda inputs uses it).
 Perf smoke (loose bounds, A/B interleaved in one process window so box
 noise cancels): the same-device loop's median must be BELOW the
-host-input loop's median (measured 5-10x gap; a regression to per-step
-host staging would flip or erase it), the same-device median must stay
-under 2.5 ms (measured 0.15-0.9 ms incl. busy windows), and the last-50
-median must not drift beyond 4x the first-50 (no intrinsic drift
+per-step-upload loop's median (measured 5-10x gap; a regression to
+per-step host staging would flip or erase it), the same-device median must
+stay under 2.5 ms (measured 0.15-0.9 ms incl. busy windows), and the
+last-50 median must not drift beyond 4x the first-50 (no intrinsic drift
 measured at this churn; the documented ~80 MB-churn drift mode reached
 4.3x over 500 runs).
 """
@@ -126,9 +135,15 @@ def exe(cuda_device):
 
 
 def _np(v):
-    # Device-resident Tensors materialize via .numpy() (lazy D2H copy);
-    # plain np.asarray on a Tensor would yield an object scalar.
-    return np.asarray(v.numpy()) if isinstance(v, etl.Tensor) else np.asarray(v)
+    # Host access on device-resident Tensors is EXPLICIT: a non-cpu-kind
+    # payload (cuda) raises on .numpy() (no implicit device-to-host
+    # transfer), so materialize via the explicit .to(cpu) hop first. Safe
+    # on llvm-cpu too: .to() is a same-device no-op returning self and
+    # .numpy() stays lazy (nothing else in this file runs llvm-cpu).
+    # Plain np.asarray on a Tensor would yield an object scalar.
+    if isinstance(v, etl.Tensor):
+        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
+    return np.asarray(v)
 
 
 def _device_loop(exe, steps, key, state):
@@ -146,8 +161,12 @@ def _device_loop(exe, steps, key, state):
 # correctness
 # ---------------------------------------------------------------------------
 def test_loop_bit_deterministic_and_device_resident(exe, cuda_device):
-    key_a, state_a = _new_key(7), _new_state(0)
-    key_b, state_b = _new_key(7), _new_state(0)
+    # The run boundary never transfers: initial host values are placed on
+    # the device ONCE (explicit .to() upload) before each loop starts.
+    key_a = etl.core.Tensor(_new_key(7)).to(cuda_device)
+    state_a = etl.core.Tensor(_new_state(0)).to(cuda_device)
+    key_b = etl.core.Tensor(_new_key(7)).to(cuda_device)
+    state_b = etl.core.Tensor(_new_state(0)).to(cuda_device)
     seq_a = []
     for _ in range(12):
         state_a, key_a = etl.run(exe, key_a, state_a)
@@ -165,12 +184,19 @@ def test_loop_bit_deterministic_and_device_resident(exe, cuda_device):
         assert np.array_equal(_np(key_b), k_a)
 
 
-def test_first_step_matches_numpy_backend_reference(exe):
+def test_first_step_matches_numpy_backend_reference(exe, cuda_device):
     # The numpy interpreter is the random-op reference; the compiled cuda
     # step must agree on the fused graph to fp32 tolerance (parity suites
-    # own the strict per-op bit-exactness pins).
+    # own the strict per-op bit-exactness pins). The cuda executable
+    # rejects host inputs at the run boundary, so the initial values are
+    # placed on the device via the explicit .to() upload; the numpy
+    # reference takes the plain host arrays.
     key, state = _new_key(7), _new_state(0)
-    cuda_out = etl.run(exe, key, state)
+    cuda_out = etl.run(
+        exe,
+        etl.core.Tensor(key).to(cuda_device),
+        etl.core.Tensor(state).to(cuda_device),
+    )
     np_out = etl.evaluate(de_step, key, state, backend="numpy")
     for c, n in zip(etl.tree_leaves(etl.tree_map(_np, cuda_out)),
                     etl.tree_leaves(etl.tree_map(_np, np_out))):
@@ -179,10 +205,16 @@ def test_first_step_matches_numpy_backend_reference(exe):
 
 
 # ---------------------------------------------------------------------------
-# structural: zero asdevicearray from the second call on
+# structural: zero asdevicearray from the first call on
 # ---------------------------------------------------------------------------
-def test_zero_asdevicearray_from_second_call(exe, monkeypatch):
+def test_zero_asdevicearray_from_first_call(exe, cuda_device, monkeypatch):
     import iree.runtime as rt
+
+    # Place the initial host values BEFORE the counting wrapper goes up
+    # (placement is an explicit one-shot upload, not a run step); every
+    # run call below is then a pure same-device pass-through.
+    key = etl.core.Tensor(_new_key(7)).to(cuda_device)
+    state = etl.core.Tensor(_new_state(1)).to(cuda_device)
 
     calls = []
 
@@ -192,43 +224,48 @@ def test_zero_asdevicearray_from_second_call(exe, monkeypatch):
 
     real = rt.asdevicearray
     monkeypatch.setattr(rt, "asdevicearray", _counting)
-    key, state = _new_key(7), _new_state(1)
-    state, key = etl.run(exe, key, state)  # step 1: host staging (allowed)
-    first_step_calls = len(calls)
-    for _ in range(20):                    # steps 2..21: pure pass-through
+    for _ in range(21):  # steps 1..21: pure pass-through, first included
         state, key = etl.run(exe, key, state)
-    assert len(calls) == first_step_calls  # ZERO asdevicearray on steps 2+
+    assert len(calls) == 0  # ZERO asdevicearray on EVERY step incl. the first
 
 
 # ---------------------------------------------------------------------------
 # perf smoke (loose bounds; A/B interleaved so shared-box noise cancels)
 # ---------------------------------------------------------------------------
-def test_same_device_loop_beats_host_restaging_and_stays_flat(exe):
+def test_same_device_loop_beats_host_restaging_and_stays_flat(exe, cuda_device):
     def _med(xs):
         return float(np.median(xs))
 
-    # Host-restaging loop: fresh host numpy state + key every step.
+    # Per-step-upload loop (the pattern to avoid — still legal under the
+    # explicit-placement model): fresh host numpy state every step, placed
+    # on the device via an explicit .to() upload (~800 KB per step) before
+    # the run. Only state is re-uploaded: the key was placed once up front
+    # and passes through device-resident (mirrors the old loop's shape).
+    fresh_states = [_new_state(2) for _ in range(24)]
+    key_h = etl.core.Tensor(_new_key(7)).to(cuda_device)
     h_times = []
-    key_h, state_h = _new_key(7), _new_state(2)
-    for _ in range(24):
-        state_h = _new_state(2)  # fresh host state each step (evox round-4)
+    for i in range(24):
         t0 = time.perf_counter()
-        state_h, key_h = etl.run(exe, key_h, state_h)
+        state_h, key_h = etl.run(
+            exe, key_h, etl.core.Tensor(fresh_states[i]).to(cuda_device)
+        )
         h_times.append((time.perf_counter() - t0) * 1e3)
     h_med = _med(h_times)
 
-    # Same-device loop: 200 steps feeding device outputs back.
-    key_d, state_d = _new_key(7), _new_state(3)
-    t0 = time.perf_counter()
-    state_d, key_d = etl.run(exe, key_d, state_d)  # one-time host staging
+    # Same-device loop: initial values placed once up front, then 200
+    # steps feeding device outputs back (pure pass-through — the FIRST run
+    # included, since the initial .to() placement already happened above).
+    key_d = etl.core.Tensor(_new_key(7)).to(cuda_device)
+    state_d = etl.core.Tensor(_new_state(3)).to(cuda_device)
     d_times, _, _ = _device_loop(exe, 200, key_d, state_d)
     d_med, d_p90 = _med(d_times), float(np.percentile(d_times, 90))
     drift = _med(d_times[150:]) / max(_med(d_times[:50]), 1e-6)
 
     # Measured: d ~0.15 (quiet) / 0.19-0.9 ms (noisy); h ~1.05 (quiet) /
-    # 1.5-2.8 ms (noisy). The relative pin is the robust discriminator.
+    # 1.5-2.8 ms (noisy, ~800 KB per-step .to() uploads). The relative pin
+    # is the robust discriminator.
     assert d_med < h_med, (
-        f"same-device median {d_med:.3f} ms NOT below host-restaging "
+        f"same-device median {d_med:.3f} ms NOT below per-step-upload "
         f"{h_med:.3f} ms — per-step host staging likely re-entered the loop"
     )
     assert d_med < 2.5, f"same-device median {d_med:.3f} ms — runaway"

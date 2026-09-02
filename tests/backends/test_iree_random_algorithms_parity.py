@@ -42,9 +42,16 @@ The xla adapter declares
 user-provided PJRT plugin (``ETL_PJRT_PLUGIN``/``plugin_path``) — there
 are NO xla tests here.
 
-The iree-cuda smoke set (device 5, ``target_backends=["cuda"]``) skips when
-the IREE cuda HAL driver or the GPU is unavailable (same guard style as
-``test_iree_emitters_parity.py``; while-loop graphs are not involved here).
+The iree-cuda smoke set (``target_backends=["cuda"]``) runs on a free GPU
+scanned via nvidia-smi (most-free device; ``etl Device("cuda", idx)`` maps to
+iree device_id ``idx + 1``) and skips when the IREE cuda HAL driver or any GPU
+is unavailable (same guard style as ``test_iree_emitters_parity.py``;
+while-loop graphs are not involved here). Under the explicit-placement model
+the smokes PLACE their host key inputs on the cuda device before the run
+(``etl.core.Tensor(key).to(cuda_device)`` — plain cuda runs never stage host
+inputs) and read the device-resident run outputs via an EXPLICIT
+device-to-host copy (``Tensor.to(etl.core.Device("cpu", 0)).numpy()`` — see
+``_np``); the uniform parity pins stay bit-exact vs numpy.
 """
 
 import numpy as np
@@ -100,9 +107,17 @@ RANDOM_NORMAL_TOL = dict(rtol=1e-4, atol=1e-5)
 def _np(v):
     """Tensor / list-or-tuple-of-Tensors -> ndarray / same-shaped ndarray
     container (the native ``exe.run([...])`` path returns a LIST of flat
-    Tensors)."""
+    Tensors).
+
+    Host materialization is EXPLICIT under the explicit-placement model:
+    any payload-backed tensor (llvm-cpu or cuda) is transferred to host via
+    ``Tensor.to(etl.core.Device("cpu", 0))`` first (``.numpy()`` on a
+    non-cpu-kind payload would raise ``DeviceError`` — no implicit
+    device-to-host transfer). ndarray-backed tensors already live on cpu:0,
+    so ``.to`` returns them unchanged (zero-copy preserved).
+    """
     if isinstance(v, etl.Tensor):
-        return np.asarray(v.numpy())
+        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
     if isinstance(v, (list, tuple)):
         return type(v)(_np(x) for x in v)
     return np.asarray(v)
@@ -123,25 +138,74 @@ def _assert_close(got, want, rtol=1e-5, atol=1e-5):
 
 
 def _parity(fn, spec, key, exact=True, **iree_kwargs):
-    """Build on iree, run, and compare vs ``etl.evaluate`` (numpy reference)."""
+    """Build on iree, run, and compare vs ``etl.evaluate`` (numpy reference).
+
+    Explicit-placement semantics: when ``iree_kwargs`` names a NON-cpu
+    ``device`` (cuda), the host ``key`` is PLACED on that device before the
+    run (``etl.core.Tensor(key).to(device)`` — a cuda run never stages host
+    inputs at the run boundary); run outputs are compared after an explicit
+    device-to-host copy (``_np`` materializes through
+    ``Tensor.to(Device('cpu', 0))``). On cpu devices the raw numpy key stays
+    legal (host-input representation path unchanged).
+    """
+    device = iree_kwargs.get("device")
     want = etl.evaluate(fn, key)
     exe = etl.build(fn, spec, backend="iree", **iree_kwargs)
-    got = etl.run(exe, key)
+    run_input = (
+        key
+        if device is None or device.kind == "cpu"
+        else etl.core.Tensor(key).to(device)
+    )
+    got = etl.run(exe, run_input)
     if exact:
         _assert_exact(got, want)
     else:
         _assert_close(got, want)
 
 
-def _require_cuda():
-    """Skip when the IREE cuda HAL driver or GPU 5 is unavailable."""
+def _pick_cuda_device_index():
+    """Most-free GPU index via nvidia-smi; ``pytest.skip`` when unavailable."""
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi") is None:
+        pytest.skip("nvidia-smi not found — no CUDA device to test")
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(f"nvidia-smi failed: {exc}")
+    if proc.returncode != 0:
+        pytest.skip(f"nvidia-smi failed: {proc.stderr.strip()}")
+    gpus = []
+    for line in proc.stdout.strip().splitlines():
+        try:
+            idx, free_mib = (part.strip() for part in line.split(","))
+            gpus.append((int(free_mib), int(idx)))
+        except ValueError:
+            continue  # malformed line — ignore
+    if not gpus:
+        pytest.skip("nvidia-smi reported no GPUs")
+    gpus.sort(reverse=True)
+    return gpus[0][1]
+
+
+@pytest.fixture(scope="module")
+def cuda_device():
+    """A free CUDA device (most-free GPU via nvidia-smi); skip when
+    unavailable (GPU-guarded; replaces the fixed-device-5 guard)."""
+    idx = _pick_cuda_device_index()
     import iree.runtime as rt
 
     try:
-        # etl Device("cuda", 5) maps to iree device_id 6 (1-based ids).
-        rt.get_driver("cuda").create_device(device_id=6)
+        # etl Device("cuda", idx) maps to iree device_id idx + 1 (1-based).
+        rt.get_driver("cuda").create_device(device_id=idx + 1)
     except Exception as exc:  # noqa: BLE001 — any driver/device failure skips
-        pytest.skip(f"IREE cuda HAL driver or GPU 5 unavailable: {exc}")
+        pytest.skip(f"IREE cuda HAL driver or GPU {idx} unavailable: {exc}")
+    return etl.core.Device("cuda", idx)
 
 
 def _signature(graph) -> Signature:
@@ -479,37 +543,45 @@ def test_cross_roundtrip_determinism():
 
 
 # ---------------------------------------------------------------------------
-# 7. iree-cuda smoke set (device 5; while-loop graphs not involved here)
+# 7. iree-cuda smoke set (most-free GPU via nvidia-smi, explicit placement;
+#    while-loop graphs not involved here)
 # ---------------------------------------------------------------------------
 
 
-def test_iree_cuda_threefry_inline_uniform_smoke():
+def test_iree_cuda_threefry_inline_uniform_smoke(cuda_device):
     """INLINE threefry on cuda — pinned via the per-call override (the
-    adapter default on cuda is native THREE_FRY)."""
-    _require_cuda()
+    adapter default on cuda is native THREE_FRY). The host key is PLACED on
+    the cuda device before the run (``etl.core.Tensor(key).to(cuda_device)``
+    — plain cuda runs never stage host inputs) and the device-resident
+    output is compared bit-exact via an explicit device-to-host copy
+    (``_np`` → ``t.to(Device('cpu', 0)).numpy()``)."""
     _parity(
         _uniform5, KEY_SPECS["threefry2x32"], KEYS["threefry2x32"][-1],
-        exact=True, device=etl.core.Device("cuda", 5),
+        exact=True, device=cuda_device,
         target_backends=["cuda"], rng_bit_generator=frozenset(),
     )
 
 
-def test_iree_cuda_philox_inline_uniform_smoke():
+def test_iree_cuda_philox_inline_uniform_smoke(cuda_device):
     """PHILOX on cuda stays on the bit-exact INLINE path (pinned via the
-    override for explicitness — the iree capability has no native PHILOX)."""
-    _require_cuda()
+    override for explicitness — the iree capability has no native PHILOX).
+    The host key is placed on ``cuda_device`` before the run; the
+    device-resident output is compared bit-exact via an explicit
+    device-to-host copy (``_np`` → ``t.to(Device('cpu', 0)).numpy()``)."""
     _parity(
         _uniform5, KEY_SPECS["philox4x32_10"], KEYS["philox4x32_10"][-1],
-        exact=True, device=etl.core.Device("cuda", 5),
+        exact=True, device=cuda_device,
         target_backends=["cuda"], rng_bit_generator=frozenset(),
     )
 
 
-def test_iree_cuda_threefry_native_uniform_smoke():
+def test_iree_cuda_threefry_native_uniform_smoke(cuda_device):
     """Native THREE_FRY on cuda — the manual LoweredProgram recipe with
-    ``target_backends=["cuda"]`` + ``load(device=cuda 5)`` (this is also
-    the adapter default path on cuda)."""
-    _require_cuda()
+    ``target_backends=["cuda"]`` + ``load(device=cuda_device)`` (this is
+    also the adapter default path on cuda). The host key is PLACED on the
+    cuda device before the run (``Tensor.to`` — plain cuda runs never stage
+    host inputs); the device-resident output is compared bit-exact via an
+    explicit device-to-host copy (``_np`` → ``t.to(Device('cpu', 0)).numpy()``)."""
     spec = KEY_SPECS["threefry2x32"]
     key = KEYS["threefry2x32"][-1]
     graph = etl.trace(_uniform5, spec)
@@ -517,7 +589,7 @@ def test_iree_cuda_threefry_native_uniform_smoke():
     artifact = adapter.compile(
         _lowered_native(graph), options={"target_backends": ["cuda"]}
     )
-    exe = adapter.load(artifact, device=etl.core.Device("cuda", 5))
+    exe = adapter.load(artifact, device=cuda_device)
     want = etl.evaluate(_uniform5, key)
-    got = exe.run([etl.core.Tensor(key.copy())])
+    got = exe.run([etl.core.Tensor(key.copy()).to(cuda_device)])
     _assert_exact(got, want)
