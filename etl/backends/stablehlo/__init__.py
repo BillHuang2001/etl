@@ -53,8 +53,9 @@ def export(graph_or_module, options: dict | None = None) -> str:
             loop additionally carries an i1 ``done`` flag and, at every
             sweep boundary (inside a nested ``stablehlo.if``), checks the
             scale-aware relative off-diagonal energy of the current A
-            against a dtype tolerance (f32 tol 1e-6, f64 tol 1e-13 —
-            initial values, calibration home
+            against a calibrated dtype tolerance (f32 tol 3e-5 — commit
+            09e145d, fires sweep ~4 of 7 on dim-45/50 sample-covariance-
+            like matrices; f64 tol 1e-13 — calibration home
             ``tests/backends/test_iree_eigh_diag_parity.py``), exiting
             once converged so converged matrices skip their remaining
             scheduled sweeps (see the Writer's ``_emit_eigh`` /
