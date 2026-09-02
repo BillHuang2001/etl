@@ -204,7 +204,9 @@ def _install_jax_shim() -> None:
     Idempotent (a ``_etl_jax_shim`` marker on the ``jax`` shim
     short-circuits) and cheap. CRITICAL ORDERING: it must run BEFORE any
     ``tvm.relax.frontend.stablehlo`` import/use — hence it is called at the
-    top of both ``check_available()`` and ``ensure_compat()``.
+    top of ``check_available()`` (inside its try, so a missing jaxlib
+    surfaces as ``core.BackendError``, never a raw ImportError) and via
+    ``ensure_compat()``, which probes ``check_available()`` first.
 
     Edge cases:
     * ``sys.modules["jax"] = None`` (a jax-blocked process): the entry is
@@ -270,8 +272,13 @@ def ensure_compat() -> None:
     global _shims_applied
     if _shims_applied:
         return
-    _install_jax_shim()
+    # Probe first: check_available installs the jax shim inside its own try
+    # (before any tvm.relax.frontend.stablehlo import) and raises
+    # ``core.BackendError`` with the pip-install hint when TVM or jaxlib is
+    # missing — never a raw ImportError/ModuleNotFoundError. The explicit
+    # call below is then an idempotent no-op.
     check_available()
+    _install_jax_shim()
 
     ir = _mlir_bindings.ir  # jaxlib.mlir.ir via the binding-provider seam
     from tvm import relax
@@ -580,12 +587,17 @@ def check_available() -> None:
     The ``jax`` package is NOT probed — the translator's ``jax._src``
     import is satisfied by the shim installed first (``_install_jax_shim``).
     """
-    _install_jax_shim()
     hint = (
         "pip install etl[tvm] (apache-tvm>=0.26 with the StableHLO frontend "
         "and jaxlib for its MLIR python bindings)"
     )
     try:
+        # CRITICAL ORDERING: the jax shim must be installed before any
+        # tvm.relax.frontend.stablehlo import/use — it is the first
+        # statement of the try so that its lazy ``jaxlib.mlir.ir`` touch
+        # (missing jaxlib -> ImportError) is wrapped into BackendError
+        # below with the pip-install hint, never a raw ModuleNotFoundError.
+        _install_jax_shim()
         import tvm  # noqa: F401
         from jaxlib import mlir  # noqa: F401
         from jaxlib.mlir import ir  # noqa: F401
