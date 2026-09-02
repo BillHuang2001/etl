@@ -126,7 +126,9 @@ def exe(cuda_device):
 
 
 def _np(v):
-    return np.asarray(v) if isinstance(v, etl.Tensor) else np.asarray(v)
+    # Device-resident Tensors materialize via .numpy() (lazy D2H copy);
+    # plain np.asarray on a Tensor would yield an object scalar.
+    return np.asarray(v.numpy()) if isinstance(v, etl.Tensor) else np.asarray(v)
 
 
 def _device_loop(exe, steps, key, state):
@@ -170,7 +172,8 @@ def test_first_step_matches_numpy_backend_reference(exe):
     key, state = _new_key(7), _new_state(0)
     cuda_out = etl.run(exe, key, state)
     np_out = etl.evaluate(de_step, key, state, backend="numpy")
-    for c, n in zip(etl.tree_leaves(_np(cuda_out)), etl.tree_leaves(_np(np_out))):
+    for c, n in zip(etl.tree_leaves(etl.tree_map(_np, cuda_out)),
+                    etl.tree_leaves(etl.tree_map(_np, np_out))):
         assert c.shape == n.shape
         assert np.allclose(c, n, rtol=1e-4, atol=1e-4), f"{c} vs {n}"
 
@@ -190,10 +193,10 @@ def test_zero_asdevicearray_from_second_call(exe, monkeypatch):
     real = rt.asdevicearray
     monkeypatch.setattr(rt, "asdevicearray", _counting)
     key, state = _new_key(7), _new_state(1)
-    key, state = etl.run(exe, key, state)  # step 1: host staging (allowed)
+    state, key = etl.run(exe, key, state)  # step 1: host staging (allowed)
     first_step_calls = len(calls)
     for _ in range(20):                    # steps 2..21: pure pass-through
-        key, state = etl.run(exe, key, state)
+        state, key = etl.run(exe, key, state)
     assert len(calls) == first_step_calls  # ZERO asdevicearray on steps 2+
 
 
