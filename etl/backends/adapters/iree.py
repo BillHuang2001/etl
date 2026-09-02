@@ -59,16 +59,24 @@ imported at module top level, so ``import etl`` stays light):
   ``rt.load_vm_module(vm_module, config)``, which binds the module to a
   SPECIFIC acquired device.
 - ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
-  array into a HAL device buffer for function input (used only for the host
-  input FALLBACKS — oversized inputs, unmappable dtypes, non-cuda devices;
-  the cuda fast path stages host inputs through persistent host-local +
-  device buffers, see ``IreeExecutable.run`` / ``_staged_input``).
+  array into a HAL device buffer for function input. Plain llvm-cpu runs
+  use it as the host-ndarray representation path (host→host ABI
+  adaptation); plain cuda runs NEVER accept host inputs — placement is the
+  explicit ``t.to(Device('cuda', N))`` first (see ``upload_tensor``), and a
+  non-device input at a cuda run is rejected with ``core.DeviceError``.
+  Host-mode external-kernel boundaries still stage host tensors at kernel
+  boundaries via ``_staged_input`` (segment executables), with
+  ``asdevicearray`` as the fallback.
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
   handle, already resident on the device. Run outputs are wrapped into
   ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
-  ``.numpy()`` materializes a LAZY host copy (``DeviceArray.to_host()``) on
-  demand, so the hot run() path performs no host round-trip. Same-device
-  DeviceArray inputs are handed to the invoke directly (no copy).
+  host copy is materialized LAZILY and EXPLICITLY: ``.numpy()`` performs the
+  fresh host copy (``DeviceArray.to_host()``) for CPU-kind outputs, while
+  non-cpu outputs are read back via the explicit
+  ``t.to(core.Device('cpu', 0)).numpy()`` transfer (no implicit
+  device-to-host transfer), so the hot run() path performs no host
+  round-trip. Same-device DeviceArray inputs are handed to the invoke
+  directly (no copy).
 
 Staging is explicit and honest: ``compile`` NEVER loads, ``load`` NEVER
 re-lowers/re-compiles. Compiler failures surface as
@@ -125,10 +133,10 @@ from ..program import CompiledArtifact, LoweredProgram, Signature
 from ..registry import register as _registry_register
 
 # ---------------------------------------------------------------------------
-# CUDA per-call fast-path configuration (measured on IREE 3.11.0, RTX A6000)
+# CUDA host->device upload configuration (measured on IREE 3.11.0, RTX A6000)
 # ---------------------------------------------------------------------------
-# Host inputs on cuda executables are uploaded through PERSISTENT staging
-# buffers cached per (input index, shape, dtype), in TWO tiers:
+# Host data reaches a cuda HAL device through PERSISTENT staging buffers
+# cached per (input index, shape, dtype), in TWO tiers:
 #   * TINY inputs (<= _PINNED_DIRECT_MAX_BYTES, measured crossover ~16-32 KB
 #     on IREE 3.11.0 / RTX A6000): the host values are memcpy'd straight
 #     into the mapped view of a persistent DEVICE_LOCAL | HOST_VISIBLE
@@ -155,13 +163,24 @@ from ..registry import register as _registry_register
 # tier's semaphore wait races the dispatch against the copy (~0.4 % of runs
 # return garbage; verified by 1000-run alternating-value stress). The wait
 # is load-bearing. The pinned tier avoids the race by construction (no DMA).
+# WHO USES THIS MACHINERY (binding — explicit device placement, R6.2):
+# plain runs NEVER stage host inputs on cuda; an input that is not already
+# on the executable's device is rejected with core.DeviceError (the
+# pipeline run-boundary check does this first). The two consumers left are
+#   * the placement provider ``upload_tensor`` (``Tensor.to``; R6.3) — a
+#     ONE-SHOT upload per call through a FRESH per-call staging dict (fresh
+#     buffers, no cache);
+#   * the split external-call SEGMENT executables (``_IreeSegmentExecutable``)
+#     — host-mode external kernels legitimately stage host tensors at
+#     kernel boundaries; each cuda segment retains its own per-
+#     (index, shape, dtype) staging cache.
 # Two invariants keep the staging path correct and fast:
 #   * the DMA tier's fresh-semaphore wait is load-bearing (see above) — never
 #     drop it;
-#   * each cuda executable retains a small DEVICE-LOCAL anchor buffer
-#     (_pool_anchor) that keeps the classic allocator's pool from emptying,
-#     so per-call result allocation/free stays in-pool (~0.04 ms measured)
-#     for users who opt into the classic allocator via
+#   * each cuda segment executable retains a small DEVICE-LOCAL anchor
+#     buffer (_pool_anchor) that keeps the classic allocator's pool from
+#     emptying, so per-call result allocation/free stays in-pool
+#     (~0.04 ms measured) for users who opt into the classic allocator via
 #     --cuda_async_allocations=false (see _configure_cuda_runtime_flags).
 # The CUDA allocator flag itself is NOT set by etl: iree's process-global
 # default (--cuda_async_allocations=true, the stream-ordered allocator) is
@@ -445,10 +464,36 @@ def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
             "iree_runtime_args are parsed after it and win on conflict"
         ) from exc
 
+
+def _runtime_args_from_env() -> list[str]:
+    """Resolve the ``iree_runtime_args`` load option from ``ETL_IREE_RUNTIME_ARGS``.
+
+    ``upload_tensor`` (the placement provider) is not a pipeline stage, so
+    it performs here the env resolution the pipeline normally applies to
+    ``load`` (``etl.pipeline_options.apply_env_options``, stage ``"load"``)
+    — byte-identical parsing, so a placement honors process-global HAL
+    flags (e.g. the classic-allocator opt-in
+    ``--cuda_async_allocations=false``) exactly like a load does.
+    Precedence/laziness/malformed-value rules are the shared ones (explicit
+    values never exist here — upload_tensor has no options dict; a
+    malformed env value raises ``core.BackendError`` naming the variable
+    and value).
+    """
+    from etl.pipeline_options import apply_env_options  # lazy: stdlib+core
+
+    resolved = apply_env_options("iree", {}, "load")
+    return resolved.get("iree_runtime_args", [])
+
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from etl.ir import Module  # noqa: F401
 
-__all__ = ["IreeBackend", "IreeExecutable", "iree_backend", "register"]
+__all__ = [
+    "IreeBackend",
+    "IreeExecutable",
+    "iree_backend",
+    "register",
+    "upload_tensor",
+]
 
 
 def _dtype_capabilities() -> frozenset:
@@ -1166,24 +1211,31 @@ class IreeExecutable(CompilerExecutable):
        per-input shape — rank and STATIC dims must match
        (``core.ShapeError``); symbolic dims pass through (IREE executes
        runtime-dynamic shapes — validated).
-    2. Per input: a device-resident tensor whose payload is an IREE
+    2. Per input (EXPLICIT placement — no implicit host<->device transfers,
+       R6.2): a device-resident tensor whose payload is an IREE
        ``DeviceArray`` on THIS executable's device (kind+index) is passed
        to the invoke directly — no host round-trip, no copy. Any other
-       input (numpy-backed host tensor, payload on a different device) is
-       staged on cuda via ``_staged_input`` (persistent host-local source +
-       per-call DMA queue_copy into a persistent device staging buffer) or
-       copied into a HAL buffer via ``rt.asdevicearray`` (fallbacks) exactly
-       as before.
+       input is REJECTED on a cuda executable with ``core.DeviceError``
+       directing to ``t.to(...)`` (defensive — the pipeline run-boundary
+       check in ``etl/pipeline.py`` normally rejects foreign-device inputs
+       first with its own message; place inputs explicitly via
+       ``t.to(Device('cuda', N))`` before the run). On an llvm-cpu
+       executable a host numpy-backed input takes the
+       ``rt.asdevicearray`` representation path (host->host ABI
+       adaptation — llvm-cpu tests depend on it). Plain runs build FRESH
+       buffers every call — no staging cache, no anchor.
     3. Invoke the entry function; handle single/multiple results (the
        invoker returns the value or a tuple).
     4. Wrap each result in ``core.Tensor(IreeDevicePayload(...))`` — a
        DEVICE-RESIDENT tensor: ``.data`` is the payload (the DeviceArray
        already on the device), ``.device`` is this executable's
-       ``core.Device`` (``Device("cpu", 0)`` for the default CPU device),
-       and ``.numpy()`` performs a LAZY host copy (``DeviceArray.to_host()``)
-       on demand — the run() hot path never touches host memory. This holds
-       for both cuda AND llvm-cpu executables (on ``local-task`` the to_host
-       mapping is zero-copy for mappable buffers).
+       ``core.Device`` (``Device("cpu", 0)`` for the default CPU device).
+       Host materialization is explicit: CPU-kind outputs get a LAZY fresh
+       host copy in ``.numpy()`` (``DeviceArray.to_host()`` — on
+       ``local-task`` the mapping is zero-copy for mappable buffers), while
+       non-cpu outputs raise ``DeviceError`` in ``.numpy()`` and are read
+       back via ``t.to(core.Device('cpu', 0)).numpy()`` — the run() hot
+       path never touches host memory either way.
     5. Validate output count + dtype against the signature output specs.
 
     ``save`` / ``load`` are inherited from ``CompilerExecutable``: ``save``
@@ -1233,23 +1285,13 @@ class IreeExecutable(CompilerExecutable):
             tuple(signature.output_specs) if signature is not None else ()
         )
         self._entry: Any = None
-        # CUDA per-call fast path (see module-level notes): a retained
-        # device-local anchor buffer keeps the allocator pool warm so per-call
-        # result allocation/free stays ~0.04 ms; the staged-input cache holds
-        # persistent host-local source + device staging buffers per
-        # (index, shape, dtype).
-        self._pool_anchor: Any = None
-        self._staged_inputs: dict | None = None
-        if device is not None and device.kind == "cuda":
-            import iree.runtime as rt
-
-            self._staged_inputs = {}
-            try:
-                self._pool_anchor = runtime_device.allocator.allocate_buffer(
-                    rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
-                )
-            except Exception:
-                self._pool_anchor = None  # best-effort perf anchor, never fatal
+        # R6.2: plain runs carry NO staging machinery (no _staged_inputs
+        # cache, no _pool_anchor anchor) — inputs must already be on this
+        # executable's device (pass-through) or host ndarray on llvm-cpu
+        # (asdevicearray representation); buffers are built FRESH per call.
+        # The staging machinery lives on in _IreeSegmentExecutable
+        # (host-mode external-kernel boundaries) and in the upload_tensor
+        # placement provider (one-shot).
 
     # ------------------------------------------------------------------ run
 
@@ -1304,12 +1346,19 @@ class IreeExecutable(CompilerExecutable):
                 # mismatches raise core.ShapeError).
                 _validate_input_shape(i, spec.shape, shape)
 
+        # R6.2: plain runs build FRESH buffers every call — no staging
+        # cache. Same-device payload/DeviceArray inputs pass through;
+        # host ndarray inputs take the asdevicearray representation path on
+        # an llvm-cpu executable and are REJECTED with core.DeviceError on a
+        # cuda executable (no implicit host-to-device transfer; the pipeline
+        # run-boundary check rejects them first — this is defense-in-depth).
         buffers = _build_buffers(
             flat_input_tensors,
             input_specs,
             self.runtime_device,
             self._core_device,
-            self._staged_inputs,
+            None,  # plain runs never stage
+            reject_foreign=self._core_device.kind != "cpu",
         )
         entry = self._entry_function()
         results = entry(*buffers)
@@ -1399,9 +1448,16 @@ def _staged_input(
     index: int,
     tensor: core.Tensor,
 ) -> Any | None:
-    """Upload a host tensor through persistent staging buffers.
+    """Upload a host tensor through staging buffers (segment boundaries + placement).
 
-    CUDA fast path replacing ``rt.asdevicearray`` for host inputs, in
+    R6.2+ consumers (binding — plain ``IreeExecutable`` runs NEVER stage):
+    this helper now serves (a) the split external-call SEGMENT executables
+    (``_IreeSegmentExecutable``) — host-mode external kernels legitimately
+    stage host tensors at kernel boundaries, and (b) the ``upload_tensor``
+    placement provider, which passes a FRESH per-call staging dict so every
+    upload uses fresh buffers (one-shot, no cache).
+
+    CUDA fast path replacing ``rt.asdevicearray`` for host tensors, in
     two tiers (both fully synchronous — nothing is left racing):
 
     * TINY inputs (nbytes <= ``_PINNED_DIRECT_MAX_BYTES``): the values
@@ -1533,19 +1589,33 @@ def _build_buffers(
     runtime_device: Any,
     core_device: Device,
     staged_inputs: dict | None,
+    *,
+    reject_foreign: bool = False,
 ) -> list:
     """Build the HAL buffers for one invoke from validated input tensors.
 
-    Shared by ``IreeExecutable.run`` and the per-segment executor: an input
+    Shared by ``IreeExecutable.run`` and the per-segment executor. An input
     tensor already living on THIS device (payload-backed with a matching
     ``core.Device`` — our own ``IreeDevicePayload`` (run outputs of this or
     another iree executable, unwrapped to the underlying DeviceArray) or a
     raw iree ``DeviceArray``) is handed to the invoke as-is — no host
     round-trip, no re-upload; the caller's validation loop already proved
-    dtype/shape, so the payload is guaranteed correct. Anything else
-    (numpy-backed host input, payload on a different device) takes the
-    staged upload on cuda (``_staged_input``), else the classic
-    ``asdevicearray`` H2D copy path.
+    dtype/shape, so the payload is guaranteed correct.
+
+    Foreign (non-pass-through) input handling depends on the caller (R6.2 —
+    explicit device placement, no implicit host<->device transfers):
+
+    * plain ``IreeExecutable`` runs pass ``staged_inputs=None``: a host
+      ndarray-backed input takes the ``rt.asdevicearray`` representation
+      path on an llvm-cpu executable (host->host ABI adaptation), and is
+      REJECTED with ``core.DeviceError`` on a cuda executable
+      (``reject_foreign=True`` — defensive: the pipeline run-boundary
+      check normally rejects foreign-device inputs first with its own
+      message; place inputs explicitly via ``t.to(Device('cuda', N))``).
+    * segment executables pass their per-segment staging cache
+      (``reject_foreign=False``): host-mode external-kernel boundaries
+      legitimately stage host tensors via ``_staged_input`` on cuda, else
+      the asdevicearray fallback (non-cuda).
     """
     import numpy as np
     import iree.runtime as rt
@@ -1561,12 +1631,34 @@ def _build_buffers(
             and tensor.device == core_device
         ):
             buffers.append(data)
-        else:
+        elif reject_foreign:
+            # Plain cuda run with a non-pass-through input (ndarray-backed
+            # host tensor or a payload on another device). Normally
+            # unreachable — the pipeline run-boundary check rejects
+            # wrong-device inputs first; this guards direct backend-level
+            # users of the executable.
+            raise core.DeviceError(
+                f"input {i} is not a device-resident tensor on this "
+                f"executable's device ({core_device!r}) and plain cuda runs "
+                "never stage host inputs: there is no implicit "
+                "host-to-device transfer at the run boundary. Place the "
+                f"input on the device explicitly first, e.g. "
+                f"t.to({core_device!r}), or run the executable on the "
+                "llvm-cpu device with host ndarray inputs"
+            )
+        elif staged_inputs is not None:
             staged = _staged_input(staged_inputs, runtime_device, i, tensor)
             if staged is not None:
                 buffers.append(staged)
-            else:
-                buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
+                continue
+            buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
+        else:
+            # Plain llvm-cpu executable: host ndarray input -> HAL buffer
+            # (host->host ABI representation). A foreign DEVICE payload
+            # reaching here fails inside tensor.numpy() with core's own
+            # DeviceError (no implicit device-to-host transfer) — also
+            # normally unreachable (the run-boundary check rejects first).
+            buffers.append(rt.asdevicearray(runtime_device, tensor.numpy()))
     return buffers
 
 
@@ -1593,8 +1685,11 @@ class _IreeSegmentExecutable:
         self.core_device = core_device
         self.input_specs = input_specs
         self._entry: Any = None
-        # CUDA per-call fast path: the same persistent staging machinery as
-        # IreeExecutable (one cache per segment — inputs repeat per run).
+        # CUDA per-call fast path (R6.2: removed from the plain
+        # IreeExecutable — retained HERE, one cache per segment, because
+        # host-mode external-kernel boundaries legitimately stage host
+        # tensors at kernel boundaries): the same two-tier persistent
+        # staging machinery as the placement provider's one-shot uploads.
         self._staged_inputs: dict | None = None
         self._pool_anchor: Any = None
         if cuda:
@@ -1673,8 +1768,9 @@ class IreeExternalExecutable(CompilerExecutable):
     - HOST mode (default registration, ``device_resident=False``): the
       dispatcher stages the operands to host numpy arrays (lazy
       ``.numpy()``), calls the kernel, and its validated host results are
-      staged BACK into the following segment's inputs (the existing
-      host-input staging machinery uploads them).
+      staged BACK into the following segment's inputs (the segment
+      executables' host-tensor staging machinery — ``_staged_input`` on
+      cuda, ``asdevicearray`` on llvm-cpu — uploads them).
     - DEVICE mode (``device_resident=True`` registration): the dispatcher
       passes the device tensors DIRECTLY (zero host staging on the way in);
       the kernel may return ``core.Tensor`` s, duck-typed device payloads
@@ -1933,9 +2029,13 @@ class IreeDevicePayload:
 
     Wraps an IREE runtime ``DeviceArray`` — a HAL buffer-view handle that is
     ALREADY resident on the executable's device — plus the ``core.Device`` it
-    lives on. Host materialization (``to_host``) is LAZY: the D2H copy happens
-    only when the wrapping tensor's ``.numpy()`` is called, so the hot
-    ``IreeExecutable.run`` path never touches host memory.
+    lives on. Host materialization (``to_host``) is LAZY and EXPLICIT: the
+    D2H copy happens only when the wrapping tensor's host-access path asks
+    for it (CPU-kind outputs materialize in ``.numpy()``; a non-cpu
+    wrapping tensor is read back via the explicit
+    ``t.to(core.Device('cpu', 0)).numpy()`` transfer — no implicit
+    device-to-host transfer), so the hot ``IreeExecutable.run`` path never
+    touches host memory.
 
     PUBLIC interop contract (device-resident external kernels): kernel authors
     may isinstance-check ``etl.backends.adapters.iree.IreeDevicePayload`` (the
@@ -2020,6 +2120,107 @@ _IreeDevicePayload = IreeDevicePayload
 
 
 # ---------------------------------------------------------------------------
+# Explicit placement provider (R6.3): Tensor.to(Device('cuda', N)) upload
+# ---------------------------------------------------------------------------
+
+
+def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
+    """Placement provider: copy a HOST tensor onto a cuda HAL device.
+
+    Registered for device kind ``"cuda"`` in the core device-transfer
+    provider registry (``core.register_device_transfer_provider``), so
+    ``tensor.to(core.Device('cuda', N))`` dispatches here (the lazy
+    backends-level thunk also delegates here by attribute lookup). Provider
+    contract (core, v1): receives a HOST ndarray-backed
+    ``Device("cpu", 0)`` tensor plus the target ``core.Device`` and returns
+    a ``core.Tensor`` placed on the target device — a fresh device-resident
+    tensor wrapping an ``IreeDevicePayload`` over the freshly uploaded iree
+    ``DeviceArray``.
+
+    Implementation:
+    1. Source check: a non-host source raises ``core.DeviceError`` directing
+       to the explicit two-hop ``t.to(cpu).to(target)`` (cross-device copies
+       are not implemented in v1 — per the core provider contract).
+    2. Runtime flags: ``ETL_IREE_RUNTIME_ARGS`` is honored exactly like
+       ``load`` does (same env parsing via ``_runtime_args_from_env``; loud
+       parse errors) so placement respects process-global HAL flags (e.g.
+       the classic-allocator opt-in ``--cuda_async_allocations=false``).
+    3. HAL device: acquired through ``_acquire_runtime_device`` — the same
+       path ``load`` uses. Each call acquires a FRESH HAL device instance;
+       feeding such buffers into a separately-loaded executable on the same
+       physical device works (iree accepts same-physical-device buffers
+       across instances — verified empirically, see the R6.4 note in
+       ``etl/backends/adapters/CONTEXT.md``), so no process-wide instance
+       cache exists.
+    4. Upload: a ONE-SHOT host->device copy through ``_staged_input`` with a
+       FRESH per-call staging dict (fresh buffers, no cache) — the
+       correctness-pinned pinned/DMA tiers (the DMA tier's fresh-semaphore
+       wait is load-bearing); oversized/unmappable inputs fall back to
+       ``rt.asdevicearray``.
+    5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
+
+    Failures surface as ``core.DeviceError`` / ``core.BackendError`` with an
+    actionable message — never a raw iree exception.
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    if not isinstance(tensor, core.Tensor):
+        raise core.DeviceError(
+            f"Tensor.to upload requires a core.Tensor source, got "
+            f"{type(tensor).__name__}"
+        )
+    if not isinstance(device, Device):
+        raise core.DeviceError(
+            f"Tensor.to upload requires a core.Device target, got "
+            f"{type(device).__name__}"
+        )
+    if device.kind != "cuda":
+        raise core.DeviceError(
+            f"the {IreeBackend.name} placement provider places data on cuda "
+            f"devices only, got {device!r}"
+        )
+    # Provider source contract: a HOST ndarray-backed cpu:0 tensor in v1. A
+    # device-resident source cannot be copied device->device by this
+    # provider — suggest the explicit two-hop transfer.
+    if not isinstance(tensor.data, np.ndarray) or tensor.device != Device("cpu", 0):
+        raise core.DeviceError(
+            f"Tensor.to cannot copy {tensor.device!r} tensor data directly "
+            f"to {device!r}: cross-device copies are not implemented in v1. "
+            "Transfer in two explicit hops instead: "
+            "t.to(core.Device('cpu', 0)) first, then .to(target)."
+        )
+    # Runtime flags exactly like load (env ETL_IREE_RUNTIME_ARGS; loud
+    # parse errors), then the same HAL-device acquisition path.
+    runtime_args = _runtime_args_from_env()
+    _apply_iree_runtime_args(runtime_args)
+    try:
+        runtime_device = _acquire_runtime_device("cuda", device, runtime_args)
+    except core.ETLError:
+        raise
+    except Exception as exc:
+        raise core.BackendError(
+            f"Tensor.to could not acquire the IREE cuda HAL device for "
+            f"{device!r} (the {IreeBackend.name} placement provider): {exc}"
+        ) from exc
+    # One-shot upload: a FRESH staging dict per call (fresh buffers, no
+    # cache — the pinned/DMA tiers with the load-bearing fresh-semaphore
+    # wait, falling back to asdevicearray for oversized/unmappable inputs).
+    try:
+        staged = _staged_input({}, runtime_device, 0, tensor)
+        if staged is None:
+            staged = rt.asdevicearray(runtime_device, tensor.numpy())
+    except core.ETLError:
+        raise
+    except Exception as exc:
+        raise core.BackendError(
+            f"Tensor.to could not upload the host tensor to {device!r} via "
+            f"the {IreeBackend.name} backend: {exc}"
+        ) from exc
+    return core.Tensor(IreeDevicePayload(staged, device))
+
+
+# ---------------------------------------------------------------------------
 # Adapter activation: singleton + register-on-first-use entry point
 # ---------------------------------------------------------------------------
 
@@ -2035,6 +2236,14 @@ def register() -> IreeBackend:
     ``core.BackendError`` with the hint ``pip install etl[iree]`` when the
     IREE packages are missing; re-registering the SAME instance is a no-op
     (the registry tolerates idempotent re-registration).
+
+    ALSO overwrites the core device-transfer provider for kind ``"cuda"``
+    with the DIRECT ``upload_tensor`` (R6.3): ``etl.backends`` registers a
+    lazy thunk over this module at import time; once the adapter is active
+    (packages available — ``check_available`` above), the direct provider
+    replaces the thunk. Registration is last-wins and idempotent, so
+    re-registering is safe.
     """
     iree_backend.check_available()
+    core.register_device_transfer_provider("cuda", upload_tensor)
     return _registry_register(iree_backend)
