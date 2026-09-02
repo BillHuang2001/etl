@@ -1388,6 +1388,8 @@ def _wait_copy_semaphore(sem: Any) -> None:
     query = getattr(sem, "query", None)
     if query is None or query() >= 1:
         return
+    import iree.runtime as rt
+
     rt.HalFence.create_at(sem, 1).wait()
 
 
