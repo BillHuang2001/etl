@@ -15,6 +15,12 @@ section) and ``etl/ops/constant.py``:
 - ``core.TraceError`` outside a trace / for a SymbolicTensor input / for any
   non-Tensor input (ndarray, list, scalar); ``etl.constant`` is the public
   entry point registered via ``core.register_constant_builder``.
+- Explicit device placement: a NON-cpu tensor (``device.kind != "cpu"``) is
+  rejected with ``core.DeviceError`` — the snapshot would be an implicit
+  device-to-host transfer, which never happens. The documented preparation
+  path is the explicit two-step ``tensor.to(core.Device('cpu', 0))`` then
+  ``etl.constant``; cpu-kind PAYLOAD tensors (host-reachable via
+  ``to_host()``, not ndarray-backed) pass the gate and snapshot normally.
 """
 import importlib
 import warnings
@@ -23,6 +29,7 @@ import numpy as np
 import pytest
 
 import etl
+from etl import core
 
 from tests.ops.conftest import ops_of, run_numpy
 
@@ -236,6 +243,96 @@ def test_constant_of_symbolic_tensor_raises_traceerror():
 
     with pytest.raises(etl.TraceError, match="already a graph value"):
         etl.trace(f, etl.TensorSpec((2,), etl.float32))
+
+
+# ---------------------------------------------------------------------------
+# Explicit device placement: non-cpu tensors are rejected; the explicit
+# .to(cpu) two-step is the documented preparation path
+# ---------------------------------------------------------------------------
+
+
+class _FakeDevicePayload:
+    """Minimal duck-typed device payload (protocol documented on
+    ``core.Tensor``: ``.shape`` / ``.dtype``, optional ``.device`` — a
+    ``core.Device`` — and ``to_host() -> ndarray``). Local stand-in only;
+    tests never import from ``tests/core``.
+    """
+
+    def __init__(self, array, device):
+        self._array = np.asarray(array)
+        self.shape = self._array.shape
+        self.dtype = self._array.dtype
+        self.device = device
+
+    def to_host(self):
+        """A FRESH host copy (a real device buffer would copy on demand)."""
+        return self._array.copy()
+
+
+def test_constant_of_non_cpu_tensor_raises_deviceerror():
+    """A device-resident (non-cpu) tensor cannot be embedded: the snapshot
+    would be an implicit device-to-host transfer, which never happens at
+    constant snapshot time."""
+    data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    cuda_tensor = core.Tensor(_FakeDevicePayload(data, core.Device("cuda", 0)))
+    assert cuda_tensor.device == core.Device("cuda", 0)
+
+    def f():
+        return etl.constant(cuda_tensor)
+
+    with pytest.raises(etl.DeviceError) as excinfo:
+        etl.trace(f)
+    message = str(excinfo.value)
+    assert "etl.constant requires host data" in message
+    assert "no implicit device-to-host transfer" in message
+    assert "t.to(" in message
+
+
+def test_constant_embeds_after_explicit_to_cpu_transfer():
+    """The explicit two-step workflow (R2): ``Tensor.to(core.Device('cpu',
+    0))`` on a non-cpu payload tensor returns a fresh HOST tensor — the legal
+    way to prepare device data for constant embedding."""
+    data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    cuda_tensor = core.Tensor(_FakeDevicePayload(data, core.Device("cuda", 0)))
+
+    host_tensor = cuda_tensor.to(core.Device("cpu", 0))
+    # The explicit transfer yields a fresh ndarray-backed tensor on cpu:0;
+    # the source stays untouched on its device.
+    assert host_tensor.device == core.Device("cpu", 0)
+    assert isinstance(host_tensor.data, np.ndarray)
+    assert host_tensor is not cuda_tensor
+    assert cuda_tensor.device == core.Device("cuda", 0)
+
+    def f():
+        return etl.constant(host_tensor)
+
+    graph = etl.trace(f)
+    const_op = ops_of(graph, "constant")[0]
+    np.testing.assert_array_equal(const_op.attributes["value"], data)
+
+    # End-to-end: the graph evaluates to the embedded values (numpy backend).
+    executable = etl.load(etl.compile(etl.lower(graph)))
+    np.testing.assert_array_equal(etl.run(executable).numpy(), data)
+
+
+def test_constant_of_cpu_kind_device_payload_embeds_fine():
+    """The snapshot gate is kind-based (``device.kind != 'cpu'``), NOT
+    ndarray-backedness: a cpu-kind PAYLOAD tensor (host-reachable via
+    ``to_host()``) passes the gate and snapshots normally."""
+    data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    cpu_tensor = core.Tensor(_FakeDevicePayload(data, core.Device("cpu", 0)))
+    assert cpu_tensor.device == core.Device("cpu", 0)
+    assert not isinstance(cpu_tensor.data, np.ndarray)  # payload-backed
+
+    def f():
+        return etl.constant(cpu_tensor)
+
+    graph = etl.trace(f)
+    const_op = ops_of(graph, "constant")[0]
+    np.testing.assert_array_equal(const_op.attributes["value"], data)
+
+    executable = etl.load(etl.compile(etl.lower(graph)))
+    np.testing.assert_array_equal(etl.run(executable).numpy(), data)
 
 
 # ---------------------------------------------------------------------------
