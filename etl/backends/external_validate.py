@@ -14,8 +14,10 @@ Canonical API:
 - ``validate_outputs(arrays, declared_specs, label, evaluate_shape=None)
   -> list[core.Tensor]`` — the count must match ``len(declared_specs)``
   (``core.BackendError``); per output: entries are unwrapped to numpy
-  arrays (``core.Tensor`` -> ``.numpy()``; anything else =>
-  ``core.BackendError``), specs are extracted defensively (``ir.ValueType``
+  arrays (``core.Tensor`` -> materialized via the EXPLICIT transfer API
+  ``.to(core.Device("cpu", 0)).numpy()`` — every device->host copy routes
+  through ``.to()``; anything else => ``core.BackendError``), specs are
+  extracted defensively (``ir.ValueType``
   objects duck-typed via ``.dtype``/``.shape``; ``{"dtype": ..., "shape":
   ...}`` dict wire form — ``core.BackendError`` for anything else), dtype
   must match exactly (``core.BackendError`` — no silent coercion), and the
@@ -235,8 +237,10 @@ def validate_outputs(
     Count must match ``len(declared_specs)`` (``core.BackendError`` — the
     caller's ``ir.verify`` guarantees this equals the op's result count);
     per output: the entry is unwrapped to an ndarray (``core.Tensor`` via
-    ``.numpy()``; anything else => ``core.BackendError``), dtype must match
-    exactly (``core.BackendError`` — no silent coercion), and the declared
+    the EXPLICIT transfer API ``.to(core.Device("cpu", 0)).numpy()`` —
+    every device->host copy routes through ``.to()``; anything else =>
+    ``core.BackendError``), dtype must match exactly
+    (``core.BackendError`` — no silent coercion), and the declared
     shape is evaluated (``evaluate_shape`` per dim; ``None`` dims unchecked
     — runtime-dynamic) and compared to the actual output shape
     (``core.ShapeError``). Valid outputs are wrapped in ``core.Tensor``
@@ -253,7 +257,14 @@ def validate_outputs(
     for i, (entry, spec) in enumerate(zip(arrays, declared_specs)):
         where = f"{label} output {i}"
         if isinstance(entry, core.Tensor):
-            entry = entry.numpy()
+            # Host-mode kernel results may in principle be device-resident
+            # (a kernel returning a device payload tensor): materialize via
+            # the EXPLICIT transfer API — every device->host copy routes
+            # through .to(), never an implicit .numpy() on a non-cpu
+            # payload (which raises core.DeviceError under the
+            # physical-truth semantics). cpu-kind tensors pass through
+            # unchanged (a failed transfer raises core.DeviceError).
+            entry = entry.to(core.Device("cpu", 0)).numpy()
         if not isinstance(entry, np.ndarray):
             raise core.BackendError(
                 f"{label}: callback output {i} is "
