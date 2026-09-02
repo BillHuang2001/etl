@@ -23,10 +23,16 @@ the repo-root ``probe_new_emitters.py`` with the same fixed seed
 (``np.random.default_rng(7)``).
 
 The iree-cuda smoke set (device 5, ``target_backends=["cuda"]``) skips when
-the IREE cuda HAL driver or the GPU is unavailable. While-loop graphs are
-deliberately excluded from cuda (upstream iree cuda HAL crashes on while —
-documented in ``etl/bench`` Known Issues; ``scan`` is therefore cpu-only
-here).
+the IREE cuda HAL driver or the GPU is unavailable. The smokes follow the
+explicit device-placement model: each run input is moved to
+``Device("cuda", 5)`` via the explicit ``core.Tensor(...).to(...)``
+transfer before ``etl.run`` (no implicit host→device staging happens at
+the run boundary — a cuda executable rejects host inputs), and the cuda
+outputs are read back through the explicit ``.to(core.Device("cpu", 0))``
+transfer (a non-cpu payload's ``.numpy()`` raises ``DeviceError``).
+While-loop graphs are deliberately excluded from cuda (upstream iree cuda
+HAL crashes on while — documented in ``etl/bench`` Known Issues; ``scan``
+is therefore cpu-only here).
 """
 
 import numpy as np
@@ -81,10 +87,49 @@ U64 = np.array([1, 2 ** 63, 0xFFFFFFFFFFFFFFFF], dtype=np.uint64)
 
 
 def _np(v):
-    """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays."""
+    """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays.
+
+    Device-aware readback (explicit device placement): a NON-cpu tensor
+    (an iree-cuda run output) is first moved to the host via the explicit
+    ``t.to(core.Device('cpu', 0))`` transfer — ``.numpy()`` on a
+    non-cpu-kind payload raises ``core.DeviceError``. Cpu tensors (the
+    numpy backend and iree-llvm-cpu) keep the plain ``.numpy()`` path —
+    byte-identical to the pre-placement model.
+    """
     if isinstance(v, etl.Tensor):
+        if v.device.kind != "cpu":
+            v = v.to(etl.core.Device("cpu", 0))
         return np.asarray(v.numpy())
     return np.asarray(v)
+
+
+def _place_inputs(args, device):
+    """Explicitly place host inputs on ``device`` before ``etl.run``.
+
+    Run-boundary device contract (``core.Tensor.to`` / pipeline ``run``):
+    no implicit host→device transfer happens at the run boundary, so a
+    cuda executable rejects cpu/host input tensors (including raw numpy
+    arrays, which are cpu:0) with ``core.DeviceError``. Each ndarray input
+    is wrapped via ``core.Tensor`` and moved with the explicit
+    ``.to(device)``; ``core.Tensor`` inputs pass through ``.to(device)``.
+    Cpu devices (``device is None`` or kind ``"cpu"`` — the llvm-cpu
+    runs) are a NO-OP: the host arrays are fed exactly as before.
+    """
+    if device is None or device.kind == "cpu":
+        return args
+    placed = []
+    for value in args:
+        if isinstance(value, etl.Tensor):
+            placed.append(value.to(device))
+        elif isinstance(value, np.ndarray):
+            placed.append(etl.core.Tensor(value).to(device))
+        else:
+            raise TypeError(
+                "cannot place a cuda run input of type "
+                f"{type(value).__qualname__}: expected a numpy ndarray or "
+                "an etl.Tensor"
+            )
+    return tuple(placed)
 
 
 def _assert_exact(got, want):
@@ -106,12 +151,21 @@ def _parity(fn, *specs, args, exact=True, ref=None, **iree_kwargs):
 
     ``ref``: optional explicit numpy reference (an ndarray) asserted against
     BOTH sides; ``None`` means the numpy backend output is the reference.
+
+    Device-aware (explicit device placement): when ``iree_kwargs`` carry a
+    non-cpu ``device`` (the cuda smokes), every run input is explicitly
+    placed on that device first via ``_place_inputs`` (the run boundary
+    never transfers implicitly — a cuda executable rejects host inputs)
+    and the run outputs are read back through the explicit ``.to(cpu)``
+    host transfer inside ``_np`` (a non-cpu payload's ``.numpy()`` raises
+    ``DeviceError``). Cpu devices (``device`` absent — the llvm-cpu runs)
+    feed the host arrays as-is: byte-identical to the pre-placement model.
     """
     want = etl.evaluate(fn, *args)
     if ref is not None:
         _assert_exact(want, ref)
     exe = etl.build(fn, *specs, backend="iree", **iree_kwargs)
-    got = etl.run(exe, *args)
+    got = etl.run(exe, *_place_inputs(args, iree_kwargs.get("device")))
     if exact:
         _assert_exact(got, want)
     else:
@@ -535,7 +589,12 @@ def test_random_iree_determinism(case_id, fn, specs, args):
 
 # ---------------------------------------------------------------------------
 # 6. iree-cuda smoke set (device 5; while-loop graphs deliberately excluded
-# — upstream iree cuda HAL crashes on while)
+# — upstream iree cuda HAL crashes on while). Explicit device placement:
+# _parity moves every host input to Device("cuda", 5) via
+# core.Tensor(...).to(...) before etl.run (the run boundary never
+# transfers implicitly — host inputs to a cuda executable raise
+# DeviceError) and reads the cuda outputs back through the explicit
+# .to(core.Device("cpu", 0)) host transfer in _np.
 # ---------------------------------------------------------------------------
 
 CUDA_CASES = [
