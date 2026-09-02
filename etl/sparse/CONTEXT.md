@@ -102,6 +102,19 @@ instance (canonical validation applies). The format leaf picks the variant.
 - **No sparse constant in v1**: `etl.constant(concrete_sparse)` raises
   `core.TraceError` via the existing guard in `etl/ops/constant.py`
   ("etl.constant expects a concrete core.Tensor, got SparseTensor").
+- **Device handling — containers are device-agnostic (v1).** No sparse class
+  stores or validates a device; device exists only per-leaf on the underlying
+  `core.Tensor`/`core.TensorSpec` (leaf specs may carry `device`, but
+  `SparseTensorSpec` never reads/propagates it — `from_concrete` builds leaf
+  specs without device at value.py:928). The ONLY device-touching line in the
+  subtree is value.py:155 (`core.Tensor(normalized, device=leaf.device)` — the
+  int64-normalization copy preserves the source leaf's device label; per the
+  core contract an ndarray-backed Tensor may carry any label, so this stays
+  cpu for numpy leaves). Concrete-phase validation/layout helpers and
+  `from_dense` unwrap `core.Tensor` leaves via `.numpy()` (value.py:136/188/
+  221/286/355/912, ops.py:293) — an implicit host copy if a leaf were ever a
+  device-payload tensor. Sparse graph ops run only on the numpy backend (cpu),
+  whose kernels return ndarray-backed cpu `core.Tensor`s.
 
 ## Known issues / v1 deferrals (explicit errors, never silent)
 
