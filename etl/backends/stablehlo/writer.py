@@ -247,17 +247,21 @@ class Writer:
         self._while_init_rewrite = bool(
             (options or {}).get("while_init_rewrite", True)
         )
-        #: eigh_early_exit exporter option (bool, default True): the
+        #: eigh_early_exit exporter option (bool, default False): the
         #: ``eigh`` while-Jacobi composition additionally carries an i1
         #: ``done`` flag and, at every sweep boundary (inside a nested
         #: ``stablehlo.if``), checks the scale-aware relative off-diagonal
         #: energy of the current A against a dtype tolerance, exiting once
-        #: converged (skips the remaining scheduled sweeps). ``False``
-        #: emits the EXACT pre-option text (5 carries, cond ``k < total``)
-        #: — the A/B measurement lever and safety valve (see ``_emit_eigh``
-        #: and ``_emit_eigh_sweep_check``).
+        #: converged (skips the remaining scheduled sweeps). ``True`` emits
+        #: that machinery; ``False`` (the default) emits the EXACT
+        #: pre-option text (5 carries, cond ``k < total``). The early exit
+        #: is validated on llvm-cpu only and is known-broken on iree-cuda
+        #: at invoke (deterministic dealloca INVALID_ARGUMENT at n=10,
+        #: SIGSEGV at n=50, under BOTH allocators), so the default is OFF;
+        #: option-on stays available as an llvm-cpu opt-in (see
+        #: ``_emit_eigh`` and ``_emit_eigh_sweep_check``).
         self._eigh_early_exit = bool(
-            (options or {}).get("eigh_early_exit", True)
+            (options or {}).get("eigh_early_exit", False)
         )
 
     # ------------------------------------------------------------------
@@ -2128,7 +2132,8 @@ class Writer:
         as the identity). The carried pair counter walks the sweep order
         (0,1), (0,2), …, (n−2, n−1) and ``k`` counts total rotations (cond
         ``k < total``). With the ``eigh_early_exit`` exporter option (bool,
-        default True) the loop additionally carries an i1 ``done`` flag:
+        default False) set to True the loop additionally carries an i1
+        ``done`` flag:
         at every sweep boundary a nested ``stablehlo.if`` checks the
         scale-aware relative off-diagonal energy of the current A (masked
         squared Frobenius vs the full squared energy, per-matrix with an
@@ -2148,8 +2153,12 @@ class Writer:
         use-graph-topology family as the while SEGV lore in CONTEXT.md),
         while the k-clamp is 10/10 clean and keeps the cond region
         byte-identical to the pre-option text. The cond region stays
-        exactly ``k < total`` in BOTH modes. ``False`` emits the exact
-        pre-option 5-carry text (the A/B measurement lever). Dynamic (p, q)
+        exactly ``k < total`` in BOTH modes. ``False`` (the DEFAULT) emits
+        the exact pre-option 5-carry text. NOTE (known-broken on
+        iree-cuda): the option-on convergence exit crashes at invoke on
+        iree-cuda 3.11 under BOTH allocators (deterministic dealloca
+        ``INVALID_ARGUMENT`` at n=10, SIGSEGV at n=50) — validated on
+        llvm-cpu only, hence the default is OFF. Dynamic (p, q)
         indexing uses gathers (never
         ``stablehlo.slice`` — its start indices must be static), and every
         constant/iota is hoisted OUTSIDE the loop (iree crashes on
