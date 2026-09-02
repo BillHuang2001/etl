@@ -849,6 +849,45 @@ def test_eigh_dynamic_dims_deferred_naming_op():
     assert "not supported" in msg
 
 
+def test_eigh_early_exit_option_emits_sweep_check():
+    # eigh_early_exit=True (OPT-IN; default is False — option-on crashes
+    # iree-cuda at invoke, dealloca INVALID_ARGUMENT n=10 / SIGSEGV n=50,
+    # llvm-cpu-only) dim-10 f32 export carries the convergence-based
+    # early-exit machinery (f32 tol 3e-5): SIX while carries, hoisted i!=j
+    # mask / rotations-per-sweep 45 / squared tol (3e-5)^2 / done-init
+    # constants, ONE nested sweep-boundary stablehlo.if, two energy
+    # reduces, k-clamp.
+    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32),
+                   options={"eigh_early_exit": True})
+    assert "dense<[[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]," in mlir
+    assert "stablehlo.constant dense<45> : tensor<i64>" in mlir          # rps
+    assert "stablehlo.constant dense<9.000000189551827E-10> : tensor<f32>" in mlir  # tol^2
+    assert "stablehlo.constant dense<false> : tensor<i1>" in mlir        # done init
+    assert mlir.count('"stablehlo.if"') == 1
+    assert mlir.count('"stablehlo.reduce"') == 2
+    assert "stablehlo.remainder" in mlir
+    assert mlir.count("(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>") == 5
+
+
+def test_eigh_early_exit_default_emits_pre_option_text():
+    # The DEFAULT (no options) == byte-identical pre-option (344d3eb)
+    # text — none of the machinery may appear while the plain composition
+    # stays intact (the default flip b227e44; option-on is llvm-cpu-only).
+    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
+    assert "stablehlo.if" not in mlir
+    assert "stablehlo.remainder" not in mlir
+    assert '"stablehlo.reduce"' not in mlir
+    assert "9.000000189551827E-10" not in mlir
+    assert "dense<45> : tensor<i64>" not in mlir
+    assert "dense<[[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]," not in mlir
+    assert "dense<false>" not in mlir and "dense<true>" not in mlir
+    assert '"stablehlo.while"' in mlir
+    assert "stablehlo.constant dense<225> : tensor<i64>" in mlir  # 5 sweeps x 45
+    assert "stablehlo.sort" in mlir and "stablehlo.gather" in mlir and "stablehlo.iota" in mlir
+    assert "stablehlo.slice" not in mlir
+    assert "-> (tensor<10xf32>, tensor<10x10xf32>)" in mlir
+
+
 def test_diag_rank1_exports_iota_select_composition():
     # rank-1 (n,) → the (n, n) diagonal matrix: iota-EQ mask + select over
     # a broadcast of the input — no gather.

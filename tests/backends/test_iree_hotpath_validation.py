@@ -13,12 +13,16 @@ round, commits 2622de9/d132b6c):
 * input-validation fast path: an all-static spec whose tuple EQUALS the
   runtime shape skips the per-dim walk. The observable contract is
   UNCHANGED — matching inputs pass, static-dim mismatches raise
-  ``core.ShapeError`` with the canonical message (input + dim), rank
-  mismatches raise ``core.ShapeError``, dtype mismatches raise
-  ``core.BackendError`` ("never silently coerce"), and declared
+  ``core.ShapeError`` with the canonical message (pytree path + dim),
+  rank mismatches raise ``core.ShapeError``, dtype mismatches raise
+  ``core.DTypeError`` (never a silent coercion), and declared
   symbolic (``Dim``) / unchecked (``None``) dims still fall through to the
   walker. Pinned here on llvm-cpu: the fast path is observably equivalent
-  for every accepting AND rejecting input class.
+  for every accepting AND rejecting input class. (The errors surface from
+  the pipeline input walker — ``shape mismatch for input at path [i]: ...``
+  with ``core.ShapeError``/``core.DTypeError`` per the core error taxonomy —
+  which always runs before the adapter executable is invoked; the iree
+  adapter's own ``input {i}: ...`` checks are defense-in-depth only.)
 
 SEMANTICS ONLY — no timing assertions (perf lives in the GPU-guarded
 same-device-loop suite). IREE runs the real MLIR compiler (seconds per
@@ -131,21 +135,33 @@ def test_static_shape_fast_path_accepts_matching_inputs():
 def test_static_shape_mismatch_raises_shape_error_naming_dim():
     exe = _build_exe(_add, SPECS)
     bad = np.zeros((4, 7), dtype=np.float32)
-    with pytest.raises(etl.ShapeError, match="input 1: shape mismatch at dim 1"):
+    with pytest.raises(
+        etl.ShapeError,
+        match=r"shape mismatch for input at path \[1\]: spec shape "
+              r"\(4, 6\) vs actual shape \(4, 7\) \(dim 1 must be 6, got 7\)",
+    ):
         etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(bad))
 
 
 def test_rank_mismatch_raises_shape_error():
     exe = _build_exe(_add, SPECS)
     flat = np.zeros((4,), dtype=np.float32)
-    with pytest.raises(etl.ShapeError, match="input 0: rank mismatch"):
+    with pytest.raises(
+        etl.ShapeError,
+        match=r"rank mismatch for input at path \[0\]: spec shape "
+              r"\(4, 6\) has rank 2, got shape \(4,\) with rank 1",
+    ):
         etl.run(exe, etl.core.Tensor(flat), etl.core.Tensor(XB))
 
 
-def test_dtype_mismatch_raises_backenderror_never_coerces():
+def test_dtype_mismatch_raises_dtype_error_never_coerces():
     exe = _build_exe(_add, SPECS)
     f64 = XA.astype(np.float64)
-    with pytest.raises(etl.BackendError, match="never silently coerce"):
+    with pytest.raises(
+        etl.DTypeError,
+        match=r"dtype mismatch for input at path \[0\]: spec dtype "
+              r"float32, got float64",
+    ):
         etl.run(exe, etl.core.Tensor(f64), etl.core.Tensor(XB))
 
 
@@ -168,7 +184,11 @@ def test_static_shape_mismatch_raises_on_segment_executable():
         ok = etl.run(exe, etl.core.Tensor(XA))
         _assert_exact(ok, XA)
         bad = np.zeros((4, 7), dtype=np.float32)
-        with pytest.raises(etl.ShapeError, match="shape mismatch at dim 1"):
+        with pytest.raises(
+            etl.ShapeError,
+            match=r"shape mismatch for input at path \[0\]: spec shape "
+                  r"\(4, 6\) vs actual shape \(4, 7\) \(dim 1 must be 6, got 7\)",
+        ):
             etl.run(exe, etl.core.Tensor(bad))
     finally:
         etl.unregister_external_kernel(name)

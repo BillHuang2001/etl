@@ -209,3 +209,59 @@ def test_eigh_dim25_f32_contract():
     assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3), (
         f"w vs numpy: max abs diff {np.max(np.abs(gw - ww))}"
     )
+
+
+# --- 3. eigh_early_exit exporter option (llvm-cpu only) ----------------------
+#
+# The `eigh_early_exit` option (bool, default False) adds a convergence
+# early exit to the while-Jacobi composition: an i1 done carry + a nested
+# stablehlo.if at every sweep boundary (scale-aware relative off-diagonal
+# energy vs the CALIBRATED f32 tolerance 3e-5), exiting via a k-clamp. The
+# iree adapter does NOT forward the option (compiler.py `_exporter_options`
+# reserves only rng_bit_generator / sort_emission / while_init_rewrite), so
+# these tests splice the directly-exported text into the lowered payload
+# under its "mlir_text" key — both modes are explicit here. Option-on is
+# known-broken at invoke on iree-cuda (dealloca INVALID_ARGUMENT n=10 /
+# SIGSEGV n=50) and validated on llvm-cpu only — this file never requests
+# cuda. Measured (dim-50 sample-covariance-like f32): the exit fires at the
+# sweep-4 boundary of 7; dim-45 cov-like stays on the full schedule or
+# exits sweep ~4-5 with results inside the same contract.
+
+
+def _cov_like(n, seed, k=5):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, k))
+    a = x @ x.T + np.eye(n)
+    return ((a + a.T) / 2).astype(np.float32)
+
+
+def _run_eigh_variant(A, spec, early_exit):
+    # Splice the directly-exported text into the payload (the adapters do
+    # not forward eigh_early_exit; both modes are explicit here since the
+    # option defaults to False). The iree LoweredProgram payload carries
+    # the MLIR text under "mlir_text" (etl.backends.compiler).
+    graph = etl.trace(_eigh, spec)
+    lowered = etl.lower(graph, backend="iree")
+    text = etl.backends.stablehlo.export(
+        graph, options={"eigh_early_exit": early_exit})
+    lowered = etl.LoweredProgram(backend="iree", signature=lowered.signature,
+                                 payload={**lowered.payload, "mlir_text": text})
+    got = etl.run(etl.load(etl.compile(lowered, backend="iree"), backend="iree"), A)
+    return _np(got[0]), _np(got[1])
+
+
+def test_eigh_dim45_f32_early_exit_contract():
+    A = _cov_like(45, seed=0)
+    gw, gv, ww, _ = _run_eigh(_eigh, A, etl.TensorSpec((45, 45), etl.float32))
+    _check_eigh_contract(A, gw, gv, rtol=1e-3, atol=1e-3)
+    assert np.allclose(gw, ww, rtol=1e-3, atol=1e-3)
+
+
+def test_eigh_dim45_early_exit_off_matches_on():
+    A = _cov_like(45, seed=0)
+    spec = etl.TensorSpec((45, 45), etl.float32)
+    gw_on, gv_on = _run_eigh_variant(A, spec, early_exit=True)
+    gw_off, gv_off = _run_eigh_variant(A, spec, early_exit=False)
+    _check_eigh_contract(A, gw_on, gv_on, rtol=1e-3, atol=1e-3)
+    _check_eigh_contract(A, gw_off, gv_off, rtol=1e-3, atol=1e-3)
+    assert np.allclose(gw_on, gw_off, rtol=1e-3, atol=1e-3)
