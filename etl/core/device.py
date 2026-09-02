@@ -7,6 +7,13 @@ utilities that produce ordinary local ``Tensor``\\s — they do no graph
 rewriting, no implicit communication, and never shard inside the graph
 (collectives are the explicit in-graph communication mechanism, owned by
 ``etl.dist``).
+
+**v1 physical truth (binding):** these helpers operate on host (numpy)
+memory only. The source tensor must be ndarray-backed on
+``Device("cpu", 0)`` and every target device must be ``Device("cpu", 0)`` —
+they cannot physically place data on other devices (that is the explicit
+``Tensor.to`` transfer, see ``tensor.py``); anything else raises
+:class:`DeviceError`, never a raw attribute error on a device payload.
 """
 
 from __future__ import annotations
@@ -104,6 +111,34 @@ def _invalid_axis_error(axis: Any) -> DeviceError:
     )
 
 
+def _host_only_error(fn: str, device: Device, *, source: bool = False) -> DeviceError:
+    """Canonical v1 physical-truth error for ``split_tensor``/``replicate_tensor``.
+
+    These helpers prepare host data only: the source must be ndarray-backed
+    on ``Device('cpu', 0)`` and every target must be ``Device('cpu', 0)``.
+    ``device`` is the offending device (the source tensor's device or a
+    target device); ``source=True`` distinguishes a device-resident source
+    (a payload on any device) from a non-host target. Raised BEFORE any
+    payload attribute is touched — a device payload has no ``.ndim``, so
+    this replaces what used to be a raw ``AttributeError`` leak.
+    """
+    lead = (
+        f"{fn} requires a host (numpy) source tensor on Device('cpu', 0), "
+        f"but got a device-resident tensor on {device!r}"
+        if source
+        else (
+            f"{fn} requires host (numpy) tensors on Device('cpu', 0) and "
+            f"cannot operate on {device!r}"
+        )
+    )
+    return DeviceError(
+        lead + ": in v1 these helpers never transfer data across devices, "
+        "and there is no implicit device-to-host transfer — call "
+        "t.to(core.Device('cpu', 0)) first, or use t.to(target) to place "
+        "data on another device"
+    )
+
+
 def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Tensor"]:
     """Split a local tensor along ``axis`` into one tensor per device.
 
@@ -112,6 +147,11 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
     associates each chunk with the corresponding device. No graph rewriting,
     no collectives, no implicit communication — the caller is responsible for
     moving/using the resulting local tensors.
+
+    v1 physical truth: the source must be ndarray-backed host data on
+    ``Device("cpu", 0)`` and every target device must be
+    ``Device("cpu", 0)`` — this helper cannot place data on other devices
+    (use the explicit ``Tensor.to`` transfer for that).
 
     Args:
         tensor: The local concrete tensor to split.
@@ -124,8 +164,10 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
 
     Raises:
         DeviceError: If ``devices`` is empty, if ``tensor`` is not a
-            :class:`Tensor`, if ``axis`` is not an integer (bools included),
-            if ``axis`` is out of range, or if the split fails.
+            :class:`Tensor`, if the source or a target device is not
+            ``Device("cpu", 0)`` (v1: host data only), if ``axis`` is not an
+            integer (bools included), if ``axis`` is out of range, or if the
+            split fails.
         ShapeError: If ``tensor.shape[axis]`` is not divisible by
             ``len(devices)``.
     """
@@ -135,6 +177,15 @@ def split_tensor(tensor: "Tensor", axis: int, devices: List[Device]) -> List["Te
 
     if not isinstance(tensor, Tensor):
         raise DeviceError(f"split_tensor expects a Tensor, got {type(tensor).__name__}")
+    # v1 physical truth (checked BEFORE touching .data.ndim — a device
+    # payload has no ndim, so this replaces the raw AttributeError leak):
+    # the source must be ndarray-backed host data and every target must be
+    # the host device; these helpers cannot place data on other devices.
+    if not isinstance(tensor.data, np.ndarray) or tensor.device != Device("cpu", 0):
+        raise _host_only_error("split_tensor", tensor.device, source=True)
+    for dev in devices:
+        if dev != Device("cpu", 0):
+            raise _host_only_error("split_tensor", dev)
     ndim = tensor.data.ndim
     # bools are rejected up-front (they are ints, but never a valid axis).
     if isinstance(axis, bool):
@@ -178,6 +229,11 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
     with every device (v1: views over the same numpy buffer). No graph
     rewriting, no collectives, no implicit communication.
 
+    v1 physical truth: the source must be ndarray-backed host data on
+    ``Device("cpu", 0)`` and every target device must be
+    ``Device("cpu", 0)`` — this helper cannot place data on other devices
+    (use the explicit ``Tensor.to`` transfer for that).
+
     Args:
         tensor: The local concrete tensor to replicate.
         devices: Target devices (one result tensor each).
@@ -186,8 +242,9 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
         A list of :class:`Tensor`\\s, one per device, all sharing the data.
 
     Raises:
-        DeviceError: If ``devices`` is empty or ``tensor`` is not a
-            :class:`Tensor`.
+        DeviceError: If ``devices`` is empty, if ``tensor`` is not a
+            :class:`Tensor`, or if the source or a target device is not
+            ``Device("cpu", 0)`` (v1: host data only).
     """
     if not devices:
         raise DeviceError("replicate_tensor requires at least one device")
@@ -197,5 +254,12 @@ def replicate_tensor(tensor: "Tensor", devices: List[Device]) -> List["Tensor"]:
         raise DeviceError(
             f"replicate_tensor expects a Tensor, got {type(tensor).__name__}"
         )
+    # v1 physical truth: the source must be ndarray-backed host data and
+    # every target must be the host device (no cross-device placement).
+    if not isinstance(tensor.data, np.ndarray) or tensor.device != Device("cpu", 0):
+        raise _host_only_error("replicate_tensor", tensor.device, source=True)
+    for dev in devices:
+        if dev != Device("cpu", 0):
+            raise _host_only_error("replicate_tensor", dev)
     # The SAME ndarray object tagged with each device — no copies.
     return [_tensor(tensor.data, device) for device in devices]
