@@ -941,7 +941,31 @@ def _validate_tensor(spec: "core.TensorSpec", leaf: Any, path) -> "core.Tensor":
     return tensor
 
 
-def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
+def _check_run_device(tensor: "core.Tensor", expected_device, path) -> None:
+    """Run-boundary device enforcement for one tensor leaf.
+
+    Binding design principle: no implicit device↔host transfer. Every run
+    input tensor must ALREADY be at the executable's device — a cuda
+    executable never silently stages host inputs. A tensor whose device
+    differs from the executable's device raises ``core.DeviceError`` naming
+    the input tree path, BOTH devices, and the explicit transfer remedy,
+    before the backend is dispatched. When the executable reports no device
+    (``expected_device is None`` — a device-less backend executable) no
+    enforcement is possible and the check passes.
+    """
+    if expected_device is None:
+        return
+    if tensor.device != expected_device:
+        raise core.DeviceError(
+            f"input at path {path} is on device {tensor.device}, but the "
+            f"executable runs on device {expected_device}: no implicit "
+            f"device-to-host or host-to-device transfer happens at the run "
+            f"boundary — move the tensor to the executable's device "
+            f"explicitly via t.to({expected_device!r})"
+        )
+
+
+def _prepare_flat_inputs_slow(signature, bound: dict, args, expected_device) -> list:
     """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
     in block-arg (tensor-leaf) order.
 
@@ -950,7 +974,10 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
     arguments must match the *reduced* input tree (bound leaf positions
     removed) — anything else raises ``core.TraceError`` with both specs in
     the message. Static leaves are compared by type qualname + ``==`` value
-    (``core.TraceError`` naming the pytree path and values).
+    (``core.TraceError`` naming the pytree path and values). Every tensor
+    leaf — user-supplied AND bound — is checked against ``expected_device``
+    (the executable's device) via ``_check_run_device``; a leaf on another
+    device raises ``core.DeviceError`` naming its tree path.
 
     This is the fallback path: it rebuilds the runtime TreeSpec via
     ``core.flatten`` and is therefore also the source of the canonical
@@ -1006,11 +1033,13 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
         if _is_tensor_leaf_spec(leaf_spec):
             spec = next(tensor_specs)
             if leaf_index in bound:
-                tensors.append(bound[leaf_index])
+                tensor = bound[leaf_index]
             else:
-                tensors.append(
-                    _validate_tensor(spec, next(user_iter), _format_path(path))
+                tensor = _validate_tensor(
+                    spec, next(user_iter), _format_path(path)
                 )
+            _check_run_device(tensor, expected_device, _format_path(path))
+            tensors.append(tensor)
         else:
             recorded = next(static_values)
             leaf = next(user_iter)
@@ -1025,7 +1054,8 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args) -> list:
     return tensors
 
 
-def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
+def _prepare_flat_inputs(signature, bound: dict, args, plan=None,
+                         expected_device=None) -> list:
     """Flatten + validate run-time inputs; return flat ``core.Tensor`` list
     in block-arg (tensor-leaf) order.
 
@@ -1034,7 +1064,12 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
     arguments must match the *reduced* input tree (bound leaf positions
     removed) — anything else raises ``core.TraceError`` with both specs in
     the message. Static leaves are compared by type qualname + ``==`` value
-    (``core.TraceError`` naming the pytree path and values).
+    (``core.TraceError`` naming the pytree path and values). Every tensor
+    leaf — user-supplied AND bound — is checked against ``expected_device``
+    (the executable's device) via ``_check_run_device``; a leaf on another
+    device raises ``core.DeviceError`` naming its tree path (deterministic
+    first-mismatch order in pre-order traversal), always BEFORE the backend
+    is dispatched.
 
     Fast path: ``plan`` (from ``_build_input_plan``, cached on the
     executable) precomputes the per-leaf layout, so structure checking and
@@ -1051,7 +1086,7 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
     expected_tree, entries, total, n_bound, _bound_keys = plan
     user_leaves = []
     if not _fast_structure_walk(expected_tree, args, user_leaves):
-        return _prepare_flat_inputs_slow(signature, bound, args)
+        return _prepare_flat_inputs_slow(signature, bound, args, expected_device)
     expected_user = total - n_bound
     if len(user_leaves) != expected_user:
         raise core.TraceError(
@@ -1073,9 +1108,11 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None) -> list:
         if is_tensor:
             bound_tensor = bound.get(leaf_index)
             if bound_tensor is not None:
-                tensors.append(bound_tensor)
+                tensor = bound_tensor
             else:
-                tensors.append(_validate_tensor(spec, next(user_iter), path))
+                tensor = _validate_tensor(spec, next(user_iter), path)
+            _check_run_device(tensor, expected_device, path)
+            tensors.append(tensor)
         else:
             leaf = next(user_iter)
             kind = type(leaf).__qualname__
@@ -1188,9 +1225,14 @@ def run(executable, *args, **options):
     Accepts an ``Executable`` or a ``BoundExecutable`` (anything else ->
     ``TypeError``). Flattens inputs via the signature TreeSpec, validates
     dtype/shape/device against the recorded specs and static values
-    (DTypeError/ShapeError/DeviceError/TraceError), calls the backend
-    executable with flat tensors, and reconstructs the structured outputs
-    (including recorded static output leaves).
+    (DTypeError/ShapeError/DeviceError/TraceError), and enforces the
+    run-boundary device contract: every tensor leaf must ALREADY be at the
+    executable's device — no implicit device↔host transfer ever happens at
+    the run boundary, so a cuda executable rejects cpu/host inputs
+    (including raw numpy ndarrays, which are cpu:0 tensors) with a
+    ``core.DeviceError`` naming the input path and both devices. Then calls
+    the backend executable with flat tensors, and reconstructs the
+    structured outputs (including recorded static output leaves).
 
     Options contract: ``options`` are backend-specific per-run options,
     validated by the backend executable against its ``KNOWN_OPTIONS`` union
@@ -1219,7 +1261,8 @@ def run(executable, *args, **options):
         )
     signature = executable.signature
     flat_tensors = _prepare_flat_inputs(
-        signature, bound, args, executable._get_input_plan()
+        signature, bound, args, executable._get_input_plan(),
+        expected_device=executable.device,
     )
     options = apply_env_options(executable.backend, options, "run")
     backend_executable = executable.backend_executable
@@ -1239,7 +1282,10 @@ def bind(executable, **bindings):
     named via ``core.TensorSpec(..., name=...)`` — there is no automatic
     naming; duplicate names -> ``core.TraceError`` as ambiguous); bound
     tensors are dtype/shape/device compatible with their specs (numpy
-    ndarrays wrapped via ``core.from_numpy``). Returns a wrapper that
+    ndarrays wrapped via ``core.from_numpy``), and must ALREADY be at the
+    executable's device — a bound tensor on another device fails fast with
+    the run-boundary ``core.DeviceError`` (no implicit device↔host
+    transfer), before any run. Returns a wrapper that
     supplies the bound values when invoked. Never alters the graph or
     recompiles; all inputs may be bound (``run`` then takes no arguments).
 
@@ -1284,7 +1330,10 @@ def bind(executable, **bindings):
                 f"{available}"
             )
         leaf_index, spec = entry
-        bound[leaf_index] = _validate_tensor(spec, value, _format_path((name,)))
+        path = _format_path((name,))
+        tensor = _validate_tensor(spec, value, path)
+        _check_run_device(tensor, executable.device, path)
+        bound[leaf_index] = tensor
         bound_names[name] = leaf_index
     return BoundExecutable(executable, bound, bound_names)
 

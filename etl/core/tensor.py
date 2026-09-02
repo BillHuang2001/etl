@@ -4,10 +4,21 @@ A :class:`Tensor` wraps either a numpy ``ndarray`` (dtype, shape, device,
 data — numpy host memory) or an opaque *device payload* object (duck-typed:
 ``shape``/``dtype``/``device`` + a ``to_host()`` host-copy path, see
 :class:`Tensor`). ndarray-backed tensors are the v1 default: DLPack interop
-is zero-copy in both directions. ``SymbolicTensor`` (see ``symbolic.py``) is
-the graph-side counterpart and must never be confused with a concrete
-``Tensor``: concrete tensors cannot enter a graph implicitly (closure
-capture is a ``TraceError``; ``etl.constant`` is the only explicit way).
+is zero-copy in both directions.
+
+**Explicit placement (binding).** A tensor is always a *local physical
+tensor*: ndarray-backed data IS host memory and therefore always lives on
+``Device("cpu", 0)``; a device payload lives on the device it declares.
+There are NO implicit device transfers in etl — ``.numpy()``/DLPack on a
+non-CPU-kind payload raise :class:`DeviceError`, and placing data on another
+device is always the explicit ``Tensor.to(device)`` (which dispatches to the
+registered device-transfer provider for the target kind, see
+:func:`register_device_transfer_provider`).
+
+``SymbolicTensor`` (see ``symbolic.py``) is the graph-side counterpart and
+must never be confused with a concrete ``Tensor``: concrete tensors cannot
+enter a graph implicitly (closure capture is a ``TraceError``;
+``etl.constant`` is the only explicit way).
 
 The concrete creators in this module (``tensor``, ``zeros``, ``ones``,
 ``full``, ``empty``, ``from_numpy``, ``from_dlpack``) are part of the only
@@ -17,7 +28,7 @@ go through compiled graphs, never be added here.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -25,7 +36,19 @@ from .device import Device
 from .dtypes import dtype as _dtype
 from .errors import DeviceError
 
-__all__ = ["Tensor", "from_numpy", "from_dlpack", "tensor", "zeros", "ones", "full", "empty"]
+__all__ = [
+    "Tensor",
+    "from_numpy",
+    "from_dlpack",
+    "tensor",
+    "zeros",
+    "ones",
+    "full",
+    "empty",
+    # device-transfer provider hook (populated by etl.backends at import
+    # time; internal getter _get_device_transfer_provider not in __all__)
+    "register_device_transfer_provider",
+]
 
 
 def _default_dtype(inferred: Any) -> np.dtype:
@@ -45,6 +68,62 @@ def _default_dtype(inferred: Any) -> np.dtype:
     return dt
 
 
+# --- device-transfer provider registry (explicit placement; see Tensor.to) --
+# Follows the core registration-hook pattern (operator handlers in
+# symbolic.py): core only holds the registry; ``etl.backends`` registers the
+# lazy "cuda" thunk at import time, and the iree adapter overwrites it with a
+# direct provider when it activates (last registration wins). A provider
+# receives a HOST tensor (ndarray-backed, Device("cpu", 0)) plus the target
+# ``core.Device`` and returns a ``Tensor`` placed on the target device.
+
+_DEVICE_TRANSFER_PROVIDERS: Dict[str, Callable] = {}
+
+
+def register_device_transfer_provider(kind: str, provider: Callable) -> None:
+    """Register the device-transfer provider for ``Tensor.to`` kind ``kind``.
+
+    Called by ``etl.backends`` at import time (kind ``"cuda"`` → a lazy
+    thunk over the iree adapter) and overwritten by the iree adapter when it
+    activates — re-registering a kind replaces the previous provider.
+
+    Args:
+        kind: Device kind the provider places data on (e.g. ``"cuda"``).
+        provider: Callable ``provider(tensor, device) -> Tensor`` receiving a
+            host (ndarray-backed, ``Device("cpu", 0)``) tensor and the target
+            :class:`Device`, returning a tensor placed on the target.
+
+    Raises:
+        TypeError: If ``kind`` is not a non-empty string or ``provider`` is
+            not callable.
+    """
+    if not isinstance(kind, str) or not kind:
+        raise TypeError("device-transfer provider kind must be a non-empty string")
+    if not callable(provider):
+        raise TypeError(
+            f"Device-transfer provider for kind {kind!r} must be callable"
+        )
+    _DEVICE_TRANSFER_PROVIDERS[kind] = provider
+
+
+def _get_device_transfer_provider(kind: str) -> Callable:
+    """Return the registered provider for ``kind`` or raise a clear DeviceError.
+
+    Internal cross-module contract (``Tensor.to`` and tests). A provider
+    receives a host (ndarray-backed, ``Device("cpu", 0)``) tensor and a
+    target ``core.Device`` and returns a ``Tensor`` placed on the target.
+    """
+    provider = _DEVICE_TRANSFER_PROVIDERS.get(kind)
+    if provider is None:
+        raise DeviceError(
+            f"no device-transfer provider is registered for device kind "
+            f"{kind!r}: Tensor.to cannot place data on devices of this "
+            "kind. The etl iree backend registers a 'cuda' placement "
+            "provider when activated — see "
+            "core.register_device_transfer_provider."
+        )
+    return provider
+
+
 class Tensor:
     """A materialized runtime tensor.
 
@@ -53,21 +132,27 @@ class Tensor:
     - a numpy ``ndarray`` (the v1 default): ``.data`` is the array itself,
       ``.numpy()`` returns the same reference (zero-copy), DLPack export is
       zero-copy, and ``__eq__`` compares metadata + elementwise values.
+      ndarray-backed data IS host memory, so the tensor always lives on
+      ``Device("cpu", 0)`` (physical truth — see :meth:`__init__`).
     - an opaque *device payload* object (duck-typed protocol — core never
       imports backend code): a device-resident buffer exposing ``.shape``
       (tuple of ints), ``.dtype`` (anything :func:`etl.dtype` normalizes),
       optionally ``.device`` (a :class:`Device` or ``None``), and a way to
       materialize a host copy — a ``to_host()`` method returning an
       ``ndarray`` (tried first) or convertibility via ``np.asarray(payload)``
-      (fallback). For these tensors ``.data`` is the payload itself,
-      ``.numpy()`` performs a LAZY host copy on demand (a fresh copy per
-      call — never cached, so device-memory updates are never stale and no
-      host memory is retained), ``__dlpack__``/``__dlpack_device__`` raise
-      :class:`DeviceError` (call ``.numpy()`` first), and ``__eq__`` compares
-      metadata only (dtype/shape/device — never a hidden host copy).
+      (fallback). For these tensors ``.data`` is the payload itself and
+      ``.device`` is the payload's device (an explicit ``device=`` argument
+      must agree with it). Host access is EXPLICIT: a CPU-kind payload's
+      ``.numpy()`` performs a LAZY fresh host copy on demand (never cached,
+      so device-memory updates are never stale and no host memory is
+      retained), while a non-CPU-kind payload's ``.numpy()``/DLPack raise
+      :class:`DeviceError` — no implicit device-to-host transfer; move the
+      data with :meth:`Tensor.to`. ``__eq__`` compares metadata only
+      (dtype/shape/device — never a hidden host copy).
 
     Concrete tensors are *local physical tensors* — multi-device layouts are
-    prepared explicitly via ``split_tensor``/``replicate_tensor``.
+    prepared explicitly via ``split_tensor``/``replicate_tensor``, and moving
+    a tensor to another device is the explicit :meth:`to` method.
 
     Attributes:
         data: The underlying :class:`numpy.ndarray`, or the device payload
@@ -77,41 +162,74 @@ class Tensor:
         dtype: The dtype as a :class:`numpy.dtype` (derived from ``data``).
         shape: The concrete shape tuple (derived from ``data``).
         device: The :class:`Device` this tensor lives on. For ndarray-backed
-            tensors the default is ``Device("cpu", 0)``. A device payload
-            must know its device: an explicit ``device=`` argument wins,
-            else ``payload.device`` is used, else a :class:`DeviceError` is
-            raised.
+            tensors this is always ``Device("cpu", 0)`` (numpy host memory).
+            A device payload must know its device: an explicit ``device=``
+            argument must equal ``payload.device`` when the payload declares
+            one, else ``payload.device`` is used, else a :class:`DeviceError`
+            is raised.
     """
 
     def __init__(self, data: Any, device: Optional[Device] = None):
-        if not isinstance(data, np.ndarray):
-            # Device payload (duck-typed protocol): must at least describe
-            # itself (shape/dtype). Host materialization (to_host or
-            # np.asarray) is checked lazily in .numpy().
-            if not (hasattr(data, "shape") and hasattr(data, "dtype")):
-                raise TypeError(
-                    "Tensor data must be a numpy ndarray or a device payload "
-                    "object exposing shape/dtype (plus to_host() or "
-                    f"__array__), got {type(data).__name__}"
+        if isinstance(data, np.ndarray):
+            # R1 physical truth: ndarray-backed data IS host memory, so the
+            # tensor can only live on Device('cpu', 0).
+            if device is not None and device != Device("cpu", 0):
+                raise DeviceError(
+                    f"Tensor data is host (numpy) memory and physically "
+                    f"lives on Device('cpu', 0), not on {device!r}: a "
+                    "numpy-backed tensor cannot be constructed on another "
+                    "device. To place data on another device, transfer "
+                    "explicitly after construction, e.g. "
+                    "t.to(core.Device('cuda', 0)) — there is no implicit "
+                    "transfer."
                 )
-            if device is None:
-                payload_device = getattr(data, "device", None)
-                if payload_device is None:
-                    raise DeviceError(
-                        "Tensor wrapping a device payload requires a device: "
-                        "pass device=... or expose payload.device (a "
-                        f"core.Device); payload of type {type(data).__name__} "
-                        "provides neither"
-                    )
-                if not isinstance(payload_device, Device):
-                    raise TypeError(
-                        "payload.device must be a core.Device or None, got "
-                        f"{type(payload_device).__name__} from "
-                        f"{type(data).__name__}"
-                    )
-                device = payload_device
+            self.data = data
+            self.device = Device("cpu", 0)
+            return
+        # Device payload (duck-typed protocol): must at least describe
+        # itself (shape/dtype). Host materialization (to_host or
+        # np.asarray) is checked lazily in .numpy().
+        if not (hasattr(data, "shape") and hasattr(data, "dtype")):
+            raise TypeError(
+                "Tensor data must be a numpy ndarray or a device payload "
+                "object exposing shape/dtype (plus to_host() or "
+                f"__array__), got {type(data).__name__}"
+            )
+        payload_device = getattr(data, "device", None)
+        if device is None:
+            if payload_device is None:
+                raise DeviceError(
+                    "Tensor wrapping a device payload requires a device: "
+                    "pass device=... or expose payload.device (a "
+                    f"core.Device); payload of type {type(data).__name__} "
+                    "provides neither"
+                )
+            if not isinstance(payload_device, Device):
+                raise TypeError(
+                    "payload.device must be a core.Device or None, got "
+                    f"{type(payload_device).__name__} from "
+                    f"{type(data).__name__}"
+                )
+            device = payload_device
+        elif payload_device is not None:
+            if not isinstance(payload_device, Device):
+                raise TypeError(
+                    "payload.device must be a core.Device or None, got "
+                    f"{type(payload_device).__name__} from "
+                    f"{type(data).__name__}"
+                )
+            if device != payload_device:
+                raise DeviceError(
+                    f"Tensor device mismatch: explicit device={device!r} "
+                    f"conflicts with the payload's own device "
+                    f"{payload_device!r}. A device payload physically "
+                    "lives on its declared device and cannot be relabeled: "
+                    "construct the Tensor without device= to use the "
+                    "payload's device, or move the data explicitly with "
+                    "t.to(...) between devices."
+                )
         self.data = data
-        self.device = device if device is not None else Device("cpu", 0)
+        self.device = device
 
     @property
     def dtype(self) -> np.dtype:
@@ -130,14 +248,91 @@ class Tensor:
         mutating the returned array mutates the tensor's data (see the
         ``data`` attribute caveat about graph constants).
 
-        Device-payload-backed tensors: a LAZY host copy materialized on
-        demand — a FRESH copy per call, never cached (device memory may be
-        updated in place by the backend, and caching would retain host
-        memory for the tensor's lifetime).
+        Device-payload-backed tensors: host access is explicit. A CPU-kind
+        payload (``Device('cpu', 0)`` — e.g. iree llvm-cpu buffers) gets a
+        LAZY host copy materialized on demand — a FRESH copy per call,
+        never cached (device memory may be updated in place by the backend,
+        and caching would retain host memory for the tensor's lifetime). A
+        NON-CPU-kind payload (e.g. cuda) raises :class:`DeviceError` — no
+        implicit device-to-host transfer; call :meth:`to` first.
         """
         if isinstance(self.data, np.ndarray):
             return self.data
+        if self.device.kind != "cpu":
+            raise DeviceError(
+                f"Tensor.numpy() needs host memory, but this tensor lives "
+                f"on {self.device!r}: there is no implicit device-to-host "
+                "transfer. Transfer explicitly first, e.g. "
+                "t.to(core.Device('cpu', 0)).numpy()."
+            )
         return self._host_copy()
+
+    def to(self, device: Device) -> "Tensor":
+        """Explicitly transfer/place this tensor on ``device``.
+
+        The ONLY way to move a tensor across devices (no implicit transfers
+        anywhere in etl). Semantics:
+
+        - ``device == self.device`` → returns ``self`` (no copy).
+        - ``device`` kind ``"cpu"`` (only ``Device('cpu', 0)`` exists):
+          ndarray-backed sources are already on cpu:0; a device-payload
+          source is copied to fresh host memory (the explicit D2H transfer).
+        - any other kind (e.g. ``"cuda"``): dispatches to the registered
+          device-transfer provider for that kind (see
+          :func:`register_device_transfer_provider`). The provider receives
+          a HOST tensor (ndarray-backed, cpu:0) in v1; a payload-backed
+          source raises :class:`DeviceError` suggesting the explicit
+          two-hop ``t.to(cpu).to(target)`` — cross-device copies are not
+          implemented in v1.
+
+        Args:
+            device: The target :class:`Device`.
+
+        Returns:
+            A tensor on ``device`` (``self`` when already there).
+
+        Raises:
+            TypeError: If ``device`` is not a :class:`Device`.
+            DeviceError: If the target does not exist (cpu index != 0), the
+                transfer is not implemented in v1 (payload source to a
+                non-cpu target), or no provider is registered for the
+                target kind.
+        """
+        if not isinstance(device, Device):
+            raise TypeError(
+                f"Tensor.to expects a core.Device, got {type(device).__name__}"
+            )
+        if device == self.device:
+            return self
+        if device.kind == "cpu":
+            if device.index != 0:
+                raise DeviceError(
+                    "Tensor.to: only Device('cpu', 0) exists for kind "
+                    f"'cpu' (got {device!r}) — CPU tensors always live on "
+                    "the host"
+                )
+            # An ndarray-backed source would already be on cpu:0 (equal →
+            # returned above); reaching here means a device-payload source:
+            # this is the EXPLICIT device-to-host transfer (fresh copy).
+            return Tensor(self._host_copy())
+        if not isinstance(self.data, np.ndarray):
+            raise DeviceError(
+                f"Tensor.to cannot copy {self.device!r} data directly to "
+                f"{device!r}: cross-device copies are not implemented in "
+                "v1. Transfer in two explicit hops instead: "
+                "t.to(core.Device('cpu', 0)) first, then .to(target)."
+            )
+        provider = _DEVICE_TRANSFER_PROVIDERS.get(device.kind)
+        if provider is None:
+            raise DeviceError(
+                f"Tensor.to cannot place data on {device!r}: no "
+                f"device-transfer provider is registered for device kind "
+                f"{device.kind!r}. The etl iree backend provides cuda "
+                "placement — activate it (import etl.backends or the iree "
+                "adapter) or register a provider via "
+                "core.register_device_transfer_provider."
+            )
+        return provider(self, device)
 
     def _host_copy(self) -> np.ndarray:
         """Materialize a fresh host numpy copy from a device payload.
@@ -174,11 +369,25 @@ class Tensor:
         return arr
 
     def _dlpack_unavailable(self) -> DeviceError:
-        """The error raised when DLPack is requested on a device payload."""
+        """The error raised when DLPack is requested on a device payload.
+
+        CPU-kind payloads (host-mappable memory): DLPack is unavailable —
+        the caller materializes a host copy via ``.numpy()`` first.
+        Non-CPU-kind payloads (e.g. cuda): the memory is genuinely not host
+        memory — the caller must transfer explicitly (``t.to(...)``) first.
+        """
+        if self.device.kind == "cpu":
+            return DeviceError(
+                "Tensor.__dlpack__ is unavailable for a device payload "
+                f"(device={self.device!r}): call .numpy() first to "
+                "materialize a host copy"
+            )
         return DeviceError(
-            "Tensor.__dlpack__ is unavailable for a device payload "
-            f"(device={self.device!r}): call .numpy() first to materialize "
-            "a host copy"
+            f"Tensor.__dlpack__ is unavailable for a device payload "
+            f"(device={self.device!r}): the memory is not host memory, and "
+            "there is no implicit device-to-host transfer. Transfer "
+            "explicitly first, e.g. t.to(core.Device('cpu', 0)), then call "
+            ".numpy() and export the host array."
         )
 
     def __dlpack__(self, stream: Any = None):
@@ -190,8 +399,10 @@ class Tensor:
 
         Device-payload-backed tensors: DLPack is unavailable (exporting a
         device buffer requires a device-aware consumer) — raises
-        :class:`DeviceError` telling the caller to materialize a host copy
-        via ``.numpy()`` first.
+        :class:`DeviceError`. CPU-kind payloads are told to materialize a
+        host copy via ``.numpy()`` first; non-CPU-kind payloads (e.g. cuda)
+        are told to transfer explicitly via ``t.to(...)`` first (no
+        implicit device-to-host transfer).
 
         Args:
             stream: Optional stream hint for the consumer (ignored for CPU
@@ -242,7 +453,8 @@ class Tensor:
 
         If EITHER tensor is device-payload-backed, ``__eq__`` compares
         metadata ONLY (dtype/shape/device) — never a hidden host copy
-        (``.numpy()`` is the explicit way to materialize host data).
+        (``.numpy()``/``to()`` are the explicit ways to access or move the
+        data).
         """
         if not isinstance(other, Tensor):
             return NotImplemented
@@ -316,6 +528,27 @@ def from_dlpack(obj: Any) -> Tensor:
     return Tensor(array, device=Device("cpu", 0))
 
 
+def _check_creator_device(creator: str, device: Optional[Device]) -> None:
+    """R1 physical truth for the concrete creators: host-only targets.
+
+    Concrete creators (``tensor``/``zeros``/``ones``/``full``/``empty``)
+    produce ndarray-backed (host) tensors, so ``device`` may only be
+    ``None`` or ``Device("cpu", 0)``. Anything else raises a
+    creator-specific :class:`DeviceError` naming the creator — never letting
+    ``Tensor.__init__``'s message leak through. Placing data on another
+    device is an explicit post-creation ``Tensor.to(...)`` transfer.
+    """
+    if device is None or device == Device("cpu", 0):
+        return
+    raise DeviceError(
+        f"etl.{creator}(...) creates host (numpy) memory, which can only "
+        f"live on Device('cpu', 0), not on {device!r}: concrete creators "
+        "cannot place data on other devices. Create the tensor on the "
+        "host and transfer explicitly with t.to(...) — there is no "
+        "implicit transfer."
+    )
+
+
 def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = None) -> Tensor:
     """Create a concrete tensor from array-like data.
 
@@ -336,11 +569,17 @@ def tensor(data: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
     Args:
         data: Array-like data (ndarray, list, scalar, ...).
         dtype: Optional target dtype (anything ``etl.dtype`` accepts).
-        device: Optional target device (default ``Device("cpu", 0)``).
+        device: Optional target device — only ``None`` (default) or
+            ``Device("cpu", 0)``: creators produce host (numpy) memory
+            (place on another device via ``Tensor.to`` afterwards).
 
     Returns:
         The new concrete :class:`Tensor`.
+
+    Raises:
+        DeviceError: If ``device`` is anything but ``Device("cpu", 0)``.
     """
+    _check_creator_device("tensor", device)
     if dtype is None:
         inferred = np.asarray(data).dtype
         # ndarrays carry an explicit dtype (respected as-is); Python data
@@ -361,11 +600,17 @@ def zeros(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
         dtype: Element dtype; defaults to ``float32`` — the library's
             documented default dtype (numpy defaults to ``float64``; etl
             deliberately deviates, matching ``TensorSpec``).
-        device: Optional target device (default CPU).
+        device: Optional target device — only ``None`` (default) or
+            ``Device("cpu", 0)`` (host memory; other devices need an
+            explicit ``Tensor.to`` transfer).
 
     Returns:
         The new concrete :class:`Tensor`.
+
+    Raises:
+        DeviceError: If ``device`` is anything but ``Device("cpu", 0)``.
     """
+    _check_creator_device("zeros", device)
     if dtype is None:
         dtype = np.float32
     array = np.zeros(shape, dtype=_dtype(dtype))
@@ -380,11 +625,17 @@ def ones(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = Non
         dtype: Element dtype; defaults to ``float32`` — the library's
             documented default dtype (numpy defaults to ``float64``; etl
             deliberately deviates, matching ``TensorSpec``).
-        device: Optional target device (default CPU).
+        device: Optional target device — only ``None`` (default) or
+            ``Device("cpu", 0)`` (host memory; other devices need an
+            explicit ``Tensor.to`` transfer).
 
     Returns:
         The new concrete :class:`Tensor`.
+
+    Raises:
+        DeviceError: If ``device`` is anything but ``Device("cpu", 0)``.
     """
+    _check_creator_device("ones", device)
     if dtype is None:
         dtype = np.float32
     array = np.ones(shape, dtype=_dtype(dtype))
@@ -403,11 +654,17 @@ def full(
             ``fill_value``, except an inferred ``float64`` becomes ``float32``
             (the library's documented default dtype; integer fills keep
             ``int64``).
-        device: Optional target device (default CPU).
+        device: Optional target device — only ``None`` (default) or
+            ``Device("cpu", 0)`` (host memory; other devices need an
+            explicit ``Tensor.to`` transfer).
 
     Returns:
         The new concrete :class:`Tensor`.
+
+    Raises:
+        DeviceError: If ``device`` is anything but ``Device("cpu", 0)``.
     """
+    _check_creator_device("full", device)
     if dtype is None:
         dtype = _default_dtype(np.asarray(fill_value).dtype)
     array = np.full(shape, fill_value, dtype=_dtype(dtype))
@@ -425,11 +682,17 @@ def empty(shape: Any, dtype: Optional[Any] = None, device: Optional[Device] = No
         dtype: Element dtype; defaults to ``float32`` — the library's
             documented default dtype (numpy defaults to ``float64``; etl
             deliberately deviates, matching ``TensorSpec``).
-        device: Optional target device (default CPU).
+        device: Optional target device — only ``None`` (default) or
+            ``Device("cpu", 0)`` (host memory; other devices need an
+            explicit ``Tensor.to`` transfer).
 
     Returns:
         The new (uninitialized) concrete :class:`Tensor`.
+
+    Raises:
+        DeviceError: If ``device`` is anything but ``Device("cpu", 0)``.
     """
+    _check_creator_device("empty", device)
     if dtype is None:
         dtype = np.float32
     array = np.empty(shape, dtype=_dtype(dtype))

@@ -18,13 +18,17 @@ Contents:
   (``tensor``, ``zeros``, ``ones``, ``full``, ``empty``, ``from_numpy``,
   ``from_dlpack``) + ``constant`` (explicit graph embedding).
 - **Devices** — ``Device``, ``devices()``, explicit multi-device preparation
-  ``split_tensor`` / ``replicate_tensor``.
+  ``split_tensor`` / ``replicate_tensor`` (v1: host data only).
 - **Pytrees** — ``TreeSpec``, ``flatten`` / ``unflatten`` /
   ``register_pytree_node``.
 
 ``SymbolicTensor`` operator overloads dispatch through a handler registry
 (``register_operator_handlers``) that ``etl.ops`` populates at import time —
-this is what keeps the import DAG acyclic.
+this is what keeps the import DAG acyclic. Likewise ``Tensor.to`` (the
+explicit device-transfer API) dispatches through the device-transfer
+provider registry (``register_device_transfer_provider``) that
+``etl.backends`` populates at import time (kind ``"cuda"`` → a lazy thunk
+over the iree adapter).
 
 Status: implementation phase complete — all value-model behaviors are
 implemented (no stubs remain).
@@ -71,11 +75,13 @@ from .symbolic import (
 )
 from .tensor import (
     Tensor,
+    _get_device_transfer_provider,  # internal cross-module contract (Tensor.to)
     empty,
     from_dlpack,
     from_numpy,
     full,
     ones,
+    register_device_transfer_provider,  # populated by etl.backends at import time
     tensor,
     zeros,
 )
@@ -140,6 +146,8 @@ __all__ = [
     "from_dlpack",
     # operator-handler hook (populated by etl.ops)
     "register_operator_handlers",
+    # device-transfer provider hook (populated by etl.backends; Tensor.to)
+    "register_device_transfer_provider",
     # devices
     "Device",
     "devices",

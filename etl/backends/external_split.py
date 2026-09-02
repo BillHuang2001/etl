@@ -7,8 +7,10 @@ host-dispatch path: a graph containing ``external_call`` ops is split at
 ``external_call`` inside) plus a kernel-call PLAN. Segments run on the device;
 at each ``external_call`` boundary the registered kernel is dispatched with
 the segment's DEVICE-RESIDENT output tensors — a HOST-mode kernel (default
-registration) receives host numpy arrays (staged via lazy ``.numpy()`` at the
-boundary), while a DEVICE-mode kernel (``device_resident=True`` registration)
+registration) receives host numpy arrays (staged via the EXPLICIT
+``Tensor.to(core.Device("cpu", 0)).numpy()`` materialization at the boundary —
+never an implicit ``.numpy()`` on a possibly device-resident payload), while a
+DEVICE-mode kernel (``device_resident=True`` registration)
 receives the device tensors DIRECTLY (never host-staged) and may return
 device tensors / duck payloads / host arrays — and its validated results
 occupy the plan slots consumed by the following segment.
@@ -672,7 +674,11 @@ def dispatch_external_kernel(
 
     - HOST mode (``device_resident=False`` — the default registration, the
       exact round-2 semantics): the operand tensors are staged to host numpy
-      arrays (``.numpy()``), the kernel is called with them, and its return is
+      arrays via the EXPLICIT transfer API (``Tensor.to(core.Device("cpu",
+      0)).numpy()`` — every device->host materialization routes through
+      ``.to()``, never an implicit ``.numpy()`` on a possibly device-resident
+      payload; cpu-kind payloads pass through unchanged), the kernel is
+      called with them, and its return is
       normalized and validated against the declared ``result_types`` with the
       SHARED canonical wording (``etl/backends/external_validate.py`` — count
       (``BackendError``), dtype exact (``BackendError`` — no silent
@@ -707,7 +713,12 @@ def dispatch_external_kernel(
         )
     kernel, device_resident = entry
     if not device_resident:
-        host_arrays = [t.numpy() for t in operand_tensors]
+        # Host-mode boundary staging: materialize each operand on the CPU
+        # through the EXPLICIT transfer API (never an implicit .numpy() on a
+        # possibly device-resident payload — under the physical-truth
+        # semantics .numpy() on a non-cpu payload raises DeviceError). A
+        # failed transfer already raises core.DeviceError — let it propagate.
+        host_arrays = [t.to(core.Device("cpu", 0)).numpy() for t in operand_tensors]
         result = kernel(*host_arrays)
         arrays = normalize_results(result, label)
         return validate_outputs(arrays, result_types, label), True

@@ -121,6 +121,9 @@ def constant(tensor) -> "core.SymbolicTensor":
     Raises:
         core.TraceError: no active trace; ``tensor`` is a
             ``SymbolicTensor`` (already a graph value) or not a ``Tensor``.
+        core.DeviceError: ``tensor`` is not on a cpu-kind device — the
+            snapshot would be an implicit device-to-host transfer (no
+            implicit device↔host transfers, ever).
     """
     builder = _utils.check_in_trace()
     loc = _utils.get_location(depth=2)
@@ -135,6 +138,17 @@ def constant(tensor) -> "core.SymbolicTensor":
             f"etl.constant expects a concrete core.Tensor, got "
             f"{type(tensor).__name__} — only concrete tensor data can be "
             "embedded into a graph"
+        )
+    # Snapshot gate: the data is copied via ``tensor.numpy()`` — for a
+    # non-cpu tensor that would be an IMPLICIT device-to-host (D2H)
+    # transfer, which is never allowed. cpu-kind tensors (ndarray-backed
+    # or cpu:0 payload-backed) hold host data and snapshot normally.
+    if tensor.device.kind != "cpu":
+        raise core.DeviceError(
+            f"etl.constant requires host data: the tensor is on device "
+            f"{tensor.device} — no implicit device-to-host transfer happens "
+            f"at constant snapshot time; transfer it to the CPU explicitly "
+            f"via t.to(core.Device('cpu', 0)) before embedding"
         )
     # SNAPSHOT the data: copy the underlying buffer so later mutation of the
     # source tensor cannot change the graph.
