@@ -2133,8 +2133,9 @@ class Writer:
         scale-aware relative off-diagonal energy of the current A (masked
         squared Frobenius vs the full squared energy, per-matrix with an
         AND across the batch) and sets ``done`` once it is below the dtype
-        tolerance (f32 tol 1e-6, f64 tol 1e-13 — initial values; see
-        ``_emit_eigh_sweep_check``). The loop then exits by CLAMPING the
+        tolerance (f32 tol 3e-5, f64 tol 1e-13 — CALIBRATED f32 value, see
+        the tol comment at the constant below). The loop then exits by
+        CLAMPING the
         rotation counter: when ``done`` fires the body returns
         ``k := total`` (a scalar ``select`` on the post-increment counter),
         so the next cond check ``k < total`` fails — converged matrices
@@ -2326,12 +2327,23 @@ class Writer:
             if batch:  # broadcast to the carried (n, n, batch...) layout
                 m_neq = self._bcast(m_neq, dtype, (n, n), t_shape, [0, 1], lines)
             # Rotations per sweep (the remainder divisor) and the squared
-            # dtype tolerance (tol f32 1e-6 / f64 1e-13 — INITIAL values;
-            # the calibration home is
-            # tests/backends/test_iree_eigh_diag_parity.py). tol_sq is
+            # dtype tolerance. f32 tol CALIBRATED to 3e-5 (WS-C task 2
+            # step B, measured on iree-llvm-cpu 3.11 — calibration data in
+            # /tmp/eigh_calib.py; parity home:
+            # tests/backends/test_iree_eigh_diag_parity.py): the full parity
+            # suite stays 9/9 green with fat margins at every looser
+            # candidate (3e-5 keeps dim25/batched-3x3 on the FULL schedule,
+            # identical to the pre-option text), while 3e-5 fires the exit
+            # at sweep ~4 of 7 on dim50 sample-covariance-like matrices
+            # (measured 11-21% savings; 1e-5 fires sweep ~5/6 inconsistently,
+            # 1e-6 essentially never). 1e-4 was REJECTED: no extra dim50
+            # savings, and parity-family matrices start exiting early
+            # (dim25 reconstruction error grows ~10x, batched 3x3 ~22x).
+            # f64 stays 1e-13 (fixed 8-sweep schedule — parity passes).
+            # tol_sq is
             # broadcast to (batch,) when batched (the per-matrix sq terms
             # are (batch,)-shaped).
-            tol = 1e-6 if dtype == np.dtype("float32") else 1e-13
+            tol = 3e-5 if dtype == np.dtype("float32") else 1e-13
             i_rps, extra = self._scalar_constant_for(i64, n * (n - 1) // 2, ())
             lines.extend(extra)
             tol_sq, extra = self._scalar_constant_for(dtype, tol * tol, batch)
@@ -2607,9 +2619,10 @@ class Writer:
         ``sq_offdiag`` the squared Frobenius energy of the off-diagonal
         part (``a*a`` masked by the hoisted 0/1 i != j matrix), ``sq_total``
         the full squared energy, and ``tol_sq`` the hoisted squared dtype
-        tolerance (f32 tol 1e-6, f64 tol 1e-13 — INITIAL values; the
-        calibration home is tests/backends/test_iree_eigh_diag_parity.py,
-        a later agent tunes against it). No sqrt: the comparison is done on
+        tolerance (f32 tol 3e-5, f64 tol 1e-13 — f32 CALIBRATED in WS-C
+        task 2 step B: parity suite 9/9 green with margin, dim50 cov-like
+        fires sweep ~4 for 11-21% savings; 1e-4 rejected — see the tol
+        comment in ``_emit_eigh``). No sqrt: the comparison is done on
         the squared energies. ``converged`` is evaluated PER MATRIX (the
         matrix dims 0,1 of the transposed layout are reduced first, giving
         a (batch,) result) and AND-reduced across the batch — the loop
