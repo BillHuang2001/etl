@@ -144,7 +144,7 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
 `../../tests/backends/` (sibling — read-only from here; test-related writes escalate to root):
 - `registry.py`: register/get/duplicate/unknown-name behavior.
 - numpy interpreter: per-op coverage per kernel category; symbolic-dim binding at run time; dynamic control flow; `runtime_call` sync execution; block impl dispatch (impl vs portable decomposition vs missing ⇒ BackendError); collectives — single-rank identity AND multi-rank in-process simulation via the `CollectiveExecutor` hook; persistence round-trips (artifact save/load, backend mismatch ⇒ PersistenceError).
-- stablehlo: golden-text exports for the v1 table (elementwise, reduce, dot, if/while, symbolic-dims rendering), deferred ops ⇒ BackendError naming the op; new-emitter parity — gather/sort/argsort/argmin/argmax/tile/scatter, bit-exact random, scan-through-while graphs, and shifts vs numpy via iree-llvm-cpu (`test_iree_emitters_parity.py`, 41 tests + 5 iree-cuda smoke tests on `Device("cuda", 5)`, GPU-guarded).
+- stablehlo: golden-text exports for the v1 table (elementwise, reduce, dot, if/while, symbolic-dims rendering), deferred ops ⇒ BackendError naming the op; new-emitter parity — gather/sort/argsort/argmin/argmax/tile/scatter, bit-exact random, scan-through-while graphs, and shifts vs numpy via iree-llvm-cpu (`test_iree_emitters_parity.py`, 48 tests + 5 iree-cuda smoke tests on `Device("cuda", 5)`, GPU-guarded).
 - CPU only, pytest, numpy-only deps.
 
 ## Routing table
