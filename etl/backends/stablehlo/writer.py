@@ -2978,7 +2978,7 @@ class Writer:
     def _dot_batch_dim_equal(self, d1, d2) -> bool:
         """True when two aligned batch dims are provably equal at runtime:
         equal statics, structurally equal symbolic dims, ``None`` pairs,
-        or same-named ``Dim``\ s (core semantics: same name unifies)."""
+        or same-named ``Dim``\\ s (core semantics: same name unifies)."""
         if d1 == d2:
             return True
         return (

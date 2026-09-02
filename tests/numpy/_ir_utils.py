@@ -10,7 +10,7 @@ _LOC_RE = re.compile(r"\s+loc\(.*?\)\s*$")
 
 
 def normalize_ir(text: str) -> str:
-    """Strip per-op `` loc("file":line:col)`` tokens from pretty-printed IR.
+    r"""Strip per-op `` loc("file":line:col)`` tokens from pretty-printed IR.
 
     The regex ``\s+loc\(.*?\)\s*$`` is applied to each line, before removing
     leading/trailing whitespace, because loc tokens differ between enp

@@ -174,7 +174,7 @@ class _DimArithmeticMixin:
 class Dim(_DimArithmeticMixin):
     """A named symbolic dimension with an optional known size.
 
-    Two ``Dim``\s are equal iff name and size match. A ``Dim`` is a valid
+    Two ``Dim``\\s are equal iff name and size match. A ``Dim`` is a valid
     ``DimExpr`` operand and participates in arithmetic via the shared mixin.
 
     Attributes:
