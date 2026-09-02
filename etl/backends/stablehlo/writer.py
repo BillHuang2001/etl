@@ -228,6 +228,12 @@ class Writer:
         self._sort_emission = _normalize_sort_emission(
             (options or {}).get("sort_emission", "pair")
         )
+        #: Ops already emitted at a hoisted position (by ``_emit_if``'s
+        #: while-in-if workaround, see ``_hoist_if_branch_whiles``): their
+        #: result names are bound, so ``_block_body_lines`` must SKIP them
+        #: when the branch regions are emitted (their lines already landed
+        #: BEFORE the enclosing ``stablehlo.if``).
+        self._hoisted_ops: set[int] = set()
         #: while_init_rewrite exporter option (bool, default True): replace
         #: ALL-ZERO rank>=1 constant while-INIT operands with computed zeros
         #: (``not``/``and`` + a dtype-changing ``convert`` + ``reduce`` over a
@@ -3441,11 +3447,50 @@ class Writer:
 
     # --- Control flow ---
 
+    # iree 3.11 mis-lowers a `stablehlo.while` nested inside a
+    # `stablehlo.if` region (upstream; garbage binding descriptor at
+    # invoke — `IndexError OUT_OF_RANGE ... binding length=...` on BOTH
+    # llvm-cpu and cuda at every opt level; proven with raw
+    # `iree-compile` + `iree-run-module` on the identical mlir with and
+    # without the if wrapper; minimal repro `probe_min_while_if.mlir`).
+    # `_emit_eigh`'s cyclic-Jacobi composition contains a while, so any
+    # `etl.cond` wrapping an eigh decomposition (the evox CMAES fused
+    # tell) used to emit exactly that crash shape.
+    #
+    # WORKAROUND: `_emit_if` HOISTS every while-producing subgraph out of
+    # the branch regions — the branch-block prefix up to the last
+    # while-producing op (``eigh`` / ``while`` / an ``if`` whose regions
+    # recursively contain one) is emitted BEFORE the ``stablehlo.if`` and
+    # the branch regions reference the hoisted values lexically
+    # (StableHLO regions capture enclosing values). Safe because every op
+    # that reaches the exporter is pure (effectful ops — collectives,
+    # runtime_call/external_call — defer with BackendError, so nothing
+    # with side effects can be moved). The hoisted prefix may compute
+    # unconditionally what a branch computed conditionally — pure
+    # semantics are preserved. The eigh composition stays a single while
+    # (O(1) emitted text — no compile blowup at dim 50).
+    #
+    # Known residual: an eigh/while nested inside a cond inside a cond
+    # (the inner if is inside the outer REGION, not the outer block
+    # prefix) still emits while-in-if — upstream; restructure or
+    # precompute. eigh inside a while BODY is not hoisted (semantics:
+    # per-iteration) — while-in-while is a separate upstream question.
+
     def _emit_if(self, op: Op) -> str:
         pred = op.operands[0]
+        # Bind the branch block args to the if operands BEFORE any hoisting
+        # so the hoisted prefix resolves branch-local references to the
+        # enclosing operand names (they dominate the hoist point — the if's
+        # operands are emitted by the enclosing block before this op).
+        for region in op.regions:
+            for block in region.blocks:
+                for arg, operand in zip(block.arguments, op.operands):
+                    self._names[id(arg)] = self._name(operand)
+        lines = []
+        self._hoist_if_branch_whiles(op, lines)
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
-        lines = [f'{lhs}"stablehlo.if"({self._name(pred)}) ({{']
+        lines.append(f'{lhs}"stablehlo.if"({self._name(pred)}) ({{')
         lines.append(self._emit_if_region(op.regions[0], op))
         lines.append("  }, {")
         lines.append(self._emit_if_region(op.regions[1], op))
@@ -3454,6 +3499,51 @@ class Writer:
             f"{self._result_types_str(op.results)}"
         )
         return "\n".join(lines)
+
+    def _hoist_if_branch_whiles(self, op: Op, lines: list) -> None:
+        """Hoist every while-producing subgraph out of an ``if``'s branch
+        regions (the iree 3.11 while-in-if workaround — see the comment
+        above). For each branch block, the prefix up to and including the
+        LAST while-producing op is emitted into ``lines`` (the enclosing
+        block, just before the ``if``) and marked in ``self._hoisted_ops``
+        so ``_block_body_lines`` skips it when the region is emitted."""
+        for region in op.regions:
+            for block in region.blocks:
+                ops = list(block.ops)
+                last = None
+                for i, bop in enumerate(ops):
+                    if bop.name == "return":
+                        break
+                    if self._is_while_producing(bop):
+                        last = i
+                if last is None:
+                    continue
+                for bop in ops[: last + 1]:
+                    self._hoisted_ops.add(id(bop))
+                    text = self._emit_op(bop)
+                    if text:
+                        lines.append(text)
+
+    def _is_while_producing(self, bop: Op) -> bool:
+        """True when emitting ``bop`` produces a ``stablehlo.while``:
+        the ``eigh`` composition (one while), a direct ``while`` op, or an
+        ``if`` whose regions recursively contain one."""
+        if bop.name in ("eigh", "while"):
+            return True
+        if bop.name == "if":
+            return any(
+                self._region_has_while_producing(region)
+                for region in bop.regions
+            )
+        return False
+
+    def _region_has_while_producing(self, region) -> bool:
+        return any(
+            self._is_while_producing(bop)
+            for block in region.blocks
+            for bop in block.ops
+            if bop.name != "return"
+        )
 
     def _emit_if_region(self, region, op: Op) -> str:
         """One `if` branch: no block args (StableHLO branches capture the
@@ -3842,6 +3932,8 @@ class Writer:
                 else:
                     lines.append(terminator)
                 break
+            if id(op) in self._hoisted_ops:
+                continue  # already emitted before the enclosing `if`
             text = self._emit_op(op)
             if text:
                 lines.append(text)
