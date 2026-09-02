@@ -155,15 +155,19 @@ from ..registry import register as _registry_register
 # tier's semaphore wait races the dispatch against the copy (~0.4 % of runs
 # return garbage; verified by 1000-run alternating-value stress). The wait
 # is load-bearing. The pinned tier avoids the race by construction (no DMA).
-# Two invariants keep the DMA tier fast:
-#   * the CUDA driver's ASYNC (stream-ordered) allocator is disabled via the
-#     process-global runtime flag --cuda_async_allocations=false: with it
-#     enabled the pool re-trims to empty whenever invoke results are freed,
-#     making every subsequent invocation ~1.1 ms (vs ~0.04 ms warm);
+# Two invariants keep the staging path correct and fast:
+#   * the DMA tier's fresh-semaphore wait is load-bearing (see above) — never
+#     drop it;
 #   * each cuda executable retains a small DEVICE-LOCAL anchor buffer
 #     (_pool_anchor) that keeps the classic allocator's pool from emptying,
-#     so per-call result allocation/free stays ~0.04 ms (measured: 4 KB
-#     anchor suffices, independent of the result size class).
+#     so per-call result allocation/free stays in-pool (~0.04 ms measured)
+#     for users who opt into the classic allocator via
+#     --cuda_async_allocations=false (see _configure_cuda_runtime_flags).
+# The CUDA allocator flag itself is NOT set by etl: iree's process-global
+# default (--cuda_async_allocations=true, the stream-ordered allocator) is
+# the fast, validated state on iree 3.11.0 — forcing it false measured
+# ~2-3x slower per step on fused DE/PSO 4096x50 graphs (see
+# _configure_cuda_runtime_flags).
 # DESIGN NOTE (measured, do not "simplify" back): the earlier fast path had
 # dispatches read the host values directly from a persistent DEVICE_LOCAL |
 # HOST_VISIBLE ("pinned", host-mapped DEVICE memory) buffer, memcpy'd from
@@ -176,7 +180,7 @@ from ..registry import register as _registry_register
 # DMA queue_copy is ~0.01 ms, so the staged path tracks the pure invoke
 # cost (measured 0.08-0.13 ms/call quiet, ~0.3 ms under PCIe contention on
 # this busy 8-GPU box).
-# Both invariants and the staging are pure performance configuration —
+# The staging and the anchor are pure performance configuration —
 # correctness-neutral (identical buffers, copies, and synchronization as
 # the default paths).
 _CUDA_FLAGS_CONFIGURED = False
@@ -325,7 +329,7 @@ def _acquire_runtime_device(
     import iree.runtime as rt
 
     if device_kind == "cuda":
-        _configure_cuda_runtime_flags(tuple(runtime_args))
+        _configure_cuda_runtime_flags()
         driver = rt.get_driver("cuda")
         device_id = device.index + 1
         try:
@@ -389,33 +393,31 @@ def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
 
 
 def _configure_cuda_runtime_flags(user_args: tuple[str, ...] = ()) -> None:
-    """Parse the process-global CUDA allocator flag ONCE (idempotent).
+    """CUDA allocator-flag policy point — etl forces NOTHING by default.
 
-    The etl default ``--cuda_async_allocations=false`` is OVERRIDABLE and
-    applied ONLY when neither the user's explicit ``iree_runtime_args`` load
-    option nor the ``IREE_PY_RUNTIME_FLAGS`` env var mentions
-    ``cuda_async_allocations`` (env is parsed at iree import; the explicit
-    option is parsed AFTER it and wins by last-wins flag semantics). Parse
-    errors of the DEFAULT are ignored (best-effort performance tuning, never
-    correctness) — user-provided runtime args are parsed separately with LOUD
-    errors (``_apply_iree_runtime_args``).
+    iree's process-global default for ``--cuda_async_allocations`` is
+    ``true`` (stream-ordered allocations). etl deliberately never parses the
+    flag itself: measured with interleaved same-session A/B runs on iree
+    3.11.0 / RTX A6000 (fused DE/PSO step graphs, one ``etl.run`` per step,
+    pop 32..4096 x dim 10..50), the async pool is the fast state everywhere
+    — 4096x50: ~1.16 ms/step vs ~2.2-3.5 ms/step with the flag forced to
+    ``false`` (every per-call result alloc/free round-trips the CUDA driver
+    with a full device sync); the historic "async-ON re-trims the pool ~1.1
+    ms per invocation" observation (ceb2ba2-era comments) did NOT reproduce
+    on the current stack. This function is the single place a future default
+    could be pinned; today it intentionally stays a no-op.
+
+    Users who need the classic allocator pool opt in per load via the
+    ``iree_runtime_args`` load option (e.g. ``["--cuda_async_allocations=false"]``
+    — parsed with LOUD errors by ``_apply_iree_runtime_args``) or the
+    ``IREE_PY_RUNTIME_FLAGS`` env var (parsed by iree.runtime at import).
+    The flag is process-global and parsed once: the first cuda load in a
+    process fixes the state for every later load.
     """
     global _CUDA_FLAGS_CONFIGURED
     if _CUDA_FLAGS_CONFIGURED:
         return
     _CUDA_FLAGS_CONFIGURED = True
-    if "cuda_async_allocations" in os.environ.get("IREE_PY_RUNTIME_FLAGS", ""):
-        return
-    if any(
-        _flag_name(flag) == "--cuda_async_allocations" for flag in user_args
-    ):
-        return  # the user's explicit iree_runtime_args wins
-    try:
-        import iree.runtime as rt
-
-        rt.flags.parse_flags("--cuda_async_allocations=false")
-    except Exception:
-        pass  # flag unavailable — the anchor alone still helps
 
 
 def _apply_iree_runtime_args(runtime_args: list[str] | None) -> None:
@@ -885,14 +887,15 @@ class IreeBackend(CompilerBackend):
         4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
            ``core.BackendError``) and parse the ``iree_runtime_args`` load
            option (list/tuple of iree runtime/loader flags, e.g.
-           ``["--cuda_async_allocations=false"]``) via
-           ``iree.runtime.flags.parse_flags`` — the explicit option is parsed
-           AFTER ``IREE_PY_RUNTIME_FLAGS`` (parsed at iree import) and wins
-           by last-wins semantics; a flag the runtime rejects raises
-           ``core.BackendError`` (never silent). etl's own default
-           ``--cuda_async_allocations=false`` (cuda only) is applied ONLY
-           when neither the explicit option nor the env mentions it — the
-           hardcoded-flag lesson: every etl default is overridable.
+           ``["--cuda_async_allocations=false"]`` — the classic-allocator
+           opt-in) via ``iree.runtime.flags.parse_flags`` — the explicit
+           option is parsed AFTER ``IREE_PY_RUNTIME_FLAGS`` (parsed at iree
+           import) and wins by last-wins semantics; a flag the runtime
+           rejects raises ``core.BackendError`` (never silent). etl itself
+           sets NO process-global runtime flag — iree's own defaults stand
+           (cuda: ``--cuda_async_allocations=true``, see
+           ``_configure_cuda_runtime_flags``) — the hardcoded-flag lesson:
+           every flag a user can name is theirs to set.
         5. Validate the device: ``None`` (CPU default) or a ``core.Device``
            of kind ``"cpu"`` or ``"cuda"`` — a non-``Device`` object raises
            ``core.DeviceError``; another kind raises ``core.BackendError``

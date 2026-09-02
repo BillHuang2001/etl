@@ -295,41 +295,37 @@ def _install_fake_iree_runtime(monkeypatch, parse_flags_impl):
     return calls
 
 
-def test_iree_cuda_flags_default_applied(monkeypatch):
-    """Neither the user's runtime args nor IREE_PY_RUNTIME_FLAGS mention
-    cuda_async_allocations -> etl's default is parsed."""
+def test_iree_cuda_allocator_policy_parses_nothing(monkeypatch):
+    """etl forces NO process-global cuda allocator flag.
+
+    The adapter default is iree's own ``--cuda_async_allocations=true``
+    (stream-ordered allocations) — the fast, validated state on iree 3.11.0
+    (interleaved A/B on fused DE/PSO step graphs: forcing ``false`` measured
+    ~2-3x slower per step). ``_configure_cuda_runtime_flags`` is the policy
+    point and parses nothing itself, regardless of user args or env: the
+    only paths for the flag are the user's ``iree_runtime_args`` load option
+    (loud, via ``_apply_iree_runtime_args``) and ``IREE_PY_RUNTIME_FLAGS``
+    (parsed by iree.runtime at import)."""
     calls = _install_fake_iree_runtime(monkeypatch, lambda *a: None)
     monkeypatch.setattr(iree_adapt, "_CUDA_FLAGS_CONFIGURED", False)
     iree_adapt._configure_cuda_runtime_flags()
-    assert calls == [("--cuda_async_allocations=false",)]
-
-
-def test_iree_cuda_flags_suppressed_by_user_args(monkeypatch):
-    """The user's explicit iree_runtime_args mentioning cuda_async_allocations
-    suppress etl's default (the explicit option wins by last-wins semantics)."""
-    calls = _install_fake_iree_runtime(monkeypatch, lambda *a: None)
-    monkeypatch.setattr(iree_adapt, "_CUDA_FLAGS_CONFIGURED", False)
-    iree_adapt._configure_cuda_runtime_flags(("--cuda_async_allocations=true",))
     assert calls == []
-
-
-def test_iree_cuda_flags_suppressed_by_env(monkeypatch):
-    """IREE_PY_RUNTIME_FLAGS mentioning cuda_async_allocations suppresses
-    etl's default (env parsed at iree import wins over the later default)."""
-    calls = _install_fake_iree_runtime(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(iree_adapt, "_CUDA_FLAGS_CONFIGURED", False)
+    iree_adapt._configure_cuda_runtime_flags(("--cuda_async_allocations=false",))
+    assert calls == []
     monkeypatch.setattr(iree_adapt, "_CUDA_FLAGS_CONFIGURED", False)
     monkeypatch.setenv("IREE_PY_RUNTIME_FLAGS", "--cuda_async_allocations=true")
     iree_adapt._configure_cuda_runtime_flags()
     assert calls == []
 
 
-def test_iree_cuda_flags_configured_once(monkeypatch):
-    """The process-global flag is parsed at most once (idempotent)."""
+def test_iree_cuda_allocator_policy_configured_once(monkeypatch):
+    """The policy point is idempotent (guard preserved for a future default)."""
     calls = _install_fake_iree_runtime(monkeypatch, lambda *a: None)
     monkeypatch.setattr(iree_adapt, "_CUDA_FLAGS_CONFIGURED", False)
     iree_adapt._configure_cuda_runtime_flags()
     iree_adapt._configure_cuda_runtime_flags(("--cuda_async_allocations=true",))
-    assert calls == [("--cuda_async_allocations=false",)]
+    assert calls == []
 
 
 def test_iree_apply_runtime_args_valid_flag(monkeypatch):
