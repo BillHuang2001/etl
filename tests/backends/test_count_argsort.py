@@ -28,7 +28,12 @@ Pinned here:
 * llvm-cpu parity: ascending / descending / tie-heavy / axis-0, all
   bit-exact vs the stable numpy references,
 * the upstream-bug path: argsort axis 64 bit-exact on iree-cuda
-  (GPU-guarded via an nvidia-smi free-device scan).
+  (GPU-guarded via an nvidia-smi free-device scan). Cuda runs use the
+  explicit-device-placement semantics: the host input is uploaded via
+  ``Tensor.to`` BEFORE ``etl.run`` (a cuda executable rejects host inputs
+  at the run boundary — no implicit device↔host transfer ever happens
+  there), and the device-resident output is transferred back to host
+  explicitly (``Tensor.numpy()`` on a cuda payload is a ``DeviceError``).
 """
 
 import numpy as np
@@ -218,8 +223,26 @@ CUDA_CASES = [
 def test_cuda_argsort_axis64(fn, spec, arg, ref, cuda_device):
     """The 2-operand sort at axis >= 32 fails to bufferize on iree-cuda
     (upstream); the count emission (the iree default "auto" here) must run
-    bit-exact."""
+    bit-exact.
+
+    Explicit device placement (run-boundary contract): the host input is
+    placed on the cuda device via ``Tensor.to`` BEFORE ``etl.run`` — a
+    cuda executable never stages host inputs, so raw numpy arrays (cpu:0
+    tensors) are rejected at the run boundary. The output is a
+    device-resident payload tensor: ``.numpy()`` raises ``DeviceError``,
+    and the explicit ``to(Device('cpu', 0))`` transfer is the only host
+    path used for the bit-exact comparison.
+    """
     exe = etl.build(
         fn, spec, backend="iree", device=cuda_device, target_backends=["cuda"]
     )
-    _assert_exact(etl.run(exe, arg), ref)
+    # Place the input on the executable's device first (run never stages
+    # host inputs; scalars would need the same placement).
+    arg_dev = etl.core.Tensor(arg).to(cuda_device)
+    got = etl.run(exe, arg_dev)
+    # Device-resident output: no implicit device-to-host transfer — .numpy()
+    # on a cuda payload tensor is a DeviceError.
+    with pytest.raises(etl.core.DeviceError):
+        got.numpy()
+    got_host = etl.tree_map(lambda t: t.to(etl.core.Device("cpu", 0)), got)
+    _assert_exact(got_host, ref)
