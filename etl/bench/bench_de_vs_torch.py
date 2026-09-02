@@ -40,16 +40,18 @@ int64 key and a ``(P, D)`` f32 state and produces ``(new_state, best, key)``.
 Three timing sides with IDENTICAL step semantics per cell
 ----------------------------------------------------------
 1. **etl iree-cuda SAME-DEVICE loop** — build once (``target_backends=
-   ["cuda"]``, ``opt_level="O3"``, free GPU); the first step stages the host
-   state once (unavoidable — there is no upload-only API); steps 2..N feed
-   the previous step's device-resident outputs (state + split key) back.
-   ``.numpy()`` is NEVER called in the timed loop (the invoke is fully
-   synchronous with the device queue — see the adapter notes — so the
-   per-call wall time is the honest per-step latency).
+   ["cuda"]``, ``opt_level="O3"``, free GPU); the host key/state are placed
+   on the device ONCE up front via the explicit ``Tensor.to(device)``
+   transfer (``place_input`` — a no-op on cpu devices); every step then
+   feeds the previous step's device-resident outputs (state + split key)
+   back. ``.numpy()`` is NEVER called in the timed loop (the invoke is
+   fully synchronous with the device queue — see the adapter notes — so
+   the per-call wall time is the honest per-step latency).
 2. **etl iree-cuda HOST-RESTAGING loop** — the FINAL-5 evox pattern: fresh
-   host numpy state (and key) are passed in every step and the outputs are
-   read back (``state.numpy()``) every step — an 800 KB D2H readback + an
-   800 KB H2D staging per step at ``(4096, 50)``.
+   host numpy state (and key) are explicitly placed on the device every
+   step (``place_input``) and the outputs are read back every step via an
+   explicit host transfer (``to_host`` — ``.to(cpu)``) — an 800 KB D2H
+   readback + an 800 KB H2D copy per step at ``(4096, 50)``.
 3. **torch eager CUDA loop** — the same math in torch on cuda (randint
    parents, randn ``(P, D)``, advanced-indexing gathers, ``where``/clamp,
    sum-square fitness, greedy best update); state tensors stay on cuda
@@ -379,10 +381,10 @@ def _etl_device_pass(exe, key0, state0, warmup, timed, device):
     timed loop measures pure run time)."""
     key = place_input(np.array(key0), device)
     state = place_input(np.asarray(state0), device)
-    for _ in range(warmup):  # untimed (step 1 stages the host state once)
+    for _ in range(warmup):  # untimed warm-up (host state placed once, up front)
         state, _best, key = etl.run(exe, key, state)
     times = []
-    for _ in range(timed):  # steps 2..N: device pass-through, NO .numpy()
+    for _ in range(timed):  # device pass-through every step, NO .numpy()
         t0 = time.perf_counter()
         state, _best, key = etl.run(exe, key, state)
         times.append((time.perf_counter() - t0) * 1e3)

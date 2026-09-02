@@ -40,9 +40,12 @@ Methodology (per config)
   traced once per (op, size, algorithm) and cached; tracing is excluded from
   the timing.
 - ``best_ms`` = best-of-``repeats`` of ``run()`` after ``warmup`` untimed
-  runs, via ``perf_counter`` around ``run()`` ONLY. On cuda the run returns a
-  device-resident ``Tensor``; the host copy (``.numpy()``) is NEVER part of
-  the timed loop.
+  runs, via ``perf_counter`` around ``run()`` ONLY. The host key is placed
+  on the run device ONCE up front (``place_input`` — the explicit
+  ``Tensor.to(device)`` transfer; no implicit host→device staging inside
+  the loop). On cuda the run returns a device-resident ``Tensor``; host
+  copies happen only in the verification step, via an explicit ``.to(cpu)``
+  readback (``to_host`` — a no-op on cpu targets), never in the timed loop.
 - Bit-exactness: every successful compiler-target config is verified against
   the numpy-backend run of the SAME graph + key (bitwise ``array_equal``;
   ``normal`` f32 additionally falls back to the documented
