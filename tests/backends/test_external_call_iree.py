@@ -46,6 +46,20 @@ The numpy backend is unchanged: it resolves the default slot only, so each
 device-mode test also registers a default-slot HOST kernel (identical math)
 as the ``_run_numpy`` reference — pinning that device mode is consumed by
 iree alone.
+
+The iree-cuda tests run under the explicit-device-placement model (no
+implicit host<->device transfers anywhere): each cuda run input is placed
+on the executable's device FIRST via ``Tensor.to(cuda_device)`` — a host
+numpy array at the run boundary now raises ``core.DeviceError`` naming the
+input path (only llvm-cpu executables still accept host inputs). Kernel
+boundaries are unchanged: host-mode boundaries stage operands/results
+through the EXPLICIT ``Tensor.to(core.Device('cpu', 0)).numpy()``
+materialization (an explicit kernel contract — never an implicit
+transfer), while device-resident boundaries keep zero host round-trips.
+The device-resident run outputs are read back via the explicit
+``out.to(core.Device('cpu', 0)).numpy()`` — a bare ``out.numpy()`` on a
+cuda payload tensor raises ``core.DeviceError`` (no implicit
+device-to-host transfer).
 """
 
 import warnings
@@ -993,7 +1007,13 @@ def test_device_unregistered_kernel_raises_naming_registry():
 
 
 # ---------------------------------------------------------------------------
-# iree-cuda (GPU-guarded): same host-dispatch semantics on a real device
+# iree-cuda (GPU-guarded): host-dispatch semantics on a real device under
+# the explicit-device-placement model — cuda run inputs must ALREADY live
+# on the executable's device (placed via Tensor.to(cuda_device); a host
+# array at the run boundary raises core.DeviceError); host-mode kernel
+# boundaries still stage via the EXPLICIT .to(cpu) transfer (kernel
+# contract); device-resident run outputs are read back via
+# out.to(core.Device("cpu", 0)) — a bare .numpy() raises core.DeviceError.
 # ---------------------------------------------------------------------------
 
 
@@ -1042,20 +1062,40 @@ def cuda_device():
 
 
 def test_cuda_mid_graph_call_bit_exact(cuda_device):
+    """Host-mode kernel dispatch on a real GPU under the explicit-placement
+    model: the run input is placed on the executable's device first
+    (``Tensor.to(cuda_device)`` — a host array at the run boundary raises
+    ``core.DeviceError``), the host-mode boundary still stages via the
+    EXPLICIT ``.to(cpu)`` transfer, and the device-resident run output is
+    read back via ``out.to(core.Device('cpu', 0))`` — a bare ``out.numpy()``
+    raises ``core.DeviceError`` (no implicit device-to-host transfer)."""
     exe = _build_exe(
         _mid_graph, _specs(SPEC), device=cuda_device, target_backends=["cuda"]
     )
+    x_in = etl.core.Tensor(X).to(cuda_device)
+    out = etl.run(exe, x_in)
+    with pytest.raises(etl.core.DeviceError):
+        out.numpy()
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_mid_graph, X)
+        out.to(etl.core.Device("cpu", 0)), _run_numpy(_mid_graph, X)
     )
 
 
 def test_cuda_sequential_calls_bit_exact(cuda_device):
+    """Two sequential host-mode calls on a real GPU under the
+    explicit-placement model: the run input is placed on the executable's
+    device first (``Tensor.to(cuda_device)``), and the device-resident run
+    output (a bare ``.numpy()`` raises ``core.DeviceError``) is bit-exact
+    vs the numpy reference after the explicit ``out.to(cpu)`` transfer."""
     exe = _build_exe(
         _sequential, _specs(SPEC), device=cuda_device, target_backends=["cuda"]
     )
+    x_in = etl.core.Tensor(X).to(cuda_device)
+    out = etl.run(exe, x_in)
+    with pytest.raises(etl.core.DeviceError):
+        out.numpy()
     _assert_bit_exact(
-        etl.run(exe, etl.Tensor(X)), _run_numpy(_sequential, X)
+        out.to(etl.core.Device("cpu", 0)), _run_numpy(_sequential, X)
     )
 
 
@@ -1077,10 +1117,15 @@ def _make_cuda_relay_kernel(device):
 
 
 def test_cuda_device_kernel_bit_exact_and_operands_device_resident(cuda_device):
-    """Device-resident mode on a real GPU: operands arrive as device
-    payloads living on the cuda device (asserted inside the kernel), a
-    device result comes back, and the graph output — still on the cuda
-    device — is bit-exact vs the numpy reference."""
+    """Device-resident mode on a real GPU under the explicit-placement
+    model: the run input is placed on the executable's device first
+    (``Tensor.to(cuda_device)`` — a host array at the run boundary raises
+    ``core.DeviceError``), operands arrive as device payloads living on the
+    cuda device (asserted inside the kernel), a device result comes back,
+    and the graph output — still on the cuda device, so a bare
+    ``out.numpy()`` raises ``core.DeviceError`` (no implicit
+    device-to-host transfer) — is bit-exact vs the numpy reference after
+    the explicit ``out.to(core.Device('cpu', 0))`` host transfer."""
     name = "t_dev_cuda_relay"
     with _device_kernel(
         name, lambda x: x * 2.0, _make_cuda_relay_kernel(cuda_device)
@@ -1091,7 +1136,13 @@ def test_cuda_device_kernel_bit_exact_and_operands_device_resident(cuda_device):
             device=cuda_device,
             target_backends=["cuda"],
         )
-        out = etl.run(exe, etl.Tensor(X))
+        x_in = etl.core.Tensor(X).to(cuda_device)
+        out = etl.run(exe, x_in)
         assert isinstance(out, etl.Tensor)
         assert out.data.device == cuda_device
-        _assert_bit_exact(out, _run_numpy(_dev_cuda_graph, X))
+        with pytest.raises(etl.core.DeviceError):
+            out.numpy()
+        _assert_bit_exact(
+            out.to(etl.core.Device("cpu", 0)),
+            _run_numpy(_dev_cuda_graph, X),
+        )

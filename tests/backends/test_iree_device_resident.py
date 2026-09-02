@@ -1,25 +1,39 @@
 """iree adapter device-resident tensor semantics (regression suite).
 
-Pins the device-resident execution contract (``etl/backends/adapters/iree.py``):
+Pins the EXPLICIT device-placement execution contract
+(``etl/backends/adapters/iree.py`` + ``core.Tensor.to``/``.numpy`` + the
+pipeline run-boundary device check in ``etl/pipeline.py``):
 
 * run outputs on BOTH llvm-cpu and cuda are payload-backed ``core.Tensor``\\ s:
   ``.data`` is the duck-typed device payload (the iree DeviceArray), never a
-  numpy ndarray; ``.device`` is the executable's ``core.Device``; the host
-  copy happens LAZILY in ``.numpy()``.
-* same-device input pass-through: a run-out tensor fed back into an iree
+  numpy ndarray; ``.device`` is the executable's ``core.Device``.
+* host access is EXPLICIT: a CPU-kind payload's (llvm-cpu) ``.numpy()``
+  materializes a LAZY fresh host copy on demand; a NON-CPU-kind payload's
+  (cuda) ``.numpy()`` RAISES ``core.DeviceError`` — no implicit
+  device-to-host transfer — the explicit
+  ``t.to(core.Device('cpu', 0)).numpy()`` hop is the only host path.
+* run-boundary placement (R5): every tensor input to ``etl.run`` must ALREADY
+  live on the executable's device. Host numpy inputs to a cuda executable are
+  ILLEGAL — feeding a cpu:0 tensor (or a raw numpy array, auto-wrapped as
+  cpu:0) raises ``core.DeviceError`` naming the input path; inputs must be
+  placed explicitly via ``t.to(core.Device('cuda', N))`` before ``run``.
+* same-device input pass-through: a device-resident tensor fed into an iree
   executable's ``run()`` goes device-to-device — ``iree.runtime.asdevicearray``
-  is NEVER called for it (monkeypatched to raise).
-* host numpy inputs still work on both targets.
+  is NEVER called for it (monkeypatched to raise). Under the
+  explicit-placement model EVERY cuda call with device-resident inputs is such
+  a pass-through: ZERO ``asdevicearray`` calls from the very first call.
+* llvm-cpu executables still accept host cpu:0 ndarray inputs via
+  ``asdevicearray`` (host→host representation copy, unchanged).
 * the numpy backend is untouched: ndarray-backed outputs, zero-copy
   same-reference ``.numpy()``.
 
 SEMANTICS ONLY: nothing here depends on the internal host-input upload
 mechanism (persistent pinned buffers vs ``rt.asdevicearray``). The llvm-cpu
 host-input test asserts ``asdevicearray`` IS used on that target (the current
-observable contract there); the cuda host-input test asserts correctness
-without pinning the upload path. GPU tests additionally guard on a free
-device scanned via nvidia-smi (most-free GPU; etl ``Device("cuda", idx)``
-maps to iree device_id ``idx + 1``, 1-based).
+observable contract there); the cuda host-input test pins the run-boundary
+``DeviceError`` (host inputs never reach the executable). GPU tests
+additionally guard on a free device scanned via nvidia-smi (most-free GPU;
+etl ``Device("cuda", idx)`` maps to iree device_id ``idx + 1``, 1-based).
 
 IREE runs the real MLIR compiler (seconds per compile), so executables are
 cached per (fn, specs, device, target_backends) — one compile per distinct
@@ -63,9 +77,20 @@ def _row_sum(x):
 
 
 def _np(v):
-    """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays."""
+    """Tensor / tuple-of-Tensors → ndarray / tuple-of-ndarrays.
+
+    Host access is explicit: payload-backed Tensors are host-materialized via
+    the explicit transfer ``v.to(core.Device('cpu', 0)).numpy()`` — a
+    no-op (returns self) for cpu-kind payloads whose lazy ``.numpy()`` then
+    applies, and the explicit D2H hop for non-cpu-kind (cuda) payloads whose
+    ``.numpy()`` would raise ``DeviceError``. ndarray-backed Tensors are
+    already host memory (cpu:0 → ``to`` returns self → same zero-copy
+    reference). The numpy-backend zero-copy assertion
+    (``test_numpy_backend_untouched``) calls ``.numpy()`` directly and is
+    unaffected.
+    """
     if isinstance(v, etl.Tensor):
-        return np.asarray(v.numpy())
+        return np.asarray(v.to(etl.core.Device("cpu", 0)).numpy())
     return np.asarray(v)
 
 
@@ -237,41 +262,89 @@ def test_numpy_backend_untouched():
 
 def test_cuda_runout_device_resident(cuda_device):
     exe = _build_exe(_add, ADD_SPECS, device=cuda_device, target_backends=["cuda"])
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    out = etl.run(
+        exe,
+        etl.core.Tensor(XA).to(cuda_device),
+        etl.core.Tensor(XB).to(cuda_device),
+    )
     _assert_device_resident(out, cuda_device)
     assert out.dtype == np.dtype("float32")
-    _assert_exact(out, etl.evaluate(_add, XA, XB))
+    # Semantic pin (explicit-placement model): a cuda run-out payload tensor
+    # never transfers implicitly — .numpy() raises DeviceError (no implicit
+    # device-to-host transfer); the explicit .to(cpu) hop is the only host
+    # path and round-trips bit-exact vs the numpy backend.
+    with pytest.raises(etl.core.DeviceError, match="no implicit device-to-host"):
+        out.numpy()
+    host = out.to(etl.core.Device("cpu", 0))
+    assert isinstance(host.data, np.ndarray)  # explicit D2H → host memory
+    assert host.device == etl.core.Device("cpu", 0)
+    _assert_exact(host, etl.evaluate(_add, XA, XB))
 
 
 def test_cuda_reduce_runout_dtype_shape(cuda_device):
     exe = _build_exe(_row_sum, SUM_SPECS, device=cuda_device, target_backends=["cuda"])
-    out = etl.run(exe, etl.core.Tensor(XR))
+    out = etl.run(exe, etl.core.Tensor(XR).to(cuda_device))
     _assert_device_resident(out, cuda_device)
     assert out.shape == (4,)  # reduce over axis 1 of (4, 8)
     assert out.dtype == np.dtype("float32")
     # fp32 reduction accumulation-order noise: within tolerance of numpy.
+    # _np host-materializes via .to(cpu) — a cuda output's .numpy() would raise.
     _assert_close(out, etl.evaluate(_row_sum, XR), rtol=1e-5, atol=1e-5)
 
 
-def test_cuda_host_input_works(cuda_device):
+def test_cuda_host_inputs_require_explicit_placement(cuda_device):
     exe = _build_exe(_add, ADD_SPECS, device=cuda_device, target_backends=["cuda"])
-    out = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    # (a) Run-boundary contract (R5): a cuda executable NEVER stages host
+    # inputs — feeding host cpu:0 tensors raises DeviceError naming the input
+    # path and the explicit placement remedy, before the backend dispatches.
+    with pytest.raises(etl.core.DeviceError) as excinfo:
+        etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
+    msg = str(excinfo.value)
+    assert "input at path [0]" in msg  # the offending input tree path
+    assert (
+        "no implicit device-to-host or host-to-device transfer happens at "
+        "the run boundary" in msg
+    )
+    assert "t.to(" in msg  # the explicit placement remedy
+    # Raw numpy arrays auto-wrap as cpu:0 host tensors — same boundary error.
+    with pytest.raises(
+        etl.core.DeviceError,
+        match="no implicit device-to-host or host-to-device transfer happens "
+        "at the run boundary",
+    ):
+        etl.run(exe, XA, XB)
+    # (b) Inputs placed explicitly via .to(cuda_device) run bit-exact.
+    out = etl.run(
+        exe,
+        etl.core.Tensor(XA).to(cuda_device),
+        etl.core.Tensor(XB).to(cuda_device),
+    )
     _assert_exact(out, etl.evaluate(_add, XA, XB))
 
 
 def test_cuda_passthrough_zero_asdevicearray_calls(cuda_device, monkeypatch):
     exe = _build_exe(_add, ADD_SPECS, device=cuda_device, target_backends=["cuda"])
-    out1 = etl.run(exe, etl.core.Tensor(XA), etl.core.Tensor(XB))
-    out2 = etl.run(exe, etl.core.Tensor(XB), etl.core.Tensor(XA))
+    # Place BOTH inputs explicitly BEFORE the monkeypatch: under the
+    # explicit-placement model every cuda call with device-resident inputs is
+    # a same-device pass-through — ZERO asdevicearray calls from the very
+    # FIRST call (the monkeypatch raises if the path ever regresses).
+    xa = etl.core.Tensor(XA).to(cuda_device)
+    xb = etl.core.Tensor(XB).to(cuda_device)
 
     def _forbid(*args, **kwargs):
         raise AssertionError(
-            "asdevicearray must not be called for a same-device "
-            "pass-through input"
+            "asdevicearray must never be called: a cuda run with "
+            "device-resident inputs is a same-device pass-through (zero "
+            "host staging from the very first call)"
         )
 
     import iree.runtime as rt
 
     monkeypatch.setattr(rt, "asdevicearray", _forbid)
-    out3 = etl.run(exe, out1, out2)
-    _assert_exact(out3, etl.evaluate(_add, XA + XB, XB + XA))
+    out1 = etl.run(exe, xa, xb)
+    # A run-out device tensor fed straight back in is likewise a same-device
+    # pass-through with no host staging.
+    out2 = etl.run(exe, out1, xa)
+    # Host comparison goes through the explicit .to(cpu) hop (_np).
+    _assert_exact(out1, etl.evaluate(_add, XA, XB))
+    _assert_exact(out2, etl.evaluate(_add, XA + XB, XA))

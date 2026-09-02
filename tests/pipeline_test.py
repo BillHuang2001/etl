@@ -490,6 +490,123 @@ def test_bind_validation():
 
 
 # ---------------------------------------------------------------------------
+# Run/bind boundary device enforcement (explicit placement, R5)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCudaPayload:
+    """Duck-typed cuda-kind device payload (.shape/.dtype/.device/.to_host).
+
+    A CPU-only stand-in for a real device-resident buffer: ``device`` is a
+    ``core.Device`` of kind ``"cuda"`` and ``to_host()`` materializes a
+    FRESH host ndarray — no backend imports, no GPU needed.
+    """
+
+    def __init__(self, shape=(3,), dtype=np.float32):
+        self._shape = tuple(shape)
+        self.dtype = dtype
+        self.device = etl.Device("cuda", 0)
+        count = int(np.prod(self._shape))
+        self._data = np.arange(count, dtype=dtype).reshape(self._shape)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def to_host(self):
+        return self._data.copy()
+
+
+def _cuda_kind_tensor(shape=(3,), dtype=np.float32):
+    """A ``core.Tensor`` wrapping the fake cuda-kind payload."""
+    return etl.Tensor(_FakeCudaPayload(shape=shape, dtype=dtype))
+
+
+@etl.defn
+def _add_one(x):
+    """`x + 1.0` — the trivial single-input graph for boundary checks."""
+    return etl.add(x, 1.0)
+
+
+def test_run_rejects_input_on_another_device():
+    """R5 run boundary: every input tensor must ALREADY be at the
+    executable's device. A cuda-kind tensor fed to the cpu numpy executable
+    raises DeviceError naming the input path, both devices, and the explicit
+    ``t.to(...)`` remedy — no implicit device↔host transfer at run time."""
+    executable = etl.build(_add_one, etl.TensorSpec((3,), etl.float32))
+    assert executable.device == etl.Device("cpu", 0)
+
+    with pytest.raises(etl.DeviceError) as excinfo:
+        etl.run(executable, _cuda_kind_tensor())
+    message = str(excinfo.value)
+    assert "input at path [0] is on device" in message
+    assert "no implicit device" in message
+    assert "t.to(" in message
+    assert "Device(kind='cuda', index=0)" in message
+    assert "Device(kind='cpu', index=0)" in message
+
+
+def test_run_device_mismatch_names_nested_path():
+    """A structured input with one cpu leaf and one cuda-kind leaf fails at
+    the foreign leaf, naming its pytree path (deterministic first-mismatch
+    order; the cpu leaf at 'a' passes the boundary check)."""
+
+    @etl.defn
+    def f(d):
+        return etl.add(d["a"], d["b"])
+
+    executable = etl.build(
+        f,
+        {
+            "a": etl.TensorSpec((3,), etl.float32, name="a"),
+            "b": etl.TensorSpec((3,), etl.float32, name="b"),
+        },
+    )
+    inputs = {"a": etl.ones((3,), dtype=etl.float32), "b": _cuda_kind_tensor()}
+    with pytest.raises(etl.DeviceError) as excinfo:
+        etl.run(executable, inputs)
+    message = str(excinfo.value)
+    assert "input at path [0]['b'] is on device" in message
+    assert "no implicit device" in message
+    assert "t.to(" in message
+
+
+def test_bind_rejects_tensor_on_another_device():
+    """Binding a cuda-kind tensor into a cpu executable fails fast with the
+    same run-boundary DeviceError (no implicit transfer at bind time)."""
+    executable = etl.build(
+        _add_one, etl.TensorSpec((3,), etl.float32, name="x")
+    )
+    with pytest.raises(etl.DeviceError) as excinfo:
+        etl.bind(executable, x=_cuda_kind_tensor())
+    message = str(excinfo.value)
+    assert "input at path ['x'] is on device" in message
+    assert "no implicit device" in message
+    assert "t.to(" in message
+
+
+def test_run_accepts_cpu_inputs_positive_control():
+    """Positive control: cpu-kind inputs — a core.Tensor and a raw numpy
+    ndarray (auto-wrapped as a cpu:0 tensor) — run fine on the cpu
+    executable; the explicit ``t.to(cpu)`` transfer unblocks the cuda-kind
+    tensor."""
+    executable = etl.build(_add_one, etl.TensorSpec((3,), etl.float32))
+    expected = np.arange(3, dtype=np.float32) + 1.0
+
+    out_tensor = etl.run(executable, etl.tensor(np.arange(3, dtype=np.float32)))
+    np.testing.assert_array_equal(out_tensor.numpy(), expected)
+
+    out_ndarray = etl.run(executable, np.arange(3, dtype=np.float32))
+    np.testing.assert_array_equal(out_ndarray.numpy(), expected)
+
+    # the documented remedy: move the tensor explicitly, then run
+    moved = _cuda_kind_tensor().to(etl.Device("cpu", 0))
+    assert moved.device == etl.Device("cpu", 0)
+    out_moved = etl.run(executable, moved)
+    np.testing.assert_array_equal(out_moved.numpy(), expected)
+
+
+# ---------------------------------------------------------------------------
 # Run-time structure mismatches name the first diverging pytree path
 # ---------------------------------------------------------------------------
 

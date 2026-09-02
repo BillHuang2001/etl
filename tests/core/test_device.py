@@ -6,6 +6,14 @@ view: every assertion follows the implemented contract documented in
 ``etl/core/CONTEXT.md`` and ``etl/core/device.py`` (e.g. ``split_tensor``
 returns *views* and ``replicate_tensor`` shares one buffer — both documented
 "no copies" v1 semantics).
+
+**v1 physical truth (binding):** ``split_tensor``/``replicate_tensor`` are
+host-data-only helpers — the source must be an ndarray-backed tensor on
+``Device('cpu', 0)`` and every target device must be ``Device('cpu', 0)``.
+Non-host targets (cuda, or cpu with index != 0) and device-payload sources
+raise ``DeviceError`` with the explicit-transfer remedy (never a raw
+``AttributeError`` on a payload); axis/divisibility/type errors are unchanged
+for valid host sources.
 """
 
 from dataclasses import FrozenInstanceError
@@ -13,8 +21,31 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from etl.core import Device, devices, replicate_tensor, split_tensor, tensor
+from etl.core import Device, Tensor, devices, replicate_tensor, split_tensor, tensor
 from etl.core.errors import DeviceError, ShapeError
+
+# Stable fragments of the canonical v1 host-data-only DeviceError (see
+# device._host_only_error): the source and target variants both carry the
+# explicit-transfer remedy, so one regex asserts the documented fragments
+# "host (numpy)", "Device('cpu', 0)", "no implicit device" and "t.to(".
+_HOST_ONLY_FRAGMENTS = (
+    r"host \(numpy\).*Device\('cpu', 0\).*no implicit device.*t\.to\("
+)
+
+
+class _DummyDevicePayload:
+    """Minimal device-payload duck type: shape/dtype/device only.
+
+    Deliberately has NO ndarray data (and no ``.ndim``) — it mirrors a
+    device-resident buffer (e.g. an iree ``DeviceArray``) and pins the
+    regression where ``split_tensor``/``replicate_tensor`` probed
+    ``.data.ndim`` on payload sources and leaked a raw ``AttributeError``.
+    """
+
+    def __init__(self, device: Device):
+        self.shape = (2, 3)
+        self.dtype = np.float32
+        self.device = device
 
 
 # --- Device -----------------------------------------------------------------
@@ -112,7 +143,10 @@ class TestDevices:
 
 
 class TestSplitTensor:
-    TWO = [Device("cpu"), Device("cpu", 1)]
+    # v1 physical truth: every target must be Device('cpu', 0) — the helper
+    # cannot place data on other devices, so multi-piece targets all name
+    # the host device.
+    TWO = [Device("cpu"), Device("cpu")]
 
     def test_split_along_axis(self):
         t = tensor(np.arange(12).reshape(4, 3))
@@ -131,6 +165,7 @@ class TestSplitTensor:
         t = tensor(np.arange(12).reshape(4, 3))
         parts = split_tensor(t, 0, self.TWO)
         assert np.shares_memory(parts[0].data, t.data)
+        assert np.shares_memory(parts[1].data, t.data)
 
     def test_split_negative_axis(self):
         t = tensor(np.arange(12).reshape(4, 3))
@@ -142,11 +177,12 @@ class TestSplitTensor:
             assert part.device == Device("cpu")
 
     def test_split_single_device(self):
+        # A single host target: one piece covering all the data.
         t = tensor(np.arange(12).reshape(4, 3))
-        parts = split_tensor(t, 0, [Device("cuda", 3)])
+        parts = split_tensor(t, 0, [Device("cpu")])
         assert len(parts) == 1
         assert np.array_equal(parts[0].data, t.data)
-        assert parts[0].device == Device("cuda", 3)
+        assert parts[0].device == Device("cpu", 0)
 
     def test_original_unchanged(self):
         t = tensor(np.arange(12).reshape(4, 3))
@@ -174,27 +210,53 @@ class TestSplitTensor:
             split_tensor(t, 0.5, self.TWO)
 
     @pytest.mark.parametrize(
-        ("shape", "target_devices"),
+        ("shape", "n_devices"),
         [
-            ((5, 3), [Device("cpu"), Device("cpu", 1)]),
-            ((2, 3), [Device("cpu")] * 4),
+            ((5, 3), 2),
+            ((2, 3), 4),
         ],
     )
-    def test_non_divisible_raises(self, shape, target_devices):
+    def test_non_divisible_raises(self, shape, n_devices):
+        # Dimension size not divisible by the chunk count → ShapeError, for a
+        # valid host source and all-host targets (non-host targets are
+        # covered by test_non_host_target_raises).
         t = tensor(np.zeros(shape))
         with pytest.raises(ShapeError, match="not divisible"):
-            split_tensor(t, 0, target_devices)
+            split_tensor(t, 0, [Device("cpu")] * n_devices)
 
     def test_non_tensor_raises(self):
         with pytest.raises(DeviceError, match="split_tensor expects a Tensor, got list"):
             split_tensor([1, 2, 3, 4], 0, self.TWO)
+
+    @pytest.mark.parametrize(
+        "target",
+        [Device("cuda", 3), Device("cpu", 1)],
+        ids=["cuda", "cpu-index-1"],
+    )
+    def test_non_host_target_raises(self, target):
+        # v1 physical truth: only Device('cpu', 0) targets are legal — a cuda
+        # (or cpu index != 0) target raises the canonical DeviceError with
+        # the explicit-transfer remedy; the helper never places data on
+        # other devices and never transfers implicitly.
+        t = tensor(np.arange(12).reshape(4, 3))
+        with pytest.raises(DeviceError, match=_HOST_ONLY_FRAGMENTS):
+            split_tensor(t, 0, [target])
+
+    def test_payload_source_raises_device_error(self):
+        # Regression pin: a device-payload source raises the canonical
+        # DeviceError (validated BEFORE any payload attribute access) — not a
+        # raw AttributeError from the old .data.ndim probe.
+        t = Tensor(_DummyDevicePayload(Device("cuda", 0)))
+        with pytest.raises(DeviceError, match=_HOST_ONLY_FRAGMENTS):
+            split_tensor(t, 0, [Device("cpu")])
 
 
 # --- replicate_tensor -------------------------------------------------------
 
 
 class TestReplicateTensor:
-    TWO = [Device("cpu"), Device("cpu", 1)]
+    # v1 physical truth: every target must be Device('cpu', 0).
+    TWO = [Device("cpu"), Device("cpu")]
 
     def test_replicate_values_and_devices(self):
         t = tensor(np.arange(6).reshape(2, 3))
@@ -207,18 +269,19 @@ class TestReplicateTensor:
             assert part.device == device
 
     def test_replicate_shares_single_buffer(self):
-        # Documented v1 semantics: "The SAME ndarray object tagged with each
-        # device — no copies."  Replicas share one buffer (not distinct ones).
+        # Documented v1 semantics: "no copies" — replicas share one buffer
+        # (not distinct ones).
         t = tensor(np.arange(6))
         parts = replicate_tensor(t, self.TWO)
         assert parts[0].data is parts[1].data
         assert parts[0].data is t.data
 
     def test_replicate_single_device(self):
+        # A single host target: one replica sharing the source data.
         t = tensor(np.arange(6))
-        parts = replicate_tensor(t, [Device("cuda", 3)])
+        parts = replicate_tensor(t, [Device("cpu")])
         assert len(parts) == 1
-        assert parts[0].device == Device("cuda", 3)
+        assert parts[0].device == Device("cpu", 0)
         assert np.array_equal(parts[0].data, t.data)
 
     def test_original_unchanged(self):
@@ -236,3 +299,22 @@ class TestReplicateTensor:
             DeviceError, match="replicate_tensor expects a Tensor, got ndarray"
         ):
             replicate_tensor(np.arange(6), self.TWO)
+
+    @pytest.mark.parametrize(
+        "target",
+        [Device("cuda", 3), Device("cpu", 1)],
+        ids=["cuda", "cpu-index-1"],
+    )
+    def test_non_host_target_raises(self, target):
+        # v1 physical truth: only Device('cpu', 0) targets are legal — see
+        # TestSplitTensor.test_non_host_target_raises for the contract.
+        t = tensor(np.arange(6))
+        with pytest.raises(DeviceError, match=_HOST_ONLY_FRAGMENTS):
+            replicate_tensor(t, [target])
+
+    def test_payload_source_raises_device_error(self):
+        # Regression pin: same as TestSplitTensor's — a device-payload source
+        # raises the canonical DeviceError, never an AttributeError.
+        t = Tensor(_DummyDevicePayload(Device("cuda", 0)))
+        with pytest.raises(DeviceError, match=_HOST_ONLY_FRAGMENTS):
+            replicate_tensor(t, [Device("cpu")])

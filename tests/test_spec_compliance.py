@@ -23,6 +23,12 @@ contract in `../etl/CONTEXT.md`). Groups (one class per group, in file order):
                                graph-time computation ops (no eager mode),
                                polymorphic creators, pure symbolic leaves,
                                static-leaf snapshotting, explicit deferrals.
+15. `TestExplicitPlacement` — no implicit device transfer: placement is
+                               explicit (R1/R2/R3/R5/R6) — host memory cannot
+                               be relabeled, `.numpy()` on a non-cpu payload
+                               raises, `Tensor.to` is the only transfer API,
+                               and run/bind/constant boundaries reject
+                               foreign-device tensors.
 
 Conventions: small shapes, CPU only, fast. Tests assert the documented
 contract; a test exposing a contract violation stays failing with a
@@ -1282,3 +1288,125 @@ class TestSparseExplicitness:
             etl.vjp(_sparse_to_dense, etl.TensorSpec((3, 4), etl.float32))(
                 csc_spec
             )
+
+
+# ===========================================================================
+# 15. Explicit placement — no implicit device transfer (R1/R2/R3/R5/R6)
+# ===========================================================================
+#
+# Design-principle pins: "placement is explicit". A tensor is a local
+# physical tensor; host (numpy) memory cannot be relabeled onto another
+# device, `.numpy()` on a non-cpu device payload raises (no implicit
+# device-to-host transfer), `Tensor.to(device)` is the ONLY transfer API,
+# and the run/bind/constant boundaries reject tensors that are not already
+# where they must be. All CPU-only: the foreign device is a local fake
+# payload duck-typed to the device-payload protocol (.shape/.dtype/.device/
+# .to_host) — no backend imports, no GPU.
+
+
+class _FakeCudaPayload:
+    """Tiny duck-typed cuda-kind device payload: shape/dtype/device
+    (a core.Device of kind "cuda") + ``to_host()`` -> FRESH ndarray."""
+
+    def __init__(self, shape=(3,), dtype=np.float32):
+        self._shape = tuple(shape)
+        self.dtype = dtype
+        self.device = etl.Device("cuda", 0)
+        count = int(np.prod(self._shape))
+        self._data = np.arange(count, dtype=dtype).reshape(self._shape)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def to_host(self):
+        return self._data.copy()
+
+
+def _cuda_kind_tensor(shape=(3,), dtype=np.float32):
+    """A concrete ``core.Tensor`` wrapping the fake cuda-kind payload."""
+    return etl.Tensor(_FakeCudaPayload(shape=shape, dtype=dtype))
+
+
+class TestExplicitPlacement:
+    def test_host_memory_cannot_be_relabeled_cuda(self):
+        """R1: ndarray-backed data IS host memory — constructing a Tensor
+        with device=Device('cuda', 0) raises DeviceError (no relabeling of
+        host memory), naming the explicit t.to transfer as the remedy."""
+        array = np.zeros(3, dtype=np.float32)
+        with pytest.raises(etl.DeviceError) as excinfo:
+            etl.Tensor(array, device=etl.Device("cuda", 0))
+        message = str(excinfo.value)
+        assert "host (numpy)" in message
+        assert "t.to(" in message
+        assert "Device(kind='cuda', index=0)" in message
+
+    def test_concrete_creator_rejects_non_cpu_device(self):
+        """Concrete creators (etl.zeros) produce host memory — a cuda device
+        target raises DeviceError, never a silent relabel."""
+        with pytest.raises(etl.DeviceError) as excinfo:
+            etl.zeros((3,), device=etl.Device("cuda", 0))
+        message = str(excinfo.value)
+        assert "etl.zeros" in message
+        assert "host (numpy)" in message
+        assert "t.to(" in message
+
+    def test_numpy_on_non_cpu_payload_raises(self):
+        """.numpy() on a cuda-kind payload raises DeviceError — there is no
+        implicit device-to-host transfer; t.to(cpu) comes first."""
+        with pytest.raises(etl.DeviceError) as excinfo:
+            _cuda_kind_tensor().numpy()
+        message = str(excinfo.value)
+        assert "no implicit device" in message
+        assert "t.to(" in message
+
+    def test_to_cpu_materializes_fresh_host_copy(self):
+        """The explicit transfer t.to(Device('cpu', 0)) on a non-cpu payload
+        yields a cpu:0 tensor whose values round-trip through to_host()."""
+        source = _cuda_kind_tensor(shape=(4,))
+        host = source.to(etl.Device("cpu", 0))
+        assert host.device == etl.Device("cpu", 0)
+        assert isinstance(host.data, np.ndarray)
+        np.testing.assert_array_equal(
+            host.numpy(), np.arange(4, dtype=np.float32)
+        )
+
+    def test_to_same_device_returns_self(self):
+        """t.to(its own device) is the identity — no copy, no error."""
+        tensor = _cuda_kind_tensor()
+        assert tensor.to(tensor.device) is tensor
+
+    def test_run_boundary_rejects_foreign_device_input(self):
+        """R5: run on a cpu executable rejects a cuda-kind input with a
+        DeviceError naming the input path — no implicit device↔host
+        transfer ever happens at the run boundary (mirrors the pipeline
+        tests as a compliance statement)."""
+
+        @etl.defn
+        def f(x):
+            return etl.add(x, 1.0)
+
+        executable = etl.build(f, etl.TensorSpec((3,), etl.float32))
+        with pytest.raises(etl.DeviceError) as excinfo:
+            etl.run(executable, _cuda_kind_tensor())
+        message = str(excinfo.value)
+        assert "input at path [0] is on device" in message
+        assert "no implicit device" in message
+        assert "t.to(" in message
+
+    def test_constant_rejects_non_cpu_tensor(self):
+        """R6: embedding a non-cpu tensor via etl.constant raises DeviceError
+        — the snapshot would be an implicit device-to-host transfer."""
+        captured = {}
+
+        @etl.defn
+        def f():
+            captured["out"] = etl.constant(_cuda_kind_tensor())
+            return captured["out"]
+
+        with pytest.raises(etl.DeviceError) as excinfo:
+            etl.trace(f)
+        message = str(excinfo.value)
+        assert "requires host data" in message
+        assert "t.to(" in message
+        assert "Device(kind='cuda', index=0)" in message
