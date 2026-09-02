@@ -1294,7 +1294,15 @@ class IreeExecutable(CompilerExecutable):
                     f"input {i}: expected dtype {spec.dtype}, got "
                     f"{tensor.dtype} — never silently coerce"
                 )
-            _validate_input_shape(i, spec.shape, tensor.shape)
+            shape = tensor.shape
+            if spec.shape != shape:
+                # Static-shape fast path: an all-static spec whose tuple
+                # EQUALS the runtime shape needs no per-dim walk (the common
+                # steady-state case). Any symbolic/dynamic/None entry makes
+                # the tuples unequal and falls into the walk, which applies
+                # the exact per-dim semantics (symbolic passes, None skipped,
+                # mismatches raise core.ShapeError).
+                _validate_input_shape(i, spec.shape, shape)
 
         buffers = _build_buffers(
             flat_input_tensors,
@@ -1360,6 +1368,28 @@ class IreeExecutable(CompilerExecutable):
             )
         self._entry = entry
         return entry
+
+def _wait_copy_semaphore(sem: Any) -> None:
+    """Block until a queue_copy's completion semaphore reaches 1.
+
+    Query-first fast path: ``HalSemaphore.query()`` is a cheap host-side
+    read (no kernel sync), and a copy issued on a short queue often
+    completes before the host reaches the wait — in that case the
+    heavyweight ``HalFence.wait()`` (fixed host-side cost ~0.02-0.2 ms on
+    the cuda HAL, measured) is skipped entirely. The ordering guarantee is
+    UNCHANGED: when the query shows the copy still pending (value < 1),
+    the full fence wait runs exactly as before — the invoke never races
+    the copy (the wait remains load-bearing; queue_copy is not reliably
+    stream-ordered ahead of invoke dispatches on the iree cuda HAL).
+    Semaphore values are monotonic, so query-then-wait is race-free.
+    Falls back to the plain wait when the runtime lacks ``query``
+    (legacy iree-runtime distributions).
+    """
+    query = getattr(sem, "query", None)
+    if query is None or query() >= 1:
+        return
+    rt.HalFence.create_at(sem, 1).wait()
+
 
 def _staged_input(
     staged_inputs: dict | None,
@@ -1442,7 +1472,7 @@ def _staged_input(
             rt.HalFence.create_at(sem, 0),
             rt.HalFence.create_at(sem, 1),
         )
-        rt.HalFence.create_at(sem, 1).wait()
+        _wait_copy_semaphore(sem)
         return staging_da
     if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
         staged_inputs.clear()  # bounded cache; correctness unaffected
@@ -1490,7 +1520,7 @@ def _staged_input(
         rt.HalFence.create_at(sem, 0),
         rt.HalFence.create_at(sem, 1),
     )
-    rt.HalFence.create_at(sem, 1).wait()
+    _wait_copy_semaphore(sem)
     staged_inputs[key] = ("dma", (hl_buf, hl_view, staging_da))
     return staging_da
 
@@ -1603,7 +1633,12 @@ class _IreeSegmentExecutable:
                     f"{spec.dtype}, got {tensor.dtype} — never silently "
                     "coerce"
                 )
-            _validate_input_shape(i, spec.shape, tensor.shape)
+            shape = tensor.shape
+            if spec.shape != shape:
+                # Static-shape fast path (see IreeExecutable.run): exact
+                # tuple equality skips the per-dim walk; symbolic/dynamic
+                # entries fall into the walk with identical semantics.
+                _validate_input_shape(i, spec.shape, shape)
         buffers = _build_buffers(
             flat_input_tensors,
             input_specs,
@@ -1928,10 +1963,20 @@ class IreeDevicePayload:
     on cuda it is a fresh D2H copy per call.
     """
 
-    __slots__ = ("_array", "device")
+    __slots__ = ("_array", "_shape", "_dtype", "device")
 
     def __init__(self, array: Any, device: Device) -> None:
         self._array = array
+        # Metadata cached at construction: an iree runtime ``DeviceArray`` is
+        # immutable in shape/dtype for its lifetime (run outputs, staged
+        # inputs, and external-kernel results are all created once with fixed
+        # metadata), and every access to the raw ``DeviceArray`` shape/dtype
+        # is a nanobind round-trip through iree's array_interop. The hot
+        # ``IreeExecutable.run`` validation loops read tensor dtype/shape
+        # several times per call (per-input validation + output validation),
+        # so resolving once here keeps the per-call Python overhead flat.
+        self._shape = tuple(array.shape)
+        self._dtype = array.dtype
         self.device = device
 
     @property
@@ -1946,11 +1991,11 @@ class IreeDevicePayload:
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return tuple(self._array.shape)
+        return self._shape
 
     @property
     def dtype(self) -> np.dtype:
-        return self._array.dtype
+        return self._dtype
 
     def to_host(self) -> np.ndarray:
         """Materialize a host copy of the device buffer (lazy D2H)."""
