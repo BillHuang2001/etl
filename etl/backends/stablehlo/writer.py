@@ -247,6 +247,18 @@ class Writer:
         self._while_init_rewrite = bool(
             (options or {}).get("while_init_rewrite", True)
         )
+        #: eigh_early_exit exporter option (bool, default True): the
+        #: ``eigh`` while-Jacobi composition additionally carries an i1
+        #: ``done`` flag and, at every sweep boundary (inside a nested
+        #: ``stablehlo.if``), checks the scale-aware relative off-diagonal
+        #: energy of the current A against a dtype tolerance, exiting once
+        #: converged (skips the remaining scheduled sweeps). ``False``
+        #: emits the EXACT pre-option text (5 carries, cond ``k < total``)
+        #: — the A/B measurement lever and safety valve (see ``_emit_eigh``
+        #: and ``_emit_eigh_sweep_check``).
+        self._eigh_early_exit = bool(
+            (options or {}).get("eigh_early_exit", True)
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -2115,13 +2127,37 @@ class Writer:
         ``A' = J^T·B`` (row updates), ``V = V·J`` (column updates; V starts
         as the identity). The carried pair counter walks the sweep order
         (0,1), (0,2), …, (n−2, n−1) and ``k`` counts total rotations (cond
-        ``k < total``). Dynamic (p, q) indexing uses gathers (never
+        ``k < total``). With the ``eigh_early_exit`` exporter option (bool,
+        default True) the loop additionally carries an i1 ``done`` flag:
+        at every sweep boundary a nested ``stablehlo.if`` checks the
+        scale-aware relative off-diagonal energy of the current A (masked
+        squared Frobenius vs the full squared energy, per-matrix with an
+        AND across the batch) and sets ``done`` once it is below the dtype
+        tolerance (f32 tol 1e-6, f64 tol 1e-13 — initial values; see
+        ``_emit_eigh_sweep_check``). The loop then exits by CLAMPING the
+        rotation counter: when ``done`` fires the body returns
+        ``k := total`` (a scalar ``select`` on the post-increment counter),
+        so the next cond check ``k < total`` fails — converged matrices
+        skip their remaining scheduled sweeps (exit only after a completed
+        sweep — the final scheduled sweep always completes). The exit is
+        deliberately NOT expressed in the cond region (``and(k < total,
+        not(done))``): using a loop-carried i1 through ``not``/``and`` in
+        the cond crashes iree-compile 3.11's AffinityAnalysis
+        deterministically (measured 0/10 SIGSEGV on 3x3 f32, same
+        use-graph-topology family as the while SEGV lore in CONTEXT.md),
+        while the k-clamp is 10/10 clean and keeps the cond region
+        byte-identical to the pre-option text. The cond region stays
+        exactly ``k < total`` in BOTH modes. ``False`` emits the exact
+        pre-option 5-carry text (the A/B measurement lever). Dynamic (p, q)
+        indexing uses gathers (never
         ``stablehlo.slice`` — its start indices must be static), and every
         constant/iota is hoisted OUTSIDE the loop (iree crashes on
         constants inside while bodies — ``util.global.load`` undefined
         ``@__hoisted_*``; see Known Issues). The emitted text is O(1) in n
         and in the sweep count — the unrolled predecessor's O(n²·sweeps)
-        text (10x10 ~17 s build) is gone, so dim ≥ 25 compiles. A stable
+        text (10x10 ~17 s build) is gone, so dim ≥ 25 compiles (the dense
+        eye constant for the V init already made the text O(n²) in the
+        matrix data; the early-exit i≠j mask keeps it O(n²)). A stable
         pair-sort then orders the final diagonal ASCENDING (numpy
         ``linalg.eigh`` contract) and a gather reorders the V columns by
         the sorted permutation. Every rotation is applied with full-matrix
@@ -2262,15 +2298,68 @@ class Writer:
         total = self._eigh_sweeps(n, dtype) * n * (n - 1) // 2
         i_total, extra = self._scalar_constant_for(i64, total, ())
         lines.extend(extra)
-        # --- the while loop: carries (a, v, p, q, k) ----------------------
+        # --- eigh_early_exit: sweep-boundary convergence check ------------
+        # When enabled (the default) the loop carries an extra i1 ``done``
+        # flag: at every sweep boundary (k % rps == 0, rps = n(n-1)/2
+        # rotations per sweep) a nested ``stablehlo.if`` computes the
+        # scale-aware relative off-diagonal energy of the current A and
+        # sets ``done`` once it is below the dtype tolerance; when ``done``
+        # fires the body CLAMPS k to the rotation total, so the (unchanged)
+        # cond ``k < total`` exits — converged matrices skip their
+        # remaining scheduled sweeps. All constants/masks are hoisted
+        # OUTSIDE the loop (constants inside while regions crash iree —
+        # ``util.global.load`` undefined ``@__hoisted_*``). The option
+        # defaults True; ``False`` emits the exact pre-option text.
+        early_exit = self._eigh_early_exit
+        if early_exit:
+            i1 = np.dtype("bool")
+            # The (n, n) i != j mask as a 0/1 matrix in the computation
+            # dtype — multiplying a*a by it keeps exactly the off-diagonal
+            # energy (exact for 0/1 factors; equivalent to the select
+            # formulation without a zero operand inside the loop).
+            m_neq = self._new_name()
+            lines.append(
+                f"{m_neq} = stablehlo.constant "
+                f"{self._constant_text(np.logical_not(np.eye(n, dtype=bool)).astype(dtype))}"
+                f" : {self._type_str(dtype, (n, n))}"
+            )
+            if batch:  # broadcast to the carried (n, n, batch...) layout
+                m_neq = self._bcast(m_neq, dtype, (n, n), t_shape, [0, 1], lines)
+            # Rotations per sweep (the remainder divisor) and the squared
+            # dtype tolerance (tol f32 1e-6 / f64 1e-13 — INITIAL values;
+            # the calibration home is
+            # tests/backends/test_iree_eigh_diag_parity.py). tol_sq is
+            # broadcast to (batch,) when batched (the per-matrix sq terms
+            # are (batch,)-shaped).
+            tol = 1e-6 if dtype == np.dtype("float32") else 1e-13
+            i_rps, extra = self._scalar_constant_for(i64, n * (n - 1) // 2, ())
+            lines.extend(extra)
+            tol_sq, extra = self._scalar_constant_for(dtype, tol * tol, batch)
+            lines.extend(extra)
+            # Rank-0 inits: the done carry (false), the and-reduce init
+            # (true), and the sum-reduce init (zero).
+            b_false, extra = self._scalar_constant_for(i1, False, ())
+            lines.extend(extra)
+            b_true, extra = self._scalar_constant_for(i1, True, ())
+            lines.extend(extra)
+            z_zero, extra = self._scalar_constant_for(dtype, 0.0, ())
+            lines.extend(extra)
+        # --- the while loop: carries (a, v, p, q, k[, done]) --------------
         a_type = self._type_str(dtype, t_shape)
         i64_scalar = self._elem_type(i64)
-        carry_types = (
-            f"({a_type}, {a_type}, {i64_scalar}, {i64_scalar}, {i64_scalar})"
-        )
-        arg_types = (a_type, a_type, i64_scalar, i64_scalar, i64_scalar)
-        # Cond region: k < total (no closing brace — `_emit_while` style).
-        cond_args = [self._new_name() for _ in range(5)]
+        i1_scalar = self._elem_type(np.dtype("bool"))
+        arg_types = [a_type, a_type, i64_scalar, i64_scalar, i64_scalar]
+        if early_exit:
+            arg_types.append(i1_scalar)
+        carry_types = "(" + ", ".join(arg_types) + ")"
+        n_carries = len(arg_types)
+        # Cond region: k < total — ALWAYS, in both modes. The early-exit
+        # `done` flag never appears here: a loop-carried i1 through
+        # not/and in the cond crashes iree-compile 3.11's AffinityAnalysis
+        # (measured 0/10 SIGSEGV); the body instead clamps k to total when
+        # done fires (see below), so this cond region is byte-identical to
+        # the pre-option text. No closing brace — `_emit_while` style.
+        cond_args = [self._new_name() for _ in range(n_carries)]
         cond_lines = []
         cnd = self._cmp(cond_args[4], i_total, "LT", i64, (), cond_lines)
         cond_region = (
@@ -2281,7 +2370,7 @@ class Writer:
             + f"\n    stablehlo.return {cnd} : tensor<i1>"
         )
         # Body region: one rotation on (p, q), then the pair/counter step.
-        body_args = [self._new_name() for _ in range(5)]
+        body_args = [self._new_name() for _ in range(n_carries)]
         body_lines = []
         a2, v2 = self._emit_jacobi_rotation_loop_body(
             body_args[0], body_args[1], body_args[2], body_args[3],
@@ -2304,18 +2393,40 @@ class Writer:
         q2 = self._sel(q_last, q_after, q_inc, i64, (), body_lines)
         p2 = self._sel(sweep_end, i_zero, p2, i64, (), body_lines)
         q2 = self._sel(sweep_end, i_one, q2, i64, (), body_lines)
+        if early_exit:
+            # Sweep-boundary convergence check (nested stablehlo.if); the
+            # pair counter's own sweep_end (above) is the (p, q) wrap
+            # condition — this is the ROTATION-count sweep boundary
+            # (k2 % rps == 0), which fires at the same iterations.
+            done2 = self._emit_eigh_sweep_check(
+                body_lines, a2, body_args[5], k2, dtype, batch, t_shape,
+                m_neq, tol_sq, z_zero, b_true, i_rps, i_zero, i1_scalar,
+            )
+            # Exit via the k-clamp: when done fires, return k := total so
+            # the NEXT cond check (k < total) fails — the loop stops one
+            # rotation after convergence is detected, exactly like a cond
+            # on `done` would, but WITHOUT touching the loop-carried i1 in
+            # the cond region (iree AffinityAnalysis SEGV, see the docstring
+            # and the cond comment above). O(1) scalar op per rotation.
+            k2 = self._sel(done2, i_total, k2, i64, (), body_lines)
+        ret_values = [a2, v2, p2, q2, k2]
+        if early_exit:
+            ret_values.append(done2)
         body_region = (
             "  ^bb0("
             + ", ".join(f"{nm} : {tp}" for nm, tp in zip(body_args, arg_types))
             + "):\n"
             + "\n".join("    " + line for line in body_lines)
-            + f"\n    stablehlo.return {a2}, {v2}, {p2}, {q2}, {k2} : "
-            + f"{a_type}, {a_type}, {i64_scalar}, {i64_scalar}, {i64_scalar}"
+            + f"\n    stablehlo.return {', '.join(ret_values)} : "
+            + ", ".join(arg_types)
         )
-        result_names = [self._new_name() for _ in range(5)]
+        inits = [a, v, i_zero, i_one, i_zero]
+        if early_exit:
+            inits.append(b_false)
+        result_names = [self._new_name() for _ in range(n_carries)]
         lines.append(
             f"{', '.join(result_names)} = \"stablehlo.while\"("
-            f"{', '.join([a, v, i_zero, i_one, i_zero])}) ({{\n"
+            f"{', '.join(inits)}) ({{\n"
             + cond_region
             + "\n  }, {\n"
             + body_region
@@ -2475,6 +2586,105 @@ class Writer:
         v2 = self._sel(row_p, self._bcast(nvp, dtype, vec_shape, t_shape, row_dims, lines), v_name, dtype, t_shape, lines)
         v2 = self._sel(row_q, self._bcast(nvq, dtype, vec_shape, t_shape, row_dims, lines), v2, dtype, t_shape, lines)
         return a2, v2
+
+    def _emit_eigh_sweep_check(self, body_lines, a2, done, k2, dtype, batch,
+                               t_shape, mask, tol_sq, z_zero, b_true,
+                               i_rps, i_zero, i1_scalar) -> str:
+        """Emit the sweep-boundary convergence check for the ``eigh``
+        early exit (``eigh_early_exit`` exporter option; called from
+        ``_emit_eigh``) and return the NEW ``done`` carry SSA name.
+
+        The check runs ONLY at sweep boundaries — inside a nested
+        ``stablehlo.if`` guarded by ``sweep_end = (k2 % rps == 0)``, where
+        ``rps = n(n-1)/2`` is the hoisted rotations-per-sweep constant and
+        ``k2 = k+1 >= 1`` (so the positive-multiple test alone excludes
+        the k == 0 first iteration) — keeping the per-rotation cost at one
+        scalar predicate + one scalar if pass-through (the false branch
+        returns the carried ``done`` unchanged), while the O(n^2) work
+        executes once per executed sweep (~1 extra dispatch per sweep vs
+        the 45/1225 rotations per sweep). The condition is SCALE-AWARE and
+        relative: ``done = done OR sq_offdiag <= tol_sq * sq_total`` with
+        ``sq_offdiag`` the squared Frobenius energy of the off-diagonal
+        part (``a*a`` masked by the hoisted 0/1 i != j matrix), ``sq_total``
+        the full squared energy, and ``tol_sq`` the hoisted squared dtype
+        tolerance (f32 tol 1e-6, f64 tol 1e-13 — INITIAL values; the
+        calibration home is tests/backends/test_iree_eigh_diag_parity.py,
+        a later agent tunes against it). No sqrt: the comparison is done on
+        the squared energies. ``converged`` is evaluated PER MATRIX (the
+        matrix dims 0,1 of the transposed layout are reduced first, giving
+        a (batch,) result) and AND-reduced across the batch — the loop
+        carries ONE shared (p, q) pair for the whole batch, so the exit
+        must wait for the SLOWEST batch element (a whole-tensor sum could
+        stop while a low-energy batch element is still unconverged). For
+        batch = () this reduces exactly to the scalar comparison. The if
+        regions reference only body/captured values (never constants
+        defined inside a region — iree constant-hoisting breaks).
+
+        Lines are appended to ``body_lines`` with their region indentation
+        baked relative to the while-body base indent (the ``_emit_eigh``
+        body join adds the base 4 spaces per element): the if line at +0,
+        region headers at +2, region ops at +4.
+        """
+        i64 = np.dtype("int64")
+        # Sweep boundary: k2 (post-increment) is a positive multiple of rps.
+        rem = self._ew("remainder", k2, i_rps, i64, (), body_lines)
+        sweep_end = self._cmp(rem, i_zero, "EQ", i64, (), body_lines)
+        # The nested if's TRUE-region ops (flat single lines — assembled
+        # below at +4 relative to the if line).
+        ops: list[str] = []
+        a2sq = self._ew("multiply", a2, a2, dtype, t_shape, ops)
+        masked = self._ew("multiply", a2sq, mask, dtype, t_shape, ops)
+        b_shape = tuple(batch)
+        sq_off = self._emit_eigh_reduce(ops, masked, dtype, t_shape,
+                                        b_shape, [0, 1], z_zero)
+        sq_tot = self._emit_eigh_reduce(ops, a2sq, dtype, t_shape,
+                                        b_shape, [0, 1], z_zero)
+        thresh = self._ew("multiply", sq_tot, tol_sq, dtype, b_shape, ops)
+        conv_e = self._cmp(sq_off, thresh, "LE", dtype, b_shape, ops)
+        conv = conv_e
+        if b_shape:  # AND-reduce the per-matrix flags across the batch
+            conv = self._emit_eigh_reduce(
+                ops, conv_e, np.dtype("bool"), b_shape, (),
+                list(range(len(b_shape))), b_true,
+            )
+        done_or = self._ew("or", done, conv, np.dtype("bool"), (), ops)
+        # The if RESULT is a distinct fresh name (the or inside the true
+        # region already holds ``done_or`` — reusing the same name across
+        # the region boundary is legal shadowing but confusing).
+        done2 = self._new_name()
+        # Assemble the nested if.
+        body_lines.append(f'{done2} = "stablehlo.if"({sweep_end}) ({{')
+        body_lines.append("  ^bb0:")
+        body_lines.extend("    " + line for line in ops)
+        body_lines.append(f"    stablehlo.return {done_or} : {i1_scalar}")
+        body_lines.append("  }, {")
+        body_lines.append("  ^bb0:")
+        body_lines.append(f"    stablehlo.return {done} : {i1_scalar}")
+        body_lines.append(f"  }}) : ({i1_scalar}) -> {i1_scalar}")
+        return done2
+
+    def _emit_eigh_reduce(self, lines, operand, dtype, src_shape, out_shape,
+                          dims, init_name) -> str:
+        """One ``stablehlo.reduce`` for the eigh convergence check,
+        emitting every physical line separately (no embedded newlines — the
+        caller's uniform per-element indentation then applies to the whole
+        op). ``dtype`` selects the reducer: add (float energies) or and
+        (i1 batch flags). Returns the result SSA name."""
+        elem_t = self._elem_type(dtype)
+        r = self._new_name()
+        a1, a2 = self._new_name(), self._new_name()
+        mnemonic = "add" if np.dtype(dtype) != np.dtype("bool") else "and"
+        lines.append(f'{r} = "stablehlo.reduce"({operand}, {init_name}) ({{')
+        lines.append(f"  ^bb0({a1}: {elem_t}, {a2}: {elem_t}):")
+        s = self._new_name()
+        lines.append(f"    {s} = stablehlo.{mnemonic} {a1}, {a2} : {elem_t}")
+        lines.append(f"    stablehlo.return {s} : {elem_t}")
+        lines.append(
+            f"  }}) {{dimensions = {self._i64_array(dims)}}} : "
+            f"({self._type_str(dtype, src_shape)}, {elem_t}) -> "
+            f"{self._type_str(dtype, out_shape)}"
+        )
+        return r
 
     def _index_single(self, idx_name, lines) -> str:
         """Rank-0 i64 scalar → a ``(1,)`` i64 index tensor — the index

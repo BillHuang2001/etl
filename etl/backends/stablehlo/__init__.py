@@ -48,6 +48,19 @@ def export(graph_or_module, options: dict | None = None) -> str:
             (bool, default True) rewrites all-zero rank>=1 constant while
             INIT operands into computed zeros (the iree 3.11.0
             AffinityAnalysis SEGV workaround — see the Writer).
+            ``eigh_early_exit`` (bool, default True) enables the ``eigh``
+            while-Jacobi composition's convergence-based early exit: the
+            loop additionally carries an i1 ``done`` flag and, at every
+            sweep boundary (inside a nested ``stablehlo.if``), checks the
+            scale-aware relative off-diagonal energy of the current A
+            against a dtype tolerance (f32 tol 1e-6, f64 tol 1e-13 —
+            initial values, calibration home
+            ``tests/backends/test_iree_eigh_diag_parity.py``), exiting
+            once converged so converged matrices skip their remaining
+            scheduled sweeps (see the Writer's ``_emit_eigh`` /
+            ``_emit_eigh_sweep_check``). ``False`` emits the exact
+            pre-option 5-carry text — the A/B measurement lever and
+            safety valve.
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external
