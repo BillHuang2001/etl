@@ -238,24 +238,49 @@ def _threefry2x32(c0, c1, k0, k1):
     ``(x0, x1)`` plus the counter increment ``x1 += (i+1)``, where
     ``ks = (k0, k1, k0 ^ k1 ^ 0x1BD11BDA)``. Pinned by the Random123 KAT:
     (key 0, ctr 0) -> (0x6b200159, 0x99ba4efe).
+
+    Runs in uint32 lanes, where arithmetic wraps mod 2^32 BY DEFINITION
+    (per the module's wrap contract) — the previous uint64-lane form masked
+    every add with ``& 0xFFFFFFFF`` because it did not rely on wrap; the
+    uint32 lanes are value-IDENTICAL to that masked math (the rotate
+    ``(x1 << r) | (x1 >> (32 - r))`` on uint32 drops exactly the bits above
+    32 that the uint64 ``& M`` removed, so the low 32 bits are identical;
+    all shift amounts 13/15/26/6/17/29/16/24 and 32-r in 3..19 are < 32 —
+    valid uint32 shifts). uint32 lanes are half the bytes of the uint64 form
+    (the f32/bulk-RNG hot path).
+
+    Zero-d counter handling: 0-d ufunc results collapse to numpy scalars,
+    whose wrapping adds warn (``RuntimeWarning: overflow encountered in
+    scalar add``) — numpy scalar arithmetic warns on wrap while ARRAY
+    arithmetic wraps silently by definition (the wrap contract above). 0-d
+    counters (numpy scalars / Python ints / 0-d arrays — the child-key path
+    ``random_key_mix``/``split`` and direct KAT test calls) therefore run as
+    1-element arrays (a ``reshape(1)`` view, no copy), with the all-0-d
+    results reshaped back to 0-d. nd-array counters (the bulk hot path —
+    ``_words_for``/``_normal_word_pairs``) pass through copy-free.
     """
-    # Work in uint64 lanes (values in [0, 2^32)): adds of two 32-bit values
-    # never overflow uint64, so no wrap-around is relied on (and numpy emits
-    # no overflow warnings, incl. for scalar cipher calls).
-    M = np.uint64(0xFFFFFFFF)
-    k0 = np.uint64(k0)
-    k1 = np.uint64(k1)
-    x0 = ((np.asarray(c0, dtype=np.uint64) & M) + k0) & M
-    x1 = ((np.asarray(c1, dtype=np.uint64) & M) + k1) & M
-    ks = (k0, k1, k0 ^ k1 ^ np.uint64(_PARITY32))
+    k0 = np.uint32(k0)
+    k1 = np.uint32(k1)
+    c0a = np.asarray(c0, dtype=np.uint32)
+    c1a = np.asarray(c1, dtype=np.uint32)
+    scalar_call = c0a.ndim == 0 and c1a.ndim == 0
+    if c0a.ndim == 0:
+        c0a = c0a.reshape(1)
+    if c1a.ndim == 0:
+        c1a = c1a.reshape(1)
+    x0 = c0a + k0
+    x1 = c1a + k1
+    ks = (k0, k1, k0 ^ k1 ^ _PARITY32)
     for i in range(5):
         rots = _ROT_A if i % 2 == 0 else _ROT_B
         for r in rots:
-            x0 = (x0 + x1) & M
-            x1 = (((x1 << np.uint64(r)) | (x1 >> np.uint64(32 - r))) ^ x0) & M
-        x0 = (x0 + ks[(i + 1) % 3]) & M
-        x1 = (x1 + ks[(i + 2) % 3] + np.uint64(i + 1)) & M
-    return x0.astype(np.uint32), x1.astype(np.uint32)
+            x0 = x0 + x1
+            x1 = ((x1 << r) | (x1 >> (32 - r))) ^ x0
+        x0 = x0 + ks[(i + 1) % 3]
+        x1 = x1 + ks[(i + 2) % 3] + np.uint32(i + 1)
+    if scalar_call:
+        return x0.reshape(()), x1.reshape(())
+    return x0, x1
 
 
 def _philox4x32(c0, c1, c2, c3, key):
