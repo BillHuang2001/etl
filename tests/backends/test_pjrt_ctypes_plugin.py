@@ -128,6 +128,58 @@ def test_version_gate_rejects_wrong_major(wrong_major_plugin):
 
 
 # ---------------------------------------------------------------------------
+# (a2) process-global shared client (one refcounted client per plugin path)
+# ---------------------------------------------------------------------------
+
+
+def test_shared_client_refcount_semantics(tmp_path):
+    """``acquire_client``/``release_client`` share ONE client per plugin
+    path; the client is destroyed only when the LAST reference is released.
+
+    Load-bearing for real GPU plugins: each PJRT client grabs a large BFC
+    device-memory pool (~0.9 x free VRAM) and the plugin ABORTS the process
+    when a new client cannot allocate — a fresh client per load exhausted
+    the GPU in multi-executable processes (measured: jax_cuda12_pjrt
+    0.10.2's xla_cuda_plugin.so, RTX A6000). Each test here builds its OWN
+    plugin path so the process-global registry state is isolated.
+    """
+    plug = _build_plugin(tmp_path, "fake_shared_client.so")
+    plugin = xla_util._load_plugin({"plugin_path": str(plug)})
+    client = xla_util.acquire_client(plugin)
+    client2 = xla_util.acquire_client(plugin)
+    assert client is client2
+    assert not client.closed
+    xla_util.release_client(plugin)
+    assert not client.closed  # the second reference keeps it alive
+    xla_util.release_client(plugin)
+    assert client.closed  # destroyed at zero references
+    assert plugin.path not in xla_util._shared_clients
+
+
+def test_close_one_executable_keeps_shared_client(tmp_path, monkeypatch):
+    """Loaded executables share the client; closing one executable keeps
+    the client alive for the others and destroys it only at the last close."""
+    plug = _build_plugin(tmp_path, "fake_shared_client_2.so")
+    monkeypatch.setenv("ETL_PJRT_PLUGIN", str(plug))
+    fn, specs = u.matmul_relu_sum()
+    artifact = _compile_fake(fn, specs, plug)
+    a, b = u.matmul_relu_sum_args()
+    expected = etl.evaluate(fn, a, b)
+    backend = etl.backends.get(NAME)
+    exe1 = backend.load(artifact)
+    exe2 = backend.load(artifact)
+    assert exe1._client is exe2._client  # one shared client per plugin path
+    shared = exe1._client
+    exe1.close()
+    assert exe1._client is None
+    # exe2 still holds the remaining reference — it must still run.
+    (out,) = exe2.run([etl.tensor(a), etl.tensor(b)])
+    np.testing.assert_array_equal(out.numpy(), np.zeros_like(expected.numpy()))
+    exe2.close()
+    assert shared.closed  # the last close destroyed the shared client
+
+
+# ---------------------------------------------------------------------------
 # (b) full driver plumbing through the real backend
 # ---------------------------------------------------------------------------
 

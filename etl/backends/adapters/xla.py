@@ -23,6 +23,13 @@ docstring for provenance) and the driver in ``xla_util.py``. The full flow:
   format="mlir"}`` — the plugin accepts StableHLO MLIR text directly (the
   header documents ``"mlir"`` as "MLIR module bytecode (or string)"); no
   MLIR parsing happens in this process.
+- **Clients**: ONE refcounted ``PJRT_Client`` per plugin path
+  process-wide (``xla_util.acquire_client``/``release_client``) — compile,
+  load, and ``check_available`` all share it; a loaded executable holds one
+  reference until ``close()``. Load-bearing for real GPU plugins: they grab
+  a large BFC memory pool per client (~0.9 x free VRAM) and ABORT the whole
+  process (not a catchable PJRT error) when a new client cannot allocate —
+  a fresh client per load exhausted the GPU in multi-executable processes.
 - **Buffers**: ``PJRT_Client_BufferFromHostBuffer`` (dense row-major numpy
   arrays, all 14 etl dtypes incl. complex64/128) -> execute ->
   ``PJRT_Buffer_ToHostBuffer`` -> ``core.Tensor`` exactly like the numpy
@@ -78,6 +85,8 @@ from .xla_util import (
     _StaticShapeError,
     _load_plugin,
     _resolve_static_shape,
+    acquire_client,
+    release_client,
     set_opt_level,
 )
 
@@ -166,7 +175,10 @@ class XlaBackend(CompilerBackend):
 
         Checks (1) the vendored ctypes bindings module integrity, (2)
         plugin discovery + ``GetPjRtApi`` + the ABI version gate, and (3)
-        a live ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip.
+        a live ``PJRT_Client_Create``/``PJRT_Client_Destroy`` round-trip
+        through the process-global shared client (``acquire_client`` /
+        ``release_client`` — creates the client when no one else holds it,
+        destroys it when the probe is the only user).
         Raises ``core.BackendError`` naming the missing piece and how to
         provide/build a plugin (``ETL_PJRT_PLUGIN`` /
         ``options["plugin_path"]``, ``bazel build
@@ -179,8 +191,8 @@ class XlaBackend(CompilerBackend):
                 "no layout"
             )
         plugin = _load_plugin()  # discovery + GetPjRtApi + version gate
-        client = plugin.create_client()  # live create/destroy round-trip
-        client.close()
+        client = acquire_client(plugin)  # live create/destroy round-trip
+        release_client(plugin)
 
     # ---------------------------------------------------------------- compile
 
@@ -285,8 +297,11 @@ class XlaBackend(CompilerBackend):
             )
 
         # Compile through the plugin (step 4) — errors raise BackendError.
+        # The client comes from the process-global shared cache (one live
+        # client per plugin path; see xla_util.acquire_client) and is
+        # released (destroyed when this was the only user) in the finally.
         plugin = _load_plugin(options)
-        client = plugin.create_client()
+        client = acquire_client(plugin)
         try:
             loaded = client.compile(payload["mlir_text"], compile_options)
             try:
@@ -295,7 +310,7 @@ class XlaBackend(CompilerBackend):
                 loaded.close()
             platform_name, platform_version = client.platform_info()
         finally:
-            client.close()
+            release_client(plugin)
 
         import numpy as np
 
@@ -360,13 +375,16 @@ class XlaBackend(CompilerBackend):
         (None or a CPU ``core.Device``; non-``Device`` ->
         ``core.DeviceError``; non-cpu kind -> ``core.BackendError``), and
         the payload format. The base64 executable is deserialized with
-        ``PJRT_Executable_DeserializeAndLoad`` on a fresh client from the
-        (re-discovered) plugin — the ``plugin_path`` load option is honored
-        for discovery (falls back to ``ETL_PJRT_PLUGIN`` / well-known
-        paths). Options are validated against ``KNOWN_OPTIONS`` (unknown
-        keys => ``core.BackendError``). NEVER re-traces, re-lowers, or
-        re-compiles; a deserialization failure (environment/ABI mismatch)
-        raises ``core.PersistenceError`` — no silent recompilation.
+        ``PJRT_Executable_DeserializeAndLoad`` on the process-global shared
+        client for the (re-discovered) plugin (one refcounted client per
+        plugin path — ``acquire_client``/``release_client``; the executable
+        releases its reference in ``close()``) — the ``plugin_path`` load
+        option is honored for discovery (falls back to ``ETL_PJRT_PLUGIN`` /
+        well-known paths). Options are validated against ``KNOWN_OPTIONS``
+        (unknown keys => ``core.BackendError``). NEVER re-traces, re-lowers,
+        or re-compiles; a deserialization failure (environment/ABI
+        mismatch) raises ``core.PersistenceError`` — no silent
+        recompilation.
         """
         if artifact.backend != self.name:
             raise core.PersistenceError(
@@ -405,7 +423,10 @@ class XlaBackend(CompilerBackend):
             )
 
         plugin = _load_plugin(options)  # plugin_path load option honored
-        client = plugin.create_client()
+        # One process-global client per plugin path (refcounted): the
+        # executable takes a reference and releases it in close() — the
+        # client is destroyed only when the LAST reference is released.
+        client = acquire_client(plugin)
         try:
             serialized = base64.b64decode(payload["executable_base64"])
             try:
@@ -417,8 +438,8 @@ class XlaBackend(CompilerBackend):
                     f"{exc} — never silently recompiling"
                 ) from exc
         except Exception:
-            client.close()  # only on failure — success hands the client over
-            raise
+            release_client(plugin)  # only on failure — success hands the
+            raise                     # reference to the executable
         return XlaExecutable(
             artifact=artifact,
             device=effective_device,
@@ -471,17 +492,22 @@ class XlaExecutable(CompilerExecutable):
         self._plugin = plugin  # keeps the loaded plugin library alive
 
     def close(self) -> None:
-        """Release the plugin handles (executable first, then client).
+        """Release the plugin handles (executable first, then the client ref).
 
-        Not part of the ``Executable`` protocol; call it when done with the
-        executable (the process also reclaims everything at exit).
+        The client is a reference on the process-global shared client for
+        the plugin path: closing the executable destroys the ``PJRT_Client``
+        only when NO other executable still holds a reference
+        (``release_client``). Not part of the ``Executable`` protocol; call
+        it when done with the executable (the process also reclaims
+        everything at exit).
         """
         if self.native_module is not None:
             self.native_module.close()
             self.native_module = None
         if self._client is not None:
-            self._client.close()
+            release_client(self._plugin)
             self._client = None
+            self._plugin = None
 
     # -------------------------------------------------------------------- run
 

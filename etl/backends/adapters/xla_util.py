@@ -25,7 +25,10 @@ Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
    ``PJRT_Client_Compile`` with ``PJRT_Program{code=mlir_text,
    format="mlir"}`` — the plugin accepts StableHLO MLIR text directly (the
    header documents ``"mlir"`` as "MLIR module bytecode (or string)"). No
-   MLIR parsing happens in this process.
+   MLIR parsing happens in this process. Clients come from the
+   process-global refcounted cache (``acquire_client``/``release_client`` —
+   ONE live client per plugin path; see the section note: GPU plugins grab
+   a large BFC pool per client and abort the process on exhaustion).
 4. **Inputs.** ``PJRT_Client_BufferFromHostBuffer`` with dense
    row-major numpy arrays and ``kImmutableUntilTransferCompletes``
    semantics: the driver awaits the returned ``done_with_host_buffer``
@@ -46,7 +49,8 @@ destroys the error, and raises ``core.BackendError`` naming the failing
 step. No silent fallbacks. Lifecycle hygiene: every handle the plugin
 creates (errors, events, buffers, executables, clients) is destroyed via
 the matching ``PJRT_*_Destroy`` entry point in ``try/finally`` or the
-handle wrappers' ``close()``.
+handle wrappers' ``close()``; clients additionally follow the shared-cache
+reference discipline (``acquire_client``/``release_client``).
 
 Import discipline (binding): stdlib + ``etl.core`` + the sibling
 ``_pjrt_c_api`` module only at top level; numpy is imported inside
@@ -71,6 +75,8 @@ __all__ = [
     "_find_plugin_path",
     "_load_plugin",
     "_DEFAULT_PLUGIN_PATHS",
+    "acquire_client",
+    "release_client",
     "set_opt_level",
 ]
 
@@ -418,6 +424,65 @@ def _load_plugin(options: dict | None = None) -> "PjrtPlugin":
             plugin.initialize()
             _initialized_plugins.add(path)
     return plugin
+
+
+# ---------------------------------------------------------------------------
+# Process-global shared client (refcounted, one live client per plugin path)
+# ---------------------------------------------------------------------------
+#
+# Real GPU PJRT plugins (jax_cuda12_pjrt's xla_cuda_plugin.so et al.) grab a
+# large BFC allocator pool per PJRT client (measured: ~35.65 GiB on an RTX
+# A6000 — 0.9 x free memory at creation) and the plugin ABORTS THE WHOLE
+# PROCESS (an uncaught C++ exception, not a catchable PJRT_Error) when a new
+# client's pool cannot be allocated. Creating a fresh client per compile/load
+# (the original design) therefore exhausts GPU memory in any long-lived
+# process that loads several executables. The driver now keeps ONE refcounted
+# client per plugin path process-wide: the first acquirer creates it, the
+# last release destroys it — matching how XLA's own frontends use one client
+# per process, and bounding GPU memory to a single pool.
+
+#: path -> [client, refcount] (guarded by ``_shared_clients_lock``).
+_shared_clients: dict[str, list] = {}
+_shared_clients_lock = threading.Lock()
+
+
+def acquire_client(plugin: "PjrtPlugin") -> "_Client":
+    """Return the process-global client for ``plugin`` (creating it once).
+
+    Callers that keep the client across calls (e.g. a loaded executable)
+    MUST pair each ``acquire_client`` with exactly one ``release_client``
+    once they are done with it — the client is destroyed only when the last
+    reference is released. Creating a ``PJRT_Client`` can allocate the
+    plugin's device memory pool, so the single-client-per-path cache is
+    load-bearing for GPU plugins (see the section note above).
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None:
+            client = plugin.create_client()
+            _shared_clients[plugin.path] = [client, 1]
+            return client
+        entry[1] += 1
+        return entry[0]
+
+
+def release_client(plugin: "PjrtPlugin") -> None:
+    """Drop one reference on the shared client for ``plugin``.
+
+    Destroys the client (``PJRT_Client_Destroy``) when the reference count
+    reaches zero. Raises ``core.BackendError`` if the plugin fails the
+    destroy call — never silent.
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None:
+            return  # nothing to release (defensive; balanced callers)
+        entry[1] -= 1
+        if entry[1] > 0:
+            return
+        del _shared_clients[plugin.path]
+        client = entry[0]
+    client.close()
 
 
 # ---------------------------------------------------------------------------
