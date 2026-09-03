@@ -69,7 +69,7 @@ Transforms are graph→graph, but `vmap(f)/grad(f)/jvp(f)/vjp(f)` on a bare func
 ## v1 scope vs deferred
 
 - **v1 supported**: straight-line op graphs (all ops with registered rules); nested vmap via composition (rule support permitting); `stop_gradient`; custom blocks via `block:<name>` rules.
-- **Deferred → `TransformError`**: vectorizing region-bearing control-flow ops (`cond`/`while_loop`/`scan`) — no batching rules are registered for them in v1; non-zero `in_axes`/`out_axes` entries (mapped axes must be leading; transpose-based normalization is planned); vectorizing `runtime_call` (callbacks are per-value Python); `external_call` (no `external:<name>` rules registered until the external-kernel rule-registration surface lands).
+- **Deferred → `TransformError`**: vectorizing region-bearing control-flow ops (`cond`/`while_loop`/`scan`) — no batching rules are registered for them in v1; non-zero `in_axes`/`out_axes` entries (mapped axes must be leading; transpose-based normalization is planned); vectorizing `runtime_call` (callbacks are per-value Python); `external_call` with NO `external:<name>` rules and no registered portable (the external-kernel rule surface — `ExternalKernel.batching_rule/jvp_rule/vjp_rule` + portable decomposition fallbacks — is live; see "Notes for agents").
 - **Non-goals here**: no caching of transformed graphs (design principle 3), no backend awareness, no lowering.
 
 ## Constraints
