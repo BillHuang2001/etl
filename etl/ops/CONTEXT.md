@@ -49,7 +49,7 @@ The 15 public names `sort argsort topk tile stack flip roll clamp eye matmul cum
 - `matmul` = dot sugar with rank-1 promote/squeeze (`dot`'s rank ≥ 2 contract and `__matmul__` → dot unchanged).
 - `isnan` = comparison composition.
 
-Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Backend coverage: numpy = full reference; compiler backends (stablehlo/iree/xla/tvm) defer the 8 new IR ops with explicit `BackendError` (no exporter entries added); compositions work via their components.
+Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Backend coverage: numpy = full reference; compiler backends (stablehlo/iree/xla/tvm) export `sort`/`argsort`/`tile` as v1 StableHLO and defer `flip`/`roll`/`cumprod`/`nan_to_num` with explicit `BackendError`; `diag` is v1 via a flatten+gather (rank-2) / iota+select (rank-1) composition; compositions work via their components (export coverage owned by `../backends/`).
 
 ## IR op definitions (ownership decision — binding)
 
@@ -63,15 +63,17 @@ The generic SSA machinery and the op **registry** live in `etl.ir`, and the cano
 
 | File | Area |
 |---|---|
-| `__init__.py` | Re-exports the 99 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
+| `__init__.py` | Re-exports the 102 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
 | `_utils.py` | Internal: `check_in_trace`, `get_location`, `as_operand`, `weak_scalar_dtype`, `promote_dtypes`, `broadcast_shapes`, `reduced_shape`, `normalize_axes` + `ETL_DISABLE_LOCATIONS_ENV` |
-| `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor` |
+| `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan acos floor ceil round tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor bitwise_left_shift bitwise_right_shift` |
 | `comparison.py` | `equal not_equal less less_equal greater greater_equal logical_and logical_or logical_not select` |
 | `indexing.py` | `broadcast reshape transpose slice gather scatter concatenate pad` (+ `getitem`, the operator-handler entry — not in `__all__`) |
 | `reductions.py` | `reduce_sum reduce_max reduce_min reduce_mean reduce_prod sum max min mean prod argmax argmin` |
 | `linalg.py` | `dot conv tril triu cumsum solve matmul cumprod diagonal trace norm eigh cholesky qr matrix_rank svd matrix_exp` |
 | `sorting.py` | `sort argsort topk` |
 | `structural.py` | `tile stack flip roll clamp diag isnan nan_to_num eye linspace` |
+| `stats.py` | `var std median nansum` — documented compositions over ordinary ops, no dedicated IR ops |
+| `random.py` | The `etl.random` frontend: `key split split_n uniform normal randint permutation multinomial` (6 algorithm-aware random IR ops, re-exported via `etl/random.py`) |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `ETL_LARGE_CONSTANT_BYTES`, `constant_like`) |
 | `external.py` | `external_call` — the graph-side declaration of a named external-kernel call (see `../CONTEXT.md` "External kernels") |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
