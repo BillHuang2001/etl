@@ -631,6 +631,14 @@ class _Client(_Handle):
                     f"{exc} — ensure ptxas (from the CUDA toolkit) is on "
                     "PATH (the XLA CUDA plugin invokes it at compile time)"
                 ) from None
+            if "libdevice" in str(exc):
+                raise core.BackendError(
+                    f"{exc} — provide the NVVM libdevice bitcode by "
+                    "setting XLA_FLAGS=--xla_gpu_cuda_data_dir=<dir> where "
+                    "<dir>/nvvm/libdevice/libdevice.10.bc exists (any CUDA "
+                    "12 toolkit layout works, e.g. the libdevice.10.bc "
+                    "shipped in a triton/warp wheel)"
+                ) from None
             raise
         return _LoadedExecutable(self.plugin, args.executable)
 

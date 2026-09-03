@@ -8,8 +8,14 @@ against the numpy reference backend on CUDA (RTX A6000):
   A. PSO-shaped graph (split + uniform + elementwise move + argmin + gather)
   B. DE-shaped graph (split_n normal/randint + gather 3 parents + select)
   C. OpenES-shaped graph (normal + dot + reduce + gradient update)
-  D. RNG bit-exactness for threefry2x32 and philox4x32_10 (native
-     stablehlo.rng_bit_generator paths on xla)
+  D. RNG bit-exactness for threefry2x32 and philox4x32_10 (the xla
+     adapter default — the exporter's bit-exact inline expansions; the
+     native stablehlo.rng_bit_generator path was dropped from the xla
+     capability set after real-plugin validation: the plugin's
+     spec-strict u64-state importer rejects etl's u32-word state layout
+     at compile, and XLA's THREE_FRY/PHILOX are different ciphers
+     (threefry2x64 / 2-word philox4x32-10) than etl's threefry2x32 /
+     4-word philox4x32_10 — native bit-exactness impossible by design)
   E. non-dominate-rank-shaped while_loop ((n,n) bool dominance matrix +
      intra-body reduce + bool->int32 casts)
 
@@ -21,6 +27,10 @@ Env (set in the shell BEFORE launching — all must exist at plugin load):
   LD_LIBRARY_PATH=<dir with libcudnn.so.9 >= 9.8.0>  (the plugin is compiled
       against cuDNN 9.8.0; with the venv's 9.1.0 every compile fails
       RET_CHECK dnn_support != nullptr)
+  XLA_FLAGS=--xla_gpu_cuda_data_dir=<dir with nvvm/libdevice/libdevice.10.bc>
+      (graphs using libdevice routines — e.g. random.normal's Box-Muller
+      log/sqrt/cos — fail PJRT_Client_Compile without it when no system
+      CUDA toolkit is installed)
   CUDA_VISIBLE_DEVICES=<free gpu>  (the adapter executes on
       client.addressable_devices()[0] = the visible device)
   PATH must contain ptxas (the plugin invokes it at compile time).
@@ -177,8 +187,11 @@ def sectionB(numpy_only):
         return
     print(f"  numpy {t_np*1000:.0f} ms / xla {t_xla*1000:.0f} ms")
     check("B.key", actual[0].numpy(), expected[0].numpy(), mode="bit")
-    check("B.trial", actual[1].numpy(), expected[1].numpy(), mode="bit")
-    check("B.mutant", actual[2].numpy(), expected[2].numpy(), mode="bit")
+    # trial/mutant consume the f32 random.normal z — the documented
+    # Box-Muller f32 fast-path tolerance budget (same as section D's
+    # normal_f32), not bit-exact.
+    check("B.trial", actual[1].numpy(), expected[1].numpy(), mode="tol")
+    check("B.mutant", actual[2].numpy(), expected[2].numpy(), mode="tol")
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +259,7 @@ def sectionD(numpy_only):
         check(f"D.{alg}.uniform_f64", actual[2].numpy(), expected[2].numpy(),
               mode="bit")
         check(f"D.{alg}.normal_f64", actual[3].numpy(), expected[3].numpy(),
-              mode="bit")
+              mode="tol", tol=1e-12)  # 1-ulp libdevice-vs-libm noise (~4e-16)
         check(f"D.{alg}.normal_f32", actual[4].numpy(), expected[4].numpy(),
               mode="tol", tol=1e-4)  # documented Box-Muller f32 fast path
         check(f"D.{alg}.randint", actual[5].numpy(), expected[5].numpy(),
@@ -271,16 +284,19 @@ def non_dominate_rank(fit):
     lt_any = etl.max(etl.cast(lt, etl.int32), axes=2) == 1  # any(<)
     dom = etl.logical_and(le_all, lt_any)  # (n, n) bool
     i0 = etl.constant(etl.tensor(0, dtype=etl.int32))
+    i1 = etl.constant(etl.tensor(1, dtype=etl.int32))
     rank0 = etl.constant(etl.zeros((n,), dtype=etl.int32))
 
-    def cond(i, rank):
+    def cond(state):
+        i, rank = state
         return i < n
 
-    def body(i, rank):
+    def body(state):
+        i, rank = state
         col = etl.gather(dom, i, axis=1)  # gather column i (dynamic index)
-        r_i = 1 + etl.sum(etl.cast(col, etl.int32), axes=0)  # bool->int32
+        r_i = i1 + etl.sum(etl.cast(col, etl.int32), axes=0)  # bool->int32
         rank = etl.scatter(rank, i, r_i, axis=0)
-        return i + 1, rank
+        return i + i1, rank
 
     _, rank = etl.while_loop(cond, body, (i0, rank0))
     return rank

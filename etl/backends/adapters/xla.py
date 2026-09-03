@@ -157,14 +157,20 @@ class XlaBackend(CompilerBackend):
         runtime_calls=False,
         custom_blocks=False,
         async_collectives=False,
-        # {"threefry2x32", "philox4x32_10"} by design: XLA ships
-        # RngBitGenerator with THREE_FRY/PHILOX (the exporter's native
-        # rng_bit_generator path with the verified [key0,key1,ctr...]
-        # state layout). The xla tests stay gate-skipped without a
-        # user-provided PJRT plugin — bit-exactness of BOTH algorithms
-        # must be re-validated against the numpy reference with a real
-        # plugin (see adapters/CONTEXT.md).
-        rng_bit_generator=frozenset({"threefry2x32", "philox4x32_10"}),
+        # frozenset() — empty by design. XLA ships RngBitGenerator with
+        # THREE_FRY/PHILOX, but real-plugin validation (jax_cuda12_pjrt
+        # 0.10.2's xla_cuda_plugin.so) showed the native path is unusable
+        # for etl's algorithms: (1) the exporter's u32-word key-first
+        # state layout fails PJRT_Client_Compile on XLA's spec-strict
+        # u64-state importer ("Binary op add with different element
+        # types: u32[1] and u64[]"), and (2) even spec-compliant, XLA's
+        # THREE_FRY is threefry2x64 / PHILOX is 2-word philox4x32-10 —
+        # different ciphers than etl's threefry2x32 / 4-word
+        # philox4x32_10, so bit-exactness vs the numpy reference is
+        # impossible by design. The exporter's bit-exact inline
+        # expansions are the default; the per-call `rng_bit_generator`
+        # lower option still lets users force the native path.
+        rng_bit_generator=frozenset(),
     )
 
     # ---------------------------------------------------------- availability
