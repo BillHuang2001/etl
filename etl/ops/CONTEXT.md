@@ -65,7 +65,7 @@ The generic SSA machinery and the op **registry** live in `etl.ir`, and the cano
 |---|---|
 | `__init__.py` | Re-exports the 99 public names (`__all__`); import-time `_registration.register_operator_handlers()` |
 | `_utils.py` | Internal: `check_in_trace`, `get_location`, `as_operand`, `weak_scalar_dtype`, `promote_dtypes`, `broadcast_shapes`, `reduced_shape`, `normalize_axes` + `ETL_DISABLE_LOCATIONS_ENV` |
-| `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor` |
+| `elementwise.py` | `add subtract multiply divide power remainder maximum minimum abs negate square sqrt exp log log1p sin cos tan acos floor ceil round tanh sigmoid relu gelu erf sign cast bitwise_and bitwise_or bitwise_xor bitwise_left_shift bitwise_right_shift` |
 | `comparison.py` | `equal not_equal less less_equal greater greater_equal logical_and logical_or logical_not select` |
 | `indexing.py` | `broadcast reshape transpose slice gather scatter concatenate pad` (+ `getitem`, the operator-handler entry — not in `__all__`) |
 | `reductions.py` | `reduce_sum reduce_max reduce_min reduce_mean reduce_prod sum max min mean prod argmax argmin` |
