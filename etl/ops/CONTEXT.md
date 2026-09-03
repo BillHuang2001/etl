@@ -49,7 +49,7 @@ The 15 public names `sort argsort topk tile stack flip roll clamp eye matmul cum
 - `matmul` = dot sugar with rank-1 promote/squeeze (`dot`'s rank ≥ 2 contract and `__matmul__` → dot unchanged).
 - `isnan` = comparison composition.
 
-Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Backend coverage: numpy = full reference; compiler backends (stablehlo/iree/xla/tvm) defer the 8 new IR ops with explicit `BackendError` (no exporter entries added); compositions work via their components.
+Transform coverage: no vjp/batching rules for the 8 new IR ops + eye/linspace → `TransformError` (the random-op pattern); clamp/matmul/isnan/stack/topk inherit their composition's rules. Backend coverage: numpy = full reference; compiler backends (stablehlo/iree/xla/tvm) export `sort`/`argsort`/`tile` as v1 StableHLO and defer `flip`/`roll`/`cumprod`/`nan_to_num` with explicit `BackendError`; `diag` is v1 via a flatten+gather (rank-2) / iota+select (rank-1) composition; compositions work via their components (export coverage owned by `../backends/`).
 
 ## IR op definitions (ownership decision — binding)
 
@@ -72,6 +72,8 @@ The generic SSA machinery and the op **registry** live in `etl.ir`, and the cano
 | `linalg.py` | `dot conv tril triu cumsum solve matmul cumprod diagonal trace norm eigh cholesky qr matrix_rank svd matrix_exp` |
 | `sorting.py` | `sort argsort topk` |
 | `structural.py` | `tile stack flip roll clamp diag isnan nan_to_num eye linspace` |
+| `stats.py` | `var std median nansum` — documented compositions over ordinary ops, no dedicated IR ops |
+| `random.py` | The `etl.random` frontend: `key split split_n uniform normal randint permutation multinomial` (6 algorithm-aware random IR ops, re-exported via `etl/random.py`) |
 | `constant.py` | `constant runtime_call stop_gradient` (+ `ETL_LARGE_CONSTANT_BYTES`, `constant_like`) |
 | `external.py` | `external_call` — the graph-side declaration of a named external-kernel call (see `../CONTEXT.md` "External kernels") |
 | `_registration.py` | `OPERATOR_HANDLERS` mapping, `register_operator_handlers` (implemented) |
