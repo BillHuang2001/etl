@@ -751,15 +751,18 @@ def _emit_rng_bit_generator(w, op, alg, key, salt, n_words, lines) -> str:
     ``stablehlo.rng_bit_generator`` with ``algorithm = PHILOX`` is NOT
     validated against the numpy reference anywhere — iree 3.11 fails to
     legalize it (so "philox4x32_10" is absent from the iree capability
-    set), tvm has no rng_bit_generator support, and the xla adapter's
-    capability set includes philox only by design, gate-skipped without a
-    user-provided PJRT plugin. The StableHLO philox
+    set), tvm has no rng_bit_generator support, and the xla adapter
+    declares NO native algorithms after real-plugin validation
+    (jax_cuda12_pjrt 0.10.2): the plugin's spec-strict u64-state importer
+    rejects etl's u32-word key-first state at compile, and XLA's
+    THREE_FRY/PHILOX are different ciphers than etl's threefry2x32 /
+    4-word philox4x32_10 — native bit-exactness impossible by design.
+    The StableHLO philox
     cipher consumes only the 2-word key (Random123 semantics), while the
     etl reference uses the 4-word CYCLIC round-key schedule — so native
     philox words may differ from the numpy reference for nonzero keys.
-    Bit-exactness MUST be re-validated against a real XLA plugin before
-    any adapter enables native philox; if XLA's philox semantics differ,
-    philox stays on the bit-exact INLINE path for xla."""
+    Native philox stays OFF by default on every adapter; the per-call
+    ``rng_bit_generator`` option can still force it explicitly."""
     key_name = w._name(key)
     if alg == ALGORITHM_THREEFRY2X32:
         key_words, counter_words, alg_enum = 2, 2, "THREE_FRY"

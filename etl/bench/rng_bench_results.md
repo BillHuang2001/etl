@@ -45,11 +45,11 @@ Native THREE_FRY is bit-exact vs numpy (and == inline == numpy) on both llvm-cpu
 4. **No native-primitive dependency** — works on every backend and target with zero legalization risk.
 5. **Backward compatible** — bit-identical to the pre-framework default stream; no test/user churn.
 
-**When to choose another algorithm explicitly**: `threefry2x32` for small-sample GPU workloads and native-primitive backends (iree now emits native THREE_FRY for it by default — ~2× faster on cuda); `philox4x32_10` for XLA-native deployments (native PHILOX is v1 export-only on xla until validated against a real PJRT plugin; on iree it runs the bit-exact inline path).
+**When to choose another algorithm explicitly**: `threefry2x32` for small-sample GPU workloads and native-primitive backends (iree now emits native THREE_FRY for it by default — ~2× faster on cuda); `philox4x32_10` when targeting native `rng_bit_generator` backends other than XLA (native PHILOX was validated OFF for xla with the real plugin — XLA's spec-strict u64-state importer rejects etl's u32-word state at compile, and XLA's THREE_FRY/PHILOX are different ciphers than etl's threefry2x32 / 4-word philox4x32_10, so native bit-exactness is impossible by design; xla runs the bit-exact inline path).
 
 ## Follow-on change driven by this benchmark
 
-`Capabilities.rng_bit_generator` is now a per-algorithm set (was a single bool): iree declares `{"threefry2x32"}` — native THREE_FRY is the iree default for threefry (bit-exact, 1.6–2.1× faster on cuda); xla declares both (by design, re-validate with a real plugin); tvm none. The reserved per-call `rng_bit_generator` option (bool or collection of names) overrides the capability per `lower()`/`build()`/`evaluate()` call (inline pinning, e.g. `rng_bit_generator=frozenset()`).
+`Capabilities.rng_bit_generator` is now a per-algorithm set (was a single bool): iree declares `{"threefry2x32"}` — native THREE_FRY is the iree default for threefry (bit-exact, 1.6–2.1× faster on cuda); xla declares none (the native path was DROPPED after real-plugin validation — spec-strict u64-state importer + different ciphers — bit-exact inline default); tvm none. The reserved per-call `rng_bit_generator` option (bool or collection of names) overrides the capability per `lower()`/`build()`/`evaluate()` call (inline pinning, e.g. `rng_bit_generator=frozenset()`).
 
 ## Reproduce
 
