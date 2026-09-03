@@ -193,7 +193,7 @@ def openes_step(key, theta):
     z = etl.random.normal(key, shape=(P, D))
     eps = z * 0.1
     scores = etl.reshape(etl.dot(eps, etl.reshape(theta, (D, 1))), (P,))
-    grad = etl.mean(eps * etl.expand_dims(scores, 1), axes=0)  # (D,)
+    grad = etl.mean(eps * etl.reshape(scores, (P, 1)), axes=0)  # (D,)
     theta_new = theta + 0.01 * grad
     return theta_new, scores
 
