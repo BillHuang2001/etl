@@ -1,8 +1,18 @@
 """Sorting frontend: ``sort``, ``argsort``, ``topk`` (graph ops).
 
 Semantics follow numpy (``sort``/``argsort``); ``topk`` is a pure composition
-over ``sort``/``argsort`` + ``gather`` of a static ``0..k-1`` index constant
 (no dedicated IR op — see the design note in this node's CONTEXT.md):
+
+- ``topk`` values/indices are the first ``k`` entries of the axis-sorted
+  tensor (descending for ``largest=True``, ascending otherwise). For
+  ``k > 1``: ``sort``/``argsort`` + ``gather`` of the static ``0..k-1``
+  index constant. For ``k == 1``: an O(n) ``argmax``/``argmin`` +
+  ``reduce_max``/``reduce_min`` fast path (``keepdims=True``) —
+  bit-identical results for finite keys (the stable argsort's
+  first-extremal index equals the first occurrence of the extremum), with
+  NO sort op on any backend (critical on iree-cuda, where the 1-operand
+  sort is single-threaded O(n²)); float NaN keys are cleaned to +inf so
+  NaN sorts last ascending exactly like ``np.sort`` (see ``topk``).
 
 - ``topk`` values/indices are the first ``k`` entries of the axis-sorted
   tensor (descending for ``largest=True``, ascending otherwise) — for a
@@ -26,7 +36,10 @@ import numpy as np
 from etl import core
 
 from . import _utils
+from . import comparison as _comparison
 from . import indexing as _indexing
+from . import reductions as _reductions
+from . import structural as _structural
 
 __all__ = ["sort", "argsort", "topk"]
 
@@ -142,13 +155,23 @@ def argsort(x, axis=-1, descending=False, stable=False) -> "core.SymbolicTensor"
 def topk(x, k, axis=-1, largest=True) -> tuple["core.SymbolicTensor", "core.SymbolicTensor"]:
     """Top-k values and their indices along an axis.
 
-    Composition: ``sort``/``argsort`` (descending for ``largest=True``,
-    ascending otherwise) followed by a ``gather`` of the static index range
-    ``0..k-1`` along the axis — no dedicated IR op. ``k`` is a static
-    non-negative int; ``k <=`` the static axis extent is validated at trace
-    time (``ShapeError``); a symbolic axis extent defers the check to run
-    time, where the gather kernel raises an explicit ``ShapeError`` when
-    ``k`` exceeds the extent (never silent truncation).
+    Composition (no dedicated IR op): for ``k > 1``, ``sort``/``argsort``
+    (descending for ``largest=True``, ascending otherwise) followed by a
+    ``gather`` of the static index range ``0..k-1`` along the axis; for
+    ``k == 1``, an O(n) ``argmax``/``argmin`` + ``reduce_max``/
+    ``reduce_min`` fast path (``keepdims=True``) — bit-identical results
+    for finite keys (the stable argsort's first-extremal index equals the
+    first occurrence of the extremum) and NO sort op on any backend. Float
+    NaN keys are cleaned to +inf before the arg/min reduction, matching
+    ``np.sort``'s NaN-last order: ``largest=False`` picks the smallest
+    finite entry (all-NaN → the first NaN), ``largest=True`` picks the
+    first NaN (the NaN-propagating max). ``k`` is a static non-negative
+    int; ``k <=`` the static axis extent is validated at trace time
+    (``ShapeError``); a symbolic axis extent defers the check to run time,
+    where the gather kernel raises an explicit ``ShapeError`` when ``k``
+    exceeds the extent (numpy ``take`` raises ``IndexError`` for
+    out-of-bounds indices, converted by the kernel — never silent
+    truncation).
 
     Args:
         x: ``SymbolicTensor`` of rank >= 1.
@@ -189,6 +212,39 @@ def topk(x, k, axis=-1, largest=True) -> tuple["core.SymbolicTensor", "core.Symb
             f"topk: k={k} exceeds the axis extent {extent} along axis "
             f"{axis_norm}"
         )
+    if k == 1:
+        # O(n) fast path, backend-agnostic (no sort op): the k == 1 entries
+        # of the axis-sorted tensor are the axis extremum + its
+        # first-occurrence index (the stable argsort's first entry) —
+        # bit-identical to the sort/argsort composition for finite keys,
+        # while avoiding the iree-cuda single-threaded O(n²) 1-operand sort
+        # entirely. Float NaN keys are cleaned to +inf before the arg
+        # reduction (and the min-reduce), so NaN sorts LAST ascending
+        # exactly like np.sort: the smallest entry skips NaNs, the largest
+        # entry is the first NaN, and the numpy/stablehlo backends AGREE
+        # (the stablehlo argmax/argmin NaN divergence is bypassed); the
+        # only documented divergence is a NaN-vs-real-+inf INDEX tie (both
+        # sort beyond every finite value). All-NaN picks the first NaN
+        # (value NaN via the fix-up below).
+        xk = x
+        if x.dtype.kind == "f":
+            xk = _comparison.select(_structural.isnan(x), np.inf, x)
+        if largest:
+            indices = _reductions.argmax(xk, axis=axis_norm, keepdims=True)
+            # NaN-propagating max == the descending sort's first value in
+            # every case (numpy and stablehlo maximum both propagate NaN).
+            values = _reductions.reduce_max(x, axes=axis_norm, keepdims=True)
+        else:
+            indices = _reductions.argmin(xk, axis=axis_norm, keepdims=True)
+            values = _reductions.reduce_min(xk, axes=axis_norm, keepdims=True)
+            if x.dtype.kind == "f":
+                # All-NaN: the cleaned min is +inf; the composition's first
+                # ascending entry is NaN — restore it.
+                all_nan = _reductions.reduce_min(
+                    _structural.isnan(x), axes=axis_norm, keepdims=True
+                )
+                values = _comparison.select(all_nan, np.nan, values)
+        return values, indices
     values = _emit_sort(builder, x, axis_norm, largest, False, "sort", loc)
     indices = _emit_sort(builder, x, axis_norm, largest, False, "argsort", loc)
     pick = np.arange(k, dtype=np.int64)

@@ -591,7 +591,15 @@ class IreeBackend(CompilerBackend):
     # `stablehlo.sort` whenever the sorted-axis extent is >= 32 (upstream
     # iree 3.11.0 bug) — the count-based composition (bit-exact vs numpy on
     # both targets) is used for those argsorts, the two-operand sort for the
-    # rest. Explicit per-call override: `lower(..., sort_emission="pair"|"count")`.
+    # rest. On CUDA TARGETS the default is upgraded to "count" (see
+    # ``_exporter_options`` below: the 1-operand VALUES sort that `etl.sort`
+    # / topk's values composition emits lowers to a SINGLE-THREADED O(n²)
+    # kernel on iree-cuda — sort n=1001 = 33.8 ms, n=10001 = 3.39 s, the
+    # evox SO step cost at scale — while the count composition's sorted
+    # values are bit-exact and ~120-134× faster there; llvm-cpu keeps "auto"
+    # because its count values-composition is ~1.6× slower than the
+    # 1-operand sort at n ≥ 10000). Explicit per-call override:
+    # `lower(..., sort_emission="pair"|"count")`.
     default_sort_emission = "auto"
     capabilities = Capabilities(
         dynamic_shapes=True,
@@ -640,6 +648,34 @@ class IreeBackend(CompilerBackend):
                 f"unavailable: {exc}. Install them with "
                 f"`pip install etl[iree]`"
             ) from exc
+
+    def _exporter_options(self, options: dict | None) -> dict:
+        """Shared exporter options + the iree-target ``sort_emission`` default.
+
+        The reserved ``sort_emission`` lower option defaults to this
+        adapter's class default (``"auto"``); when it is unset (or
+        explicitly ``"auto"``) AND the caller's lower options carry
+        ``target_backends`` containing ``"cuda"``, the default is upgraded
+        to ``"count"`` (see ``default_sort_emission``): on iree-cuda the
+        1-operand ``stablehlo.sort`` the VALUES sort emission produces
+        lowers to a single-threaded O(n²) kernel, while the count
+        composition's sorted values are bit-exact there and ~120-134×
+        faster. llvm-cpu keeps ``"auto"`` (its count values-composition is
+        ~1.6× slower than the 1-operand sort at n ≥ 10000). The sugar
+        pipeline (``build``/``evaluate``) forwards the resolved
+        ``target_backends`` to ``lower()`` (see
+        ``pipeline._resolve_backend_device`` — for an iree-family backend
+        with a cuda device it is ``["cuda"]``), and the explicit pipeline
+        may pass it to ``lower()`` as well (an accepted compile-stage key),
+        so this default resolves at lower() time; an explicit per-call
+        ``sort_emission="pair"|"count"`` always wins.
+        """
+        opts = super()._exporter_options(options)
+        if opts["sort_emission"] == "auto":
+            targets = (options or {}).get("target_backends")
+            if isinstance(targets, (list, tuple)) and "cuda" in targets:
+                opts["sort_emission"] = "count"
+        return opts
 
     def compile(
         self, lowered: LoweredProgram, options: dict | None = None
