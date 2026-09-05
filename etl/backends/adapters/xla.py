@@ -33,7 +33,10 @@ docstring for provenance) and the driver in ``xla_util.py``. The full flow:
 - **Buffers**: ``PJRT_Client_BufferFromHostBuffer`` (dense row-major numpy
   arrays, all 14 etl dtypes incl. complex64/128) -> execute ->
   ``PJRT_Buffer_ToHostBuffer`` -> ``core.Tensor`` exactly like the numpy
-  interpreter.
+  interpreter (the CPU path). Device-resident executables (loaded on
+  ``Device("cuda", N)``) pass ``XlaDevicePayload`` inputs through with
+  zero host staging and return ``XlaDevicePayload`` outputs that stay on
+  the device (see the ``XlaDevicePayload`` class + ``upload_tensor``).
 - **Persistence**: ``PJRT_Executable_Serialize`` /
   ``PJRT_Executable_DeserializeAndLoad`` (true serialize; no load-time
   recompile).
@@ -72,6 +75,7 @@ bodies. ``import etl`` / ``import etl.backends`` never import this module
 from __future__ import annotations
 
 import base64
+import weakref
 from typing import Any, ClassVar
 
 from etl import core
@@ -87,10 +91,18 @@ from .xla_util import (
     _resolve_static_shape,
     acquire_client,
     release_client,
+    release_payload,
     set_opt_level,
 )
 
-__all__ = ["XlaBackend", "XlaExecutable", "xla_backend", "register"]
+__all__ = [
+    "XlaBackend",
+    "XlaExecutable",
+    "XlaDevicePayload",
+    "xla_backend",
+    "register",
+    "upload_tensor",
+]
 
 #: Payload format tag recorded into the CompiledArtifact payload.
 _ARTIFACT_FORMAT = "xla-serialized-executable"
@@ -378,9 +390,25 @@ class XlaBackend(CompilerBackend):
 
         Validates the recorded backend (``core.PersistenceError`` naming
         both on mismatch), the plugin (``check_available``), the device
-        (None or a CPU ``core.Device``; non-``Device`` ->
-        ``core.DeviceError``; non-cpu kind -> ``core.BackendError``), and
-        the payload format. The base64 executable is deserialized with
+        (None or a ``core.Device``; non-``Device`` ->
+        ``core.DeviceError``), and the payload format. Device model
+        (explicit placement — mirroring the iree adapter):
+
+        - ``None`` or ``Device("cpu", 0)``: a CPU executable that stages
+          host inputs via ``PJRT_Client_BufferFromHostBuffer`` and copies
+          outputs back via ``PJRT_Buffer_ToHostBuffer`` (the historical
+          behavior, unchanged). A non-zero cpu index is a
+          ``core.DeviceError`` (only ``Device('cpu', 0)`` exists).
+        - ``Device("cuda", N)``: a device-resident executable on the
+          client's addressable device N (``core.BackendError`` naming the
+          index and the device count when out of range; other kinds are a
+          ``core.BackendError`` naming the supported set). Its inputs must
+          be device-resident ``XlaDevicePayload`` tensors on the same
+          device (host inputs raise ``core.DeviceError`` — never staged),
+          and its outputs stay on the device as ``XlaDevicePayload``
+          tensors.
+
+        The base64 executable is deserialized with
         ``PJRT_Executable_DeserializeAndLoad`` on the process-global shared
         client for the (re-discovered) plugin (one refcounted client per
         plugin path — ``acquire_client``/``release_client``; the executable
@@ -407,13 +435,21 @@ class XlaBackend(CompilerBackend):
                     "device must be None or a core.Device, got "
                     f"{type(device).__name__}"
                 )
-            if device.kind != "cpu":
+            if device.kind == "cpu" and device.index != 0:
+                raise core.DeviceError(
+                    "only Device('cpu', 0) exists for kind 'cpu' — a CPU "
+                    f"executable always runs on the host, got {device!r}"
+                )
+            if device.kind not in ("cpu", "cuda"):
                 raise core.BackendError(
-                    f"the xla adapter supports only CPU devices, got "
-                    f"{device!r}"
+                    "the xla adapter supports CPU ('cpu') and GPU ('cuda') "
+                    f"devices, got {device!r}"
                 )
         effective_device = (
             device if device is not None else core.Device("cpu", 0)
+        )
+        device_index = (
+            effective_device.index if effective_device.kind == "cuda" else None
         )
 
         payload = artifact.payload
@@ -434,6 +470,18 @@ class XlaBackend(CompilerBackend):
         # client is destroyed only when the LAST reference is released.
         client = acquire_client(plugin)
         try:
+            # Resolve the raw PJRT_Device* for device-resident runs
+            # (None for CPU — execute stays on the compile-time device).
+            execute_device: int | None = None
+            if device_index is not None:
+                devices = client.addressable_devices()
+                if device_index >= len(devices):
+                    raise core.BackendError(
+                        f"the xla plugin client reports {len(devices)} "
+                        "addressable device(s); cannot run on "
+                        f"{effective_device!r}"
+                    )
+                execute_device = devices[device_index]
             serialized = base64.b64decode(payload["executable_base64"])
             try:
                 loaded = client.deserialize(serialized)
@@ -453,6 +501,7 @@ class XlaBackend(CompilerBackend):
             entry_functions=tuple(payload.get("entry_functions", ())),
             client=client,
             plugin=plugin,
+            execute_device=execute_device,
         )
 
 
@@ -460,14 +509,29 @@ class XlaExecutable(CompilerExecutable):
     """Run-time object for the xla backend (satisfies ``Executable``).
 
     ``native_module`` is the driver's ``_LoadedExecutable`` (a live
-    ``PJRT_LoadedExecutable``); ``run(flat_input_tensors)`` stages numpy
-    host buffers through ``PJRT_Client_BufferFromHostBuffer``, executes,
-    copies the output buffers back via ``PJRT_Buffer_ToHostBuffer``, and
-    wraps the results as ``core.Tensor`` exactly like the numpy interpreter
-    (``core.Tensor(np.asarray(...))``). ``save``/``load`` are the SHARED
-    ``CompilerExecutable`` implementations (artifact round-trip; the
-    executable is reconstructed explicitly at ``load`` — device handles
-    are never serialized).
+    ``PJRT_LoadedExecutable``). ``run(flat_input_tensors)`` semantics depend
+    on the load device (explicit placement — mirroring the iree adapter):
+
+    - **CPU executable** (``Device("cpu", 0)``): inputs are staged from
+      numpy host buffers through ``PJRT_Client_BufferFromHostBuffer``,
+      executed, and the output buffers are copied back via
+      ``PJRT_Buffer_ToHostBuffer`` and wrapped as ``core.Tensor`` exactly
+      like the numpy interpreter (``core.Tensor(np.asarray(...))``).
+    - **Device-resident executable** (``Device("cuda", N)``): every input
+      must already be a device-resident ``core.Tensor`` carrying an
+      ``XlaDevicePayload`` on this executable's device (and from the same
+      client) — its PJRT buffer is handed to
+      ``PJRT_LoadedExecutable_Execute`` DIRECTLY with zero host staging; a
+      host input raises ``core.DeviceError`` (never staged — there is no
+      implicit host->device transfer; place it explicitly via
+      ``t.to(Device('cuda', N))``). Outputs are wrapped as
+      ``XlaDevicePayload`` tensors that STAY on the device (their
+      ``.numpy()`` raises the standard ``core.DeviceError``; read them back
+      via the explicit ``t.to(cpu).numpy()``).
+
+    ``save``/``load`` are the SHARED ``CompilerExecutable``
+    implementations (artifact round-trip; the executable is reconstructed
+    explicitly at ``load`` — device handles are never serialized).
     """
 
     backend_name: ClassVar[str] = "xla"
@@ -486,6 +550,7 @@ class XlaExecutable(CompilerExecutable):
         entry_functions: tuple[str, ...] = (),
         client: Any = None,
         plugin: Any = None,
+        execute_device: Any = None,
     ) -> None:
         super().__init__(
             artifact=artifact,
@@ -496,16 +561,19 @@ class XlaExecutable(CompilerExecutable):
         )
         self._client = client
         self._plugin = plugin  # keeps the loaded plugin library alive
+        # The raw PJRT_Device* this executable executes on (None = the
+        # compile-time device — the CPU path, unchanged).
+        self._execute_device = execute_device
 
     def close(self) -> None:
         """Release the plugin handles (executable first, then the client ref).
 
         The client is a reference on the process-global shared client for
         the plugin path: closing the executable destroys the ``PJRT_Client``
-        only when NO other executable still holds a reference
-        (``release_client``). Not part of the ``Executable`` protocol; call
-        it when done with the executable (the process also reclaims
-        everything at exit).
+        only when NO other executable (or a live ``XlaDevicePayload``
+        output) still holds a reference (``release_client``). Not part of
+        the ``Executable`` protocol; call it when done with the executable
+        (the process also reclaims everything at exit).
         """
         if self.native_module is not None:
             self.native_module.close()
@@ -527,11 +595,15 @@ class XlaExecutable(CompilerExecutable):
         Validates inputs EXACTLY against ``signature.input_specs``:
         count (``BackendError``), type, dtype (``DTypeError``) and the
         static shape recorded at compile time (``ShapeError`` — the xla
-        adapter's shapes are static). Inputs are staged via
-        ``PJRT_Client_BufferFromHostBuffer``, executed, and the output
-        buffers are copied back and wrapped as ``core.Tensor`` exactly like
-        the numpy interpreter. Output count/dtype/shape are validated
-        against ``signature.output_specs``. A runtime failure raises
+        adapter's shapes are static). A CPU executable stages inputs via
+        ``PJRT_Client_BufferFromHostBuffer``, executes, and copies the
+        output buffers back as ``core.Tensor`` (the historical behavior).
+        A device-resident executable passes ``XlaDevicePayload`` inputs
+        through with ZERO host staging (any host input raises
+        ``core.DeviceError`` — no implicit host->device transfer) and
+        returns ``XlaDevicePayload`` outputs that stay on the device.
+        Output count/dtype/shape are validated against
+        ``signature.output_specs``. A runtime failure raises
         ``core.BackendError`` naming the cause — never a silent fallback.
 
         ``options``: per-run options, validated against ``KNOWN_OPTIONS`` —
@@ -564,7 +636,8 @@ class XlaExecutable(CompilerExecutable):
         expected_shapes = [
             tuple(recorded_input_shapes[i]) for i in range(len(input_specs))
         ]
-        arrays = []
+        device_resident = self.device is not None and self.device.kind != "cpu"
+        arrays: list[Any] = []
         for i, (tensor, spec, expected) in enumerate(
             zip(flat_input_tensors, input_specs, expected_shapes)
         ):
@@ -584,18 +657,43 @@ class XlaExecutable(CompilerExecutable):
                     f"{tuple(tensor.shape)} — the xla adapter requires "
                     "exact static shapes"
                 )
-            arrays.append(tensor.numpy())
+            if device_resident:
+                self._check_device_resident_input(i, tensor)
+                arrays.append(tensor.data.buffer)  # pass the PJRT buffer
+            else:
+                arrays.append(tensor.numpy())
 
-        buffers = [self._client.buffer_from_host(array) for array in arrays]
+        if device_resident:
+            buffers = arrays  # _Buffer handles owned by their payloads
+        else:
+            buffers = [self._client.buffer_from_host(array) for array in arrays]
         output_buffers: list[Any] = []
         try:
-            output_buffers = self.native_module.execute(buffers)
-            tensors = [core.Tensor(buffer.to_host()) for buffer in output_buffers]
+            output_buffers = self.native_module.execute(
+                buffers, execute_device=self._execute_device
+            )
+            if device_resident:
+                # Outputs STAY on the device — wrap them as payloads; the
+                # payloads own the buffers (never closed here).
+                tensors = [
+                    core.Tensor(
+                        XlaDevicePayload(
+                            self._plugin, self._client, buffer, self.device
+                        )
+                    )
+                    for buffer in output_buffers
+                ]
+            else:
+                tensors = [
+                    core.Tensor(buffer.to_host()) for buffer in output_buffers
+                ]
         finally:
-            for buffer in buffers:
-                buffer.close()
-            for buffer in output_buffers:
-                buffer.close()
+            if not device_resident:
+                # CPU path: staged inputs and copied outputs are owned here.
+                for buffer in buffers:
+                    buffer.close()
+                for buffer in output_buffers:
+                    buffer.close()
 
         output_specs = tuple(self.signature.output_specs)
         if len(tensors) != len(output_specs):
@@ -619,6 +717,47 @@ class XlaExecutable(CompilerExecutable):
                     f"{tuple(tensor.shape)}"
                 )
         return tensors
+
+    def _check_device_resident_input(self, i: int, tensor: core.Tensor) -> None:
+        """Validate input ``i`` of a device-resident run (explicit placement).
+
+        The input must be an ``XlaDevicePayload`` tensor on this
+        executable's device, created by the same shared client — its PJRT
+        buffer is executed directly (zero host staging). Host tensors and
+        foreign payloads raise ``core.DeviceError`` with the same message
+        family as the iree adapter: there is no implicit host->device
+        transfer at the run boundary (the pipeline rejects host inputs
+        first for ``etl.run``; this is the defensive check for direct
+        backend-level ``exe.run([...])`` calls).
+        """
+        payload = tensor.data
+        if not isinstance(payload, XlaDevicePayload):
+            raise core.DeviceError(
+                f"input {i} is not a device-resident tensor on this "
+                f"executable's device ({self.device!r}): the xla adapter "
+                "never stages host inputs for a device-resident run — "
+                "there is no implicit host-to-device transfer at the run "
+                "boundary. Place inputs on the device explicitly first "
+                f"via t.to({self.device!r}) (the xla backend's placement "
+                "provider), or load the executable on Device('cpu', 0) "
+                f"for host staging. Got a tensor carrying "
+                f"{type(payload).__name__}."
+            )
+        if payload.device != self.device:
+            raise core.DeviceError(
+                f"input {i} is on {payload.device!r}, but the executable "
+                f"runs on {self.device!r}: no implicit device-to-device or "
+                "host-to-device transfer happens at the run boundary — "
+                f"move the tensor to the executable's device explicitly "
+                f"via t.to({self.device!r})."
+            )
+        if payload.client is not self._client:
+            raise core.DeviceError(
+                f"input {i} carries an xla device payload owned by a "
+                "different PJRT client/plugin than this executable's — a "
+                "buffer from another client cannot be executed (never "
+                "silently mixed)."
+            )
 
     def _recorded_shapes(self, field: str, count: int) -> list[list[int]]:
         """Read the static-shape gate results recorded in the artifact payload.
@@ -649,8 +788,147 @@ class XlaExecutable(CompilerExecutable):
         return shapes
 
 
+class XlaDevicePayload:
+    """PUBLIC device-resident payload wrapping a live PJRT buffer.
+
+    The ``.data`` of device-resident ``core.Tensor`` outputs of
+    device-resident ``XlaExecutable`` runs and of the explicit placement
+    path ``t.to(Device('cuda', N))`` (``upload_tensor``). The wrapped
+    ``PJRT_Buffer`` stays alive for the payload's lifetime; the payload
+    holds one reference on the process-global shared client
+    (``acquire_client``) and releases it — destroying the buffer BEFORE
+    the client, guarded against stale-cache ordering — when garbage
+    collected. It exposes the ``core.Tensor`` device-payload protocol:
+
+    - ``.buffer``: the driver ``_Buffer`` (the live ``PJRT_Buffer``) —
+      the unit handed to ``PJRT_LoadedExecutable_Execute`` for
+      same-device pass-through (zero host round-trips).
+    - ``.shape`` / ``.dtype``: metadata queries (never a host copy).
+    - ``.device``: the ``core.Device`` the buffer physically lives on.
+    - ``.to_host()``: the EXPLICIT device-to-host copy
+      (``PJRT_Buffer_ToHostBuffer``) — invoked by ``t.to(cpu)`` /
+      ``.numpy()`` on a cpu-kind payload; a non-cpu payload's
+      ``.numpy()`` raises the standard ``core.DeviceError`` (no implicit
+      transfer).
+    - ``.client``: the owning shared client (identity-checked by
+      device-resident runs).
+
+    Users may isinstance-check this public class exactly like
+    ``IreeDevicePayload``. Buffers are never aliased by ``core.Tensor``
+    wrappers; each run produces fresh payloads.
+    """
+
+    __slots__ = ("_buffer", "_device", "_client", "_finalizer")
+
+    def __init__(self, plugin: Any, client: Any, buffer: Any, device: core.Device) -> None:
+        self._buffer = buffer
+        self._device = device
+        self._client = client
+        # Own one shared-client reference for the buffer's lifetime: PJRT
+        # buffers must outlive... in fact be destroyed BEFORE the client
+        # that owns them — the guarded release_payload enforces that order.
+        acquire_client(plugin)
+        self._finalizer = weakref.finalize(
+            self, release_payload, plugin, client, buffer
+        )
+
+    @property
+    def buffer(self) -> Any:
+        """The live driver ``_Buffer`` (the wrapped ``PJRT_Buffer``)."""
+        return self._buffer
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The buffer's concrete shape (metadata query — no host copy)."""
+        return self._buffer.shape
+
+    @property
+    def dtype(self) -> Any:
+        """The buffer's numpy dtype (metadata query — no host copy)."""
+        return self._buffer.dtype
+
+    @property
+    def device(self) -> core.Device:
+        """The ``core.Device`` this buffer physically lives on."""
+        return self._device
+
+    @property
+    def client(self) -> Any:
+        """The shared PJRT client that owns this buffer (identity check)."""
+        return self._client
+
+    def to_host(self) -> Any:
+        """The EXPLICIT device-to-host copy (``PJRT_Buffer_ToHostBuffer``).
+
+        A fresh numpy array per call — never cached (device memory may be
+        updated in place by later executes).
+        """
+        return self._buffer.to_host()
+
+
 #: The module-level singleton (registered on first use by the registry).
 xla_backend = XlaBackend()
+
+
+def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
+    """The core device-transfer provider for kind ``"cuda"`` (explicit placement).
+
+    Registered by ``register()`` — overwriting whatever provider currently
+    serves kind ``"cuda"`` (idempotent, last-wins — the same pattern as the
+    iree adapter: in a mixed process, whichever adapter activated LAST owns
+    "cuda" placement; the other backend rejects foreign payloads with a
+    clear ``core.DeviceError``). The contract (``core.Tensor.to``):
+
+    - the source must be a HOST ndarray-backed tensor on ``Device("cpu",
+      0)`` — anything else raises ``core.DeviceError`` suggesting the
+      explicit two-hop ``t.to(cpu).to(target)`` (no cross-device copies in
+      v1);
+    - the target must be a ``Device("cuda", N)`` with N below the plugin
+      client's addressable-device count (``core.BackendError`` naming the
+      count otherwise) — the plugin is discovered via ``ETL_PJRT_PLUGIN`` /
+      well-known paths (``Tensor.to`` passes no options);
+    - the upload is ONE-SHOT: ``PJRT_Client_BufferFromHostBuffer`` on the
+      shared client (fresh buffer, no cache), returning a fresh
+      device-resident ``core.Tensor`` wrapping an ``XlaDevicePayload``.
+
+    This is the bootstrap for device-resident loops: place the seed state
+    once with ``state.to(Device('cuda', N))``, then feed each run's
+    device-resident outputs back as the next inputs — zero host
+    round-trips after the first placement.
+    """
+    if not isinstance(tensor, core.Tensor):
+        raise core.DeviceError(
+            "the xla placement provider expects a core.Tensor, got "
+            f"{type(tensor).__name__}"
+        )
+    if device.kind != "cuda":
+        # Defensive: the provider is registered for kind "cuda" only.
+        raise core.DeviceError(
+            f"the xla placement provider places data on 'cuda' devices "
+            f"only, got {device!r}"
+        )
+    if tensor.device != core.Device("cpu", 0):
+        raise core.DeviceError(
+            f"cannot place a {tensor.device!r} tensor on {device!r}: the "
+            "xla placement path stages host memory only (v1 has no "
+            "cross-device copies). Transfer in two explicit hops instead: "
+            "t.to(core.Device('cpu', 0)) first, then .to(target)."
+        )
+    plugin = _load_plugin()
+    client = acquire_client(plugin)
+    try:
+        devices = client.addressable_devices()
+        if not 0 <= device.index < len(devices):
+            raise core.BackendError(
+                f"the xla plugin client reports {len(devices)} addressable "
+                f"device(s); cannot place data on {device!r}"
+            )
+        buffer = client.buffer_from_host(tensor.numpy(), device_index=device.index)
+    except Exception:
+        release_client(plugin)
+        raise
+    payload = XlaDevicePayload(plugin, client, buffer, device)
+    return core.Tensor(payload)
 
 
 def register() -> None:
@@ -663,6 +941,14 @@ def register() -> None:
     pip-installable dependency; the user provides the plugin binary via
     ``options["plugin_path"]`` or the ``ETL_PJRT_PLUGIN`` environment
     variable. Does nothing observable when already registered.
+
+    On activation it ALSO overwrites the core device-transfer provider for
+    kind ``"cuda"`` with this adapter's ``upload_tensor`` (idempotent,
+    last-wins — mirroring the iree adapter): ``t.to(Device('cuda', N))``
+    then stages host data onto the PJRT plugin's device N through the
+    shared client, returning an ``XlaDevicePayload`` tensor — the explicit
+    bootstrap for device-resident xla loops.
     """
     XlaBackend.check_available()
     _registry_register(xla_backend)
+    core.register_device_transfer_provider("cuda", upload_tensor)
