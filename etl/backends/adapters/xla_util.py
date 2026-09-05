@@ -708,7 +708,13 @@ class _Client(_Handle):
         """
         import numpy as np
 
-        arr = np.ascontiguousarray(array)
+        # NOTE: np.ascontiguousarray has a hardcoded ndmin=1 (numpy#5300) —
+        # it silently promotes 0-d arrays to shape (1,), which would stage a
+        # rank-0 host tensor as a (1,) buffer. Convert with np.asarray
+        # (0-d-preserving) first and force contiguity only for ndim >= 1.
+        arr = np.asarray(array)
+        if arr.ndim and not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
         dtype_name = np.dtype(arr.dtype).name
         try:
             buffer_type = _DTYPE_NAME_TO_PJRT[dtype_name]
