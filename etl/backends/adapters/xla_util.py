@@ -708,7 +708,13 @@ class _Client(_Handle):
         """
         import numpy as np
 
-        arr = np.ascontiguousarray(array)
+        # NOTE: np.ascontiguousarray has a hardcoded ndmin=1 (numpy#5300) —
+        # it silently promotes 0-d arrays to shape (1,), which would stage a
+        # rank-0 host tensor as a (1,) buffer. Convert with np.asarray
+        # (0-d-preserving) first and force contiguity only for ndim >= 1.
+        arr = np.asarray(array)
+        if arr.ndim and not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
         dtype_name = np.dtype(arr.dtype).name
         try:
             buffer_type = _DTYPE_NAME_TO_PJRT[dtype_name]
@@ -718,7 +724,20 @@ class _Client(_Handle):
                 f"{dtype_name!r} — supported: "
                 + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
             ) from None
-        dims = (ctypes.c_int64 * max(1, len(arr.shape)))(*arr.shape)
+        if arr.ndim:
+            dims = (ctypes.c_int64 * arr.ndim)(*arr.shape)
+        else:
+            # rank-0: pass dims=NULL with num_dims=0 — the header-contract
+            # form for a rank-0 dense buffer. RE-PROBED on the real
+            # jax_cuda12_pjrt 0.10.2 plugin: PJRT_Buffer_Dimensions reports
+            # shape () for BOTH NULL and non-NULL dims with num_dims=0 (the
+            # earlier "(1,) for non-NULL dims + num_dims=0" quirk does not
+            # reproduce on 0.10.2 — the historical (1,) symptom was the
+            # np.ascontiguousarray ndmin=1 promotion above, which staged a
+            # genuinely-1-d array with num_dims=1). The fake test plugin
+            # emulates the non-NULL→(1,) quirk as a driver-regression guard
+            # pinning the NULL form regardless.
+            dims = None
         data_ptr = (
             ctypes.cast(arr.ctypes.data, ctypes.c_void_p)
             if arr.size

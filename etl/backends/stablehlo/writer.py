@@ -219,12 +219,22 @@ class Writer:
         )
         #: sort_emission exporter option: ``"pair"`` (default — the
         #: two-operand (key, iota) ``stablehlo.sort`` composition), ``"count"``
-        #: (the count-based O(n^2) composition with NO sort op, bit-exact vs
-        #: numpy on both llvm-cpu and cuda), or ``"auto"`` (per argsort:
-        #: ``"count"`` whenever the sorted-axis extent >= 32, else ``"pair"``).
+        #: (the count-based composition with NO sort op — bit-exact vs
+        #: numpy on both llvm-cpu and cuda; in the strict count mode the
+        #: VALUES ``sort`` op ALSO routes through its sorted-values column:
+        #: on iree-cuda the 1-operand sort lowers to a single-threaded
+        #: O(n²) kernel — see stablehlo/CONTEXT.md — while the count
+        #: composition is ~120-134× faster there; on llvm-cpu the count
+        #: values-composition is ~1.6× SLOWER than the 1-operand sort at
+        #: n ≥ 10000, so only the strict mode routes — ``"auto"``/``"pair"``
+        #: keep the 1-operand VALUES emission unchanged), or ``"auto"`` (per
+        #: argsort: ``"count"`` whenever the sorted-axis extent >= 32, else
+        #: ``"pair"``; values stay ``"pair"``).
         #: The iree-cuda HAL cannot bufferize multi-operand sorts at sorted
         #: axis >= 32 (upstream iree 3.11.0 bug) — the iree adapter passes
-        #: ``"auto"`` by default (see CompilerBackend.default_sort_emission).
+        #: ``"auto"`` by default, upgraded to ``"count"`` when the compile
+        #: ``target_backends`` contains cuda (see
+        #: ``IreeBackend._exporter_options``).
         self._sort_emission = _normalize_sort_emission(
             (options or {}).get("sort_emission", "pair")
         )
@@ -1688,7 +1698,17 @@ class Writer:
         Equal elements are indistinguishable in the output, so the
         ``stable`` attr only fixes tie ORDER for argsort (via the iota
         tie-break) — here it is irrelevant. Bool operands sort via an i8
-        key (StableHLO compare on i1 only supports EQ/NE)."""
+        key (StableHLO compare on i1 only supports EQ/NE).
+
+        Emission mode: in STRICT ``sort_emission="count"`` mode the sorted
+        values come from ``_emit_stable_argsort``'s count composition (the
+        sorted-VALUES column — bit-exact vs numpy on llvm-cpu AND cuda, and
+        on iree-cuda it dodges the single-threaded O(n²) kernel the
+        1-operand pair form lowers to; see stablehlo/CONTEXT.md). ``"pair"``
+        and ``"auto"`` keep the 1-operand emission (unchanged llvm-cpu
+        behavior: the count values-composition is ~1.6× slower than its
+        1-operand sort at n ≥ 10000, so the count routing is gated to the
+        strict mode — the iree adapter passes it on cuda targets)."""
         x = op.operands[0]
         rank = x.type.rank
         axis = self._normalize_axis(op.attributes.get("axis", -1), rank, "sort.axis")
@@ -1706,26 +1726,34 @@ class Writer:
                 f"{self._type_str(np.dtype('int8'), x_shape)}"
             )
             key_name, keys_dtype = t, np.dtype("int8")
-        elem = self._elem_type(keys_dtype)
-        a1, a2 = self._new_name(), self._new_name()
-        cmp = self._new_name()
-        region = (
-            "({\n"
-            f"  ^bb0({a1}: {elem}, {a2}: {elem}):\n"
-            f'    {cmp} = "stablehlo.compare"({a1}, {a2}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
-            f" : ({elem}, {elem}) -> tensor<i1>\n"
-            f"    stablehlo.return {cmp} : tensor<i1>\n"
-            "  })"
-        )
-        s = self._new_name()
-        lines.append(
-            f'{s} = "stablehlo.sort"({key_name}) {region} '
-            f"{{dimension = {axis} : i64}} : "
-            f"({self._type_str(keys_dtype, x_shape)}) -> "
-            f"{self._type_str(keys_dtype, x_shape)}"
-        )
-        cur = s
+        if self._sort_emission == "count":
+            # Count mode: reuse the count-based STABLE argsort composition's
+            # sorted-VALUES column (the index column is discarded). The
+            # values are the same regardless of the tie order.
+            cur, _ = self._emit_stable_argsort(
+                key_name, keys_dtype, x_shape, axis, lines
+            )
+        else:
+            elem = self._elem_type(keys_dtype)
+            a1, a2 = self._new_name(), self._new_name()
+            cmp = self._new_name()
+            region = (
+                "({\n"
+                f"  ^bb0({a1}: {elem}, {a2}: {elem}):\n"
+                f'    {cmp} = "stablehlo.compare"({a1}, {a2}) '
+                f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+                f" : ({elem}, {elem}) -> tensor<i1>\n"
+                f"    stablehlo.return {cmp} : tensor<i1>\n"
+                "  })"
+            )
+            s = self._new_name()
+            lines.append(
+                f'{s} = "stablehlo.sort"({key_name}) {region} '
+                f"{{dimension = {axis} : i64}} : "
+                f"({self._type_str(keys_dtype, x_shape)}) -> "
+                f"{self._type_str(keys_dtype, x_shape)}"
+            )
+            cur = s
         if keys_dtype.kind != np.dtype(x.type.dtype).kind:
             t = self._new_name()
             lines.append(
