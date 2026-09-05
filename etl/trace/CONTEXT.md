@@ -320,6 +320,7 @@ editing messages, keep the wording of existing paths intact.
 
 ## Known warts
 
+- **`_is_static_value` numpy-scalar asymmetry** (`_tree.py`): `np.float64`/`np.float32`-family values that are real Python `float`/`complex`/`str` subclasses (e.g. `np.float64`, `np.complex128`, `np.str_`) PASS the `isinstance(obj, (float, complex, str))` checks and count as static, while `np.int32`/`np.int64`/`np.uint*`/`np.bool_` (not Python `int`/`bool` subclasses) and `np.float32` are REJECTED — pinned by `tests/ops/test_getitem.py::test_numpy_integer_index_unsupported_v1` and `tests/trace/test_static_snapshot.py::test_non_static_specs_are_rejected` ("is neither a core.TensorSpec nor a static"). Raw `np.ndarray` leaves are rejected by the same raise in `trace.py::_flatten_specs`; ndarrays only become inputs via `TensorSpec` (or `etl.evaluate`, which derives specs from them).
 - **`get_location` is ~89% of trace time** (`etl/ops/_utils.py`,
   `inspect.stack()` per op). Escape hatch: `ETL_DISABLE_LOCATIONS=1`. Fix
   belongs in ops/ (see "Caching & performance").
