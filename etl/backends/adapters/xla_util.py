@@ -39,6 +39,10 @@ Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
 6. **Outputs.** Per output buffer: ``PJRT_Buffer_ElementType`` +
    ``PJRT_Buffer_Dimensions`` -> allocate a writable numpy array ->
    ``PJRT_Buffer_ToHostBuffer`` -> await + destroy the completion event.
+   Device-resident execution (see ``xla.py``) skips the copy: output
+   buffers are wrapped as payloads that stay on the device, and
+   same-device payload buffers are handed to
+   ``PJRT_LoadedExecutable_Execute`` directly (no host staging).
 7. **Persistence.** ``PJRT_Executable_Serialize`` (bytes copied out; the
    serialized wrapper is released via its deleter) and
    ``PJRT_Executable_DeserializeAndLoad`` for load.
@@ -77,6 +81,7 @@ __all__ = [
     "_DEFAULT_PLUGIN_PATHS",
     "acquire_client",
     "release_client",
+    "release_payload",
     "set_opt_level",
 ]
 
@@ -485,6 +490,38 @@ def release_client(plugin: "PjrtPlugin") -> None:
     client.close()
 
 
+def release_payload(
+    plugin: "PjrtPlugin", client: "_Client", buffer: "_Buffer"
+) -> None:
+    """Guarded finalizer for device-resident payloads (see ``xla.py``).
+
+    A device-resident payload owns (a) a ``PJRT_Buffer`` created by ``client``
+    and (b) one reference on the shared client (``acquire_client``). PJRT
+    buffers must be destroyed BEFORE the client that owns them, so the
+    buffer is destroyed first; the client is destroyed only when this was
+    the last reference. The cache-identity guard makes the finalizer safe
+    for any ordering: if the client already died (e.g. its executable was
+    closed and no other holder remained), the plugin freed its buffers with
+    it, so nothing is touched — and a LATER re-created client for the same
+    plugin path is never decremented by a stale payload.
+    """
+    with _shared_clients_lock:
+        entry = _shared_clients.get(plugin.path)
+        if entry is None or entry[0] is not client:
+            return  # the owning client is gone; its buffers died with it
+        if entry[1] > 1:
+            entry[1] -= 1
+            is_last = False
+        else:
+            del _shared_clients[plugin.path]
+            is_last = True
+    try:
+        buffer.close()
+    finally:
+        if is_last:
+            client.close()
+
+
 # ---------------------------------------------------------------------------
 # Handle wrappers (lifecycle hygiene: every plugin-created object is
 # destroyed via the matching PJRT_*_Destroy entry point).
@@ -661,8 +698,14 @@ class _Client(_Handle):
         )
         return _LoadedExecutable(self.plugin, args.loaded_executable)
 
-    def buffer_from_host(self, array: Any) -> "_Buffer":
-        """Stage a numpy array as a device buffer (dense, row-major)."""
+    def buffer_from_host(self, array: Any, device_index: int | None = None) -> "_Buffer":
+        """Stage a numpy array as a device buffer (dense, row-major).
+
+        ``device_index`` selects the client's addressable device to place
+        the buffer on (default ``None`` = the first addressable device —
+        the historical behavior). An out-of-range index raises
+        ``core.BackendError`` naming the index and the device count.
+        """
         import numpy as np
 
         arr = np.ascontiguousarray(array)
@@ -681,7 +724,17 @@ class _Client(_Handle):
             if arr.size
             else ctypes.cast((ctypes.c_byte * 1)(), ctypes.c_void_p)
         )
-        device = self.addressable_devices()[0]
+        devices = self.addressable_devices()
+        if device_index is None:
+            device = devices[0]
+        else:
+            if not 0 <= device_index < len(devices):
+                raise core.BackendError(
+                    f"the xla plugin client reports {len(devices)} "
+                    f"addressable device(s); cannot stage a buffer on device "
+                    f"index {device_index}"
+                )
+            device = devices[device_index]
         args = pjrt.PJRT_Client_BufferFromHostBuffer_Args(
             struct_size=pjrt.sizeof(pjrt.PJRT_Client_BufferFromHostBuffer_Args),
             client=self.ptr,
@@ -801,12 +854,18 @@ class _LoadedExecutable(_Handle):
             if deleter:
                 deleter(args.serialized_executable)
 
-    def execute(self, buffers: list["_Buffer"]) -> list["_Buffer"]:
-        """Execute on the first addressable device; return output buffers.
+    def execute(
+        self, buffers: list["_Buffer"], execute_device: int | None = None
+    ) -> list["_Buffer"]:
+        """Execute; return output buffers.
 
-        The caller owns the returned ``_Buffer`` objects (destroy via
-        ``close()``); input buffers stay owned by the caller and may be
-        destroyed once execute returns.
+        ``execute_device`` is an optional raw ``PJRT_Device*`` (from the
+        client's ``addressable_devices()``) passed as the execute target —
+        ``None`` (the default, unchanged) means the compile-time device,
+        which is what single-device CPU flows use. The caller owns the
+        returned ``_Buffer`` objects (destroy via ``close()``); input
+        buffers stay owned by the caller and may be destroyed once execute
+        returns.
         """
         num_args = len(buffers)
         device_ptrs = (ctypes.c_void_p * max(1, num_args))(
@@ -836,7 +895,7 @@ class _LoadedExecutable(_Handle):
                 output_lists, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
             ),
             device_complete_events=None,
-            execute_device=None,
+            execute_device=execute_device,
         )
         self.plugin._check(
             self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
@@ -846,13 +905,21 @@ class _LoadedExecutable(_Handle):
 
 
 class _Buffer(_Handle):
-    """A device buffer (destroyed via ``PJRT_Buffer_Destroy``)."""
+    """A device buffer (destroyed via ``PJRT_Buffer_Destroy``).
 
-    __slots__ = ("_keepalive",)
+    ``shape``/``dtype`` are lazy metadata queries (``PJRT_Buffer_ElementType``
+    + ``PJRT_Buffer_Dimensions``) cached on the instance — reading them does
+    NOT touch host memory, so device-resident payloads can be validated and
+    wrapped without a host round-trip.
+    """
+
+    __slots__ = ("_keepalive", "_shape", "_dtype")
 
     def __init__(self, plugin: "PjrtPlugin", ptr: int, keepalive: tuple = ()) -> None:
         super().__init__(plugin, ptr)
         self._keepalive = keepalive  # host memory that must outlive the buffer
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: Any | None = None
 
     def close(self) -> None:
         if self._closed:
@@ -861,40 +928,60 @@ class _Buffer(_Handle):
         self._keepalive = ()
         self.plugin._destroy("PJRT_Buffer_Destroy", pjrt.PJRT_Buffer_Destroy_Args, self.ptr)
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The buffer's concrete shape (cached metadata query, no host copy)."""
+        if self._shape is None:
+            dim_args = pjrt.PJRT_Buffer_Dimensions_Args(
+                struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_Dimensions_Args),
+                buffer=self.ptr,
+                dims=None,
+                num_dims=0,
+            )
+            self.plugin._check(
+                self.plugin.api.PJRT_Buffer_Dimensions(ctypes.byref(dim_args)),
+                "PJRT_Buffer_Dimensions",
+            )
+            self._shape = tuple(
+                dim_args.dims[i] for i in range(dim_args.num_dims)
+            )
+        return self._shape
+
+    @property
+    def dtype(self) -> Any:
+        """The buffer's numpy dtype (cached metadata query, no host copy)."""
+        if self._dtype is None:
+            type_args = pjrt.PJRT_Buffer_ElementType_Args(
+                struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ElementType_Args),
+                buffer=self.ptr,
+                type=0,
+            )
+            self.plugin._check(
+                self.plugin.api.PJRT_Buffer_ElementType(ctypes.byref(type_args)),
+                "PJRT_Buffer_ElementType",
+            )
+            try:
+                dtype_name = _PJRT_TO_DTYPE_NAME[
+                    pjrt.PJRT_Buffer_Type(type_args.type)
+                ]
+            except KeyError:
+                raise core.BackendError(
+                    f"the PJRT plugin produced an output buffer of element "
+                    f"type {type_args.type}, which has no numpy equivalent — "
+                    "the xla adapter supports "
+                    + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
+                ) from None
+            import numpy as np
+
+            self._dtype = np.dtype(dtype_name)
+        return self._dtype
+
     def to_host(self) -> Any:
         """Copy the buffer into a fresh row-major numpy array."""
         import numpy as np
 
-        type_args = pjrt.PJRT_Buffer_ElementType_Args(
-            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ElementType_Args),
-            buffer=self.ptr,
-            type=0,
-        )
-        self.plugin._check(
-            self.plugin.api.PJRT_Buffer_ElementType(ctypes.byref(type_args)),
-            "PJRT_Buffer_ElementType",
-        )
-        try:
-            dtype_name = _PJRT_TO_DTYPE_NAME[pjrt.PJRT_Buffer_Type(type_args.type)]
-        except KeyError:
-            raise core.BackendError(
-                f"the PJRT plugin produced an output buffer of element type "
-                f"{type_args.type}, which has no numpy equivalent — the xla "
-                "adapter supports "
-                + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
-            ) from None
-        dim_args = pjrt.PJRT_Buffer_Dimensions_Args(
-            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_Dimensions_Args),
-            buffer=self.ptr,
-            dims=None,
-            num_dims=0,
-        )
-        self.plugin._check(
-            self.plugin.api.PJRT_Buffer_Dimensions(ctypes.byref(dim_args)),
-            "PJRT_Buffer_Dimensions",
-        )
-        shape = tuple(dim_args.dims[i] for i in range(dim_args.num_dims))
-        array = np.empty(shape, dtype=dtype_name)
+        shape = self.shape
+        array = np.empty(shape, dtype=self.dtype)
         dst = (
             ctypes.cast(array.ctypes.data, ctypes.c_void_p)
             if array.size
