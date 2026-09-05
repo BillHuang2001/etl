@@ -15,6 +15,14 @@ problem" for the evox-refactor fused DE/PSO 4096×50 tell graphs.
   rank-0; did NOT fix the plugin quirk, see below). All probes run with
   `sys.path.insert(0, etl_763a415)` — the etl-bench venv's editable etl is
   broken (points at a deleted worker dir).
+  **RESOLUTION (0.10.2 era, perf-fixes-3way branch):** the dims=NULL failure
+  was PLUGIN-VERSION-SPECIFIC — on the real `jax_cuda12_pjrt` 0.10.2
+  `xla_cuda_plugin.so`, `dims=NULL` + `num_dims=0` DOES round-trip shape () via
+  `PJRT_Buffer_Dimensions` (26/26 GPU probe, incl. the rank-0 staging section).
+  The driver now stages rank-0 with dims=NULL (and a second bug is fixed: the
+  old code's `np.ascontiguousarray` has a hardcoded ndmin=1 — numpy#5300 — and
+  was promoting 0-d host arrays to (1,) BEFORE the rank-0 branch was ever
+  reached).
 - **plugin**: `xla_cuda_plugin.so` from the `jax_cuda12_pjrt` 0.4.38 wheel
   (exports `GetPjrtApi`). Env `ETL_PJRT_PLUGIN=<so>` (needed at backend-registry
   activation — `plugin_path` alone fails `check_available()`), plus
@@ -64,6 +72,14 @@ Plugin evidence: `client.buffer_from_host(np.array(42, np.int64)).to_host().shap
 contract permits NULL+0. The local dims=NULL patch in `xla_util` did not help.
 Workaround: mlir surgery (value-identical). If rank-0 inputs are needed on
 xla, the plugin is the blocker, not the adapter.
+**RESOLUTION (0.10.2 plugin, perf-fixes-3way branch):** the NULL+0 → (1,)
+behavior was 0.4.38-specific. On the 0.10.2 plugin the opposite is true: a
+NON-NULL dims pointer with num_dims=0 reports (1,), while **dims=NULL +
+num_dims=0 round-trips shape ()** — verified on the real plugin. The etl
+driver now stages rank-0 with dims=NULL (plus the ascontiguousarray ndmin=1
+fix; see the Setup note), so rank-0 inputs work on xla with NO mlir surgery,
+pinned by `tests/backends/test_xla_device_resident.py::test_rank0_staging_scalar_shape`
+(the fake test plugin emulates the 0.10.2 non-NULL quirk).
 
 ## Parity evidence (seed 0, uniform(-5.12,5.12) f32, key=42)
 
@@ -147,7 +163,10 @@ Compile times: **XLA 0.6–1.3 s (DE) / 0.3–0.8 s (PSO)**; iree-compile 2.4 s 
 - Rank-0 input staging quirk is plugin-side (0.4.38): rank-0 host buffers
   become `[1]` device buffers; adapter-side workaround is graph surgery (or a
   reshape+copy in `buffer_from_host` for rank-0 — the dims=NULL attempt did not
-  help).
+  help). **RESOLVED (0.10.2 plugin, perf-fixes-3way branch):** on 0.10.2,
+  `dims=NULL` + `num_dims=0` stages rank-0 buffers that report shape () — the
+  etl driver now does exactly that (and preserves 0-d through the
+  ascontiguousarray ndmin=1 trap); no surgery needed.
 - `ETL_PJRT_PLUGIN` env needed at registry activation; `plugin_path` alone
   fails; `LD_LIBRARY_PATH` (venv nvidia wheels) required at compile; ptxas on
   PATH.
