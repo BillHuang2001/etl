@@ -747,9 +747,21 @@ static PJRT_Error* fake_PJRT_Client_BufferFromHostBuffer(
     PJRT_Client_BufferFromHostBuffer_Args* args) {
   PJRT_Error* err = maybe_fail("PJRT_Client_BufferFromHostBuffer");
   if (err) return err;
+  /* Faithful emulation of the real jax_cuda12_pjrt 0.10.2 plugin's rank-0
+     staging quirk: a NON-NULL dims pointer with num_dims == 0 yields a
+     shape-(1,) buffer, so the etl driver MUST pass dims == NULL for rank-0
+     host arrays (pins the xla_util.buffer_from_host rank-0 fix — a driver
+     regression re-staging rank-0 with a non-NULL pointer is caught by
+     test_xla_device_resident.test_rank0_staging_scalar_shape). */
+  static const int64_t fake_one[1] = {1};
+  const int64_t* dims = args->dims;
+  size_t num_dims = args->num_dims;
+  if (num_dims == 0 && dims != NULL) {
+    dims = fake_one;
+    num_dims = 1;
+  }
   PJRT_Buffer* buffer = NULL;
-  err = make_buffer(args->type, args->dims, args->num_dims, args->data, 0,
-                    &buffer);
+  err = make_buffer(args->type, dims, num_dims, args->data, 0, &buffer);
   if (err) return err;
   args->buffer = buffer;
   args->done_with_host_buffer = make_event();
