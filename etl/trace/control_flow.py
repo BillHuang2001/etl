@@ -96,6 +96,7 @@ from ._tree import (
     _flatten as _flatten_shared,
     _is_static_value,
     _registered_pytree_base,
+    _static_equal,
     _to_symbolic,
 )
 from .builder import _return_terminator, current_builder, with_builder
@@ -485,12 +486,13 @@ def cond(pred: "core.SymbolicTensor", true_fn: Any, false_fn: Any, *operands: An
             # Both static: allowed only INSIDE a registered pytree node
             # (validated per branch in `_run_branch`), and must be equal
             # across branches — mirroring while_loop's static-leaf semantics.
+            # `_static_equal` gives ndarray leaves array-equality semantics.
             if (
                 not inside_flags[i]
                 or not _is_static_value(true_leaf)
                 or not _is_static_value(false_leaf)
                 or type(true_leaf) is not type(false_leaf)
-                or not (true_leaf == false_leaf or true_leaf is false_leaf)
+                or not (_static_equal(true_leaf, false_leaf) or true_leaf is false_leaf)
             ):
                 raise core.TraceError(
                     f"etl.cond: branch output leaf {i} static values must "
@@ -640,7 +642,10 @@ def while_loop(cond_fn: Any, body_fn: Any, init: Any) -> Any:
                 if (
                     not _is_static_value(body_leaf)
                     or type(body_leaf) is not type(init_leaf)
-                    or not (body_leaf == init_leaf or body_leaf is init_leaf)
+                    # `_static_equal` gives ndarray leaves array-equality
+                    # semantics (plain `==` on arrays is elementwise →
+                    # ambiguous truth value).
+                    or not (_static_equal(body_leaf, init_leaf) or body_leaf is init_leaf)
                 ):
                     raise core.TraceError(
                         f"etl.while_loop: body_fn output leaf {i} must equal "

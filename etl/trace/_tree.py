@@ -56,10 +56,13 @@ def _is_static_value(obj: Any) -> bool:
     Accepted (per the root value-model contract): `None`, bool, int, float,
     complex, str, `enum.Enum`, numpy `dtype` objects, `slice`, `core.Dim` /
     `core.DimExpr` (symbolic shape expressions — one leaf, snapshotted like
-    any other static value), and `core.Device` (a static device spec — one
-    leaf, snapshotted like any other static value). Everything else
-    (including numpy scalars and other config objects) is NOT static in v1 —
-    the tracer raises `TraceError` for it.
+    any other static value), `core.Device` (a static device spec — one
+    leaf, snapshotted like any other static value), and `np.ndarray` (a
+    static ARRAY leaf — snapshotted at trace time, validated at run time
+    with array-equality semantics, never fed into the IR). Everything else
+    (including numpy scalar types that are not Python-scalar subclasses,
+    and other config objects) is NOT static in v1 — the tracer raises
+    `TraceError` for it.
 
     The single canonical copy: `trace.py` classifies trace inputs/outputs
     with it and `control_flow.py` classifies operands/carries with it — there
@@ -76,7 +79,26 @@ def _is_static_value(obj: Any) -> bool:
         return True
     if isinstance(obj, core.Device):
         return True
+    if isinstance(obj, np.ndarray):
+        return True
     return False
+
+
+def _static_equal(actual: Any, recorded: Any) -> bool:
+    """Static-leaf equality — array semantics for ndarrays, plain `==` else.
+
+    `==` on ndarrays returns an elementwise array whose truth value is
+    ambiguous, so ndarray leaves compare with `np.array_equal` semantics
+    (same shape, elementwise-equal values); every other static class keeps
+    plain `==`. Shared by `graph.py` + `pipeline.py` (run-time static-record
+    validation) and `control_flow.py` (cond/while static-leaf cross-checks)
+    so the sites can never drift.
+    """
+    if isinstance(recorded, np.ndarray) or isinstance(actual, np.ndarray):
+        return isinstance(recorded, np.ndarray) and isinstance(
+            actual, np.ndarray
+        ) and bool(np.array_equal(actual, recorded))
+    return bool(actual == recorded)
 
 
 def _registered_pytree_base(obj_type: Any) -> Optional[type]:

@@ -327,11 +327,45 @@ def test_all_static_init_rejected():
         etl.trace(f)
 
 
-def test_unknown_init_leaf_rejected():
-    def f():
-        return etl.while_loop(lambda s: True, lambda s: s, np.array([1.0]))
+def test_ndarray_static_init_leaf_preserved(run_graph, as_numpy):
+    """An ndarray init leaf IS a static value — it specializes the loop (never
+    loop-carried) and is re-inserted into the result structure verbatim."""
 
-    with pytest.raises(etl.TraceError, match="must be a core.SymbolicTensor"):
+    def f():
+        arr = np.array([1.0, 2.0])
+
+        def cond_fn(state):
+            return etl.less(state[0], _const(3, etl.int32))
+
+        def body_fn(state):
+            return (etl.add(state[0], _const(1, etl.int32)), arr)
+
+        init = (_const(0, etl.int32), arr)
+        return etl.while_loop(cond_fn, body_fn, init)
+
+    graph = etl.trace(f)
+    counter, arr = as_numpy(run_graph(graph))
+    assert counter == 3
+    np.testing.assert_array_equal(arr, np.array([1.0, 2.0]))
+
+
+def test_ndarray_static_leaf_change_rejected():
+    """The body must return ndarray static leaves equal to init's (array
+    equality — plain `==` on arrays would be ambiguous)."""
+
+    def f():
+        arr = np.array([1.0, 2.0])
+
+        def cond_fn(state):
+            return etl.less(state[0], _const(3, etl.int32))
+
+        def body_fn(state):
+            return (etl.add(state[0], _const(1, etl.int32)), np.array([2.0, 3.0]))
+
+        init = (_const(0, etl.int32), arr)
+        return etl.while_loop(cond_fn, body_fn, init)
+
+    with pytest.raises(etl.TraceError, match="must equal init's static value"):
         etl.trace(f)
 
 

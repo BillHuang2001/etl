@@ -61,7 +61,7 @@ concern):
 |---|---|
 | `defn.py` | the `Defn` marker decorator (nothing else) |
 | `builder.py` | the active-builder context (contextvars tuple stack) + `_return_terminator` (the canonical block-ending op) |
-| `_tree.py` | ALL shared pytree/static helpers: `_is_static_value`, `_registered_pytree_base`, `_flatten`/`_flatten_into` (parameterized leaf policy), `_iter_leaf_paths`, `_to_symbolic`, `_PYTREE_NODE_REGISTRY` alias. Imports core/ir ONLY — any trace module may import it. |
+| `_tree.py` | ALL shared pytree/static helpers: `_is_static_value`, `_static_equal` (array-aware static-leaf equality), `_registered_pytree_base`, `_flatten`/`_flatten_into` (parameterized leaf policy), `_iter_leaf_paths`, `_to_symbolic`, `_PYTREE_NODE_REGISTRY` alias. Imports core/ir ONLY — any trace module may import it. |
 | `trace.py` | the 7-step tracer: `_TraceSession`, input classification, output classification, `_trace_call_site`. Re-exports `_format_path` / `_iter_leaf_paths` for `etl.transforms.grad` (private cross-module import — keep the names and paths stable). |
 | `graph.py` | the `Graph` type: I/O validation, `StaticValue` records, `_static_record` factory, persistence delegation. Also exports `_normalize_leaf_types` (imported by `etl.transforms.vmap` — keep stable). |
 | `control_flow.py` | `cond`/`while_loop`/`scan`: region building via the `ir.Builder` (`_run_in_region`), operand classification (`_classify_operands`), registered-node rules. NEVER imports `etl.ops` (ops imports trace — the DAG stays acyclic). |
@@ -133,10 +133,10 @@ difference: no `defaultdict`/`Counter` default-factory handling in
    walker with the trace leaf policy. Leaves must be `TensorSpec` (tensor
    input; shape may hold `Dim`/`DimExpr`, `None` = dynamic) or static
    Python values (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/
-   `slice`/`core.Dim`/`core.DimExpr`/`core.Device` — see `_is_static_value`).
-   Anything else (concrete `Tensor`, ndarray, `SymbolicTensor`, …) →
-   `TraceError` with the pytree path. Capturing a concrete tensor is NEVER
-   silently allowed.
+   `slice`/`ndarray`/`core.Dim`/`core.DimExpr`/`core.Device` — see
+   `_is_static_value`). Anything else (concrete `Tensor`, `SymbolicTensor`,
+   …) → `TraceError` with the pytree path. Capturing a concrete tensor is
+   NEVER silently allowed.
 3. Build `ir.Module` + entry `ir.Function` "main" with one block arg per
    tensor leaf (arg type = (shape, dtype)). Wrap each block arg as
    `core.SymbolicTensor`; record trace-call-site `ir.Location`s.
@@ -159,10 +159,14 @@ Closure static values are naturally snapshotted because the function body
 runs once at trace time — the values are read when ops are built, and only
 explicit tensor values ever reach the IR. Run-time graph specialization is
 validated by `Graph.flatten_inputs` (static leaves must match recorded
-type+value; dtype/shape/device checked against specs with
+type+value; ndarray leaves compare via the shared `_static_equal` —
+`np.array_equal` semantics, since plain `==` on arrays is elementwise →
+ambiguous truth value; dtype/shape/device checked against specs with
 `DTypeError`/`ShapeError`/`DeviceError`; tree mismatch → `TraceError`).
 numpy arrays are accepted at run time and wrapped via `core.from_numpy`
-(documented convenience).
+(documented convenience) — that is the TENSOR path (via `TensorSpec` or
+`etl.evaluate`'s spec derivation), distinct from an ndarray STATIC leaf,
+which specializes the graph and never enters the IR.
 
 ## Graph layout
 
@@ -320,6 +324,7 @@ editing messages, keep the wording of existing paths intact.
 
 ## Known warts
 
+- **`_is_static_value` numpy-scalar asymmetry** (`_tree.py`): `np.float64`/`np.float32`-family values that are real Python `float`/`complex`/`str` subclasses (e.g. `np.float64`, `np.complex128`, `np.str_`) PASS the `isinstance(obj, (float, complex, str))` checks and count as static, while `np.int32`/`np.int64`/`np.uint*`/`np.bool_` (not Python `int`/`bool` subclasses) and `np.float32` are REJECTED — pinned by `tests/ops/test_getitem.py::test_numpy_scalar_key_unsupported_v1` and `tests/trace/test_static_snapshot.py::test_non_static_specs_are_rejected` ("is neither a core.TensorSpec nor a static"). `np.ndarray` leaves ARE static (accepted class — snapshotted at trace time, validated with `_static_equal`/`np.array_equal` semantics at run time in `Graph.flatten_inputs` and in the cond/while static cross-checks; pinned by `tests/trace/test_static_snapshot.py::test_ndarray_static_arg_accepted_and_preserved` + `tests/ops/test_getitem.py::test_ndarray_static_arg_accepted_and_preserved`); ndarrays still become TENSOR inputs via `TensorSpec` or `etl.evaluate` (which derives specs from them) — the two paths are distinct.
 - **`get_location` is ~89% of trace time** (`etl/ops/_utils.py`,
   `inspect.stack()` per op). Escape hatch: `ETL_DISABLE_LOCATIONS=1`. Fix
   belongs in ops/ (see "Caching & performance").

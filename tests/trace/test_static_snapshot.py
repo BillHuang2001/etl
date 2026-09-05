@@ -1,9 +1,10 @@
 """Contract tests for static-value snapshotting in `etl.trace`.
 
 Static Python values (`None`/bool/int/float/complex/str/`Enum`/numpy `dtype`/
-`slice` — the `_is_static_value` predicate in `etl/trace/trace.py`)
+`slice`/`ndarray` — the `_is_static_value` predicate in `etl/trace/_tree.py`)
 specialize the graph at TRACE time and are validated at RUN time
-(`Graph.flatten_inputs`). A fully-static dataclass config object is also
+(`Graph.flatten_inputs`; ndarray leaves compare with `np.array_equal`
+semantics). A fully-static dataclass config object is also
 legitimate static specialization: the tracer descends into dataclass pytree
 containers, so every static field becomes a specializing leaf. Non-static
 leaf values are still rejected. etl value types (`Device`/`Dim`/`TensorSpec`/
@@ -187,10 +188,87 @@ def test_flatten_inputs_rejects_changed_static_value():
     ],
 )
 def test_non_static_specs_are_rejected(bad):
+    # numpy SCALARS (np.float32-family) and plain objects are still NOT
+    # static values — ndarrays are the accepted array class (see
+    # test_ndarray_static_arg_accepted_and_preserved).
     with pytest.raises(
         etl.TraceError, match="is neither a core.TensorSpec nor a static"
     ):
         etl.trace(identity_fn, etl.TensorSpec((2,), etl.float32), bad)
+
+
+# --- ndarray static leaves (accepted in v1) -----------------------------------
+
+
+def _scale_fn_ndarray(x, w):
+    return etl.multiply(
+        x, etl.constant(etl.tensor(float(w[0]), dtype=etl.float32))
+    )
+
+
+def test_ndarray_static_arg_accepted_and_preserved(run_graph, as_numpy):
+    """ndarray leaves ARE static values: accepted at trace time, snapshotted
+    into a StaticValue record, and validated with array-equality semantics at
+    run time (plain `==` on arrays would be ambiguous)."""
+    arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    graph = etl.trace(_scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), arr)
+
+    # the ndarray is preserved as ONE static leaf, not a tensor input
+    (record,) = graph.static_values
+    assert record.index == 1
+    assert record.path == (1,)
+    assert record.kind == "ndarray"
+    assert record.value is arr
+    assert graph.tensor_specs == (etl.TensorSpec((3,), etl.float32),)
+
+    x = np.ones(3, dtype=np.float32)
+    # a matching ndarray passes run-time validation (array-equality)
+    np.testing.assert_array_equal(
+        as_numpy(run_graph(graph, x, arr)), float(arr[0]) * x
+    )
+    # an elementwise-different ndarray is rejected like any static mismatch
+    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+        run_graph(graph, x, np.array([2.0, 2.0, 3.0], dtype=np.float32))
+    # and so is an ndarray of a different shape
+    with pytest.raises(etl.TraceError, match="graph was specialized on"):
+        run_graph(graph, x, np.array([1.0, 2.0], dtype=np.float32))
+
+
+def test_ndarray_static_arg_specializes_graph(run_graph, as_numpy):
+    """Two traces over different ndarray statics produce different programs
+    (the static value is baked in at trace time, like any other static)."""
+    x = np.ones(3, dtype=np.float32)
+    g_small = etl.trace(
+        _scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), np.array([0.5])
+    )
+    g_large = etl.trace(
+        _scale_fn_ndarray, etl.TensorSpec((3,), etl.float32), np.array([2.0])
+    )
+
+    assert g_small.static_values[0].kind == "ndarray"
+    np.testing.assert_array_equal(
+        as_numpy(run_graph(g_small, x, np.array([0.5]))), 0.5 * x
+    )
+    np.testing.assert_array_equal(
+        as_numpy(run_graph(g_large, x, np.array([2.0]))), 2.0 * x
+    )
+
+
+def test_ndarray_static_output_preserved(run_graph, as_numpy):
+    """An ndarray RETURNED from a traced function is a static output leaf —
+    snapshotted and re-inserted verbatim (never a graph result)."""
+
+    def f(x):
+        return etl.negate(x), np.array([1, 2, 3], dtype=np.int32)
+
+    out_arr = np.array([1, 2, 3], dtype=np.int32)
+    graph = etl.trace(f, etl.TensorSpec((3,), etl.float32))
+    assert graph.output_static_values[0].kind == "ndarray"
+    assert len(graph.module.main.output_types) == 1  # only the tensor leaf
+
+    neg, arr = as_numpy(run_graph(graph, np.ones(3, dtype=np.float32)))
+    np.testing.assert_array_equal(neg, -np.ones(3, dtype=np.float32))
+    np.testing.assert_array_equal(arr, out_arr)
 
 
 # --- dataclass config static specialization -----------------------------------
@@ -300,8 +378,9 @@ def test_user_dataclass_still_descends_field_by_field():
         (True, 1),  # kind mismatch: int is not bool
         (1.0, np.float32(1.0)),  # numpy scalars are NOT static in v1
         ("a", "b"),  # str value mismatch
+        (np.array([1, 2]), np.array([1, 3])),  # ndarray value mismatch
     ],
-    ids=["value-5-vs-6", "int-vs-bool", "bool-vs-int", "float-vs-np-scalar", "str-a-vs-b"],
+    ids=["value-5-vs-6", "int-vs-bool", "bool-vs-int", "float-vs-np-scalar", "str-a-vs-b", "ndarray-value-mismatch"],
 )
 def test_flatten_inputs_rejects_static_mismatch(traced, passed):
     def fn(x, s):

@@ -243,9 +243,10 @@ def test_scan_xs_without_tensor_leaves_raises():
 
 
 def test_scan_ndarray_xs_leaf_raises():
-    with pytest.raises(
-        etl.TraceError, match="is neither a core.TensorSpec nor a static"
-    ):
+    # ndarray IS a static value now, so a bare-ndarray xs passes the trace
+    # input boundary and is rejected at the scan level instead: xs needs
+    # SymbolicTensor leaves (declare tensor inputs via TensorSpec).
+    with pytest.raises(etl.TraceError, match="must be a core.SymbolicTensor"):
         etl.trace(cumsum_scan, np.array([1.0, 2.0], dtype=np.float32))
 
 

@@ -334,21 +334,23 @@ def test_non_static_kwarg_rejected():
         etl.trace(f, etl.TensorSpec((), etl.float32))
 
 
-def test_non_symbolic_non_static_operand_rejected():
-    """A concrete numpy array operand is neither symbolic nor static → error."""
+def test_ndarray_static_operand_accepted(run_graph, as_numpy):
+    """A concrete numpy array operand IS a static value — it flows into both
+    branches unchanged (baked at trace time like any other static operand)."""
 
     def f(x):
         pred = etl.greater(x, _const(0.0, etl.float32))
         return etl.cond(
             pred,
-            lambda v, arr: v,
-            lambda v, arr: v,
+            lambda v, arr: etl.add(v, _const(float(arr[0]), etl.float32)),
+            lambda v, arr: etl.add(v, _const(float(arr[0]), etl.float32)),
             x,
             np.array([1.0], dtype=np.float32),
         )
 
-    with pytest.raises(etl.TraceError, match="must be a core.SymbolicTensor"):
-        etl.trace(f, etl.TensorSpec((), etl.float32))
+    graph = etl.trace(f, etl.TensorSpec((), etl.float32))
+    assert as_numpy(run_graph(graph, np.array(1.5, dtype=np.float32))) == 2.5
+    assert as_numpy(run_graph(graph, np.array(-1.5, dtype=np.float32))) == -0.5
 
 
 # ---------------------------------------------------------------------------

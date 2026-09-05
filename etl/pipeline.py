@@ -78,6 +78,7 @@ from etl.core import first_mismatch_path, format_path
 from etl.core import tree as _core_tree
 from etl.pipeline_options import apply_env_options
 from etl.trace import Graph
+from etl.trace._tree import _static_equal
 from etl.trace.trace import _SymbolicLeaf, _TensorSpecLeaf
 
 __all__ = ["Executable", "BoundExecutable", "lower", "compile", "load", "run",
@@ -1044,7 +1045,11 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args, expected_device) -> 
             recorded = next(static_values)
             leaf = next(user_iter)
             kind = type(leaf).__qualname__
-            if kind != type(recorded).__qualname__ or leaf != recorded:
+            # ndarray statics compare with np.array_equal semantics (plain
+            # `!=` on arrays is elementwise → ambiguous truth value).
+            if kind != type(recorded).__qualname__ or not _static_equal(
+                leaf, recorded
+            ):
                 raise core.TraceError(
                     f"graph was specialized on {recorded!r} (a "
                     f"{type(recorded).__qualname__}); run-time argument "
@@ -1116,7 +1121,11 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None,
         else:
             leaf = next(user_iter)
             kind = type(leaf).__qualname__
-            if kind != type(recorded).__qualname__ or leaf != recorded:
+            # ndarray statics compare with np.array_equal semantics (plain
+            # `!=` on arrays is elementwise → ambiguous truth value).
+            if kind != type(recorded).__qualname__ or not _static_equal(
+                leaf, recorded
+            ):
                 raise core.TraceError(
                     f"graph was specialized on {recorded!r} (a "
                     f"{type(recorded).__qualname__}); run-time argument "

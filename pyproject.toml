@@ -27,16 +27,24 @@ dev = ["pytest>=7"]
 # are deprecated and STALE (last release 20241104.1068, Nov 2024); the
 # current names are `iree-base-compiler`/`iree-base-runtime` (Python
 # namespaces unchanged: iree.compiler / iree.runtime). 2.9.0 is the first
-# release under the new names.
-iree = ["iree-base-compiler>=2.9.0", "iree-base-runtime>=2.9.0"]
+# release under the new names. Upper bound 3.10: iree 3.10.0/3.11.0 ship an
+# upstream compiler bug (unbounded Stream AffinityAnalysis DFX recursion →
+# iree-compile SIGSEGV on while-loop-heavy programs: stablehlo.while with
+# >=3 loop-carried values + select in the body); 3.9.0 compiles+runs those
+# graphs with full parity, and 3.12.0rc fixes the compiler but its runtime
+# has blocking bugs (local-task transient-buffer failure; local-sync
+# execute.indirect null-ref). Compiler and runtime versions must MATCH
+# (cross-version artifacts are rejected at load) — see Known Issue #10 in
+# etl/backends/adapters/CONTEXT.md.
+iree = ["iree-base-compiler>=2.9.0,<3.10", "iree-base-runtime>=2.9.0,<3.10"]
 # tvm needs apache-tvm (StableHLO frontend + Relax VM) and jaxlib — jaxlib
 # ONLY for its bundled LLVM MLIR python bindings (the vendored
 # `jaxlib.mlir` namespace used by apache-tvm's translator). The `jax`
 # package is never imported anywhere.
 tvm = ["apache-tvm>=0.26", "jaxlib>=0.10,<0.11"]
 compilers = [
-    "iree-base-compiler>=2.9.0",
-    "iree-base-runtime>=2.9.0",
+    "iree-base-compiler>=2.9.0,<3.10",
+    "iree-base-runtime>=2.9.0,<3.10",
     "apache-tvm>=0.26",
     "jaxlib>=0.10,<0.11",
 ]

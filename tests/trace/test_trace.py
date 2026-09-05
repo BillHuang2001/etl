@@ -391,7 +391,6 @@ BAD_SPEC_CASES = [
     pytest.param(
         etl.tensor(np.ones(3, np.float32)), id="concrete-tensor"
     ),
-    pytest.param(np.ones(3, np.float32), id="ndarray"),
     pytest.param(_symbolic_tensor(), id="symbolic-tensor"),
     pytest.param(object(), id="unknown-object"),
 ]
@@ -406,6 +405,21 @@ def test_invalid_input_spec_raises(bad_spec):
         etl.trace(f, bad_spec)
     # every error names the pytree path of the offending leaf
     assert "pytree path [0]" in str(excinfo.value)
+
+
+def test_ndarray_input_spec_is_static():
+    """A raw ndarray spec leaf IS a static value — accepted at trace time and
+    recorded in `static_values` (never a tensor input)."""
+
+    def f(x, arr):
+        return x
+
+    arr = np.ones(3, np.float32)
+    g = etl.trace(f, etl.TensorSpec((3,), etl.float32), arr)
+    assert len(g.tensor_specs) == 1  # the TensorSpec only — not the ndarray
+    (record,) = g.static_values
+    assert record.kind == "ndarray"
+    np.testing.assert_array_equal(record.value, arr)
 
 
 BAD_OUTPUT_CASES = [
