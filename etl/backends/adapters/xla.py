@@ -818,7 +818,7 @@ class XlaDevicePayload:
     wrappers; each run produces fresh payloads.
     """
 
-    __slots__ = ("_buffer", "_device", "_client", "_finalizer")
+    __slots__ = ("_buffer", "_device", "_client", "_finalizer", "__weakref__")
 
     def __init__(self, plugin: Any, client: Any, buffer: Any, device: core.Device) -> None:
         self._buffer = buffer
