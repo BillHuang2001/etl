@@ -342,6 +342,21 @@ editing messages, keep the wording of existing paths intact.
   `core.first_mismatch_path`** — aux-bearing registered nodes get no
   automatic run-time aux-equality validation via `Graph.flatten_inputs`;
   check aux explicitly or model it as static leaves.
+- **`while_loop` carry count is 1:1 with `init`'s symbolic leaves, and NO
+  carry-rewrite machinery exists anywhere in etl.** `control_flow.py:545`
+  carries exactly the `SymbolicTensor` leaves of `init` (one `while`-op
+  operand + one region block arg each — no dedup, reordering, or packing);
+  `etl/transforms` REJECTS region-bearing ops outright
+  (`transforms/batching.py:751` → `TransformError`), and the stablehlo
+  writer emits every operand positionally with no count gate
+  (`backends/stablehlo/writer.py::_emit_while`). Known consequence (iree
+  3.9.0): a ≥4-carry `stablehlo.while` in a large module (NSGA3 tell
+  graph) SIGSEGVs in AffinityAnalysis while 3-carry whiles (NSGA2) compile
+  — see `./etl/backends/stablehlo/CONTEXT.md` ("Loop-CARRIED-COUNT crash
+  observation"). Reducing carries today means USER-SIDE graph changes (e.g.
+  recompute a derived carry such as `dominates = (count == 0)` locally in
+  the cond/body instead of carrying it) — there is no CSE/DCE/region
+  simplification anywhere in etl that would do it for you.
 
 ## How to extend (hack-ability)
 
