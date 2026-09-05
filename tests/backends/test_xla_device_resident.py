@@ -131,11 +131,19 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _step(x):
+    """An iterative step graph: output shape == input shape, so each step's
+    output feeds back as the next step's input (the evox loop pattern)."""
+    return etl.add(x, 1.0)
+
+
+STEP_SPECS = (etl.TensorSpec((4, 8), etl.float32),)
+
+
 def test_same_device_loop_zero_host_staging(tmp_path, monkeypatch):
     plug = _build_plugin(tmp_path, "fake_devres_loop.so")
     _activate(plug, monkeypatch)
-    fn, specs = u.matmul_relu_sum()
-    artifact = _compile_fake(fn, specs, plug)
+    artifact = _compile_fake(_step, STEP_SPECS, plug)
     raw = _load_raw(artifact)
 
     # Spy counters: the ONLY host<->device events are BufferFromHostBuffer
@@ -158,21 +166,21 @@ def test_same_device_loop_zero_host_staging(tmp_path, monkeypatch):
 
     # Seed: the explicit one-time placement (the bootstrap host->device
     # upload) — the ONLY staging event of the whole workload.
-    a, b = u.matmul_relu_sum_args()
-    expected = etl.evaluate(fn, a, b)
-    xa, xb = etl.core.Tensor(a).to(CUDA0), etl.core.Tensor(b).to(CUDA0)
-    assert len(stages) == 2  # one per placed input
-    assert all(dev == 0 for _, dev in stages)  # staged on cuda device 0
+    x0 = u.standard_normal((4, 8))
+    expected = etl.evaluate(_step, x0)
+    state = etl.core.Tensor(x0).to(CUDA0)
+    assert len(stages) == 1  # one staged seed
+    assert stages[0][1] == 0  # staged on cuda device 0
     stages.clear()
 
     # The device-resident loop: outputs feed back as next-step inputs.
     # ZERO host staging and ZERO copy-backs from the FIRST call on.
-    (state,) = raw.run([xa, xb])
-    for _ in range(4):
-        (state,) = raw.run([state, xb])
+    for _ in range(5):
+        state = raw.run([state])[0]
     assert stages == []  # no BufferFromHostBuffer after the seed
     assert copies == []  # no ToHostBuffer during the loop
     _assert_device_resident(state, CUDA0)
+    assert state.shape == expected.shape
 
     # The explicit host read-back is the FIRST (and only) ToHostBuffer.
     host = state.to(CPU)
