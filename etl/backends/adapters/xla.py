@@ -924,10 +924,15 @@ def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
                 f"device(s); cannot place data on {device!r}"
             )
         buffer = client.buffer_from_host(tensor.numpy(), device_index=device.index)
+        # The payload's constructor acquires the shared-client reference it
+        # owns for the buffer's lifetime; the temporary reference held
+        # across the staging call is released after the payload exists (the
+        # client must never hit zero while the fresh buffer is unowned).
+        payload = XlaDevicePayload(plugin, client, buffer, device)
     except Exception:
         release_client(plugin)
         raise
-    payload = XlaDevicePayload(plugin, client, buffer, device)
+    release_client(plugin)
     return core.Tensor(payload)
 
 
