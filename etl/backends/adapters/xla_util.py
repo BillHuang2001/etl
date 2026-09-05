@@ -727,17 +727,16 @@ class _Client(_Handle):
         if arr.ndim:
             dims = (ctypes.c_int64 * arr.ndim)(*arr.shape)
         else:
-            # rank-0: pass dims=NULL with num_dims=0. The real
-            # jax_cuda12_pjrt 0.10.2 plugin reports shape (1,) for a rank-0
-            # buffer staged with a NON-NULL dims pointer (even a zeroed
-            # 1-element array), which blocks device-resident runs at payload
-            # validation ((1,) vs the spec's ()); NULL + 0 round-trips shape
-            # () (verified on the real plugin). This contradicts the
-            # 0.4.38-era "dims=NULL did not help" note in
-            # bench_logs/xla_gpu_notes.md — that was plugin-version-specific.
-            # The fake test plugin ignores dims entirely when num_dims==0, so
-            # no test pin can express the distinction there (the fix is
-            # regression-pinned only by the real-plugin probes).
+            # rank-0: pass dims=NULL with num_dims=0 — the header-contract
+            # form for a rank-0 dense buffer. RE-PROBED on the real
+            # jax_cuda12_pjrt 0.10.2 plugin: PJRT_Buffer_Dimensions reports
+            # shape () for BOTH NULL and non-NULL dims with num_dims=0 (the
+            # earlier "(1,) for non-NULL dims + num_dims=0" quirk does not
+            # reproduce on 0.10.2 — the historical (1,) symptom was the
+            # np.ascontiguousarray ndmin=1 promotion above, which staged a
+            # genuinely-1-d array with num_dims=1). The fake test plugin
+            # emulates the non-NULL→(1,) quirk as a driver-regression guard
+            # pinning the NULL form regardless.
             dims = None
         data_ptr = (
             ctypes.cast(arr.ctypes.data, ctypes.c_void_p)

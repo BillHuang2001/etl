@@ -129,13 +129,17 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
 def test_rank0_staging_scalar_shape(tmp_path, monkeypatch):
     """rank-0 host arrays stage as shape-() buffers.
 
-    Regression pin for the xla_util.buffer_from_host rank-0 fix: the real
-    jax_cuda12_pjrt 0.10.2 plugin reports shape (1,) for a rank-0 buffer
-    staged with a NON-NULL dims pointer + num_dims=0 (the fake plugin
-    emulates that quirk), which blocked device-resident runs at payload
-    validation — evox states carry rank-0 leaves (``key`` () i64,
-    ``generation`` () i32). The driver must pass ``dims=NULL`` so shape ()
-    round-trips.
+    Regression pin for the xla_util.buffer_from_host rank-0 fix: the driver
+    stages rank-0 host arrays with ``dims=NULL`` + ``num_dims=0`` (the
+    header-contract form), so shape () round-trips via
+    ``PJRT_Buffer_Dimensions`` — verified on the real jax_cuda12_pjrt
+    0.10.2 plugin (both NULL and non-NULL dims report () there when
+    num_dims=0; the historical (1,) symptom was traced to
+    ``np.ascontiguousarray``'s hardcoded ndmin=1 promoting 0-d to (1,)
+    BEFORE dims handling). The fake plugin emulates the hypothesized
+    non-NULL-dims quirk as a driver-regression guard: evox states carry
+    rank-0 leaves (``key`` () i64, ``generation`` () i32), and any driver
+    regression re-staging rank-0 as a non-NULL-dims (1,) array fails here.
     """
     plug = _build_plugin(tmp_path, "fake_devres_rank0.so")
     _activate(plug, monkeypatch)
