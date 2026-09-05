@@ -11,9 +11,11 @@ ShapeError for out-of-range axes).
 
 ``topk``: regression coverage for the trace-time ``_sort_axis`` arity bug
 (topk crashed with ``TypeError``) and the numpy-exact semantics of the
-``topk`` composition (``sort``/``argsort`` + ``gather`` of ``0..k-1``):
-values/indices agree with ``np.sort``/``np.argsort`` axis slices, dtype
-rules, static ``k <= extent`` validation (``ShapeError``), symbolic extents,
+``topk`` composition (``k > 1``: ``sort``/``argsort`` + ``gather`` of
+``0..k-1``; ``k == 1``: the O(n) ``argmax``/``argmin`` + ``gather`` fast
+path — no sort op): values/indices agree with ``np.sort``/``np.argsort``
+axis slices (and ``np.argmax``/``np.argmin`` for ``k == 1``), dtype rules,
+static ``k <= extent`` validation (``ShapeError``), symbolic extents,
 and error kinds.
 """
 from __future__ import annotations
@@ -136,6 +138,118 @@ def test_topk_largest_non_bool_raises_type_error():
 def test_topk_bad_axis_type_raises_type_error():
     with pytest.raises(TypeError, match="topk: axis must be an int"):
         run_numpy(lambda t: _topk(t, 1, axis=1.5), np.array([3.0, 1.0, 2.0]))
+
+
+# ---------------------------------------------------------------------------
+# topk k == 1 fast path (argmax/argmin + gather — no sort op)
+# ---------------------------------------------------------------------------
+
+
+def test_topk_k1_matches_argmax_argmin():
+    """k == 1: values == the axis extremum, indices == np.argmax/np.argmin
+    (the stable argsort's first-extremal index) — bit-identical to the
+    sort/argsort composition."""
+    x = np.array([3.0, 1.0, 2.0])
+    values, indices = run_numpy(lambda t: _topk(t, 1), x)
+    assert values.shape == (1,) and indices.shape == (1,)
+    assert np.array_equal(values, [np.max(x)])
+    assert np.array_equal(indices, [np.argmax(x)])
+    assert values.dtype == x.dtype
+    assert indices.dtype == np.int64
+    values, indices = run_numpy(lambda t: _topk(t, 1, largest=False), x)
+    assert np.array_equal(values, [np.min(x)])
+    assert np.array_equal(indices, [np.argmin(x)])
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_k1_2d_matches_numpy(axis, largest):
+    """2-D k == 1 along every axis: numpy argmax/argmin keepdims +
+    take_along_axis equivalence."""
+    x = np.array([[3.0, 1.0, 4.0], [1.0, 5.0, 9.0], [2.0, 6.0, 5.0]])
+    values, indices = run_numpy(
+        lambda t: _topk(t, 1, axis=axis, largest=largest), x
+    )
+    arg = np.argmax(x, axis=axis, keepdims=True) if largest else np.argmin(
+        x, axis=axis, keepdims=True
+    )
+    assert np.array_equal(indices, arg)
+    assert np.array_equal(values, np.take_along_axis(x, arg, axis=axis))
+
+
+def test_topk_k1_ties_pick_the_first_extremal_index():
+    """Ties: the first extremal index (numpy argmax/argmin semantics —
+    identical to the stable argsort's first entry)."""
+    x = np.array([2.0, 3.0, 3.0, 1.0])
+    values, indices = run_numpy(lambda t: _topk(t, 1), x)
+    assert np.array_equal(values, [3.0])
+    assert np.array_equal(indices, [1])  # np.argmax picks the FIRST 3.0
+    values, indices = run_numpy(lambda t: _topk(t, 1, largest=False), x)
+    assert np.array_equal(values, [1.0])
+    assert np.array_equal(indices, [3])
+
+
+def test_topk_k1_nan_matches_composition():
+    """Float NaN follows np.sort's NaN-last order (composition-exact):
+    ``largest=True`` picks the first NaN (the NaN-propagating max);
+    ``largest=False`` picks the smallest FINITE entry (NaN cleaned to +inf),
+    all-NaN -> the first NaN."""
+    x = np.array([1.0, np.nan, 2.0])
+    values, indices = run_numpy(lambda t: _topk(t, 1), x)
+    assert np.isnan(values[0])
+    assert indices[0] == np.flip(np.argsort(x, kind="stable"))[0]  # 1
+    values, indices = run_numpy(lambda t: _topk(t, 1, largest=False), x)
+    assert values[0] == np.sort(x)[0]  # 1.0 — NOT np.min(x) (NaN)
+    assert indices[0] == np.argsort(x, kind="stable")[0]  # 0
+    # all-NaN: the first NaN in both directions.
+    xa = np.array([np.nan, np.nan])
+    values, indices = run_numpy(lambda t: _topk(t, 1), xa)
+    assert np.isnan(values[0]) and indices[0] == 0
+    values, indices = run_numpy(lambda t: _topk(t, 1, largest=False), xa)
+    assert np.isnan(values[0]) and indices[0] == 0
+    # NaN + real +inf: both sort beyond every finite value; the VALUES stay
+    # composition-exact (documented corner: the INDEX tie between a NaN and
+    # a real +inf resolves to the first cleaned entry).
+    xi = np.array([np.nan, np.inf])
+    values, indices = run_numpy(lambda t: _topk(t, 1, largest=False), xi)
+    assert values[0] == np.inf  # composition: ascending sort = [inf, nan]
+    assert indices[0] == 0  # corner: composition index is 1 (documented)
+
+
+def test_topk_k1_int_and_bool_dtypes():
+    x = np.array([3, 1, 2], dtype=np.int32)
+    values, indices = run_numpy(lambda t: _topk(t, 1), x)
+    assert values.dtype == np.int32 and indices.dtype == np.int64
+    assert np.array_equal(values, [3]) and np.array_equal(indices, [0])
+    xb = np.array([False, True, False])
+    values, indices = run_numpy(lambda t: _topk(t, 1), xb)
+    assert values.dtype == np.bool_ and indices.dtype == np.int64
+    assert np.array_equal(values, [True]) and np.array_equal(indices, [1])
+
+
+def test_topk_k1_graph_has_no_sort_op():
+    """The k == 1 graph carries argmax/argmin + gather and NO sort/argsort
+    op (the fast path is backend-agnostic)."""
+    graph = etl.trace(lambda t: _topk(t, 1), etl.TensorSpec((4,), etl.float32))
+    names = [
+        op.name
+        for fn in graph.module.functions
+        for block in fn.region.blocks
+        for op in block.ops
+    ]
+    assert "argmax" in names
+    assert "sort" not in names and "argsort" not in names
+    graph = etl.trace(
+        lambda t: _topk(t, 1, largest=False), etl.TensorSpec((4,), etl.float32)
+    )
+    names = [
+        op.name
+        for fn in graph.module.functions
+        for block in fn.region.blocks
+        for op in block.ops
+    ]
+    assert "argmin" in names
+    assert "sort" not in names and "argsort" not in names
 
 
 # ---------------------------------------------------------------------------

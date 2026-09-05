@@ -126,6 +126,30 @@ def test_cuda_runout_device_resident(tmp_path, monkeypatch):
     )
 
 
+def test_rank0_staging_scalar_shape(tmp_path, monkeypatch):
+    """rank-0 host arrays stage as shape-() buffers.
+
+    Regression pin for the xla_util.buffer_from_host rank-0 fix: the real
+    jax_cuda12_pjrt 0.10.2 plugin reports shape (1,) for a rank-0 buffer
+    staged with a NON-NULL dims pointer + num_dims=0 (the fake plugin
+    emulates that quirk), which blocked device-resident runs at payload
+    validation — evox states carry rank-0 leaves (``key`` () i64,
+    ``generation`` () i32). The driver must pass ``dims=NULL`` so shape ()
+    round-trips.
+    """
+    plug = _build_plugin(tmp_path, "fake_devres_rank0.so")
+    _activate(plug, monkeypatch)
+    for value, dtype in ((42, np.int64), (7, np.int32), (2.5, np.float32)):
+        t = etl.core.Tensor(np.array(value, dtype=dtype)).to(CUDA0)
+        _assert_device_resident(t, CUDA0)
+        assert t.shape == (), f"rank-0 staged as {t.shape!r}, not ()"
+        assert t.dtype == np.dtype(dtype)
+        host = t.to(CPU)
+        np.testing.assert_array_equal(
+            host.numpy(), np.asarray(value, dtype=dtype)
+        )
+
+
 # ---------------------------------------------------------------------------
 # 2. same-device loop: zero host staging after the seed placement
 # ---------------------------------------------------------------------------
