@@ -257,8 +257,8 @@ def trace(fn_or_defn: Any, *specs: Any) -> Graph:
            `DimExpr`; `None` dims = runtime-dynamic, unchecked),
          - a static Python value per `_is_static_value` → graph
            specialization,
-         - anything else (incl. concrete `core.Tensor`, numpy arrays,
-           `SymbolicTensor`, unknown objects) → `core.TraceError` naming the
+         - anything else (incl. concrete `core.Tensor`, `SymbolicTensor`,
+           unknown objects) → `core.TraceError` naming the
            pytree path. Capturing a concrete tensor as an input spec is
            NEVER silently allowed.
     3. Build an `ir.Module` + entry `ir.Function` ("main") with one block arg
@@ -352,7 +352,7 @@ def _flatten_specs(
                 "core.TensorSpec nor a static Python value. Tensor inputs "
                 "must be declared as TensorSpec(shape, dtype); static values "
                 "may be None/bool/int/float/complex/str/Enum/dtype/slice/"
-                "Dim/DimExpr/Device. "
+                "ndarray/Dim/DimExpr/Device. "
                 "Concrete tensors are never silently captured — declare them "
                 "as explicit inputs via TensorSpec, or embed their data "
                 "explicitly with etl.constant inside the traced function."
@@ -422,8 +422,8 @@ def _classify_outputs(
                 f"{type(leaf).__name__}. Graph outputs must be "
                 "core.SymbolicTensor values (built by tensor ops) or static "
                 "Python values (None/bool/int/float/complex/str/Enum/dtype/"
-                "slice). There is no eager mode — concrete tensors (Tensor/"
-                "numpy arrays) can never be returned from a traced function."
+                "slice/ndarray). There is no eager mode — concrete tensors "
+                "(Tensor) can never be returned from a traced function."
             )
     return tuple(result_values), tuple(output_static_values), output_tree
 

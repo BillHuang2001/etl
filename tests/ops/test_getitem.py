@@ -416,10 +416,30 @@ class TestUnsupportedKeys:
                 etl.TensorSpec((), etl.int64),
             )
 
-    def test_numpy_integer_index_unsupported_v1(self):
-        # numpy scalars are NOT static Python values in v1 (see
-        # etl/trace/trace.py::_is_static_value) — an np.int64 key is rejected
-        # as a non-static index value.
+    def test_ndarray_static_arg_accepted_and_preserved(self):
+        # numpy ndarrays ARE static Python values (see
+        # etl/trace/_tree.py::_is_static_value) — an ndarray argument is
+        # accepted as a static (graph-specializing) leaf and PRESERVED in
+        # the graph's static records (used here to compute the index key).
+        def f(x, arr):
+            return x[int(arr[0])]
+
+        g = trace_fn(f, etl.TensorSpec((5, 4), etl.float32), np.array([1]))
+        (record,) = g.static_values
+        assert record.kind == "ndarray"
+        np.testing.assert_array_equal(record.value, np.array([1]))
+        assert len(ops_of(g, "gather")) == 1
+
+        # end-to-end: the static ndarray passes run-time validation
+        # (array-equality) and the baked index selects row 1
+        exe = etl.build(f, etl.TensorSpec((5, 4), etl.float32), np.array([1]))
+        out = etl.run(exe, ARR, np.array([1]))
+        np.testing.assert_array_equal(out.numpy(), ARR[1])
+
+    def test_numpy_scalar_key_unsupported_v1(self):
+        # numpy SCALARS (np.int64) are NOT static Python values and are not
+        # valid index keys — rejected by the getitem key validation (unlike
+        # ndarray arguments, which are static — see the test above).
         def f(x):
             return x[np.int64(1)]
 

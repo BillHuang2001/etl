@@ -42,6 +42,7 @@ from etl.core import describe_node, first_mismatch_path, format_path
 from etl.core.tree import _subtree_spec_at  # shared mismatch-path subtree lookup
 
 from ._tree import _iter_leaf_paths  # the ONE leaf-path iterator (see _tree.py)
+from ._tree import _static_equal  # array-aware static-leaf equality (see _tree.py)
 
 __all__ = ["Graph", "StaticValue"]
 
@@ -57,7 +58,7 @@ class StaticValue:
         index: Flat leaf index in the input (or output) tree.
         path: Pytree key path of the leaf within the tree.
         value: The static Python value itself (None/bool/int/float/complex/
-            str/Enum/dtype/slice — see the static-value predicate in
+            str/Enum/dtype/slice/ndarray — see the static-value predicate in
             `./trace.py`).
         kind: `type(value).__qualname__` — validated at run time so e.g. a
             recorded `1` never matches a passed `True`.
@@ -421,8 +422,9 @@ class Graph:
            signature; each may be a nested structure (tuple/list/dict/
            namedtuple/dataclass). The pytree structure must equal
            `input_specs`'s structure — else `core.TraceError` (path in msg).
-        2. Static leaves: type (`kind`) and `==` value must match the
-           recorded `StaticValue` — else `core.TraceError` ("graph was
+        2. Static leaves: type (`kind`) and value must match the
+           recorded `StaticValue` (ndarray leaves compare with
+           `np.array_equal` semantics) — else `core.TraceError` ("graph was
            specialized on X; run-time argument Y does not match").
         3. Tensor leaves: `core.Tensor` (or numpy `ndarray`, wrapped via
            `core.from_numpy` — documented convenience):
@@ -479,7 +481,9 @@ class Graph:
             record = static_by_index.get(i)
             if record is not None:
                 kind = type(leaf).__qualname__
-                if kind != record.kind or leaf != record.value:
+                # `_static_equal` gives ndarray leaves np.array_equal semantics
+                # (plain `!=` on arrays is elementwise → ambiguous truth).
+                if kind != record.kind or not _static_equal(leaf, record.value):
                     raise core.TraceError(
                         f"graph was specialized on {record.value!r} (a "
                         f"{record.kind}); run-time argument {leaf!r} (a "
