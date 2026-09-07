@@ -25,9 +25,12 @@ Implemented kernels:
   registry serves round-2 compiler-adapter host-dispatch). The op's ``name``
   attribute is the stable user-chosen string; the registry is resolved LAZILY
   at run time (import acyclicity) through
-  ``etl.external.get_external_kernel(name, "numpy")`` — the per-backend
-  "numpy" slot, with automatic fallback to the default (``None``) slot —
-  and an unknown name raises ``core.BackendError`` naming the kernel.
+  ``etl.external.get_external_kernel_entry(name, "numpy")`` — the per-backend
+  "numpy" slot, with automatic fallback to the default (``None``) slot; the
+  resolved slot's ``device_resident`` flag is honored: True raises
+  ``core.BackendError`` naming the kernel (the numpy backend passes host
+  numpy arrays and cannot honor device-resident semantics), and an unknown
+  name raises ``core.BackendError`` naming the kernel.
   Outputs are validated against the op's declared ``result_specs`` exactly
   like ``runtime_call``/``block_call`` (shared helpers below).
 
@@ -144,27 +147,41 @@ def _external_call(ctx: Any, op: Any, operands: tuple):
     """``external_call``: dispatch the named kernel from ``etl.external``.
 
     Kernel resolution goes through
-    ``etl.external.get_external_kernel(name, "numpy")`` (lazy import —
+    ``etl.external.get_external_kernel_entry(name, "numpy")`` (lazy import —
     import acyclicity; the per-backend "numpy" slot, with automatic
-    fallback to the default ``None`` slot): an unknown name raises
-    ``core.BackendError`` naming the kernel and pointing at
-    ``etl.register_external_kernel`` (the registry is never serialized —
-    graphs require the same kernel registrations in the process at run
-    time). The kernel receives operand tensors as numpy arrays; its return
-    is normalized and validated against the declared ``result_specs``
-    exactly like ``runtime_call`` (shared helpers).
+    fallback to the default ``None`` slot). The resolved slot's
+    ``device_resident`` flag is honored: True raises ``core.BackendError``
+    naming the kernel — the numpy backend passes host numpy arrays and
+    cannot honor device-resident semantics (register a host-mode numpy slot
+    instead). An unknown name raises ``core.BackendError`` naming the
+    kernel and pointing at ``etl.register_external_kernel`` (the registry is
+    never serialized — graphs require the same kernel registrations in the
+    process at run time). The kernel receives operand tensors as numpy
+    arrays; its return is normalized and validated against the declared
+    ``result_specs`` exactly like ``runtime_call`` (shared helpers).
     """
-    from etl.external import get_external_kernel
+    from etl.external import get_external_kernel_entry
 
     name = op.attributes["name"]
-    kernel = get_external_kernel(name, "numpy")
-    if kernel is None:
+    entry = get_external_kernel_entry(name, "numpy")
+    if entry is None:
         raise core.BackendError(
             f"op 'external_call': no external kernel registered under name "
             f"{name!r} — register it with "
             "etl.register_external_kernel(name, callable) in this process "
             "before running graphs that call it (kernels are never "
             "embedded in artifacts)"
+        )
+    kernel, device_resident = entry
+    if device_resident:
+        raise core.BackendError(
+            f"op 'external_call': kernel {name!r} is registered "
+            "device_resident=True for the numpy backend — the numpy backend "
+            "passes host numpy arrays and cannot honor device-resident "
+            "semantics; register a host-mode numpy slot "
+            "(etl.register_external_kernel(name, fn, backend='numpy') or "
+            "ExternalKernel.impl('numpy', fn)) or run the kernel on a "
+            "compiler backend like iree"
         )
     result = kernel(*[t.numpy() for t in operands])
     label = f"op 'external_call' (kernel {name!r})"

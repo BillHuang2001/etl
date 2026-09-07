@@ -108,7 +108,7 @@ class NumpyBackend(Backend):
         dtypes=_all_numpy_dtypes(),
         collectives=True,  # single-process simulation via the CollectiveExecutor hook
         runtime_calls=True,  # Python callbacks execute synchronously at the op position
-        external_calls=True,  # external_call dispatch via etl.external.get_external_kernel(name, "numpy")
+        external_calls=True,  # external_call dispatch via etl.external.get_external_kernel_entry(name, "numpy") — host-mode slots only (a resolved device_resident numpy slot raises BackendError)
         custom_blocks=True,  # registered numpy block impls
         async_collectives=False,  # simulation is synchronous
         sparse_ops=True,  # the ONLY backend with sparse-tensor support in v1
