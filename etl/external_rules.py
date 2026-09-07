@@ -38,6 +38,7 @@ from typing import Any, Callable, Tuple
 __all__ = [
     "register_batching_rule",
     "register_jvp_rule",
+    "register_pass_through_batching_rule",
     "register_portable_batching_fallback",
     "register_portable_diff_fallback",
     "register_vjp_rule",
@@ -112,6 +113,103 @@ def register_portable_diff_fallback(name: str) -> None:
     from etl import transforms
 
     transforms.vjp_rules[f"external:{name}"] = _portable_vjp_rule(name)
+
+
+def register_pass_through_batching_rule(name: str, target_name: str) -> None:
+    """Install the shared pass-through batching rule under `external:<name>`.
+
+    The DECLARATIVE batched-variant sugar (``etl.external.ExternalKernel``):
+    the rule rebuilds every mapped ``external_call`` op whose registry key
+    resolves here, carrying the name attribute ``target_name`` in the
+    rebuild. ``ExternalKernel.batch_invariant`` installs it once under
+    ``external:<name>`` with ``target_name=name`` (the kernel handles the
+    batched stack in place); ``ExternalKernel.batch_variant`` installs it
+    under BOTH ``external:<name>`` and ``external:<derived>`` with
+    ``target_name=derived`` (the derived key is what a nested-vmap second
+    pass resolves when it re-encounters the rebuilt derived-named ops).
+    Ordinary registry assignment: last registration wins.
+    """
+    if not isinstance(name, str) or not name:
+        raise TypeError(
+            f"external kernel name must be a non-empty string, got {name!r}"
+        )
+    if not isinstance(target_name, str) or not target_name:
+        raise TypeError(
+            "external kernel target name must be a non-empty string, got "
+            f"{target_name!r}"
+        )
+    from etl import transforms
+
+    transforms.batching_rules[f"external:{name}"] = _pass_through_batching_rule(
+        target_name
+    )
+
+
+def _pass_through_batching_rule(target_name: str) -> Callable:
+    """The SHARED pass-through batching rule for external_call ops.
+
+    Mirrors ``etl.transforms.batching.block_call_pass_through_rule`` with
+    the external-kernel batched-variant contract's differences:
+
+    - NO operand alignment/reshapes, ever: the kernel receives the graph's
+      batched operand stack AS-IS (incl. unmapped / 0-d operands); mixed
+      mapped counts across operands are legal.
+    - Batch dims = the leading ``k`` shape dims of the FIRST operand with
+      the max mapped count (``k`` = that count; all-unmapped ``k = 0`` →
+      empty batch dims, an unchanged-shape rebuild).
+    - Result types per result: `batch_dims + original result shape`, with
+      the ``"result_specs"`` attribute re-encoded as the SAME tuple of
+      ``ir.ValueType``s (the frontend encoding — ``ir.verify`` requires
+      exact equality with the op's result types).
+    - The rebuilt op's name attribute is ``target_name`` (unchanged original
+      name for a batch_invariant kernel; the derived name for a
+      batch_variant kernel).
+    - Result axes: ``MappedAxes(tuple(range(k)))`` per result.
+
+    The rule lookup's existing ``TransformError`` path is untouched: no rule
+    registered for a name → the canonical error (never a per-element
+    Python-loop fallback).
+    """
+
+    def rule(op: Any, operands: Any, axes: Any) -> Any:
+        from etl import ir
+        from etl.trace import current_builder
+        from etl.transforms._metadata import MappedAxes
+
+        counts = [ax.count for ax in axes]
+        mapped_count = max(counts) if counts else 0
+        if mapped_count == 0:
+            batch_dims = ()
+        else:
+            # The first operand with the most mapped axes supplies the batch
+            # dims (guaranteed to exist: mapped_count IS some operand's count).
+            batch_dims = next(
+                value.type.shape[:mapped_count]
+                for value, count in zip(operands, counts)
+                if count == mapped_count
+            )
+        result_types = tuple(
+            ir.ValueType(
+                dtype=result.type.dtype,
+                shape=batch_dims + tuple(result.type.shape),
+            )
+            for result in op.results
+        )
+        builder = current_builder()
+        new_op = builder.create(
+            "external_call",
+            operands=tuple(operands),
+            attributes={
+                "name": target_name,
+                "result_specs": result_types,
+            },
+            result_types=result_types,
+            location=op.location,
+        )
+        result_axes = MappedAxes(tuple(range(mapped_count)))
+        return tuple(new_op.results), (result_axes,) * len(op.results)
+
+    return rule
 
 
 # ---------------------------------------------------------------------------

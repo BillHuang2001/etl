@@ -10,16 +10,19 @@ the same ``register_external_kernel`` call.
 The registry is PER-BACKEND: each name maps to a dict of backend slots
 (``{backend_or_None: (callable, device_resident)}``), where ``None`` is the
 DEFAULT slot.
-Resolution at dispatch time is ``get_external_kernel(name, backend)``: the
-exact backend slot first, then the default slot, then ``None``. A kernel
-registered with the plain two-argument form lives in the default slot and is
-used by every backend. A portable decomposition (a ``@etl.defn`` graph
-function, registered via :func:`register_portable`) is the OPTIONAL graph-side
+Resolution at dispatch time is ``get_external_kernel_entry(name, backend)``
+(mode-aware: it also reports the slot's device-resident flag) — the exact
+backend slot first, then the default slot, then ``None``. A kernel registered
+with the plain two-argument form lives in the default slot and is used by
+every backend. A portable decomposition (a ``@etl.defn`` graph function,
+registered via :func:`register_portable`) is the OPTIONAL graph-side
 implementation: ``vmap``/``grad`` fall back to inlining it (pre-registered
 fallback rules under ``external:<name>``) when no explicit transform rules
 exist. ``register_external_kernel`` returns an :class:`ExternalKernel` handle
-offering decorator-style registration of backend impls, the portable, and the
-transform rules.
+offering decorator-style registration of backend impls, the portable, the
+transform rules, and the declarative batched-variant sugar
+(:meth:`ExternalKernel.batch_invariant` / :meth:`ExternalKernel.batch_variant`
+— see the derived-name convention below).
 
 Binding rules (see ``etl/CONTEXT.md``, "External kernels"):
 
@@ -45,6 +48,14 @@ Binding rules (see ``etl/CONTEXT.md``, "External kernels"):
   semantics; this makes hot-reloading kernels and adapter re-registration
   safe). The device-resident mode is stored per slot and is replaced along
   with the callable on re-registration.
+- DERIVED (batched-variant) names: kernels registered through
+  :meth:`ExternalKernel.batch_variant` live under the deterministic derived
+  name ``f"{name}{_ETL_BATCH_SUFFIX}"`` — public-by-convention. The suffix is
+  RESERVED: user-facing registrations (:func:`register_external_kernel`,
+  :func:`register_portable`) reject names containing it; internal derived
+  registrations go through the module-private ``_register_external_kernel_derived``
+  path, and :func:`unregister_external_kernel` cleans up a name's derived
+  slots/portable along with its own.
 - The registry is NOT serialized: graph artifacts carry only the kernel name;
   any process that runs a graph must re-register its kernels first
   (``BackendError`` naming the kernel otherwise).
@@ -67,6 +78,16 @@ __all__ = [
     "register_portable",
     "unregister_external_kernel",
 ]
+
+#: The deterministic DERIVED-name suffix for batched kernel variants —
+#: public-by-convention: a derived kernel name is
+#: ``f"{name}{_ETL_BATCH_SUFFIX}"``. The suffix is RESERVED for
+#: internally-derived batched kernels (see
+#: :meth:`ExternalKernel.batch_variant`, which registers the batched-variant
+#: kernel under the derived name); user-facing registrations must not use
+#: names containing it (both :func:`register_external_kernel` and
+#: :func:`register_portable` reject them).
+_ETL_BATCH_SUFFIX = "__etl_batched"
 
 #: name -> {backend_or_None: (callable, device_resident)}. Process-global;
 #: the numpy backend and the compiler-adapter dispatch resolve through
@@ -116,72 +137,140 @@ def register_external_kernel(
         transform rules).
 
     Raises:
-        TypeError: ``name`` is not a non-empty str, ``backend`` is neither
-            None nor a str, ``callable_`` is not callable,
-            ``device_resident`` is not a bool, or ``device_resident=True``
-            with ``backend=None`` (a device kernel in the default slot would
-            receive host numpy arrays from the numpy backend — register it
-            under an explicit per-backend slot instead).
+        TypeError: ``name`` is not a non-empty str, ``name`` contains the
+            reserved derived-name suffix ``_ETL_BATCH_SUFFIX`` (names of the
+            form ``f"{name}{_ETL_BATCH_SUFFIX}"`` are reserved for kernels
+            registered internally by :meth:`ExternalKernel.batch_variant`),
+            ``backend`` is neither None nor a str, ``callable_`` is not
+            callable, ``device_resident`` is not a bool, or
+            ``device_resident=True`` with ``backend=None`` (a device kernel
+            in the default slot would receive host numpy arrays from the
+            numpy backend — register it under an explicit per-backend slot
+            instead).
     """
     if not isinstance(name, str) or not name:
         raise TypeError(
             f"register_external_kernel: name must be a non-empty str, got "
             f"{type(name).__name__}"
         )
+    if _ETL_BATCH_SUFFIX in name:
+        raise TypeError(
+            f"register_external_kernel: name {name!r} contains the reserved "
+            f"suffix {_ETL_BATCH_SUFFIX!r} — that suffix is reserved for "
+            "internally-derived batched kernels (see "
+            "ExternalKernel.batch_variant, which registers the batched "
+            "variant under the derived name); register the base kernel name "
+            "instead"
+        )
+    _store_kernel_slot(
+        "register_external_kernel", name, callable_, backend, device_resident
+    )
+    return ExternalKernel(name)
+
+
+def _register_external_kernel_derived(
+    name: str,
+    callable_,
+    backend: Optional[str] = None,
+    device_resident: bool = False,
+) -> None:
+    """Internal registration path for DERIVED (batched-variant) kernel names.
+
+    Same validation and slot write as :func:`register_external_kernel` but
+    WITHOUT the reserved-suffix check: derived names are constructed
+    internally as ``f"{base}{_ETL_BATCH_SUFFIX}"`` and MUST contain the
+    suffix (only :meth:`ExternalKernel.batch_variant` uses this path in v1).
+    Non-exported; ``TypeError`` messages keep the ``register_external_kernel``
+    prefix so both paths share one canonical wording.
+    """
+    if not isinstance(name, str) or not name:
+        raise TypeError(
+            f"register_external_kernel: name must be a non-empty str, got "
+            f"{type(name).__name__}"
+        )
+    _store_kernel_slot(
+        "register_external_kernel", name, callable_, backend, device_resident
+    )
+
+
+def _store_kernel_slot(
+    label: str,
+    name: str,
+    callable_: Any,
+    backend: Optional[str],
+    device_resident: bool,
+) -> None:
+    """Shared kernel-registration validation + slot write (private).
+
+    Validates ``backend`` / ``device_resident`` / the device-resident-needs-
+    an-explicit-backend rule / callable-ness, then writes the slot. ``label``
+    prefixes the canonical ``TypeError`` messages (public registrations pass
+    ``"register_external_kernel"`` so wording stays byte-identical).
+    """
     if backend is not None and not isinstance(backend, str):
         raise TypeError(
-            f"register_external_kernel: backend must be None or a str, got "
+            f"{label}: backend must be None or a str, got "
             f"{type(backend).__name__}"
         )
     if not isinstance(device_resident, bool):
         raise TypeError(
-            f"register_external_kernel: device_resident must be a bool, got "
+            f"{label}: device_resident must be a bool, got "
             f"{type(device_resident).__name__}"
         )
     if device_resident and backend is None:
         raise TypeError(
-            "register_external_kernel: device_resident=True requires an "
-            "explicit backend — the default (backend=None) slot is also "
-            "dispatched by the numpy backend, which passes host numpy "
-            "arrays, never device tensors; register the device kernel under "
-            "a per-backend slot instead, e.g. backend='iree'"
+            f"{label}: device_resident=True requires an explicit backend — "
+            "the default (backend=None) slot is also dispatched by the numpy "
+            "backend, which passes host numpy arrays, never device tensors; "
+            "register the device kernel under a per-backend slot instead, "
+            "e.g. backend='iree'"
         )
     if not callable(callable_):
         raise TypeError(
-            f"register_external_kernel: kernel for {name!r} must be "
-            f"callable, got {type(callable_).__name__}"
+            f"{label}: kernel for {name!r} must be callable, got "
+            f"{type(callable_).__name__}"
         )
     _REGISTRY.setdefault(name, {})[backend] = (callable_, device_resident)
-    return ExternalKernel(name)
 
 
 def unregister_external_kernel(name: str) -> None:
     """Remove every kernel slot AND the registered portable for ``name``.
+
+    Also removes — when present — the DERIVED name's kernel slots and
+    portable (``f"{name}{_ETL_BATCH_SUFFIX}"``, the internally-registered
+    batched-variant namespace): unregistering the base kernel cleans up its
+    batched variant too, via the internal path (no reserved-suffix check
+    applies).
 
     Does NOT touch the ``etl.transforms`` rule registries: transform rules
     are graph-level, not run-time registrations, so they survive (re-register
     the portable to restore the fallback rules if you want them back).
 
     Raises:
-        KeyError: the name was never registered (no kernel slots and no
-            portable) — loud, never silent.
+        KeyError: neither ``name`` nor its derived form was ever registered
+            (no kernel slots and no portable) — loud, never silent.
     """
     if not isinstance(name, str) or not name:
         raise TypeError(
             f"unregister_external_kernel: name must be a non-empty str, got "
             f"{type(name).__name__}"
         )
-    has_kernel = name in _REGISTRY
-    has_portable = name in _PORTABLES
+    derived = f"{name}{_ETL_BATCH_SUFFIX}"
+    has_kernel = name in _REGISTRY or derived in _REGISTRY
+    has_portable = name in _PORTABLES or derived in _PORTABLES
     if not has_kernel and not has_portable:
         raise KeyError(
             f"unregister_external_kernel: no external kernel registered "
             f"under {name!r}"
         )
-    if has_kernel:
+    if name in _REGISTRY:
         del _REGISTRY[name]
-    if has_portable:
+    if derived in _REGISTRY:
+        del _REGISTRY[derived]
+    if name in _PORTABLES:
         del _PORTABLES[name]
+    if derived in _PORTABLES:
+        del _PORTABLES[derived]
 
 
 def get_external_kernel_entry(
@@ -216,9 +305,9 @@ def get_external_kernel(
     registry.
 
     Internal-use contract: backends resolve the ``external_call`` op's
-    ``name`` attribute through this lookup at run time (numpy passes its
-    backend name; the iree dispatch uses the mode-aware
-    :func:`get_external_kernel_entry` instead) and turn ``None`` into
+    ``name`` attribute through the mode-aware
+    :func:`get_external_kernel_entry` at run time (numpy and the iree
+    dispatch both pass their backend name) and turn ``None`` into
     ``core.BackendError`` naming the kernel. Public for diagnostics.
     """
     entry = get_external_kernel_entry(name, backend)
@@ -243,13 +332,25 @@ def register_portable(name: str, fn) -> None:
             its declared result tensors.
 
     Raises:
-        TypeError: ``name`` is not a non-empty str, or ``fn`` is not an
-            ``@etl.defn`` function.
+        TypeError: ``name`` is not a non-empty str, ``name`` contains the
+            reserved derived-name suffix ``_ETL_BATCH_SUFFIX`` (names of the
+            form ``f"{name}{_ETL_BATCH_SUFFIX}"`` are reserved for kernels
+            registered internally by :meth:`ExternalKernel.batch_variant`),
+            or ``fn`` is not an ``@etl.defn`` function.
     """
     if not isinstance(name, str) or not name:
         raise TypeError(
             f"register_portable: name must be a non-empty str, got "
             f"{type(name).__name__}"
+        )
+    if _ETL_BATCH_SUFFIX in name:
+        raise TypeError(
+            f"register_portable: name {name!r} contains the reserved suffix "
+            f"{_ETL_BATCH_SUFFIX!r} — that suffix is reserved for "
+            "internally-derived batched kernels (see "
+            "ExternalKernel.batch_variant, which registers the batched "
+            "variant under the derived name); register the base kernel name "
+            "instead"
         )
     _validate_portable(name, fn)
     _PORTABLES[name] = fn
@@ -293,6 +394,15 @@ class ExternalKernel:
     a per-backend kernel, :meth:`portable` registers the ``@etl.defn`` graph
     decomposition, and :meth:`batching_rule` / :meth:`vjp_rule` /
     :meth:`jvp_rule` register transform rules under ``external:<name>``.
+    :meth:`batch_invariant` / :meth:`batch_variant` are the DECLARATIVE
+    batched-variant sugar: they declare how ``vectorize``/``vmap`` may pass
+    mapped operands through to the kernel and install the shared
+    pass-through batching rule (rebuilding each mapped ``external_call`` op
+    of this name with prepended batch dims — never reshaping operands, never
+    a Python-loop fallback). ``batch_variant`` additionally registers the
+    batched-variant kernel under the DERIVED name
+    ``f"{name}{_ETL_BATCH_SUFFIX}"`` (reserved namespace — registered only
+    through the internal path).
 
     Attributes:
         name: The kernel name this handle registers under.
@@ -300,6 +410,14 @@ class ExternalKernel:
 
     def __init__(self, name: str) -> None:
         self.name = name
+
+    @property
+    def _derived_name(self) -> str:
+        """The deterministic DERIVED kernel name for this handle's batched
+        variant: ``f"{self.name}{_ETL_BATCH_SUFFIX}"`` (the reserved
+        batched-variant namespace — registered only through the internal
+        path, cleaned up by :func:`unregister_external_kernel`)."""
+        return f"{self.name}{_ETL_BATCH_SUFFIX}"
 
     def impl(
         self,
@@ -341,6 +459,78 @@ class ExternalKernel:
             self.name, fn, backend=backend, device_resident=device_resident
         )
         return fn
+
+    def batch_invariant(self) -> "ExternalKernel":
+        """Declare this kernel BATCH-INVARIANT — no callable argument.
+
+        Semantics: the kernel treats extra leading mapped (batch) axes as
+        ordinary operand axes and is called ONCE with the full batched
+        operand stack (a plain elementwise-style numpy kernel is naturally
+        invariant). Installs the shared pass-through batching rule under
+        ``external:<name>``: ``vectorize``/``vmap`` rebuild each mapped
+        ``external_call`` op carrying this handle's name with its name
+        attribute UNCHANGED and its result types/specs gaining the leading
+        batch dims — operands are passed through AS-IS (never reshaped).
+
+        Returns ``self`` (chaining-friendly).
+        """
+        from .external_rules import register_pass_through_batching_rule
+
+        register_pass_through_batching_rule(self.name, target_name=self.name)
+        return self
+
+    def batch_variant(
+        self,
+        fn: Optional[Callable] = None,
+        *,
+        backend: Optional[str] = None,
+        device_resident: bool = False,
+    ):
+        """Register a BATCHED-VARIANT kernel for this handle.
+
+        Mirrors :meth:`impl`'s forms exactly::
+
+            handle.batch_variant(my_batched_kernel)                        # direct
+            @handle.batch_variant                                          # decorator
+            def batched(*arrays): ...
+            @handle.batch_variant(backend="iree", device_resident=True)    # decorator w/ args
+            def batched_device(*tensors): ...
+
+        Registers ``fn`` under the DERIVED name ``f"{name}{_ETL_BATCH_SUFFIX}"``
+        (the reserved batched-variant namespace, via the internal
+        registration path) with the SAME backend-slot + ``device_resident``
+        semantics as :meth:`impl`/``register_external_kernel`` —
+        ``device_resident=True`` with ``backend=None`` raises ``TypeError``.
+        The batched-variant kernel is called ONCE with the full batched
+        operand stack and must produce the batched declared results.
+
+        Installs the shared pass-through batching rule under BOTH registry
+        keys ``external:<name>`` AND ``external:<derived>``; the rule rebuilds
+        mapped ``external_call`` ops carrying the DERIVED name in their
+        attributes (the ``external:<derived>`` key is required because a
+        nested-vmap second pass re-resolves the rebuilt derived-named ops
+        through the registry). Ordinary registry assignment — last wins.
+
+        Returns ``fn`` when given, else the decorator.
+        """
+        from .external_rules import register_pass_through_batching_rule
+
+        derived = self._derived_name
+
+        def install() -> None:
+            register_pass_through_batching_rule(self.name, target_name=derived)
+            register_pass_through_batching_rule(derived, target_name=derived)
+
+        def decorator(f: Callable) -> Callable:
+            _register_external_kernel_derived(
+                derived, f, backend=backend, device_resident=device_resident
+            )
+            install()
+            return f
+
+        if fn is None:
+            return decorator
+        return decorator(fn)
 
     def portable(self, fn: Callable) -> Callable:
         """Register ``fn`` (an ``@etl.defn`` function) as the portable graph
