@@ -57,7 +57,7 @@ def make_pso_step(N, D):
         fitness = etl.sum(x_new * x_new, axes=1)
         fit_p = etl.sum(pbest * pbest, axes=1)  # re-eval of stored pbest
         better = fitness < fit_p
-        pbest_new = etl.select(better[:, None], x_new, pbest)
+        pbest_new = etl.select(etl.reshape(better, (N, 1)), x_new, pbest)
         best_idx = etl.argmin(fitness, axis=None)
         gbest_new = etl.gather(x_new, best_idx, axis=0)
         # Every output keeps its input's shape so the same-device loop can
@@ -85,7 +85,7 @@ def make_de_step(N, D):
         trial = etl.select(cr, mutant, pop)
         fit_new = etl.sum(trial * trial, axes=1)
         better = fit_new < fit
-        pop_new = etl.select(better[:, None], trial, pop)
+        pop_new = etl.select(etl.reshape(better, (N, 1)), trial, pop)
         best_idx = etl.argmin(fit_new, axis=None)
         gbest_new = etl.gather(trial, best_idx, axis=0)
         return k5, pop_new, fit_new, gbest_new
