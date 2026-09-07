@@ -69,18 +69,12 @@ fails). `graph`-command outputs live on CPU (numpy backend) — no GPU needed.
 
 ## Known gotchas
 
-- cuda device-transfer provider slot is process-global LAST-WINS: `etl.backends`
-  registers an iree-backed lazy thunk for kind "cuda" at MODULE IMPORT
-  (`etl/backends/__init__.py`), while the xla adapter overwrites it only at
-  activation — any later `import etl.backends` (import-order dependent, e.g.
-  via lazy submodule imports inside evox_etl) can clobber xla's provider back
-  to the iree thunk, so `t.to(Device("cuda", 0))` on host data yields an
-  `IreeDevicePayload` tensor, which xla executables reject with a clear
-  `core.DeviceError` ("Got a tensor carrying IreeDevicePayload").
-  Device-resident loops never hit this (no host→device transfers). Explicit
-  placement in an xla process: re-register after imports with
-  `etl.core.register_device_transfer_provider("cuda",
-  etl.backends.adapters.xla.upload_tensor)`.
+- Device-transfer provider registration is per-backend and order-independent
+  (fixed in 55a1d2c): each adapter registers its `upload_tensor` under its own
+  `(kind, backend)` per-backend slot, `etl.backends.registry.get` records the
+  preferred transfer backend, and `Tensor.to` resolves the preferred slot
+  first, then the flat DEFAULT slot (`etl.backends`' lazy iree thunk), then
+  `DeviceError`. The old re-registration workaround is unnecessary.
 - The run boundary enforces device-resident inputs for cuda executables
   (`core.DeviceError`, no implicit staging) — the same-device loop (feed each
   run's device `Tensor` outputs back as next inputs) is the required fast
