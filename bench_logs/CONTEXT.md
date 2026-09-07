@@ -51,6 +51,22 @@ A/B), `run_xla.sh` (env wrapper), `graph_{de,pso}_{rastrigin,sphere}[_nomon].jso
 [.mlir]` (CPU-side StableHLO exports + op-class/shape stats), `time_*.json`
 (xla + torch timings), `xla_dump/` (HLO text, thunk metadata, PTX).
 
+## iree 3.11.0 SO-cuda validation (current state — Defect A resolution)
+
+iree-cuda device-resident SO benchmarking is wired on 3.11.0 (shared venv:
+`iree-base-compiler`/`iree-base-runtime` 3.11.0, matched). Crash repro (the
+3.9.0-class init-finalization race — fresh process, 2+ consecutive
+device-resident `etl.run` sequences at 1000x50 / 10000x100 on iree-cuda, one
+process): PASSED 4/4 fresh processes (probe `probe_iree_so_cuda.py` in this dir;
+logs in $TMPDIR: `probe_run3.log`-`probe_run5.log`, `probe_final_verify.log`) —
+PSO 10000x100 ~0.88 ms/step, DE 10000x100 ~0.72, 1000x50 ~0.23–0.27 ms/step,
+exit 0. evox harness smoke (SO suite, ONE process, 6 cases, 0 crashes):
+PSO/Sphere 10000x100 3.42 ms/step, PSO/Rastrigin 1000x50 0.96, DE/Rastrigin
+10000x100 1.90, DE/Ackley 100x10 0.72, OpenES/Sphere 1000x50 0.60 — parity ok
+on all; ANOMALY (not a crash, open follow-up): CMAES/Sphere 10000x100 =
+5628.78 ms/step, parity rel 0.185 ok=False. iree compiled artifacts are
+version-specific — clear stale caches after any iree upgrade.
+
 ## Working env recipe (xla-cuda on this machine)
 
 `ETL_PJRT_PLUGIN` = evox venv's `lib/python3.11/site-packages/jax_plugins/
@@ -59,11 +75,13 @@ bchuang/xla_cuda_data`; `LD_PRELOAD=/mnt/local-ssd/bchuang/cudnn-xla/lib/
 libcudnn.so.9` (cuDNN ≥9.8; RPATH beats LD_LIBRARY_PATH); prepend that dir to
 `LD_LIBRARY_PATH`; `CUDA_VISIBLE_DEVICES=<free gpu>` (in-process device id 0);
 `PYTHONPATH=/mnt/local-ssd/bchuang/evox/src:/mnt/local-ssd/bchuang/evox`;
-interpreter = `/mnt/local-ssd/bchuang/evox/.venv/bin/python` (editable etl must
-resolve to `/mnt/local-ssd/bchuang/etl/etl` — assert `etl.__file__` at runtime).
-ptxas on PATH. Scan `nvidia-smi` for a free GPU first (GPU 7 is unusable for
-xla; iree-cuda 3.9.0 segfaults on a second in-process run — skip iree if it
-crashes). For HLO dumps add `--xla_dump_to=$TMPDIR/xla_dump
+interpreter = `/mnt/local-ssd/bchuang/evox/.venv/bin/python` (the editable etl
+install currently resolves to the Defect-fix worker worktree
+`/mnt/local-ssd/bchuang/etl/.genesis/workers/worker_T1_A2/etl` — assert
+`etl.__file__` at runtime).
+ptxas on PATH. Scan `nvidia-smi` for a free GPU first (GPU 7 is excluded:
+2689 uncorrected ECC errors — `CUDA_ERROR_ECC_UNCORRECTABLE` at HAL-device
+creation). iree-cuda runs use 3.11.0 — crash-repro clean, see below. For HLO dumps add `--xla_dump_to=$TMPDIR/xla_dump
 --xla_dump_hlo_as_text` to XLA_FLAGS (compile-time dumps land even if the run
 fails). `graph`-command outputs live on CPU (numpy backend) — no GPU needed.
 
