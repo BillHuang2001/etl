@@ -203,18 +203,29 @@ def test_three_option_traceerror_concrete_dense_inside_trace(op_call):
         pytest.param(lambda: sparse.to_coo(coo_example()), id="to_coo"),
     ],
 )
-def test_converters_concrete_inside_trace_traceerror(converter_call):
+def test_converters_concrete_inside_trace_static_outputs(converter_call):
     # The converters are POLYMORPHIC: on a concrete instance they dispatch to
     # the eager layout method (CONTEXT.md), so the op itself does not raise
-    # the three-option TraceError; the concrete result is then rejected by
-    # the trace-output validation with the "There is no eager mode"
+    # the three-option TraceError. The eager result — a dense ndarray, or a
+    # concrete sparse instance whose leaves are ndarrays — is then an
+    # ALL-STATIC output tree under the ndarray-static trace contract (commit
+    # b8062a9; see tests/trace/test_static_snapshot.py
+    # "test_ndarray_static_output_preserved"): trace() succeeds and records
+    # the result verbatim as static output values, never as IR. Only
+    # concrete core.Tensor outputs raise the "There is no eager mode"
     # TraceError. The three-option wording belongs to the computation ops'
     # operand normalization (covered above), not to this path.
     def f(a):
         return converter_call()
 
-    with pytest.raises(core.TraceError, match="There is no eager mode"):
-        etl.trace(f, coo_spec())
+    graph = etl.trace(f, coo_spec())
+    # no tensor outputs: the whole result is preserved as static output values
+    assert graph.module.main.output_types == ()
+    assert graph.output_static_values
+
+    # the run boundary round-trips the all-static output (array semantics)
+    result = run_graph(graph, coo_example())
+    np.testing.assert_array_equal(materialize(result), dense_example())
 
 
 @pytest.mark.parametrize(

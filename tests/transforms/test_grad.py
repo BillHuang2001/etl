@@ -391,7 +391,13 @@ def test_grad_concrete_tensor_args_raise():
     tf = etl.grad(f)
     with pytest.raises(etl.TraceError, match="concrete Tensors"):
         tf(etl.tensor(np.array([1.0, 2.0], np.float32)))
-    with pytest.raises(etl.TraceError):
+    # A raw np.ndarray is NOT a concrete Tensor: since commit b8062a9 ndarray
+    # leaves are STATIC trace values (see etl/trace/CONTEXT.md), so the array
+    # traces as a static value and the body runs numpy-eager (`x * x` on the
+    # ndarray). The etl op then rejects the ndarray operand with a TypeError
+    # (a Python programming error per etl/ops/_utils.py as_operand, not a
+    # TraceError). Tensor data must arrive as TensorSpec inputs.
+    with pytest.raises(TypeError, match="unsupported operand type ndarray"):
         tf(np.array([1.0, 2.0], np.float32))
 
 
