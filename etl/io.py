@@ -71,9 +71,12 @@ Without one the copy fails at ``wait()``/``result()`` with the provider
 
 Threading policy
 ----------------
-The worker is a single non-daemon thread; an ``atexit``-registered sentinel
-drains in-flight copies cleanly at interpreter exit and an idle worker
-never hangs exit. Submitting from the worker thread itself — or blocking
+The worker is a single daemon thread: interpreter exit can never block on
+it. An ``atexit``-registered sentinel drains pending copies and stops the
+worker cleanly when atexit handlers run before interpreter shutdown; when
+they do not (CPython may run ``threading._shutdown`` first), the daemon
+worker simply dies with the interpreter — pending copies are abandoned,
+never waited on. Submitting from the worker thread itself — or blocking
 there on a still-pending copy — raises ``RuntimeError`` (it would deadlock
 on its own queue). Module-level imports are stdlib + ``etl.core`` only;
 ``iree.runtime`` is imported lazily inside the bootstrap function (etl's
@@ -330,7 +333,7 @@ def _ensure_worker():
     with _state_lock:
         if _worker_thread is None or not _worker_thread.is_alive():
             thread = threading.Thread(
-                target=_worker_main, name="etl-io-worker", daemon=False
+                target=_worker_main, name="etl-io-worker", daemon=True
             )
             _worker_thread = thread
             thread.start()
