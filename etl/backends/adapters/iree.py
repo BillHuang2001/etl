@@ -1990,7 +1990,8 @@ class IreeExternalExecutable(CompilerExecutable):
                         "device_resident=True registrations skip "
                         "per-boundary host staging). Lower-time "
                         "restrictions: no control-flow bodies around calls, "
-                        "static result dims, at least one tensor operand, "
+                        "host-mode boundaries require static (integer) "
+                        "result dims, at least one tensor operand, "
                         "kernels assumed pure",
                         UserWarning,
                         stacklevel=2,

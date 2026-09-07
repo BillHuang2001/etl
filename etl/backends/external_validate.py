@@ -22,9 +22,10 @@ Canonical API:
   ...}`` dict wire form — ``core.BackendError`` for anything else), dtype
   must match exactly (``core.BackendError`` — no silent coercion), and the
   declared shape is compared to the actual shape (``core.ShapeError``).
-  ``evaluate_shape`` is an optional per-dim callable ``(dim) -> int``
+  ``evaluate_shape`` is an optional per-dim callable ``(dim) -> Any``
   resolving symbolic dims against runtime bindings (``None`` -> static
-  path, dims used as-is after decoding); ``None`` dims stay ``None``
+  path, dims used as-is after decoding; returning ``None`` marks a dim
+  unchecked); ``None`` dims stay ``None``
   (runtime-dynamic, unchecked) on BOTH paths. Valid outputs are wrapped in
   ``core.Tensor`` (default CPU device).
 - ``normalize_device_results(result, label) -> list`` — the device-kernel
@@ -34,9 +35,9 @@ Canonical API:
   tuple/list -> ``list(...)``; anything else => ``core.BackendError``
   naming the call (never a guess).
 - ``validate_device_outputs(entries, declared_specs, label,
-  wrap_device_result=None) -> list[core.Tensor]`` — METADATA-ONLY
-  validation for device-resident kernels: NEVER materializes a host copy
-  (never calls ``.numpy()``/``to_host()``). Count must match
+  wrap_device_result=None, evaluate_shape=None) -> list[core.Tensor]`` —
+  METADATA-ONLY validation for device-resident kernels: NEVER materializes
+  a host copy (never calls ``.numpy()``/``to_host()``). Count must match
   ``len(declared_specs)`` (``core.BackendError`` — same canonical wording
   as ``validate_outputs``); per output: ``core.Tensor`` entries pass
   through, ``np.ndarray`` entries wrap in ``core.Tensor`` (host result —
@@ -47,9 +48,15 @@ Canonical API:
   a guess. Then dtype must match exactly (``core.BackendError`` — no
   silent coercion) and the declared shape must match the actual shape
   (``core.ShapeError``) — the SAME canonical wording as
-  ``validate_outputs`` via the shared ``_validate_entry_spec`` helper
-  (static-int dims are guaranteed by lower-time, so no ``evaluate_shape``
-  here, but wire-form dict specs still decode).
+  ``validate_outputs`` via the shared ``_validate_entry_spec`` helper,
+  with ``evaluate_shape`` forwarded per dim (default ``None`` = strict,
+  dims compared as declared). The iree device path passes a SKIP-SYMBOLIC
+  resolver: symbolic dims (``core.Dim``/``core.DimExpr`` — e.g.
+  vmap/vectorize batch dims, which lower-time now allows for
+  device-resident boundaries) map to ``None`` (unchecked by design — the
+  kernel is the only source of the runtime extent), while rank and
+  concrete (int) dims stay exact; ``None`` dims are unchecked on both
+  paths (runtime-dynamic). Wire-form dict specs still decode.
 
 Import acyclicity: this module imports ONLY ``etl.core`` (plus ``numpy``
 and ``typing``) — never ``etl.ir`` (specs are duck-typed via attributes)
@@ -184,7 +191,7 @@ def _validate_entry_spec(
     shape: tuple,
     spec: Any,
     where: str,
-    evaluate_shape: Optional[Callable[[Any], int]] = None,
+    evaluate_shape: Optional[Callable[[Any], Any]] = None,
 ) -> None:
     """Shared per-output check: dtype EXACT, then shape EXACT vs ``spec``.
 
@@ -193,7 +200,8 @@ def _validate_entry_spec(
     wording never drifts. dtype mismatch => ``core.BackendError`` ("no
     silent dtype coercion"); shape rank/dim mismatches => ``core.ShapeError``.
     ``evaluate_shape`` resolves symbolic dims against runtime bindings
-    (host mode); ``None`` dims stay ``None`` (runtime-dynamic, unchecked).
+    (host mode) or marks them unchecked (device mode — returning ``None``);
+    ``None`` dims stay ``None`` (runtime-dynamic, unchecked).
     """
     spec_dtype, spec_shape = _extract_spec(spec, where)
     if dtype != spec_dtype:
@@ -280,6 +288,7 @@ def validate_device_outputs(
     declared_specs: Any,
     label: str,
     wrap_device_result: Optional[Callable[[Any], Any]] = None,
+    evaluate_shape: Optional[Callable[[Any], Any]] = None,
 ) -> List[core.Tensor]:
     """Validate DEVICE-kernel outputs against the declared result specs.
 
@@ -299,9 +308,14 @@ def validate_device_outputs(
     no silent coercion) and the declared shape must match the actual shape
     (``core.ShapeError``) — the SAME canonical wording as
     :func:`validate_outputs` via the shared ``_validate_entry_spec``
-    helper. Static-int dims are guaranteed by lower-time (no symbolic dims
-    in the plan), so there is no ``evaluate_shape`` here; wire-form dict
-    specs still decode defensively.
+    helper. ``evaluate_shape`` is forwarded per dim (default ``None`` =
+    strict, dims compared as declared); the iree device path passes a
+    SKIP-SYMBOLIC resolver (symbolic ``core.Dim``/``core.DimExpr`` dims ->
+    ``None``, unchecked — the kernel is the only source of the runtime
+    extent), so device-resident boundaries may declare symbolic result
+    dims (e.g. vmap/vectorize batch dims) while rank and concrete (int)
+    dims remain exact; ``None`` dims are unchecked on both paths
+    (runtime-dynamic). Wire-form dict specs still decode defensively.
 
     ``label`` names the call in error messages (e.g. the op + kernel name);
     ``wrap_device_result`` is the caller's payload-wrapping callback
@@ -331,6 +345,6 @@ def validate_device_outputs(
                 ) from exc
         if isinstance(entry, np.ndarray):
             entry = core.Tensor(entry)
-        _validate_entry_spec(entry.dtype, entry.shape, spec, where)
+        _validate_entry_spec(entry.dtype, entry.shape, spec, where, evaluate_shape)
         outputs.append(entry)
     return outputs
