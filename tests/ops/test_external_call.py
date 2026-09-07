@@ -842,3 +842,92 @@ def test_iree_lower_splits_external_call_graphs_xla_tvm_still_reject():
             )
         assert "host-dispatch" in message
         assert "not yet wired" in message
+
+
+# ---------------------------------------------------------------------------
+# Numpy dispatch mode awareness: device-resident slots never receive host data
+# ---------------------------------------------------------------------------
+
+
+def test_numpy_device_resident_slot_raises_even_with_host_default():
+    """Gap-1 pin: a ``device_resident=True`` slot registered under
+    ``backend="numpy"`` is resolved EXACTLY by the numpy backend — the
+    host-mode DEFAULT slot is not used as a fallback, because handing host
+    numpy arrays to a device-resident kernel would silently violate its
+    contract. Numpy dispatch raises ``BackendError`` naming the kernel
+    (device-resident semantics are never honored on the host path); after
+    re-registering a host-mode numpy slot the same graph runs."""
+
+    def host_fn(x):
+        return x + 1
+
+    def dev_fn(x):
+        return x + 2
+
+    etl.register_external_kernel("dr_numpy_slot", host_fn)
+    etl.register_external_kernel(
+        "dr_numpy_slot", dev_fn, backend="numpy", device_resident=True
+    )
+    try:
+        @etl.defn
+        def f(a):
+            return etl.external_call(
+                "dr_numpy_slot", a, result=etl.TensorSpec((3,), etl.int64)
+            )
+
+        a = np.array([1, 2, 3], dtype=np.int64)
+        with pytest.raises(etl.BackendError, match="device_resident") as exc:
+            run_numpy(f, a)
+        message = str(exc.value)
+        assert "dr_numpy_slot" in message  # names the kernel
+        assert "numpy backend" in message
+        assert "register a host-mode numpy slot" in message  # the remedy
+
+        # Host-mode recovery: the exact numpy slot is replaced by a host-mode
+        # entry (last-wins), so the same graph now dispatches and runs.
+        etl.register_external_kernel("dr_numpy_slot", host_fn, backend="numpy")
+        out = run_numpy(f, a)
+        np.testing.assert_array_equal(out, a + 1)
+    finally:
+        etl.unregister_external_kernel("dr_numpy_slot")
+
+
+def test_numpy_dispatch_uses_host_default_for_iree_device_kernel():
+    """A ``device_resident=True`` entry under ``backend="iree"`` must NOT
+    break numpy dispatch: the numpy backend resolves its exact slot (absent),
+    then falls back to the host-mode DEFAULT slot and runs — exact-slot
+    resolution never leaks device-resident semantics into the host path."""
+
+    def host_fn(x):
+        return x + 10
+
+    def iree_dev_fn(x):
+        return x + 20
+
+    etl.register_external_kernel("dr_iree_slot", host_fn)
+    etl.register_external_kernel(
+        "dr_iree_slot", iree_dev_fn, backend="iree", device_resident=True
+    )
+    try:
+        # Slot resolution: exact "iree" slot -> the device entry; the numpy
+        # backend lookup -> the host-mode default slot.
+        assert etl.external.get_external_kernel_entry("dr_iree_slot", "iree") == (
+            iree_dev_fn,
+            True,
+        )
+        assert etl.external.get_external_kernel_entry("dr_iree_slot", "numpy") == (
+            host_fn,
+            False,
+        )
+
+        @etl.defn
+        def f(a):
+            return etl.external_call(
+                "dr_iree_slot", a, result=etl.TensorSpec((3,), etl.int64)
+            )
+
+        a = np.array([1, 2, 3], dtype=np.int64)
+        out = run_numpy(f, a)
+        np.testing.assert_array_equal(out, a + 10)  # the host default slot ran
+    finally:
+        etl.unregister_external_kernel("dr_iree_slot")
