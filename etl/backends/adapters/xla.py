@@ -947,13 +947,17 @@ def register() -> None:
     ``options["plugin_path"]`` or the ``ETL_PJRT_PLUGIN`` environment
     variable. Does nothing observable when already registered.
 
-    On activation it ALSO overwrites the core device-transfer provider for
-    kind ``"cuda"`` with this adapter's ``upload_tensor`` (idempotent,
-    last-wins — mirroring the iree adapter): ``t.to(Device('cuda', N))``
-    then stages host data onto the PJRT plugin's device N through the
-    shared client, returning an ``XlaDevicePayload`` tensor — the explicit
-    bootstrap for device-resident xla loops.
+    Registers this adapter's ``upload_tensor`` under the PER-BACKEND slot
+    (kind ``"cuda"``, backend ``"xla"``): ``t.to(Device('cuda', N))`` then
+    stages host data onto the PJRT plugin's device N through the shared
+    client, returning an ``XlaDevicePayload`` tensor — the explicit
+    bootstrap for device-resident xla loops — whenever xla is the preferred
+    transfer backend (``registry.get("xla")`` records the preference; the
+    flat DEFAULT slot and other backends' per-backend slots are never
+    overwritten, so activation order cannot clobber any backend's provider).
     """
     XlaBackend.check_available()
     _registry_register(xla_backend)
-    core.register_device_transfer_provider("cuda", upload_tensor)
+    core.register_backend_device_transfer_provider(
+        "cuda", xla_backend.name, upload_tensor
+    )

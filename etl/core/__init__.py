@@ -26,9 +26,12 @@ Contents:
 (``register_operator_handlers``) that ``etl.ops`` populates at import time —
 this is what keeps the import DAG acyclic. Likewise ``Tensor.to`` (the
 explicit device-transfer API) dispatches through the device-transfer
-provider registry (``register_device_transfer_provider``) that
-``etl.backends`` populates at import time (kind ``"cuda"`` → a lazy thunk
-over the iree adapter).
+provider registries: ``etl.backends`` populates the flat DEFAULT slot at
+import time (kind ``"cuda"`` → a lazy thunk over the iree adapter), optional
+compiler adapters populate PER-BACKEND slots (``(kind, backend)`` — never
+clobbering each other), and ``etl.backends.registry.get(name)`` records the
+preferred transfer backend per kind (``_note_backend_transfer_preference``)
+so ``Tensor.to`` resolves the owning backend's provider order-independently.
 
 Status: implementation phase complete — all value-model behaviors are
 implemented (no stubs remain).
@@ -75,13 +78,17 @@ from .symbolic import (
 )
 from .tensor import (
     Tensor,
+    _get_backend_device_transfer_provider,  # internal cross-module contract (Tensor.to)
     _get_device_transfer_provider,  # internal cross-module contract (Tensor.to)
+    _get_preferred_transfer_backend,  # internal cross-module contract (Tensor.to)
+    _note_backend_transfer_preference,  # internal cross-module contract (etl.backends.registry)
     empty,
     from_dlpack,
     from_numpy,
     full,
     ones,
-    register_device_transfer_provider,  # populated by etl.backends at import time
+    register_backend_device_transfer_provider,  # populated by optional adapters (per-backend slots)
+    register_device_transfer_provider,  # populated by etl.backends at import time (flat DEFAULT slot)
     tensor,
     zeros,
 )
@@ -146,8 +153,10 @@ __all__ = [
     "from_dlpack",
     # operator-handler hook (populated by etl.ops)
     "register_operator_handlers",
-    # device-transfer provider hook (populated by etl.backends; Tensor.to)
+    # device-transfer provider hooks (populated by etl.backends — flat
+    # DEFAULT slot — and by optional adapters — per-backend slots; Tensor.to)
     "register_device_transfer_provider",
+    "register_backend_device_transfer_provider",
     # devices
     "Device",
     "devices",

@@ -2273,13 +2273,18 @@ def register() -> IreeBackend:
     IREE packages are missing; re-registering the SAME instance is a no-op
     (the registry tolerates idempotent re-registration).
 
-    ALSO overwrites the core device-transfer provider for kind ``"cuda"``
-    with the DIRECT ``upload_tensor`` (R6.3): ``etl.backends`` registers a
-    lazy thunk over this module at import time; once the adapter is active
-    (packages available — ``check_available`` above), the direct provider
-    replaces the thunk. Registration is last-wins and idempotent, so
-    re-registering is safe.
+    Registers this adapter's DIRECT ``upload_tensor`` under the PER-BACKEND
+    slot ``("cuda", "iree")`` (R6.3): ``etl.backends`` registers a lazy
+    thunk over this module in the flat DEFAULT slot at import time; once the
+    adapter is active (packages available — ``check_available`` above),
+    ``registry.get("iree")`` records iree as the preferred transfer backend
+    for the kinds it serves and ``Tensor.to`` routes through the direct
+    provider. The flat slot is NEVER overwritten and per-backend slots are
+    keyed per backend, so activation order cannot clobber any backend's
+    provider (no last-wins across backends).
     """
     iree_backend.check_available()
-    core.register_device_transfer_provider("cuda", upload_tensor)
+    core.register_backend_device_transfer_provider(
+        "cuda", iree_backend.name, upload_tensor
+    )
     return _registry_register(iree_backend)

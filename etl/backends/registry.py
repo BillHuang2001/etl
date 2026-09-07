@@ -14,7 +14,10 @@ retries the lookup.
 """
 from __future__ import annotations
 
-from etl.core import BackendError
+from etl.core import (
+    BackendError,
+    _note_backend_transfer_preference,  # internal cross-module contract (Tensor.to routing)
+)
 
 from .backend import Backend
 
@@ -70,9 +73,20 @@ def get(name: str) -> Backend:
     ``core.BackendError`` with a pip-install hint, propagated UNCHANGED);
     the lookup is then retried. Unknown names (and adapters that
     ``register()`` without registering anything) raise ``BackendError``.
+
+    On every successful lookup the backend is ALSO recorded as the
+    PREFERRED device-transfer backend for the device kinds it serves
+    (``_note_backend_transfer_preference`` — see ``etl.core.tensor``):
+    ``Tensor.to`` then resolves that backend's own per-backend provider
+    slot. Adapters register their providers under per-backend slots in
+    ``register()`` and NEVER overwrite each other's or the flat default
+    slot, so the active transfer provider follows the last ``get()``
+    deterministically regardless of import order (no last-wins clobbering).
+    Module import alone never changes the preference.
     """
     backend = _registry.get(name)
     if backend is not None:
+        _note_backend_transfer_preference(backend.name)
         return backend
     if name in OPTIONAL_ADAPTERS:
         import importlib
@@ -81,6 +95,7 @@ def get(name: str) -> Backend:
         module.register()
         backend = _registry.get(name)
         if backend is not None:
+            _note_backend_transfer_preference(backend.name)
             return backend
     known = ", ".join(sorted(_registry)) or "(none)"
     raise BackendError(f"unknown backend {name!r}; registered backends: {known}")

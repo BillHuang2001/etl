@@ -394,11 +394,20 @@ def test_placement_provider_contract(tmp_path, monkeypatch):
     _activate(plug, monkeypatch)
     a = u.standard_normal((4, 8))
 
-    # The provider is the xla adapter's upload_tensor (registered last-wins
-    # for kind "cuda" — the iree-mirroring pattern).
-    from etl.core.tensor import _get_device_transfer_provider
+    # The provider is the xla adapter's upload_tensor under the PER-BACKEND
+    # slot ("cuda", "xla") — the shared flat slot keeps etl.backends' lazy
+    # thunk (no last-wins clobbering across backends) and _activate's
+    # etl.backends.get("xla") made xla the preferred cuda transfer backend.
+    from etl.backends import _cuda_transfer_thunk
+    from etl.core.tensor import (
+        _DEVICE_TRANSFER_PROVIDERS,
+        _get_backend_device_transfer_provider,
+        _get_preferred_transfer_backend,
+    )
 
-    assert _get_device_transfer_provider("cuda") is xla.upload_tensor
+    assert _get_backend_device_transfer_provider("cuda", "xla") is xla.upload_tensor
+    assert _get_preferred_transfer_backend("cuda") == "xla"
+    assert _DEVICE_TRANSFER_PROVIDERS["cuda"] is _cuda_transfer_thunk
 
     # Bootstrap placement: host cpu:0 -> cuda 0 via BufferFromHostBuffer.
     xa = etl.core.Tensor(a).to(CUDA0)

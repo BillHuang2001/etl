@@ -45,9 +45,11 @@ __all__ = [
     "ones",
     "full",
     "empty",
-    # device-transfer provider hook (populated by etl.backends at import
-    # time; internal getter _get_device_transfer_provider not in __all__)
+    # device-transfer provider hooks (the flat DEFAULT slot is populated by
+    # etl.backends at import time; per-backend slots by optional adapters;
+    # internal getters/preference helpers not in __all__)
     "register_device_transfer_provider",
+    "register_backend_device_transfer_provider",
 ]
 
 
@@ -77,14 +79,30 @@ def _default_dtype(inferred: Any) -> np.dtype:
 # ``core.Device`` and returns a ``Tensor`` placed on the target device.
 
 _DEVICE_TRANSFER_PROVIDERS: Dict[str, Callable] = {}
+#: Per-backend provider slots keyed by (device kind, backend name). Populated
+#: by optional compiler adapters (iree/xla) from their ``register()`` — never
+#: by the flat-slot hook below, so no backend can clobber another's provider.
+_BACKEND_DEVICE_TRANSFER_PROVIDERS: Dict[Tuple[str, str], Callable] = {}
+#: Preferred transfer backend per device kind — recorded ONLY by
+#: ``etl.backends.registry.get(name)`` (via ``_note_backend_transfer_preference``),
+#: never by module import or plain provider registration.
+_PREFERRED_TRANSFER_BACKENDS: Dict[str, str] = {}
 
 
 def register_device_transfer_provider(kind: str, provider: Callable) -> None:
-    """Register the device-transfer provider for ``Tensor.to`` kind ``kind``.
+    """Register the FLAT DEFAULT device-transfer provider for kind ``kind``.
 
-    Called by ``etl.backends`` at import time (kind ``"cuda"`` → a lazy
-    thunk over the iree adapter) and overwritten by the iree adapter when it
-    activates — re-registering a kind replaces the previous provider.
+    The legacy shared slot: populated by ``etl.backends`` at import time
+    (kind ``"cuda"`` → a lazy thunk over the iree adapter) and by tests
+    under made-up kinds. Re-registering a kind replaces the flat slot's
+    provider (last-wins WITHIN the flat slot only). Optional compiler
+    adapters must NOT use this hook — they register per-backend slots via
+    :func:`register_backend_device_transfer_provider`, so activating one
+    backend can never clobber another's provider (order-independent).
+
+    ``Tensor.to`` resolves the PREFERRED backend's per-backend slot for the
+    target kind first (see ``etl.backends.registry.get``), falling back to
+    this flat slot, then to a :class:`DeviceError`.
 
     Args:
         kind: Device kind the provider places data on (e.g. ``"cuda"``).
@@ -103,6 +121,82 @@ def register_device_transfer_provider(kind: str, provider: Callable) -> None:
             f"Device-transfer provider for kind {kind!r} must be callable"
         )
     _DEVICE_TRANSFER_PROVIDERS[kind] = provider
+
+
+def register_backend_device_transfer_provider(
+    kind: str, backend: str, provider: Callable
+) -> None:
+    """Register backend ``backend``'s device-transfer provider for ``kind``.
+
+    The PER-BACKEND slot (keyed by ``(kind, backend)``), called by optional
+    compiler adapters (iree/xla) from their ``register()`` — never the flat
+    :func:`register_device_transfer_provider` hook. Registration is
+    order-independent: activating or using another backend never clobbers
+    this slot, and vice versa. A plain registration (e.g. adapter module
+    import) does NOT make the backend preferred — preference is recorded
+    only by ``etl.backends.registry.get(backend)`` (via the internal
+    ``_note_backend_transfer_preference``).
+
+    Args:
+        kind: Device kind the provider places data on (e.g. ``"cuda"``).
+        backend: The backend name owning this provider (matches the
+            backend's ``.name`` / the ``registry.get`` name).
+        provider: Callable ``provider(tensor, device) -> Tensor`` receiving a
+            host (ndarray-backed, ``Device("cpu", 0)``) tensor and the target
+            :class:`Device`, returning a tensor placed on the target.
+
+    Raises:
+        TypeError: If ``kind``/``backend`` is not a non-empty string or
+            ``provider`` is not callable.
+    """
+    if not isinstance(kind, str) or not kind:
+        raise TypeError("device-transfer provider kind must be a non-empty string")
+    if not isinstance(backend, str) or not backend:
+        raise TypeError(
+            "device-transfer provider backend must be a non-empty string"
+        )
+    if not callable(provider):
+        raise TypeError(
+            f"Device-transfer provider for kind {kind!r} under backend "
+            f"{backend!r} must be callable"
+        )
+    _BACKEND_DEVICE_TRANSFER_PROVIDERS[(kind, backend)] = provider
+
+
+def _get_backend_device_transfer_provider(
+    kind: str, backend: str
+) -> Optional[Callable]:
+    """Return backend ``backend``'s registered provider for ``kind`` or None.
+
+    Internal cross-module contract (``Tensor.to`` and tests). Adapters
+    register under their own backend name, so the owning backend's provider
+    is always resolvable regardless of activation/import order.
+    """
+    return _BACKEND_DEVICE_TRANSFER_PROVIDERS.get((kind, backend))
+
+
+def _note_backend_transfer_preference(backend: str) -> None:
+    """Record ``backend`` as the PREFERRED transfer backend for the kinds it serves.
+
+    Internal cross-module contract (``etl.backends.registry.get`` calls this
+    on every successful lookup). Only device kinds with a registered
+    per-backend slot under ``backend`` are affected — module import or a
+    plain provider registration never changes the preference. ``Tensor.to``
+    resolves the preferred backend's slot for the target kind first.
+    """
+    if not isinstance(backend, str) or not backend:
+        raise TypeError("backend name must be a non-empty string")
+    for (kind, registered) in _BACKEND_DEVICE_TRANSFER_PROVIDERS:
+        if registered == backend:
+            _PREFERRED_TRANSFER_BACKENDS[kind] = backend
+
+
+def _get_preferred_transfer_backend(kind: str) -> Optional[str]:
+    """Return the preferred transfer backend for ``kind`` or None.
+
+    Internal cross-module contract (``Tensor.to`` and tests).
+    """
+    return _PREFERRED_TRANSFER_BACKENDS.get(kind)
 
 
 def _get_device_transfer_provider(kind: str) -> Callable:
@@ -322,14 +416,25 @@ class Tensor:
                 "v1. Transfer in two explicit hops instead: "
                 "t.to(core.Device('cpu', 0)) first, then .to(target)."
             )
-        provider = _DEVICE_TRANSFER_PROVIDERS.get(device.kind)
+        # Order-independent provider resolution: the preferred backend's
+        # per-backend slot (set by etl.backends.registry.get) wins, then the
+        # flat DEFAULT slot (etl.backends' lazy thunk), then DeviceError.
+        # Per-backend slots are never clobbered by other backends' activation.
+        preferred = _PREFERRED_TRANSFER_BACKENDS.get(device.kind)
+        provider = None
+        if preferred is not None:
+            provider = _BACKEND_DEVICE_TRANSFER_PROVIDERS.get(
+                (device.kind, preferred)
+            )
+        if provider is None:
+            provider = _DEVICE_TRANSFER_PROVIDERS.get(device.kind)
         if provider is None:
             raise DeviceError(
                 f"Tensor.to cannot place data on {device!r}: no "
                 f"device-transfer provider is registered for device kind "
                 f"{device.kind!r}. The etl iree backend provides cuda "
-                "placement — activate it (import etl.backends or the iree "
-                "adapter) or register a provider via "
+                "placement — activate it (etl.backends.get('iree')) or "
+                "register a provider via "
                 "core.register_device_transfer_provider."
             )
         return provider(self, device)

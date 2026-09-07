@@ -52,14 +52,19 @@ __all__ = [
 
 
 # --- device-transfer provider registration (explicit placement) --------------
-# ``Tensor.to(Device('cuda', N))`` dispatches through the core registry
-# (``core.register_device_transfer_provider``); core never imports backends.
-# This package registers the "cuda" slot at import time as a LAZY thunk over
-# the iree adapter: the adapter module is imported only on first transfer,
-# and the adapter's module-level ``upload_tensor(tensor, device)`` is looked
-# up by name at call time (implemented by the iree adapter; when the adapter
-# activates it may overwrite this thunk with a direct provider under the
-# same "cuda" key — registration is last-wins, so the overwrite is safe).
+# ``Tensor.to(Device('cuda', N))`` dispatches through the core registries
+# (``core.register_device_transfer_provider`` / the per-backend slots);
+# core never imports backends. This package registers the flat DEFAULT
+# "cuda" slot at import time as a LAZY thunk over the iree adapter: the
+# adapter module is imported only on first transfer, and the adapter's
+# module-level ``upload_tensor(tensor, device)`` is looked up by name at
+# call time (implemented by the iree adapter). Optional adapters (iree/xla)
+# register their own DIRECT provider under PER-BACKEND slots
+# (``core.register_backend_device_transfer_provider``) when they activate —
+# they never overwrite this flat slot or each other, so activation/import
+# order cannot clobber any backend's provider. ``registry.get(name)``
+# records the preferred transfer backend per kind, and ``Tensor.to``
+# resolves the preferred backend's slot first, falling back to this thunk.
 
 def _cuda_transfer_thunk(tensor, device):
     """Lazy "cuda" placement provider: delegates to the iree adapter.
