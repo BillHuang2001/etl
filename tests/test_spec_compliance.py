@@ -29,6 +29,12 @@ contract in `../etl/CONTEXT.md`). Groups (one class per group, in file order):
                                raises, `Tensor.to` is the only transfer API,
                                and run/bind/constant boundaries reject
                                foreign-device tensors.
+16. `TestIoExplicitness`      — `etl.io` async host IO is documented sugar
+                               over the ONE explicit transfer primitive:
+                               prefetch/sink schedule the same explicit
+                               `Tensor.to` copies on a background worker —
+                               never implicit copying, never auto-waiting
+                               handles, failures surface at wait/result.
 
 Conventions: small shapes, CPU only, fast. Tests assert the documented
 contract; a test exposing a contract violation stays failing with a
@@ -425,6 +431,40 @@ class TestStagingExplicitness:
         )
         y_long = etl.run(etl.load(etl.compile(etl.lower(graph))), x, w)
         np.testing.assert_array_equal(y_short.numpy(), y_long.numpy())
+
+    def test_build_cached_docstring_documents_expansion(self):
+        """`etl.build_cached`'s docstring documents its exact expansion — a
+        MEMOIZED `etl.build` (the trace→lower→compile→load composition runs
+        at most once per distinct key): documented shorthand, no other
+        behavior — never an eager fallback, no cache=False escape."""
+        from etl.build_cache import build_cached
+
+        doc = build_cached.__doc__
+        assert doc, ("build_cached must carry a docstring documenting its "
+                     "memoized-build expansion")
+        for stage in ("trace", "lower", "compile", "load"):
+            assert stage in doc
+        assert "MEMOIZED" in doc
+        assert "no other behavior" in doc
+
+    def test_build_cached_equals_explicit_pipeline(self):
+        """`build_cached(f, *specs)` returns a NORMAL Executable — the same
+        program the explicit trace→lower→compile→load→run composition
+        produces (a memoized build, nothing more)."""
+        from etl.build_cache import CompileCache, build_cached
+
+        x_spec = etl.TensorSpec((2, 3), etl.float32)
+        w_spec = etl.TensorSpec((3, 4), etl.float32)
+        cached = build_cached(_dot, x_spec, w_spec, cache=CompileCache())
+        assert isinstance(cached, etl.Executable)
+
+        graph = etl.trace(_dot, x_spec, w_spec)
+        explicit = etl.load(etl.compile(etl.lower(graph)))
+        x, w = _dot_inputs()
+        np.testing.assert_array_equal(
+            etl.run(cached, x, w).numpy(),
+            etl.run(explicit, x, w).numpy(),
+        )
 
 
 # ===========================================================================
@@ -1410,3 +1450,34 @@ class TestExplicitPlacement:
         assert "requires host data" in message
         assert "t.to(" in message
         assert "Device(kind='cuda', index=0)" in message
+
+
+# ===========================================================================
+# 16. etl.io — async host IO is sugar over the ONE explicit transfer primitive
+# ===========================================================================
+#
+# Design-principle pins: async host IO introduces NO implicit copying.
+# `prefetch` (host → device) and `sink` (device → host) are documented as
+# scheduling the SAME explicit `Tensor.to` copies the caller could perform
+# synchronously, merely on a background worker — schedule-time validation is
+# synchronous, runtime failures surface at wait()/result() (never swallowed),
+# and async handles never auto-wait (no blocking destructor). All CPU-only.
+
+
+class TestIoExplicitness:
+    def test_io_module_documents_sugar_over_explicit_tensor_to(self):
+        """`etl.io`'s module docstring states its sugar contract: prefetch/
+        sink are the same explicit `Tensor.to` transfers, merely executed on
+        a background worker — no hidden staging, no implicit copies; errors
+        surface at wait()/result()/wait_all(), never swallowed; GC never
+        auto-waits."""
+        import etl.io
+
+        doc = etl.io.__doc__
+        assert doc, "etl.io must carry a module docstring documenting its contract"
+        assert "Tensor.to" in doc
+        assert "no hidden staging" in doc
+        # NB: "background" and "worker." sit on different docstring lines.
+        assert "background" in doc and "worker" in doc
+        for word in ("wait()", "wait_all()", "GC"):
+            assert word in doc

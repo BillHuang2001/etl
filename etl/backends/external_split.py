@@ -53,8 +53,14 @@ v1 lower-time constraints (explicit ``core.BackendError``, never silent):
   v1).
 - Zero-operand calls (no staging boundary — express the value via
   ``etl.constant`` or an explicit graph input instead).
-- Symbolic / runtime-dynamic result dims (staging needs STATIC integer
-  dims).
+- Symbolic / runtime-dynamic result dims on HOST-mode boundaries (host
+  staging needs STATIC integer dims). DEVICE-RESIDENT boundaries
+  (``device_resident=True`` registrations) ALLOW symbolic result dims —
+  their results are validated metadata-only at run time with the ACTUAL
+  runtime shapes (symbolic dims unchecked by design), and the stablehlo
+  exporter's per-op symbolic-shape support decides what compiles
+  (unsupported segment ops still raise their explicit ``core.BackendError``,
+  never silent).
 - Single-block regions when cloning (the region-cloning path supports
   single-block regions in v1).
 
@@ -226,6 +232,21 @@ def decode_type(encoded: dict) -> ir.ValueType:
 # ---------------------------------------------------------------------------
 
 
+def _is_device_resident_kernel(name: str) -> bool:
+    """True iff the iree-slot kernel entry for ``name`` is device-resident.
+
+    Resolution mirrors run-time dispatch (:func:`dispatch_external_kernel`):
+    the per-backend "iree" slot with automatic fallback to the default
+    (``None``) slot. An unknown name resolves to HOST mode (no entry), so
+    unregistered kernels keep the lower-time STATIC-dims gate and fail at
+    run time with the naming ``BackendError`` (pinned behavior).
+    """
+    from etl.external import get_external_kernel_entry  # lazy: import acyclicity
+
+    entry = get_external_kernel_entry(name, "iree")
+    return bool(entry is not None and entry[1])
+
+
 def validate_and_split(graph: Any) -> Tuple[List[ir.Module], dict]:
     """Split a graph containing ``external_call`` ops into segment modules + plan.
 
@@ -282,16 +303,29 @@ def validate_and_split(graph: Any) -> Tuple[List[ir.Module], dict]:
                 "zero operands has no staging boundary; express the value via "
                 "etl.constant or an explicit graph input instead"
             )
-        for spec in op.attributes["result_specs"]:
-            for dim in spec.shape:
-                if not (isinstance(dim, int) and not isinstance(dim, bool)):
-                    raise core.BackendError(
-                        f"op 'external_call' (kernel {name!r}): adapter "
-                        "host-dispatch requires STATIC (integer) result dims "
-                        "in v1 — staging needs concrete shapes; declared "
-                        f"result dim {dim!r} is symbolic/runtime-dynamic. Use "
-                        "a static TensorSpec or run the numpy backend"
-                    )
+        # Mode-aware result-dim gate: HOST-mode boundaries stage host numpy
+        # arrays at the boundary and genuinely need concrete shapes;
+        # DEVICE-RESIDENT boundaries validate results metadata-only at run
+        # time (never a host copy) and may declare symbolic /
+        # runtime-dynamic result dims (e.g. vmap/vectorize batch dims) —
+        # the stablehlo exporter's per-op symbolic-shape support decides
+        # what compiles (unsupported segment ops still raise their explicit
+        # BackendError, never silent).
+        if not _is_device_resident_kernel(name):
+            for spec in op.attributes["result_specs"]:
+                for dim in spec.shape:
+                    if not (isinstance(dim, int) and not isinstance(dim, bool)):
+                        raise core.BackendError(
+                            f"op 'external_call' (kernel {name!r}): adapter "
+                            "HOST-mode boundaries require STATIC (integer) "
+                            "result dims in v1 — host staging needs concrete "
+                            f"shapes; declared result dim {dim!r} is "
+                            "symbolic/runtime-dynamic. Use a static "
+                            "TensorSpec, register the kernel "
+                            "device-resident (device_resident=True, "
+                            'backend="iree") to run symbolic/vmapped '
+                            "variants on iree, or run the numpy backend"
+                        )
     if not call_indices:  # defensive: the caller only routes here when present
         raise core.BackendError(
             "validate_and_split requires a graph with at least one "
@@ -657,6 +691,19 @@ def decode_plan(plan: dict) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _skip_symbolic_dims(dim: Any) -> Any:
+    """Device-mode per-dim resolver: symbolic dims -> None (unchecked).
+
+    Concrete (int) dims pass through for exact comparison; declared
+    ``core.Dim`` / ``core.DimExpr`` dims (e.g. vmap/vectorize batch dims)
+    validate to ``None`` — "runtime-dynamic, unchecked" — mirroring the
+    documented None-dim rule: the kernel is the only source of the runtime
+    extent, so device-mode validation checks count/dtype/rank/concrete dims
+    exactly and reads symbolic extents back from the result metadata itself.
+    """
+    return None if isinstance(dim, (core.Dim, core.DimExpr)) else dim
+
+
 def dispatch_external_kernel(
     name: str,
     operand_tensors: Sequence[core.Tensor],
@@ -690,7 +737,12 @@ def dispatch_external_kernel(
       ``validate_device_outputs`` (METADATA-ONLY — never materializes a host
       copy; ``wrap_device_result`` wraps raw device entries, e.g. the iree
       adapter wraps raw ``DeviceArray`` results with the run's
-      ``core.Device``). Returns ``(outputs, staged)`` where ``staged`` is
+      ``core.Device``). Declared SYMBOLIC result dims (``core.Dim`` /
+      ``core.DimExpr`` — e.g. vmap/vectorize batch dims) are unchecked by
+      design (the kernel is the only source of the runtime extent; rank,
+      dtype and concrete dims are still exact), matching the lower-time
+      mode-aware gate in :func:`validate_and_split`. Returns
+      ``(outputs, staged)`` where ``staged`` is
       True only when some kernel result is host-backed (numpy/host Tensor)
       and will be staged back by the next segment — a fully device-resident
       boundary returns False.
@@ -724,6 +776,12 @@ def dispatch_external_kernel(
         return validate_outputs(arrays, result_types, label), True
     result = kernel(*operand_tensors)
     entries = normalize_device_results(result, label)
-    outputs = validate_device_outputs(entries, result_types, label, wrap_device_result)
+    outputs = validate_device_outputs(
+        entries,
+        result_types,
+        label,
+        wrap_device_result,
+        evaluate_shape=_skip_symbolic_dims,
+    )
     staged = any(isinstance(t.data, np.ndarray) for t in outputs)
     return outputs, staged
