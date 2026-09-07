@@ -258,6 +258,9 @@ from .numpy import arange  # noqa: F401  (GRAPH creation op — same object as
 # --- Key-based functional RNG (etl.random) ----------------------------------
 from . import random  # noqa: F401  (submodule; the etl.random API surface)
 
+# --- Host data IO (etl.io) -------------------------------------------------
+from . import io  # noqa: F401  (submodule; the etl.io.prefetch/sink/AsyncCopy/wait_all surface)
+
 # --- Persistence / cache (etl.persist) -------------------------------------
 from . import persist  # noqa: F401
 from .persist import Cache, FileCache  # noqa: F401
@@ -275,3 +278,6 @@ from .pipeline import (  # noqa: F401
     lower,
     run,
 )
+
+# --- Memoized build sugar (etl.build_cache) ---------------------------------
+from .build_cache import CompileCache, build_cached  # noqa: F401
