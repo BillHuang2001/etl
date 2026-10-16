@@ -49,7 +49,6 @@ regenerated from those JSONs by `./rocm_mi300x_data/gen_fragments.py`.
 | backend | device | conf examples | numeric PASS | numeric FAIL | deferral/error | crash (excluded) | lower+compile+load total | build n | bench examples |
 |---|---|---|---|---|---|---|---|---|---|
 | numpy / cpu | `cpu` | 98 | 98 | 0 | 0 | 0 | 1.1 s | 98 | 98 |
-|---|---|---|---|---|---|---|---|---|---|
 | iree / llvm-cpu | `cpu` | 98 | 75 | 0 | 23 | 0 | 18.8 s | 75 | 98 |
 | iree / rocm:0 | `rocm:0` | 97 | 70 | 0 | 27 | 1 | 25.5 s | 71 | 97 |
 | xla / rocm:0 | `rocm:0` | 98 | 59 | 0 | 39 | 0 | 93.3 s | 59 | 98 |
@@ -332,7 +331,6 @@ Slowest 8 lower+compile+load builds per compiler backend (ms):
 | backend | slowest examples |
 |---|---|
 | iree / llvm-cpu | `grad_mix` 887, `e2e_train_convnet` 644, `e2e_train_mlp` 518, `transformer` 477, `cond_while_pipeline` 416, `while_cond_combo` 411, `mha_block` 405, `while_cumsum` 392 |
-|---|---|
 | iree / rocm:0 | `grad_mix` 1556, `transformer` 1231, `e2e_train_convnet` 1078, `e2e_train_mlp` 684, `conv2d_large` 558, `cond_while_pipeline` 489, `matmul_1024` 480, `while_cond_combo` 473 |
 | xla / rocm:0 | first-of-chunk plugin restarts dominate the tail: `attention` 10297, `e2e_kmeans` 8330, `matmul_transposed` 8197, `gru_cell` 8138, `xla_batched_dot` 7793, `matmul_1024` 7734, `softmax_reg_step` 5870, `cg_step` 5833 |
 
