@@ -49,36 +49,46 @@ __all__ = [
 ]
 
 
+# Device kinds the harness accepts: "rocm" is the canonical AMD GPU kind and
+# "hip" is its accepted alias — both derive ``target_backends=["rocm"]`` (see
+# :func:`resolve_backend_options`). The kind is preserved as given ("hip" is
+# not rewritten to "rocm"); the alias is an equivalent spelling.
+_SUPPORTED_DEVICE_KINDS = ("cpu", "cuda", "rocm", "hip")
+_SUPPORTED_DEVICE_KINDS_TEXT = "'cpu', 'cuda', and 'rocm' (alias 'hip')"
+
+
 def resolve_device(device=None) -> core.Device:
     """Normalize a device argument to a :class:`~etl.core.Device`.
 
     ``None`` → ``core.Device("cpu", 0)``. A ``core.Device`` is validated
-    (kind must be ``"cpu"`` or ``"cuda"``) and returned as-is. A string
-    parses as ``"KIND[:INDEX]"`` (e.g. ``"cpu"``, ``"cuda"``, ``"cuda:3"``);
-    the kind must be ``"cpu"`` or ``"cuda"`` and the index a non-negative
-    integer. Anything else raises ``TypeError``; a bad kind or index raises
-    ``ValueError`` with a clear message.
+    (kind must be ``"cpu"``, ``"cuda"``, ``"rocm"``, or the ``"hip"`` alias)
+    and returned as-is. A string parses as ``"KIND[:INDEX]"`` (e.g.
+    ``"cpu"``, ``"cuda"``, ``"cuda:3"``, ``"rocm"``, ``"rocm:3"``, ``"hip"``,
+    ``"hip:0"``); the kind must be ``"cpu"``, ``"cuda"``, ``"rocm"``, or
+    ``"hip"`` and the index a non-negative integer. Anything else raises
+    ``TypeError``; a bad kind or index raises ``ValueError`` with a clear
+    message.
     """
     if device is None:
         return core.Device("cpu", 0)
     if isinstance(device, core.Device):
-        if device.kind not in ("cpu", "cuda"):
+        if device.kind not in _SUPPORTED_DEVICE_KINDS:
             raise ValueError(
                 f"unsupported device kind {device.kind!r}: supported kinds "
-                "are 'cpu' and 'cuda'"
+                f"are {_SUPPORTED_DEVICE_KINDS_TEXT}"
             )
         return device
     if not isinstance(device, str):
         raise TypeError(
             f"device must be None, a core.Device, or a 'KIND[:INDEX]' string "
-            f"(e.g. 'cpu', 'cuda:3'), got {type(device).__name__}"
+            f"(e.g. 'cpu', 'cuda:3', 'rocm:3'), got {type(device).__name__}"
         )
     kind, separator, index_part = device.partition(":")
     if separator:
         if ":" in index_part or not index_part:
             raise ValueError(
                 f"invalid device {device!r}: expected 'KIND[:INDEX]' "
-                "(e.g. 'cpu', 'cuda', 'cuda:3')"
+                "(e.g. 'cpu', 'cuda', 'cuda:3', 'rocm:3')"
             )
         try:
             index = int(index_part)
@@ -94,10 +104,10 @@ def resolve_device(device=None) -> core.Device:
             )
     else:
         index = 0
-    if kind not in ("cpu", "cuda"):
+    if kind not in _SUPPORTED_DEVICE_KINDS:
         raise ValueError(
             f"unsupported device kind {kind!r} in {device!r}: supported "
-            "kinds are 'cpu' and 'cuda'"
+            f"kinds are {_SUPPORTED_DEVICE_KINDS_TEXT}"
         )
     return core.Device(kind, index)
 
@@ -132,6 +142,7 @@ def resolve_backend_options(backend, device, backend_options) -> dict:
     (numpy is the only interpreter backend; all others are compiler
     backends) without an explicit ``target_backends`` option, the
     device-derived default is injected: ``["cuda"]`` for a cuda device,
+    ``["rocm"]`` for a rocm (or its ``"hip"`` alias) device,
     ``["llvm-cpu"]`` otherwise. An explicit option always wins — never
     overridden.
 
@@ -146,9 +157,12 @@ def resolve_backend_options(backend, device, backend_options) -> dict:
     options = dict(backend_options or {})
     if backend != "numpy":
         if "target_backends" not in options:
-            options["target_backends"] = (
-                ["cuda"] if device.kind == "cuda" else ["llvm-cpu"]
-            )
+            if device.kind == "cuda":
+                options["target_backends"] = ["cuda"]
+            elif device.kind in ("rocm", "hip"):
+                options["target_backends"] = ["rocm"]
+            else:
+                options["target_backends"] = ["llvm-cpu"]
         if (
             "opt_level" not in options
             and not (os.environ.get("ETL_OPT_LEVEL") or "").strip()
@@ -163,11 +177,18 @@ def resolve_torch_device(device, torch_mod):
     Returns ``None`` when the device is not cuda, torch has no CUDA support
     (``cuda.is_available()`` False), or the device index is beyond
     ``torch.cuda.device_count()`` — torch references then run on CPU
-    (``device=None``), exactly today's behavior. Receives the already
-    imported torch module — never imports torch itself (torch optionality
-    is binding).
+    (``device=None``), exactly today's behavior.
+
+    A rocm (or ``"hip"`` alias) device additionally requires a ROCm torch
+    build (``torch.version.hip`` set — on such a build the ``torch.cuda``
+    API addresses AMD GPUs); a non-ROCm torch returns ``None`` so torch
+    references run on CPU. Receives the already imported torch module —
+    never imports torch itself (torch optionality is binding).
     """
-    if device.kind != "cuda":
+    if device.kind in ("rocm", "hip"):
+        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+            return None
+    elif device.kind != "cuda":
         return None
     if not torch_mod.cuda.is_available():
         return None
