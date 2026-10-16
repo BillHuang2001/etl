@@ -3,9 +3,11 @@
 Pluggable compiler backend that consumes the shared StableHLO payload
 (``CompilerBackend.lower``, see ``../compiler.py``) and compiles it with the
 external IREE compiler, producing an IREE VM flatbuffer executed through the
-IREE runtime on the ``local-task`` CPU driver or the ``cuda`` HAL driver —
-both drivers are compiled into the runtime wheel (validated on IREE 3.11.0,
-``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316).
+IREE runtime on the ``local-task`` CPU driver, the ``cuda`` HAL driver, or
+the ``hip`` ROCm HAL driver — all three drivers are compiled into the runtime
+wheel (validated on IREE 3.11.0,
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316; ROCm validated
+on an AMD Instinct MI300X VF, gfx942, ROCm 7.1).
 
 Exact IREE Python APIs used (all inside function bodies — the heavy-import
 rule: ``iree`` / ``iree.compiler`` / ``iree.runtime`` / ``numpy`` are NEVER
@@ -15,11 +17,21 @@ imported at module top level, so ``import etl`` stays light):
   "stablehlo", extra_args=[...])`` — compiles the StableHLO MLIR payload
   in-process (spawns ``iree-compile``) and returns the VM flatbuffer as
   ``bytes``. The compile ``target_backends`` option selects the targets
-  (default ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda"}`` —
-  anything else is rejected with ``core.BackendError`` naming it, never a
-  silent fallback). ``"cuda"`` emits default sm_60 PTX, JIT'd by the CUDA
-  driver to newer archs at load (validated on 3.11.0 to sm_86 / RTX A6000 —
-  no arch flag needed). ``extra_args`` = etl's MINIMAL defaults — ALL
+  (default ``["llvm-cpu"]``; v1 supported set ``{"llvm-cpu", "cuda",
+  "rocm"}`` — anything else is rejected with ``core.BackendError`` naming
+  it, never a silent fallback). ``"cuda"`` emits default sm_60 PTX, JIT'd
+  by the CUDA driver to newer archs at load (validated on 3.11.0 to
+  sm_86 / RTX A6000 — no arch flag needed). ``"rocm"`` emits the AMDGPU
+  code object for the target arch, which IREE requires to be named
+  EXPLICITLY (compile fails without it — there is no auto-detection): the
+  adapter supplies ``--iree-rocm-target=<arch>`` as a default, with the
+  arch DETECTED at compile time from the installed ROCm tooling
+  (``amdgpu-arch``/``rocm_agent_enumerator``) so the adapter is not
+  hardcoded to one GPU; a user ``--iree-rocm-target=...`` in
+  ``iree_compile_args`` overrides the detected default by name, and a
+  detection failure with no user flag raises an actionable
+  ``core.BackendError`` (see ``_IREE_DEFAULT_ROCM_ARGS_NAME`` /
+  ``_detect_rocm_target``). ``extra_args`` = etl's MINIMAL defaults — ALL
   OVERRIDABLE via the ``iree_compile_args`` compile option (a user flag
   overriding a default by name replaces it; the small documented deny list
   ``_IREE_DENIED_COMPILE_FLAGS`` guards only the genuinely required flags;
@@ -34,10 +46,15 @@ imported at module top level, so ``import etl`` stays light):
   ``--iree-llvmcpu-link-embedded=false`` (the default embedded
   ``-nostdlib -static`` link cannot resolve libm symbols — ``log``/``cos``/
   ``floor`` — that f64 math ops lower to; the dynamically-linked dylib
-  resolves them from the system libc/libm at load time).
-- ``iree.runtime.get_driver("local-task")`` / ``get_driver("cuda")`` →
-  ``driver.create_default_device()`` (GPU 0 for cuda) — the RELIABLE
-  device-acquisition path. The historical
+  resolves them from the system libc/libm at load time) and, ONLY when
+  ``rocm`` is among the requested targets, ``--iree-rocm-target=<arch>``
+  (IREE's ROCm HAL has no target auto-detection — compilation fails without
+  it; ``--iree-hal-target-device=rocm`` is NOT required, the HAL target is
+  implied by the compile target — both verified on iree-base-compiler
+  3.11.0 / ROCm 7.1).
+- ``iree.runtime.get_driver("local-task")`` / ``get_driver("cuda")`` /
+  ``get_driver("hip")`` → ``driver.create_default_device()`` (GPU 0 for the
+  GPU drivers) — the RELIABLE device-acquisition path. The historical
   ``rt.system_setup(config=rt.Config("local-task"))`` recipe fails with
   ``TypeError: 'module' object is not callable`` because
   ``iree.runtime.system_setup`` is a MODULE in IREE 20241104.1068
@@ -45,28 +62,32 @@ imported at module top level, so ``import etl`` stays light):
   distribution is ``iree-base-runtime``); its function was replaced by
   ``system_api.Config``. This path was validated repeatedly (fresh
   processes and in-process loops).
-- ``driver.create_device(device_id=N)`` — IREE CUDA device ids are 1-BASED:
-  N maps to physical GPU index N-1 (verified empirically on 3.11.0:
-  device_id=4 -> GPU 3; device_id=1 -> GPU 0); device_id=0 raises ValueError
+- ``driver.create_device(device_id=N)`` — IREE CUDA *and* ROCm/HIP device
+  ids are 1-BASED: N maps to physical GPU index N-1 (verified empirically
+  on 3.11.0 cuda: device_id=4 -> GPU 3; device_id=1 -> GPU 0; verified on
+  the ROCm path on an MI300X VF: device_id=1 -> the only GPU, device_id=0
+  and device_id=2 raise ValueError); device_id=0 raises ValueError
   "Device id 0 not found" — never pass 0. etl maps ``Device("cuda", index)``
-  to ``device_id=index+1`` (default index 0 -> device_id 1).
+  and ``Device("rocm"|"hip", index)`` to ``device_id=index+1`` (default
+  index 0 -> device_id 1).
 - ``iree.runtime.load_vm_flatbuffer(flatbuffer_bytes, driver="local-task")``
   — loads the VM flatbuffer into a ``BoundModule`` (CPU path); entry
   functions are resolved as attributes (``module.main``). This driver-name
-  form ALWAYS creates the DEFAULT device, so it cannot select a CUDA index —
-  the CUDA path instead loads via ``rt.Config(device=device)`` +
+  form ALWAYS creates the DEFAULT device, so it cannot select a CUDA/ROCm
+  index — the CUDA and ROCm paths instead load via
+  ``rt.Config(device=device)`` +
   ``rt.VmModule.copy_buffer(config.vm_instance, vmfb)`` +
   ``rt.load_vm_module(vm_module, config)``, which binds the module to a
   SPECIFIC acquired device.
 - ``iree.runtime.asdevicearray(device, np_array)`` — copies a host numpy
   array into a HAL device buffer for function input. Plain llvm-cpu runs
   use it as the host-ndarray representation path (host→host ABI
-  adaptation); plain cuda runs NEVER accept host inputs — placement is the
-  explicit ``t.to(Device('cuda', N))`` first (see ``upload_tensor``), and a
-  non-device input at a cuda run is rejected with ``core.DeviceError``.
-  Host-mode external-kernel boundaries still stage host tensors at kernel
-  boundaries via ``_staged_input`` (segment executables), with
-  ``asdevicearray`` as the fallback.
+  adaptation); plain GPU runs (cuda and rocm) NEVER accept host inputs —
+  placement is the explicit ``t.to(Device('cuda'|'rocm', N))`` first (see
+  ``upload_tensor``), and a non-device input at a GPU run is rejected with
+  ``core.DeviceError``. Host-mode external-kernel boundaries still stage
+  host tensors at kernel boundaries via ``_staged_input`` (cuda segment
+  executables; a rocm segment uses ``asdevicearray``, the same fallback).
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
   handle, already resident on the device. Run outputs are wrapped into
   ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
@@ -84,9 +105,9 @@ re-lowers/re-compiles. Compiler failures surface as
 diagnostics — never silently swallowed or papered over.
 
 Capability notes (all validated end-to-end on IREE 3.11.0 —
-``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316 — llvm-cpu CPU
-and cuda GPU; the notes below apply to BOTH targets — fp64/fp16 etc. all work
-on cuda, and the v1 wgp list includes fp64):
+``iree-base-compiler``/``iree-base-runtime`` 3.11.0rc20260316 — llvm-cpu CPU,
+cuda GPU and rocm GPU; the notes below apply to ALL targets — fp64/fp16 etc.
+all work on cuda and rocm, and the v1 wgp list includes fp64):
 
 - ``dtypes``: float16/float32/float64/int8/int16/int32/int64/bool_. NOT
   declared: uint8/uint16 (iree-compile cannot legalize unsigned-int
@@ -101,7 +122,7 @@ on cuda, and the v1 wgp list includes fp64):
   LEGALIZED by iree-compile 20241104 ("failed to legalize operation
   'stablehlo.collective_broadcast' that was explicitly marked illegal" —
   upstream limitation); the other five compile but the local-task/local-sync
-  CPU and cuda HAL drivers of the IREE runtime wheels (3.11.0 validated)
+  CPU and cuda/hip HAL drivers of the IREE runtime wheels (3.11.0 validated)
   raise "UNIMPLEMENTED; collectives not implemented" at ``hal.channel.create``
   (the Python wheels ship no communicating channel provider). With this flag
   False, the SHARED ``lower()`` rejects every collective-effect op explicitly
@@ -245,6 +266,110 @@ _IREE_DEFAULT_LLVMCPU_ARGS = (
     "--iree-llvmcpu-target-cpu=generic",
     "--iree-llvmcpu-link-embedded=false",
 )
+# rocm-only default — added ONLY when "rocm" is among the requested targets:
+#   --iree-rocm-target=<arch>   the AMDGPU target arch of the ROCm code
+#                               object. IREE's ROCm HAL has NO target
+#                               auto-detection (verified on iree-base-compiler
+#                               3.11.0: compiling with
+#                               target_backends=["rocm"] and no target flag
+#                               fails, and --iree-hal-target-device=rocm does
+#                               NOT supply it), so the arch MUST be named.
+#                               etl resolves the arch at compile time from the
+#                               installed ROCm tooling (amdgpu-arch /
+#                               rocm_agent_enumerator — see
+#                               ``_detect_rocm_target``) rather than
+#                               hardcoding one GPU model; a user
+#                               ``--iree-rocm-target=...`` in
+#                               ``iree_compile_args`` overrides it by name
+#                               (the standard collision rule), and an
+#                               undetectable arch with no user flag raises an
+#                               actionable BackendError — never a guess.
+_IREE_DEFAULT_ROCM_ARGS_NAME = "--iree-rocm-target"
+
+
+def _detect_rocm_target() -> str | None:
+    """Detect the ROCm/AMDGPU target arch of an installed AMD GPU.
+
+    Best-effort and side-effect-free (no etl import, no GPU allocation): the
+    ROCm arch enumerators are invoked as subprocesses and the first
+    ``gfx<digits>...`` token of their stdout is returned. Resolution order:
+    ``amdgpu-arch`` (the LLVM tool iree uses), then
+    ``rocm_agent_enumerator`` (the ROCm runtime tool — returns one
+    ``gfxNNNN`` line per detected agent). Each is looked up in
+    ``$ROCM_PATH/bin`` / ``$ROCM_HOME/bin`` (falling back to ``/opt/rocm``)
+    and then on ``PATH``.
+
+    Returns the arch string (e.g. ``"gfx942"``) or ``None`` when no
+    enumerator is available / produced a ``gfx*`` arch — the caller then
+    raises an actionable error naming the ``--iree-rocm-target`` flag (the
+    adapter never guesses an arch; a wrong-arch ROCm code object fails at
+    device load with an obscure message).
+    """
+    import re
+    import shutil
+    import subprocess
+
+    tools = ("amdgpu-arch", "rocm_agent_enumerator")
+    roots = [
+        os.path.join(root, "bin")
+        for root in (
+            os.environ.get("ROCM_PATH"),
+            os.environ.get("ROCM_HOME"),
+            "/opt/rocm",
+        )
+        if root
+    ]
+    for tool in tools:
+        candidates = [os.path.join(root, tool) for root in roots]
+        found = shutil.which(tool)
+        if found:
+            candidates.append(found)
+        for candidate in candidates:
+            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+                continue
+            try:
+                completed = subprocess.run(
+                    [candidate],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            match = re.search(r"\bgfx[0-9a-f]+\b", completed.stdout or "")
+            if match:
+                return match.group(0)
+    return None
+
+
+def _rocm_target_default(user_args: list[str] | None) -> tuple[str, ...]:
+    """The ``--iree-rocm-target=<arch>`` default for a rocm compile.
+
+    A user ``--iree-rocm-target=...`` in ``iree_compile_args`` (or
+    ``ETL_IREE_COMPILE_ARGS``) suppresses the default entirely — the same
+    name-collision rule the other defaults follow, applied BEFORE detection
+    so a user-specified arch never triggers a probe. Otherwise the arch is
+    detected (``_detect_rocm_target``); an undetectable arch raises an
+    actionable ``core.BackendError`` naming the flag and the remedy (a
+    silently omitted flag would fail inside iree-compile with an unrelated
+    diagnostic).
+    """
+    for flag in user_args or ():
+        if _flag_name(flag) == _IREE_DEFAULT_ROCM_ARGS_NAME:
+            return ()
+    arch = _detect_rocm_target()
+    if arch is None:
+        raise core.BackendError(
+            f"the {IreeBackend.name} backend needs the ROCm/AMDGPU target arch "
+            f"to compile for the 'rocm' target, and none could be auto-detected "
+            f"(no 'amdgpu-arch'/'rocm_agent_enumerator' on PATH or under "
+            f"$ROCM_PATH/$ROCM_HOME//opt/rocm). IREE's ROCm HAL has no target "
+            f"auto-detection. Pass it explicitly, e.g. "
+            f"iree_compile_args=['--iree-rocm-target=gfx942'] (or set "
+            f"ETL_IREE_COMPILE_ARGS)"
+        )
+    return (f"{_IREE_DEFAULT_ROCM_ARGS_NAME}={arch}",)
 # Genuinely required flags — the small documented DENY list. Overriding these
 # would break etl's own machinery contract with ``iree.compiler.compile_str``
 # (targets/input format are passed as its parameters; the vmfb output format
@@ -286,10 +411,17 @@ def _resolve_iree_compile_args(
     joins ``defaults``, so the same name-collision machinery applies: a user
     ``--iree-opt-level=N`` in ``iree_compile_args``/``ETL_IREE_COMPILE_ARGS``
     replaces the derived flag — never both.
+
+    Target-specific defaults join ``defaults`` only when their target is
+    requested: the llvm-cpu codegen/link flags for ``"llvm-cpu"`` and the
+    detected ``--iree-rocm-target=<arch>`` for ``"rocm"`` (see
+    ``_rocm_target_default``).
     """
     defaults = list(_IREE_DEFAULT_COMPILE_ARGS) + list(opt_level_args)
     if "llvm-cpu" in target_backends:
         defaults.extend(_IREE_DEFAULT_LLVMCPU_ARGS)
+    if "rocm" in target_backends:
+        defaults.extend(_rocm_target_default(user_args))
     if not user_args:
         return defaults
     user_names = [_flag_name(flag) for flag in user_args]
@@ -313,6 +445,8 @@ def _artifact_target(target_backends: tuple[str, ...]) -> str:
         return "cpu"
     if set(target_backends) == {"cuda"}:
         return "cuda"
+    if set(target_backends) == {"rocm"}:
+        return "rocm"
     return "+".join(target_backends)
 
 
@@ -331,6 +465,31 @@ def _runtime_dependencies() -> dict:
     }
 
 
+_GPU_DEVICE_KINDS = frozenset({"cuda", "rocm"})
+
+
+def _normalize_device_kind(kind: str) -> str:
+    """Normalize a ``core.Device`` kind to its HAL driver kind.
+
+    ``"hip"`` is an accepted ALIAS for the ROCm/HIP path and normalizes to
+    ``"rocm"`` — the alias exists so users may write
+    ``Device("hip", 0)``; the ``core.Device`` LABEL is never rewritten (the
+    alias affects driver/module dispatch only, exactly like a cuda kind is
+    used verbatim). ``"cuda"``/``"cpu"`` pass through unchanged.
+    """
+    return "rocm" if kind == "hip" else kind
+
+
+def _runtime_driver_name(device_kind: str) -> str:
+    """The IREE runtime driver name for a normalized device kind.
+
+    Both GPU kinds load their modules through the ``rt.Config(device=...)``
+    path (``load_vm_flatbuffer``'s driver-name form cannot select an index);
+    the ROCm kind is dispatched through iree's ``"hip"`` driver.
+    """
+    return "hip" if device_kind == "rocm" else device_kind
+
+
 def _acquire_runtime_device(
     device_kind: str, device: Device | None, runtime_args: list[str]
 ) -> Any:
@@ -341,25 +500,33 @@ def _acquire_runtime_device(
     ``driver.create_device(device_id=index+1)`` (IREE cuda device ids are
     1-BASED: etl ``Device("cuda", index)`` maps to ``device_id = index + 1``
     — verified empirically on 3.11.0: device_id=4 -> physical GPU 3;
-    device_id=0 raises ValueError "Device id 0 not found", never pass 0);
-    the driver's ``ValueError`` for an out-of-range index is surfaced as
-    ``core.BackendError`` naming the index.
+    device_id=0 raises ValueError "Device id 0 not found", never pass 0).
+    ROCm (normalized kind ``"rocm"``, also reached via the ``"hip"`` alias):
+    the SAME 1-based mapping through iree's ``"hip"`` driver
+    (``rt.get_driver("hip")`` + ``create_device(device_id=index+1)`` —
+    verified on IREE 3.11.0 / ROCm 7.1 / MI300X VF: device_id=1 is the only
+    GPU; device_id=0 and 2 raise ValueError). The driver's ``ValueError``
+    for an out-of-range index is surfaced as ``core.BackendError`` naming
+    the index.
     """
     import iree.runtime as rt
 
-    if device_kind == "cuda":
-        _configure_cuda_runtime_flags()
-        driver = rt.get_driver("cuda")
+    if device_kind in _GPU_DEVICE_KINDS:
+        if device_kind == "cuda":
+            _configure_cuda_runtime_flags()
+        driver = rt.get_driver(_runtime_driver_name(device_kind))
         device_id = device.index + 1
         try:
             return driver.create_device(device_id=device_id)
         except ValueError as exc:
+            label = "CUDA" if device_kind == "cuda" else "ROCm/HIP"
+            check = "nvidia-smi" if device_kind == "cuda" else "rocminfo"
             raise core.BackendError(
-                f"IREE could not acquire CUDA device id {device_id} "
+                f"IREE could not acquire {label} device id {device_id} "
                 f"(1-based; physical GPU index {device.index}): {exc}. "
-                f"IREE cuda device ids are 1-based and device_id=0 does "
+                f"IREE {label} device ids are 1-based and device_id=0 does "
                 f"not exist; the requested index must be less than the "
-                f"number of available GPUs (check nvidia-smi)"
+                f"number of available GPUs (check {check})"
             ) from exc
     driver = rt.get_driver("local-task")
     return driver.create_default_device()
@@ -368,18 +535,19 @@ def _acquire_runtime_device(
 def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
     """Load one VM flatbuffer onto ``runtime_device`` (shared load path).
 
-    CUDA: the ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
+    CUDA and ROCm (``device_kind`` in ``_GPU_DEVICE_KINDS``): the
+    ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
     vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module, config)`` path —
     ``load_vm_flatbuffer``'s driver-name form always creates the DEFAULT
-    device and cannot select a CUDA index. CPU: ``load_vm_flatbuffer(vmfb,
-    driver="local-task")``; a ``ValueError`` (the runtime VM verifier
+    device and cannot select a CUDA/ROCm index. CPU: ``load_vm_flatbuffer(
+    vmfb, driver="local-task")``; a ``ValueError`` (the runtime VM verifier
     rejecting the module's required features — the mixed-install trap, see
     ``adapters/CONTEXT.md`` Known Issue #7) is surfaced as an actionable
     ``core.BackendError`` naming the cause and remedy.
     """
     import iree.runtime as rt
 
-    if device_kind == "cuda":
+    if device_kind in _GPU_DEVICE_KINDS:
         config = rt.Config(device=runtime_device)
         vm_module = rt.VmModule.copy_buffer(config.vm_instance, vmfb)
         return rt.load_vm_module(vm_module, config)
@@ -692,15 +860,18 @@ class IreeBackend(CompilerBackend):
         4. Validate options against ``KNOWN_OPTIONS`` (unknown keys =>
            ``core.BackendError``; keys valid for other stages pass). Resolve
            the compile ``target_backends`` option (default ``["llvm-cpu"]``;
-           v1 supported set ``{"llvm-cpu", "cuda"}`` — a non-list/tuple, an
+           v1 supported set ``{"llvm-cpu", "cuda", "rocm"}`` — a
+           non-list/tuple, an
            empty list, or an unknown target raises ``core.BackendError``
            naming the offending value, never a silent fallback) and the
            ``iree_compile_args`` option (arbitrary iree-compile flags —
            list/tuple of flag strings; the values are never validated by
            etl, the compiler validates them). ``iree.compiler.compile_str``
-           with those targets, ``input_type="stablehlo"`` and
-           ``extra_args`` = etl's MINIMAL defaults (f64 semantics preserved;
-           portable generic-CPU codegen; dynamically-linked llvm-cpu link —
+           is called with those targets, ``input_type="stablehlo"``
+           and ``extra_args`` = etl's MINIMAL defaults (f64 semantics
+           preserved; portable generic-CPU codegen + dynamically-linked
+           llvm-cpu link for ``llvm-cpu``; the detected ``--iree-rocm-target``
+           for ``rocm`` —
            see the module constants) MINUS any default a user flag overrides
            by name, PLUS the user's flags (deny-checked against the small
            documented ``_IREE_DENIED_COMPILE_FLAGS`` list — genuinely
@@ -787,13 +958,16 @@ class IreeBackend(CompilerBackend):
 
         Compile targets come from the ``target_backends`` compile option
         (default ``["llvm-cpu"]`` — unchanged CPU behavior). v1 supported
-        set: ``{"llvm-cpu", "cuda"}``. ``iree_compile_args`` carries
+        set: ``{"llvm-cpu", "cuda", "rocm"}``. ``iree_compile_args`` carries
         arbitrary iree-compile flags (list/tuple of flag strings; values are
         NEVER validated here — the compiler validates them and its
         diagnostics surface as BackendError). etl's minimal defaults are
         dropped when a user flag overrides them by name; the small
         documented deny list guards the genuinely required flags (see module
-        constants). The ``opt_level`` compile option (``"O0"``-``"O3"`` /
+        constants). A ``"rocm"`` target additionally carries the detected
+        ``--iree-rocm-target=<arch>`` default (IREE has no ROCm target
+        auto-detection — see ``_rocm_target_default``). The ``opt_level``
+        compile option (``"O0"``-``"O3"`` /
         0-3; UNSET = ``None`` — the derived flag must NOT appear, byte-for-
         byte current behavior) is validated via ``..options.normalize_opt_level``
         and translated to the derived flag ``--iree-opt-level=N``; the
@@ -811,7 +985,7 @@ class IreeBackend(CompilerBackend):
                 f"the {self.name} 'target_backends' compile option must be a "
                 f"non-empty list/tuple of strings, got {raw_targets!r}"
             )
-        supported_targets = {"llvm-cpu", "cuda"}
+        supported_targets = {"llvm-cpu", "cuda", "rocm"}
         for target in raw_targets:
             if target not in supported_targets:
                 raise core.BackendError(
@@ -978,14 +1152,16 @@ class IreeBackend(CompilerBackend):
            ``_configure_cuda_runtime_flags``) — the hardcoded-flag lesson:
            every flag a user can name is theirs to set.
         5. Validate the device: ``None`` (CPU default) or a ``core.Device``
-           of kind ``"cpu"`` or ``"cuda"`` — a non-``Device`` object raises
+           of kind ``"cpu"``/``"cuda"``/``"rocm"`` (``"hip"`` is accepted as
+           an alias for ``"rocm"``) — a non-``Device`` object raises
            ``core.DeviceError``; another kind raises ``core.BackendError``
            naming it.
         6. Artifact/device target compatibility — never silent: the artifact
            payload's ``target_backends`` must include the driver matching the
            requested device kind (``"llvm-cpu"`` for cpu, ``"cuda"`` for
-           cuda); absent ``target_backends`` (artifacts saved before CUDA
-           support) is treated as ``["llvm-cpu"]``. A mismatch raises
+           cuda, ``"rocm"`` for the rocm/hip kind); absent
+           ``target_backends`` (artifacts saved before CUDA support) is
+           treated as ``["llvm-cpu"]``. A mismatch raises
            ``core.BackendError`` naming both the artifact's compile targets
            and the requested device.
         7. Base64-decode the VM flatbuffer; acquire the runtime device. CPU:
@@ -994,11 +1170,13 @@ class IreeBackend(CompilerBackend):
            ``rt.get_driver("cuda")`` + ``driver.create_device(device_id=
            index+1)`` (IREE cuda ids are 1-BASED: etl index N -> device_id
            N+1; the driver's ``ValueError`` for an out-of-range index is
-           surfaced as ``core.BackendError`` naming the index) then the
+           surfaced as ``core.BackendError`` naming the index). ROCm
+           (including the ``"hip"`` alias): the SAME 1-based mapping through
+           iree's ``"hip"`` driver. Both GPU kinds then take the
            ``rt.Config(device=...)`` + ``rt.VmModule.copy_buffer(config.
            vm_instance, vmfb)`` + ``rt.load_vm_module(vm_module, config)``
            path (the ``load_vm_flatbuffer`` driver-name form always creates
-           the DEFAULT device and cannot select a CUDA index). Then resolve
+           the DEFAULT device and cannot select an index). Then resolve
            the v1 entry function (``"main"``, else the single recorded
            entry). A ``ValueError`` from the CPU ``load_vm_flatbuffer`` (the
            runtime VM verifier rejecting the module's required features — see
@@ -1062,12 +1240,14 @@ class IreeBackend(CompilerBackend):
                     f"device must be a core.Device, got "
                     f"{type(device).__name__}"
                 )
-            if device.kind not in ("cpu", "cuda"):
+            if device.kind not in ("cpu", "cuda", "rocm", "hip"):
                 raise core.BackendError(
-                    f"the {self.name} backend supports cpu and cuda devices "
-                    f"only, got device kind {device.kind!r}"
+                    f"the {self.name} backend supports cpu, cuda and rocm/hip "
+                    f"devices only, got device kind {device.kind!r}"
                 )
-            device_kind = device.kind
+            # ``"hip"`` is an alias for the ROCm/HIP path (normalized for
+            # driver/module dispatch only — the core.Device label is kept).
+            device_kind = _normalize_device_kind(device.kind)
 
         # Artifact/device target compatibility — never silent: the artifact's
         # compile targets must include the driver matching the requested
@@ -1080,7 +1260,11 @@ class IreeBackend(CompilerBackend):
             target_backends = (raw_targets,)
         else:
             target_backends = tuple(raw_targets)
-        expected_target = "llvm-cpu" if device_kind == "cpu" else "cuda"
+        expected_target = {
+            "cpu": "llvm-cpu",
+            "cuda": "cuda",
+            "rocm": "rocm",
+        }[device_kind]
         if expected_target not in target_backends:
             raise core.BackendError(
                 f"the {self.name} artifact was compiled for target(s) "
@@ -1147,13 +1331,19 @@ class IreeBackend(CompilerBackend):
                     f"device must be a core.Device, got "
                     f"{type(device).__name__}"
                 )
-            if device.kind not in ("cpu", "cuda"):
+            if device.kind not in ("cpu", "cuda", "rocm", "hip"):
                 raise core.BackendError(
-                    f"the {self.name} backend supports cpu and cuda devices "
-                    f"only, got device kind {device.kind!r}"
+                    f"the {self.name} backend supports cpu, cuda and rocm/hip "
+                    f"devices only, got device kind {device.kind!r}"
                 )
-            device_kind = device.kind
-        expected_target = "llvm-cpu" if device_kind == "cpu" else "cuda"
+            # ``"hip"`` is an alias for the ROCm/HIP path (normalized for
+            # driver/module dispatch only — the core.Device label is kept).
+            device_kind = _normalize_device_kind(device.kind)
+        expected_target = {
+            "cpu": "llvm-cpu",
+            "cuda": "cuda",
+            "rocm": "rocm",
+        }[device_kind]
 
         raw_segments = payload.get("segments")
         plan = payload.get("plan")
@@ -1223,6 +1413,12 @@ class IreeBackend(CompilerBackend):
                     runtime_device=runtime_device,
                     core_device=core_device,
                     input_specs=input_specs,
+                    # The per-call staging fast path (persistent
+                    # pinned/DMA buffers) is enabled for the cuda kind only;
+                    # a rocm segment takes the generic asdevicearray upload
+                    # path for host-mode external-kernel boundaries (a
+                    # correct, if unoptimized, upload — see the class
+                    # docstring).
                     cuda=(device_kind == "cuda"),
                 )
             )
@@ -1240,7 +1436,7 @@ class IreeExecutable(CompilerExecutable):
     """IREE runtime executable (satisfies the backend ``Executable`` protocol).
 
     Runs the compiled VM module on the acquired IREE HAL device (``local-task``
-    CPU or ``cuda`` GPU):
+    CPU, ``cuda`` or ``rocm``/``hip`` GPU):
 
     1. Validate flat inputs against the recorded ``Signature``: count
        (``core.BackendError``), per-input dtype (``core.BackendError``),
@@ -1251,11 +1447,11 @@ class IreeExecutable(CompilerExecutable):
        R6.2): a device-resident tensor whose payload is an IREE
        ``DeviceArray`` on THIS executable's device (kind+index) is passed
        to the invoke directly — no host round-trip, no copy. Any other
-       input is REJECTED on a cuda executable with ``core.DeviceError``
+       input is REJECTED on a cuda/rocm executable with ``core.DeviceError``
        directing to ``t.to(...)`` (defensive — the pipeline run-boundary
        check in ``etl/pipeline.py`` normally rejects foreign-device inputs
        first with its own message; place inputs explicitly via
-       ``t.to(Device('cuda', N))`` before the run). On an llvm-cpu
+       ``t.to(Device('cuda'|'rocm', N))`` before the run). On an llvm-cpu
        executable a host numpy-backed input takes the
        ``rt.asdevicearray`` representation path (host->host ABI
        adaptation — llvm-cpu tests depend on it). Plain runs build FRESH
@@ -1386,8 +1582,9 @@ class IreeExecutable(CompilerExecutable):
         # cache. Same-device payload/DeviceArray inputs pass through;
         # host ndarray inputs take the asdevicearray representation path on
         # an llvm-cpu executable and are REJECTED with core.DeviceError on a
-        # cuda executable (no implicit host-to-device transfer; the pipeline
-        # run-boundary check rejects them first — this is defense-in-depth).
+        # cuda/rocm executable (no implicit host-to-device transfer; the
+        # pipeline run-boundary check rejects them first — this is
+        # defense-in-depth).
         buffers = _build_buffers(
             flat_input_tensors,
             input_specs,
@@ -1644,14 +1841,14 @@ def _build_buffers(
     * plain ``IreeExecutable`` runs pass ``staged_inputs=None``: a host
       ndarray-backed input takes the ``rt.asdevicearray`` representation
       path on an llvm-cpu executable (host->host ABI adaptation), and is
-      REJECTED with ``core.DeviceError`` on a cuda executable
+      REJECTED with ``core.DeviceError`` on a cuda/rocm executable
       (``reject_foreign=True`` — defensive: the pipeline run-boundary
       check normally rejects foreign-device inputs first with its own
-      message; place inputs explicitly via ``t.to(Device('cuda', N))``).
+      message; place inputs explicitly via ``t.to(Device('cuda'|'rocm', N))``).
     * segment executables pass their per-segment staging cache
       (``reject_foreign=False``): host-mode external-kernel boundaries
       legitimately stage host tensors via ``_staged_input`` on cuda, else
-      the asdevicearray fallback (non-cuda).
+      the asdevicearray fallback (non-cuda, incl. rocm).
     """
     import numpy as np
     import iree.runtime as rt
@@ -1668,15 +1865,15 @@ def _build_buffers(
         ):
             buffers.append(data)
         elif reject_foreign:
-            # Plain cuda run with a non-pass-through input (ndarray-backed
-            # host tensor or a payload on another device). Normally
-            # unreachable — the pipeline run-boundary check rejects
+            # Plain cuda/rocm run with a non-pass-through input
+            # (ndarray-backed host tensor or a payload on another device).
+            # Normally unreachable — the pipeline run-boundary check rejects
             # wrong-device inputs first; this guards direct backend-level
             # users of the executable.
             raise core.DeviceError(
                 f"input {i} is not a device-resident tensor on this "
-                f"executable's device ({core_device!r}) and plain cuda runs "
-                "never stage host inputs: there is no implicit "
+                f"executable's device ({core_device!r}) and plain GPU runs "
+                "(cuda/rocm) never stage host inputs: there is no implicit "
                 "host-to-device transfer at the run boundary. Place the "
                 f"input on the device explicitly first, e.g. "
                 f"t.to({core_device!r}), or run the executable on the "
@@ -1706,6 +1903,13 @@ class _IreeSegmentExecutable:
     ``IreeExecutable.run``'s validation + buffer-building + invoke + lazy
     device-resident output wrapping (shared helpers), against the segment's
     own input specs.
+
+    The ``cuda`` flag enables the per-call persistent staging fast path
+    (pinned/DMA tiers + the pool anchor) used when a host-mode external
+    kernel's boundary stages host tensors; on the rocm/hip kind a host-mode
+    boundary uploads through the generic ``rt.asdevicearray`` path instead
+    (correct — the same representation an llvm-cpu segment uses — but with
+    no persistent staging buffers).
     """
 
     def __init__(
@@ -1721,7 +1925,7 @@ class _IreeSegmentExecutable:
         self.core_device = core_device
         self.input_specs = input_specs
         self._entry: Any = None
-        # CUDA per-call fast path (R6.2: removed from the plain
+        # CUDA-only per-call fast path (R6.2: removed from the plain
         # IreeExecutable — retained HERE, one cache per segment, because
         # host-mode external-kernel boundaries legitimately stage host
         # tensors at kernel boundaries): the same two-tier persistent
@@ -1806,7 +2010,7 @@ class IreeExternalExecutable(CompilerExecutable):
       ``.numpy()``), calls the kernel, and its validated host results are
       staged BACK into the following segment's inputs (the segment
       executables' host-tensor staging machinery — ``_staged_input`` on
-      cuda, ``asdevicearray`` on llvm-cpu — uploads them).
+      cuda, ``asdevicearray`` on llvm-cpu and rocm — uploads them).
     - DEVICE mode (``device_resident=True`` registration): the dispatcher
       passes the device tensors DIRECTLY (zero host staging on the way in);
       the kernel may return ``core.Tensor`` s, duck-typed device payloads
@@ -2099,7 +2303,7 @@ class IreeDevicePayload:
     ``to_host() -> np.ndarray`` tried first by ``Tensor.numpy()`` (with
     ``np.asarray`` as the fallback, via ``__array__``). On ``local-task``
     (llvm-cpu) buffers the to_host mapping is zero-copy for mappable memory;
-    on cuda it is a fresh D2H copy per call.
+    on cuda/rocm it is a fresh D2H copy per call.
     """
 
     __slots__ = ("_array", "_shape", "_dtype", "device")
@@ -2162,17 +2366,20 @@ _IreeDevicePayload = IreeDevicePayload
 
 
 def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
-    """Placement provider: copy a HOST tensor onto a cuda HAL device.
+    """Placement provider: copy a HOST tensor onto a cuda/rocm HAL device.
 
-    Registered for device kind ``"cuda"`` in the core device-transfer
-    provider registry (``core.register_device_transfer_provider``), so
-    ``tensor.to(core.Device('cuda', N))`` dispatches here (the lazy
-    backends-level thunk also delegates here by attribute lookup). Provider
-    contract (core, v1): receives a HOST ndarray-backed
+    Registered for the device kinds ``"cuda"``, ``"rocm"`` and ``"hip"`` in
+    the core device-transfer provider registry
+    (``core.register_backend_device_transfer_provider``), so
+    ``tensor.to(core.Device('cuda'|'rocm'|'hip', N))`` dispatches here (the
+    lazy backends-level thunk also delegates here by attribute lookup).
+    Provider contract (core, v1): receives a HOST ndarray-backed
     ``Device("cpu", 0)`` tensor plus the target ``core.Device`` and returns
     a ``core.Tensor`` placed on the target device — a fresh device-resident
     tensor wrapping an ``IreeDevicePayload`` over the freshly uploaded iree
-    ``DeviceArray``.
+    ``DeviceArray``. The returned tensor carries the EXACT target ``device``
+    object passed in (the ``hip`` ALIAS is normalized for the driver call
+    only — the label stays as the user wrote it).
 
     Implementation:
     1. Source check: a non-host source raises ``core.DeviceError`` directing
@@ -2180,20 +2387,23 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
        are not implemented in v1 — per the core provider contract).
     2. Runtime flags: ``ETL_IREE_RUNTIME_ARGS`` is honored exactly like
        ``load`` does (same env parsing via ``_runtime_args_from_env``; loud
-       parse errors) so placement respects process-global HAL flags (e.g.
-       the classic-allocator opt-in ``--cuda_async_allocations=false``).
+       parse errors) so placement respects process-global HAL flags.
     3. HAL device: acquired through ``_acquire_runtime_device`` — the same
-       path ``load`` uses. Each call acquires a FRESH HAL device instance;
-       feeding such buffers into a separately-loaded executable on the same
-       physical device works (iree accepts same-physical-device buffers
-       across instances — verified empirically, see the R6.4 note in
-       ``etl/backends/adapters/CONTEXT.md``), so no process-wide instance
+       path ``load`` uses (``"hip"`` driver + 1-based ``device_id =
+       index + 1`` for rocm). Each call acquires a FRESH HAL device
+       instance; feeding such buffers into a separately-loaded executable
+       on the same physical device works (iree accepts same-physical-device
+       buffers across instances — verified empirically, see the R6.4 note
+       in ``etl/backends/adapters/CONTEXT.md``), so no process-wide instance
        cache exists.
-    4. Upload: a ONE-SHOT host->device copy through ``_staged_input`` with a
-       FRESH per-call staging dict (fresh buffers, no cache) — the
-       correctness-pinned pinned/DMA tiers (the DMA tier's fresh-semaphore
-       wait is load-bearing); oversized/unmappable inputs fall back to
-       ``rt.asdevicearray``.
+    4. Upload: a ONE-SHOT host->device copy. On cuda that is
+       ``_staged_input`` with a FRESH per-call staging dict (fresh buffers,
+       no cache) — the correctness-pinned pinned/DMA tiers (the DMA tier's
+       fresh-semaphore wait is load-bearing) — falling back to
+       ``rt.asdevicearray`` for oversized/unmappable inputs. On rocm the
+       copy is ``rt.asdevicearray`` directly: the pinned/DMA staging tiers
+       are built on the cuda HAL's host-mapped/queue_copy machinery and are
+       not wired for the hip driver.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
 
     Failures surface as ``core.DeviceError`` / ``core.BackendError`` with an
@@ -2212,10 +2422,11 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
             f"Tensor.to upload requires a core.Device target, got "
             f"{type(device).__name__}"
         )
-    if device.kind != "cuda":
+    device_kind = _normalize_device_kind(device.kind)
+    if device_kind not in _GPU_DEVICE_KINDS:
         raise core.DeviceError(
             f"the {IreeBackend.name} placement provider places data on cuda "
-            f"devices only, got {device!r}"
+            f"and rocm/hip devices only, got {device!r}"
         )
     # Provider source contract: a HOST ndarray-backed cpu:0 tensor in v1. A
     # device-resident source cannot be copied device->device by this
@@ -2232,19 +2443,24 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     runtime_args = _runtime_args_from_env()
     _apply_iree_runtime_args(runtime_args)
     try:
-        runtime_device = _acquire_runtime_device("cuda", device, runtime_args)
+        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
     except core.ETLError:
         raise
     except Exception as exc:
         raise core.BackendError(
-            f"Tensor.to could not acquire the IREE cuda HAL device for "
-            f"{device!r} (the {IreeBackend.name} placement provider): {exc}"
+            f"Tensor.to could not acquire the IREE {device_kind} HAL device "
+            f"for {device!r} (the {IreeBackend.name} placement provider): "
+            f"{exc}"
         ) from exc
     # One-shot upload: a FRESH staging dict per call (fresh buffers, no
     # cache — the pinned/DMA tiers with the load-bearing fresh-semaphore
-    # wait, falling back to asdevicearray for oversized/unmappable inputs).
+    # wait) on cuda, falling back to asdevicearray for oversized/unmappable
+    # inputs; asdevicearray directly on rocm (the staging tiers are
+    # cuda-only HAL machinery).
     try:
-        staged = _staged_input({}, runtime_device, 0, tensor)
+        staged = None
+        if device_kind == "cuda":
+            staged = _staged_input({}, runtime_device, 0, tensor)
         if staged is None:
             staged = rt.asdevicearray(runtime_device, tensor.numpy())
     except core.ETLError:
@@ -2275,17 +2491,21 @@ def register() -> IreeBackend:
     (the registry tolerates idempotent re-registration).
 
     Registers this adapter's DIRECT ``upload_tensor`` under the PER-BACKEND
-    slot ``("cuda", "iree")`` (R6.3): ``etl.backends`` registers a lazy
-    thunk over this module in the flat DEFAULT slot at import time; once the
-    adapter is active (packages available — ``check_available`` above),
-    ``registry.get("iree")`` records iree as the preferred transfer backend
-    for the kinds it serves and ``Tensor.to`` routes through the direct
-    provider. The flat slot is NEVER overwritten and per-backend slots are
-    keyed per backend, so activation order cannot clobber any backend's
-    provider (no last-wins across backends).
+    slots ``("cuda", "iree")``, ``("rocm", "iree")`` and ``("hip", "iree")``
+    (R6.3): ``etl.backends`` registers a lazy thunk over this module in the
+    flat DEFAULT slot at import time; once the adapter is active (packages
+    available — ``check_available`` above), ``registry.get("iree")`` records
+    iree as the preferred transfer backend for the kinds it serves and
+    ``Tensor.to`` routes through the direct provider. The flat slot is NEVER
+    overwritten and per-backend slots are keyed per backend, so activation
+    order cannot clobber any backend's provider (no last-wins across
+    backends). Registering both the ``rocm`` and the ``hip`` kind means a
+    ``Device("hip", N)`` label resolves through this provider too (the
+    provider normalizes the kind for the driver call).
     """
     iree_backend.check_available()
-    core.register_backend_device_transfer_provider(
-        "cuda", iree_backend.name, upload_tensor
-    )
+    for kind in ("cuda", "rocm", "hip"):
+        core.register_backend_device_transfer_provider(
+            kind, iree_backend.name, upload_tensor
+        )
     return _registry_register(iree_backend)
