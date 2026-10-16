@@ -7,9 +7,11 @@ callable(inputs) -> outputs`` is an optional runner FACTORY for multi-run
 end-to-end procedures (e.g. a Python-level training loop). It receives the
 resolved backend name, the resolved :class:`~etl.core.Device`, and the
 resolved backend options dict (with the device-derived ``target_backends``
-default and the ``opt_level`` harness default (``"O3"`` for compiler
-backends; env-aware, explicit always wins) already injected, exactly what
-``stage_example``'s single-run path passes to ``etl.build``), and returns a
+default — injected for the **iree backend family only**, since
+``target_backends`` is an iree-only option — and the ``opt_level`` harness
+default (``"O3"`` for all non-numpy compiler backends; env-aware, explicit
+always wins) already injected, exactly what ``stage_example``'s single-run
+path passes to ``etl.build``), and returns a
 RUN-CALLABLE taking the SAME inputs
 list the single-run path uses (``example.generate_inputs(seed)``, a list of
 numpy arrays) and returning the same outputs structure as ``numpy_ref``
@@ -138,31 +140,37 @@ def resolve_backend(backend) -> str:
 def resolve_backend_options(backend, device, backend_options) -> dict:
     """Resolve backend compile options for a chosen backend/device.
 
-    Returns a NEW dict ``{**backend_options}``. For every non-numpy backend
-    (numpy is the only interpreter backend; all others are compiler
-    backends) without an explicit ``target_backends`` option, the
-    device-derived default is injected: ``["cuda"]`` for a cuda device,
-    ``["rocm"]`` for a rocm (or its ``"hip"`` alias) device,
-    ``["llvm-cpu"]`` otherwise. An explicit option always wins — never
-    overridden.
+    Returns a NEW dict ``{**backend_options}``.
 
-    For every non-numpy backend, when ``opt_level`` is absent from the
-    options AND the ``ETL_OPT_LEVEL`` env var is unset/blank, the harness
-    default ``"O3"`` is injected (high optimization for compiler backends).
-    An explicit ``opt_level`` always wins; ``ETL_OPT_LEVEL`` wins over the
-    harness default (injection is skipped when the env var is set, so the
-    pipeline's env machinery applies it at compile). numpy is never
-    affected — it is the reference interpreter.
+    ``target_backends`` is an **iree-only** lower option (the xla, tvm, and
+    numpy backends reject it — it is declared in no stage of theirs), so the
+    device-derived default is injected ONLY for the iree backend family
+    (``backend.startswith("iree")`` — the pipeline's own env-default
+    convention, see ``etl/pipeline.py``): when the option is absent,
+    ``["cuda"]`` for a cuda device, ``["rocm"]`` for a rocm (or its
+    ``"hip"`` alias) device, ``["llvm-cpu"]`` otherwise. An explicit option
+    always wins — never overridden. xla, tvm, and numpy receive NO
+    ``target_backends``.
+
+    For every non-numpy backend (numpy is the only interpreter backend; all
+    others are compiler backends) — iree, xla AND tvm — when ``opt_level``
+    is absent from the options AND the ``ETL_OPT_LEVEL`` env var is
+    unset/blank, the harness default ``"O3"`` is injected (high
+    optimization for compiler backends). An explicit ``opt_level`` always
+    wins; ``ETL_OPT_LEVEL`` wins over the harness default (injection is
+    skipped when the env var is set, so the pipeline's env machinery applies
+    it at compile). numpy is never affected — it is the reference
+    interpreter.
     """
     options = dict(backend_options or {})
+    if backend.startswith("iree") and "target_backends" not in options:
+        if device.kind == "cuda":
+            options["target_backends"] = ["cuda"]
+        elif device.kind in ("rocm", "hip"):
+            options["target_backends"] = ["rocm"]
+        else:
+            options["target_backends"] = ["llvm-cpu"]
     if backend != "numpy":
-        if "target_backends" not in options:
-            if device.kind == "cuda":
-                options["target_backends"] = ["cuda"]
-            elif device.kind in ("rocm", "hip"):
-                options["target_backends"] = ["rocm"]
-            else:
-                options["target_backends"] = ["llvm-cpu"]
         if (
             "opt_level" not in options
             and not (os.environ.get("ETL_OPT_LEVEL") or "").strip()
