@@ -19,6 +19,7 @@ order, and worker-thread re-entry raises `RuntimeError`.
 
 | File | Covers |
 |---|---|
+| `test_io_worker_bootstrap.py` | 15 tests: device-free plumbing pins for the worker's non-cpu context bootstrap (fake `iree` PACKAGE **and** `iree.runtime` submodule installed via `monkeypatch.setitem(sys.modules, ...)` — only `iree.runtime` is not enough), driven through the REAL process-global worker by `io.AsyncCopy(device, direction)` + `io._submit(handle, lambda: None)` (never `prefetch`/`sink`: kinds `cuda`/`rocm`/`hip` own REAL lazy transfer providers) — the driver-name mapping (`"rocm"`/`"hip"` → `"hip"`, `"cuda"` → `"cuda"`) × the 1-based `device_id = index + 1`, the throwaway device kept alive in `io._bootstrap_devices`; laziness (a cpu-kind handle calls `get_driver` never and leaves `_bootstrapped` empty); the `(kind, index)` dedup (`_bootstrapped`) — once per key, again per new index/kind, and `"hip"`/`"rocm"` as DISTINCT keys despite one driver; best-effort failure (`get_driver` or `create_device` raising, and the not-retried-after-failure behavior since `_bootstrapped.add(key)` precedes the try) never altering the copy's outcome. |
 | `test_io.py` | 37 tests: module surface/exports (incl. no iree at import, no handle `__del__`); schedule-time validation (raw ndarray → `TypeError` naming `etl.tensor(...)`; non-`core.Device` target → `TypeError` naming `etl.Device(kind, index)`; payload-backed prefetch source → `DeviceError` with the `.to(cpu)` hint; prefetch to cpu:0 or the source device → `DeviceError` "no copy needed"; sink of host ndarray-backed → `DeviceError` "already host data"; sink of cpu-kind payload → `DeviceError` "use t.numpy()" hint; validation failures never start the worker); success flows (prefetch→sink roundtrip, numerics, `.done` transitions, wait-idempotence, `result()` identity — no re-copy); worker failures re-raised VERBATIM at wait/result/wait_all (same exception object) incl. the unregistered-kind provider `DeviceError`; wait timeouts (handle pending, later wait succeeds, `wait_all(timeout=)` likewise); wait_all snapshot excludes late submissions + first-failure-in-issue-order; FIFO completion order in BOTH directions (staggered delays, strictly increasing completion times, serialized total); GC never auto-waits (dropped handles, `gc.collect()` prompt, worker completes independently, wait_all drains GC'd handles); worker-thread guards (`RuntimeError` with pinned message prefixes for prefetch/sink/wait/wait_all from the worker, worker survives guard failures); per-backend provider slot (`register_backend_device_transfer_provider` wins over the flat slot once `_note_backend_transfer_preference` fires, mirroring what `etl.backends.registry.get` calls); interpreter-exit pins via subprocess (os._exit with a 30 s copy in flight returns instantly; normal exit best-effort-drains a finite in-flight copy — never hangs). |
 
 ## Constraints
@@ -26,8 +27,10 @@ order, and worker-thread re-entry raises `RuntimeError`.
 - Device-free / CPU-only / no GPU: fake device kinds (`fio_*` — never `"cuda"`, which
   owns a lazy iree thunk), duck-typed `_DummyPayload`s, and registered
   device-transfer providers (the `tests/core/test_tensor.py` idiom) stand in for
-  real devices. No real iree required (the worker's lazy bootstrap merely
-  attempts-and-swallows a fake-driver create when iree happens to be importable).
+  real devices. No real iree required: `test_io.py` leaves the worker's lazy
+  bootstrap unexercised (it merely attempts-and-swallows a fake-driver create when
+  iree happens to be importable), while `test_io_worker_bootstrap.py` pins the
+  bootstrap itself against a fake `iree`/`iree.runtime` installed in `sys.modules`.
   Full suite ~7 s incl. 2 subprocess spawns.
 - Registries are cleaned in `finally` (`_DEVICE_TRANSFER_PROVIDERS` /
   `_BACKEND_DEVICE_TRANSFER_PROVIDERS` / `_PREFERRED_TRANSFER_BACKENDS` pops); the
@@ -51,7 +54,12 @@ order, and worker-thread re-entry raises `RuntimeError`.
   until `.wait()`/`.result()`.
 - **Spike outcome:** iree-python 3.11 exposes no simple real async host-copy API, so
   the worker-thread mechanism stands as designed — there is NO iree fast path to
-  test; the fake-provider/fake-payload machinery above is the whole suite.
+  test; the fake-provider/fake-payload machinery (`test_io.py`) plus the fake
+  `iree`/`iree.runtime` modules (`test_io_worker_bootstrap.py`) are the whole suite.
+- The worker's non-cpu context bootstrap is pinned only via fake `iree` modules
+  installed in `sys.modules`: `monkeypatch` restores them afterwards, so
+  `test_io.py`'s `test_import_pulls_no_iree` pin stays valid regardless of file
+  order, and no test in this dir ever imports the real `iree` or needs a GPU.
 - `io._worker_thread` stays `None` until the first successful submission — the
   schedule-time-validation class asserts validation errors never start it or leak
   handles.
