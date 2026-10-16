@@ -373,7 +373,11 @@ class CompilerBackend(Backend):
         ``sort_emission`` and ``while_init_rewrite`` are analogous reserved
         keys (see the stablehlo Writer): the latter defaults ON at export
         (the iree AffinityAnalysis SEGV workaround), the former to this
-        adapter's class default.
+        adapter's class default. ``dot_precision`` is likewise a reserved
+        lower option forwarded to the Writer (values ``"DEFAULT"`` /
+        ``"HIGH"`` / ``"HIGHEST"``; only ``"HIGHEST"`` disables XLA/ROCm's
+        TF32-class fp32 ``dot``); its literal default ``"DEFAULT"`` emits no
+        ``precision_config`` attribute, leaving the export unchanged.
         """
         return {
             "rng_bit_generator": (options or {}).get(
@@ -383,6 +387,7 @@ class CompilerBackend(Backend):
                 "sort_emission", self.default_sort_emission
             ),
             "while_init_rewrite": (options or {}).get("while_init_rewrite", True),
+            "dot_precision": (options or {}).get("dot_precision", "DEFAULT"),
         }
 
     def _record_signature(self, graph: "Graph", main_fn: Any) -> Signature:
