@@ -7,7 +7,7 @@
     outputs left on the device (no staging inside the timed loop)
 
 Best-of-N (N=25) wall times via perf_counter; the first warm-up calls are untimed.
-Run from the repo root:  .venv/bin/python etl/bench/_matrix2/probe_rocm_staging2.py
+Run from the repo root:  .venv/bin/python etl/bench/rocm_mi300x_data/probe_rocm_staging2.py
 """
 from __future__ import annotations
 
