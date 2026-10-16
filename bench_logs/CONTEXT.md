@@ -26,11 +26,11 @@ results/so_etl-xla-cuda.json`): DE/Rastrigin/10000x100 = 11.598 ms/step,
 DE/Sphere 11.176, PSO/Rastrigin 15.205, PSO/Sphere 17.0 — PSO was equally slow
 there, and every algorithm shows a ~5 ms/step floor even at 100×10.
 The harness stages host↔device EVERY step by design: `bench_common.
-etl_backend_spec` maps `etl-xla-cuda` → `("xla", None)` and its own notes say
-the adapters "stage inputs from host buffers and copy outputs back every step,
-so their ms/step includes device↔host transfer" (BENCHMARK_RESULTS.md Setup;
-bench_common.py comment: xla "rejects non-cpu devices at load … device spec is
-therefore None" — that note predates the device-resident xla path).
+etl_backend_spec` maps `etl-xla-cuda` → `("xla", None)` (host-staged —
+`device=None`, written before the device-resident xla path) and its own notes
+say the adapters "stage inputs from host buffers and copy outputs back every
+step, so their ms/step includes device↔host transfer" (BENCHMARK_RESULTS.md
+Setup).
 Quantified on current code with the SAME DE step graph: restaged-host execution
 (state moved H2D before each step, D2H after) = 11.2–16.6 ms/step; a pure
 H2D+D2H round trip of the state alone (10 leaves, 12.1 MB) = 9.3–10.0 ms/step;
@@ -85,8 +85,10 @@ creation). iree-cuda runs use 3.11.0 — crash-repro clean, see below. For HLO d
 --xla_dump_hlo_as_text` to XLA_FLAGS (compile-time dumps land even if the run
 fails). `graph`-command outputs live on CPU (numpy backend) — no GPU needed.
 
-## Finding (MI300X / ROCm 7.1 / jax-rocm7-pjrt 0.11.2): etl's xla driver WORKS on ROCm; the plugin corrupts the heap at process exit; TVM cannot run
-Full report: `./rocm_mi300x_findings.md`; probes in this dir:
+## Finding (MI300X / ROCm 7.1 / jax-rocm7-pjrt 0.11.2): etl's xla adapter runs on ROCm device-resident; the plugin corrupts the heap at process exit; TVM cannot run
+Full report: `./rocm_mi300x_findings.md`; conformance + performance matrix for
+the 98-example registry: `./etl/bench/rocm_mi300x_results.md` (raw harness JSON
+in `./etl/bench/rocm_mi300x_data/`); probes in this dir:
 `probe_rocm_raw_pjrt.py`, `probe_rocm_device_info.py`,
 `probe_rocm_teardown_minimal.py`, `probe_rocm_etl_pipeline.py`,
 `probe_rocm_tvm.py` — set `ETL_PJRT_PLUGIN` to the venv's
@@ -97,15 +99,16 @@ etl's vendored-header ABI gate (plugin `PJRT_Api.struct_size` = 1144 = the
 driver's `sizeof(PJRT_Api)`; API minor 115 vs the vendored 114 — appended
 fields only, no rejection/offset mismatch) and the raw driver probe is **7/7
 PASS** deterministically (discovery, dlopen/`GetPjrtApi`, initialize, client,
-`platform_name='rocm'`, compile, bit-exact execute). The full
-`etl.build(..., backend="xla")` pipeline runs with numpy parity both
-host-staged and device-resident; `pytest tests/backends/test_adapter_xla.py`
-passes 10/10 with this plugin. Two gaps: (a) `Device("rocm"/"hip", 0)` is
-REJECTED by the adapter's kind vocabulary (`etl/backends/adapters/xla.py:443`
-gate, `:452` index derivation, `:904` placement-provider kind check, `:962`
-provider registration) — the existing `"cuda"` label works on ROCm only because
-it is a dispatch label, so the follow-up is a platform-derived (or extended)
-kind set; (b) **the plugin corrupts the heap at process exit** — any process
+`platform_name='rocm'`, compile, bit-exact execute). `"rocm"` (alias `"hip"`) is
+a first-class accelerator device kind for the xla adapter: the kind is validated
+against the plugin's own `platform_name` (`xla.py` `_PLATFORM_KINDS`), a mismatch
+(e.g. `Device("cuda", 0)` on a ROCm plugin) is rejected rather than mislabelled,
+and the device-transfer provider is registered for every non-cpu kind
+(`"cuda"`/`"rocm"`/`"hip"`). So `etl.build(..., backend="xla")` + `etl.run` run
+with numpy parity host-staged and **device-resident on `Device("rocm", 0)`**,
+`Tensor.to(Device("rocm", N))` placement works, and
+`pytest tests/backends/test_adapter_xla.py` passes 10/10. The one runtime defect
+is **the plugin corrupts the heap at process exit** — any process
 that created a PJRT client aborts with `malloc_consolidate(): invalid chunk
 size` (SIGABRT 134, sometimes SIGSEGV 139) AFTER all work succeeds (no-client
 runs exit 0; `probe_rocm_teardown_minimal.py` reproduces it with **pure ctypes
@@ -122,15 +125,15 @@ additionally CPU-only by design (`adapters/tvm.py:304`).
 - MI300X/ROCm runs of anything touching a PJRT client abort at process exit
   (see the finding above) — read the PASS output, not the exit code; probe
   scripts that must exit cleanly use `os._exit(0)` or `--hard-exit`.
-- Device-transfer provider registration is per-backend and order-independent
-  (fixed in 55a1d2c): each adapter registers its `upload_tensor` under its own
-  `(kind, backend)` per-backend slot, `etl.backends.registry.get` records the
-  preferred transfer backend, and `Tensor.to` resolves the preferred slot
-  first, then the flat DEFAULT slot (`etl.backends`' lazy iree thunk), then
-  `DeviceError`. The old re-registration workaround is unnecessary.
-- The run boundary enforces device-resident inputs for cuda executables
-  (`core.DeviceError`, no implicit staging) — the same-device loop (feed each
-  run's device `Tensor` outputs back as next inputs) is the required fast
-  iteration pattern; host restaging costs ~0.8 ms per MB of state round trip.
+- Device-transfer provider registration is per-backend and order-independent:
+  each adapter registers its `upload_tensor` under its own `(kind, backend)`
+  per-backend slot, `etl.backends.registry.get` records the preferred transfer
+  backend, and `Tensor.to` resolves the preferred slot first, then the flat
+  DEFAULT slot (`etl.backends`' lazy iree thunk), then `DeviceError`.
+- The run boundary enforces device-resident inputs for non-cpu executables
+  (cuda/rocm/hip — `core.DeviceError`, no implicit staging) — the same-device
+  loop (feed each run's device `Tensor` outputs back as next inputs) is the
+  required fast iteration pattern; host restaging costs ~0.8 ms per MB of state
+  round trip.
 - Bash `for` loops + `set --` argument passing silently produced misnamed
   outputs in probe runs — use explicit per-invocation args or a Python driver.
