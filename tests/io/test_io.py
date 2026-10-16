@@ -50,6 +50,9 @@ from etl.core.tensor import (
 # ---------------------------------------------------------------------------
 # Fake device kinds + shared helpers
 # ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
 K_PREF = "fio_pref"        # registered flat-provider kind (prefetch target)
 K_SINK = "fio_sink"        # sink-source kind — payload-only, NEVER registered
 K_ABSENT = "fio_absent"    # never registered → provider DeviceError at wait()
@@ -176,6 +179,16 @@ def _wait_until(predicate, timeout, message):
         time.sleep(0.002)
 
 
+def _run_python_snippet(code, timeout=60):
+    """Run ``code`` in a fresh interpreter with the repo root importable."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        env=env, timeout=timeout,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _drain_outstanding():
     """Every test leaves the process-global worker drained (no bleed-over).
@@ -195,12 +208,15 @@ def _drain_outstanding():
 # 1. Module surface / API shape
 # ---------------------------------------------------------------------------
 class TestModuleSurface:
-    """Public surface of ``etl.io``. The pristine-state pins below hold only
+    """Public surface of ``etl.io``. The pristine-state pin below holds only
     while no copy was scheduled yet in the process: file order guarantees
     that within this file's own run, but an earlier suite in a full-process
     run (tests/backends/ collects before tests/io/) may already have started
-    the process-global worker — those pins skip then (they still run green
-    in an isolated `pytest tests/io/` run)."""
+    the process-global worker — that pin skips then (it still runs green in
+    an isolated `pytest tests/io/` run). The no-iree pin is NOT
+    process-state dependent: it is verified in a fresh subprocess
+    interpreter.
+    """
 
     @staticmethod
     def _require_pristine_process():
@@ -218,11 +234,20 @@ class TestModuleSurface:
 
     def test_import_pulls_no_iree(self):
         # Module imports are stdlib + etl.core only; iree.runtime is imported
-        # lazily inside the worker's CUDA-context bootstrap and only for
-        # non-cpu-kind copies.
-        self._require_pristine_process()
-        assert io._worker_thread is None
-        assert "iree" not in sys.modules
+        # lazily inside the worker's non-cpu-context bootstrap and only for
+        # non-cpu-kind copies. Pinned in a FRESH interpreter so the check is
+        # independent of this process's import history: an earlier suite
+        # (e.g. tests/core/test_device.py) may already have pulled
+        # iree.runtime in via etl.core.devices()'s ROCm probe, and this
+        # file's own fake-kind copies trigger the worker's lazy import.
+        code = (
+            "import sys\n"
+            "import etl.io\n"
+            "bad = sorted(m for m in sys.modules if m == 'iree' or m.startswith('iree.'))\n"
+            "assert not bad, bad\n"
+        )
+        proc = _run_python_snippet(code)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
 
     def test_initial_module_state(self):
         self._require_pristine_process()
@@ -337,7 +362,8 @@ class TestScheduleTimeValidation:
 # ---------------------------------------------------------------------------
 class TestHandleApiAndSuccessFlows:
     """First scheduled copies in the process (the worker lazily starts here;
-    the non-cpu kind also triggers-and-swallows the lazy CUDA bootstrap)."""
+    the non-cpu kind also triggers-and-swallows the lazy CUDA/ROCm
+    bootstrap)."""
 
     def test_prefetch_handle_done_transitions_and_sink_roundtrip(self):
         cfg = {"seen": [], "delay": 0.3}
@@ -830,9 +856,6 @@ class TestPerBackendProviderSlot:
 # ---------------------------------------------------------------------------
 # 11. Interpreter exit never hangs (group 5b; subprocess pins)
 # ---------------------------------------------------------------------------
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
-
 # Child 1: a 30 s copy is in flight; os._exit(0) must return immediately
 # (skips atexit — the daemon worker dies with the process, nothing is
 # joined). Exit code 0 well before the copy would have finished proves the
@@ -900,13 +923,8 @@ if not STARTED.wait(timeout=10.0):
 class TestInterpreterExitNeverHangs:
 
     def _run_child(self, code, timeout):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
         t0 = time.monotonic()
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True, text=True, timeout=timeout, env=env,
-        )
+        proc = _run_python_snippet(code, timeout=timeout)
         return proc, time.monotonic() - t0
 
     def test_os_exit_with_inflight_copy_never_blocks(self):
