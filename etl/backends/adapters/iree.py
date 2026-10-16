@@ -86,8 +86,11 @@ imported at module top level, so ``import etl`` stays light):
   placement is the explicit ``t.to(Device('cuda'|'rocm', N))`` first (see
   ``upload_tensor``), and a non-device input at a GPU run is rejected with
   ``core.DeviceError``. Host-mode external-kernel boundaries still stage
-  host tensors at kernel boundaries via ``_staged_input`` (cuda segment
-  executables; a rocm segment uses ``asdevicearray``, the same fallback).
+  host tensors at kernel boundaries via ``_staged_input`` (cuda AND rocm
+  segment executables each have their own persistent staging cache — see
+  ``_staged_input`` for the two per-kind fast paths);
+  ``rt.asdevicearray`` remains the fallback for oversized/unmappable inputs
+  and for any failure on a kind's fast path.
 - ``DeviceArray`` (``iree.runtime.DeviceArray``) — a HAL buffer-view
   handle, already resident on the device. Run outputs are wrapped into
   ``core.Tensor(IreeDevicePayload(...))`` — device-resident tensors whose
@@ -142,6 +145,7 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -231,6 +235,20 @@ _STAGED_INPUT_MAX_BYTES = 16 * 1024 * 1024  # larger inputs keep asdevicearray
 # pinned tier is both faster than the DMA tier AND immune to its race.
 _PINNED_DIRECT_MAX_BYTES = 4 * 1024
 _STAGED_INPUT_CACHE_MAX = 64  # bounded per (index, shape, dtype) cache
+# ROCm/HIP staging (see ``_rocm_staged_input``): the reusable host-source
+# buffer cache is THREAD-LOCAL and bounded separately (host-pinned buffers
+# are more expensive to hold than the per-executable device staging buffers,
+# so the bound is tighter).
+_ROCM_SOURCE_CACHE_MAX = 16
+# THREAD-LOCAL HAL device cache for the placement provider's rocm path (see
+# ``_acquire_cached_rocm_device``). Thread-local is REQUIRED: HAL devices are
+# thread-affine (Known Issue #12 in ``./CONTEXT.md``), so a process-global
+# cache would hand the ``etl.io`` worker thread a device created on another
+# thread and break it.
+_HAL_DEVICE_CACHE = threading.local()
+# THREAD-LOCAL reusable host-source buffers for the rocm staging path,
+# keyed by (shape, dtype) with the owning runtime device checked by identity.
+_ROCM_SOURCE = threading.local()
 
 # ---------------------------------------------------------------------------
 # Compile-flag policy (the options-override contract — see ../options.py)
@@ -530,6 +548,45 @@ def _acquire_runtime_device(
             ) from exc
     driver = rt.get_driver("local-task")
     return driver.create_default_device()
+
+
+def _acquire_cached_rocm_device(device: Device, runtime_args: list[str]) -> Any:
+    """Acquire (or reuse) ONE ROCm/HIP HAL device per thread.
+
+    ``driver.create_device`` measured ~46 ms per call on the ROCm HIP driver
+    (IREE 3.11.0 / MI300X) and does NOT warm up, so a fresh device per
+    ``upload_tensor`` made every rocm placement pay ~34-40 ms of pure setup
+    on top of the copy. This cache reuses the device across uploads on the
+    SAME THREAD, keyed by ``(normalized kind, device index, runtime args)``.
+
+    THREAD-LOCAL IS REQUIRED (not an optimization choice): CUDA/ROCm HAL
+    devices are THREAD-AFFINE — the ``etl.io`` worker thread separately calls
+    ``upload_tensor`` for ``prefetch`` and must get a device it created
+    itself (see Known Issue #12 in ``./CONTEXT.md`` and
+    ``etl/io.py::_bootstrap_worker_context``). A process-global cache would
+    hand the worker a device created on another thread and break every copy
+    scheduled through it. The cached devices are referenced for process
+    lifetime (the thread-local dict holds them), exactly like the worker's
+    ``_bootstrap_devices``.
+
+    Only the rocm/hip kind routes through here (``upload_tensor``);
+    ``load()`` and the cuda placement path keep their existing per-call
+    ``_acquire_runtime_device`` strategy.
+    """
+    cache = getattr(_HAL_DEVICE_CACHE, "devices", None)
+    if cache is None:
+        cache = {}
+        _HAL_DEVICE_CACHE.devices = cache
+    key = ("rocm", device.index, tuple(runtime_args))
+    runtime_device = cache.get(key)
+    if runtime_device is None:
+        # Same acquisition path load() uses ("hip" driver + 1-based
+        # device_id = index + 1), with the same ValueError ->
+        # core.BackendError surfacing; flags are applied by the caller
+        # (``upload_tensor``) exactly as before.
+        runtime_device = _acquire_runtime_device("rocm", device, runtime_args)
+        cache[key] = runtime_device
+    return runtime_device
 
 
 def _load_vm_module(vmfb: bytes, device_kind: str, runtime_device: Any) -> Any:
@@ -1413,13 +1470,13 @@ class IreeBackend(CompilerBackend):
                     runtime_device=runtime_device,
                     core_device=core_device,
                     input_specs=input_specs,
-                    # The per-call staging fast path (persistent
-                    # pinned/DMA buffers) is enabled for the cuda kind only;
-                    # a rocm segment takes the generic asdevicearray upload
-                    # path for host-mode external-kernel boundaries (a
-                    # correct, if unoptimized, upload — see the class
-                    # docstring).
-                    cuda=(device_kind == "cuda"),
+                    # The per-call staging fast path (persistent staging
+                    # buffers) is enabled for every GPU kind: cuda uses the
+                    # two-tier pinned/DMA machinery, rocm the host-local
+                    # source + queue_copy path (both far cheaper than the
+                    # generic asdevicearray upload a host-mode boundary
+                    # would otherwise pay per kernel call).
+                    device_kind=device_kind,
                 )
             )
         return IreeExternalExecutable(
@@ -1592,6 +1649,7 @@ class IreeExecutable(CompilerExecutable):
             self._core_device,
             None,  # plain runs never stage
             reject_foreign=self._core_device.kind != "cpu",
+            device_kind=_normalize_device_kind(self._core_device.kind),
         )
         entry = self._entry_function()
         results = entry(*buffers)
@@ -1680,6 +1738,7 @@ def _staged_input(
     runtime_device: Any,
     index: int,
     tensor: core.Tensor,
+    device_kind: str = "cuda",
 ) -> Any | None:
     """Upload a host tensor through staging buffers (segment boundaries + placement).
 
@@ -1689,6 +1748,15 @@ def _staged_input(
     stage host tensors at kernel boundaries, and (b) the ``upload_tensor``
     placement provider, which passes a FRESH per-call staging dict so every
     upload uses fresh buffers (one-shot, no cache).
+
+    The staging fast path is chosen by the NORMALIZED device kind
+    (``device_kind``): ``"cuda"`` takes the two-tier pinned/DMA path below,
+    ``"rocm"`` takes ``_rocm_staged_input`` (host-local source + queue_copy,
+    the same shapes, wired for the hip HAL driver). Both are fully
+    synchronous. Anything the selected path cannot handle — oversized
+    inputs, unmappable dtypes, or ANY failure on the fast path — returns
+    ``None`` so the caller falls back to ``rt.asdevicearray`` (semantics
+    identical either way).
 
     CUDA fast path replacing ``rt.asdevicearray`` for host tensors, in
     two tiers (both fully synchronous — nothing is left racing):
@@ -1746,6 +1814,17 @@ def _staged_input(
     element_type = map_dtype_to_element_type(dtype)
     if element_type is None:
         return None
+    if device_kind == "rocm":
+        return _rocm_staged_input(
+            staged_inputs,
+            runtime_device,
+            index,
+            tensor,
+            shape,
+            dtype,
+            element_type,
+            nbytes,
+        )
     key = (index, shape, dtype)
     cached = staged_inputs.get(key)
     if cached is not None:
@@ -1816,6 +1895,130 @@ def _staged_input(
     return staging_da
 
 
+def _rocm_source_buffer(
+    runtime_device: Any, shape: tuple, dtype: Any, nbytes: int
+) -> tuple[Any, Any]:
+    """Return a reusable THREAD-LOCAL host source buffer for the rocm path.
+
+    ``_rocm_staged_input`` memcpy's current host values into the mapped view
+    of a ``HOST_LOCAL | DEVICE_VISIBLE`` (``TRANSFER_SOURCE | MAPPING``)
+    buffer and then ``queue_copy``s it to the device. The SOURCE buffer is
+    safe to reuse across calls (runs are synchronous), and reusing it avoids
+    a per-call mapped-buffer allocation — the same idea as the cuda DMA
+    tier's persistent ``hl_buf``/``hl_view``, but shared across rocm
+    uploads on the thread instead of per executable (the one-shot placement
+    path has no per-executable cache to hang it off).
+
+    THREAD-LOCAL because the mapped buffer and the HAL device that owns it
+    are both thread-affine (``etl.io``'s worker thread uploads separately);
+    keyed by ``(shape, dtype)`` with the owning runtime device checked by
+    IDENTITY so a thread that talks to two devices never reuses across them.
+    Bounded at ``_ROCM_SOURCE_CACHE_MAX`` entries (a bounded cache; clearing
+    it is performance-neutral, never a correctness change).
+    """
+    cache = getattr(_ROCM_SOURCE, "buffers", None)
+    if cache is None:
+        cache = {}
+        _ROCM_SOURCE.buffers = cache
+    entry = cache.get((shape, dtype))
+    if entry is not None and entry[0] is runtime_device:
+        return entry[1], entry[2]
+    import numpy as np
+    import iree.runtime as rt
+
+    buf = runtime_device.allocator.allocate_buffer(
+        rt.MemoryType.HOST_LOCAL | rt.MemoryType.DEVICE_VISIBLE,
+        rt.BufferUsage.TRANSFER_SOURCE | rt.BufferUsage.MAPPING,
+        nbytes,
+    )
+    view = buf.map().asarray(shape, np.dtype(dtype))
+    if len(cache) >= _ROCM_SOURCE_CACHE_MAX:
+        cache.clear()
+    cache[(shape, dtype)] = (runtime_device, buf, view)
+    return buf, view
+
+
+def _rocm_staged_input(
+    staged_inputs: dict,
+    runtime_device: Any,
+    index: int,
+    tensor: core.Tensor,
+    shape: tuple,
+    dtype: Any,
+    element_type: Any,
+    nbytes: int,
+) -> Any | None:
+    """ROCm/HIP staging fast path replacing ``rt.asdevicearray``.
+
+    The hip HAL driver offers no mapped DEVICE_LOCAL host-write path that
+    matches the cuda pinned tier's cost, so rocm uses a single-tier
+    equivalent of the cuda DMA tier, measured on IREE 3.11.0 / MI300X:
+
+    * the values are memcpy'd (``np.copyto``) into the mapped view of a
+      reusable THREAD-LOCAL ``HOST_LOCAL | DEVICE_VISIBLE`` source buffer
+      (see ``_rocm_source_buffer`` — a plain cached memcpy), then a
+      per-call ``queue_copy`` transfers them into a ``DEVICE_LOCAL``
+      destination, waiting on a FRESH semaphore via the shared
+      query-first ``_wait_copy_semaphore`` before returning.
+
+    The fresh semaphore and the wait are LOAD-BEARING, exactly as on cuda
+    (reusing a waited event-semaphore aborts the HAL; and the copy is not
+    guaranteed to be ordered ahead of the invoke's dispatches — the wait is
+    what makes the staging synchronous).
+
+    Destination lifetime: for the SEGMENT executables the ``DEVICE_LOCAL``
+    destination is cached per ``(index, shape, dtype)`` in the caller's
+    ``staged_inputs`` (persistent, like the cuda tiers). For the ONE-SHOT
+    ``upload_tensor`` placement the caller passes a FRESH dict, so the
+    destination is FRESH every call — the returned ``core.Tensor`` owns its
+    buffer and must never share it with a later upload.
+
+    Returns ``None`` (caller falls back to ``rt.asdevicearray``, semantics
+    identical) on ANY failure of the fast path — a hip HAL that lacks one of
+    the primitives, an unmappable buffer, or a host-materialization error
+    other than an explicit ``core.ETLError`` (which always propagates: it is
+    the documented no-implicit-transfer error and the fallback would re-raise
+    it anyway).
+    """
+    import numpy as np
+    import iree.runtime as rt
+
+    try:
+        src_buf, src_view = _rocm_source_buffer(
+            runtime_device, shape, dtype, nbytes
+        )
+        np.copyto(src_view, tensor.numpy())
+        key = (index, shape, dtype)
+        dest = staged_inputs.get(key)
+        if dest is None:
+            if len(staged_inputs) >= _STAGED_INPUT_CACHE_MAX:
+                staged_inputs.clear()  # bounded cache; correctness unaffected
+            dest_buf = runtime_device.allocator.allocate_buffer(
+                rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, nbytes
+            )
+            dest = rt.DeviceArray(
+                runtime_device,
+                rt.HalBufferView(dest_buf, shape, element_type),
+                implicit_host_transfer=False,
+                override_dtype=dtype,
+            )
+            staged_inputs[key] = dest
+        sem = runtime_device.create_semaphore(0)
+        runtime_device.queue_copy(
+            src_buf,
+            dest._buffer_view.get_buffer(),
+            rt.HalFence.create_at(sem, 0),
+            rt.HalFence.create_at(sem, 1),
+        )
+        _wait_copy_semaphore(sem)
+        return dest
+    except core.ETLError:
+        raise
+    except Exception:
+        # Fall back to rt.asdevicearray — same bytes, same semantics.
+        return None
+
+
 def _build_buffers(
     flat_input_tensors: list[core.Tensor],
     input_specs: tuple,
@@ -1824,6 +2027,7 @@ def _build_buffers(
     staged_inputs: dict | None,
     *,
     reject_foreign: bool = False,
+    device_kind: str = "cuda",
 ) -> list:
     """Build the HAL buffers for one invoke from validated input tensors.
 
@@ -1847,8 +2051,9 @@ def _build_buffers(
       message; place inputs explicitly via ``t.to(Device('cuda'|'rocm', N))``).
     * segment executables pass their per-segment staging cache
       (``reject_foreign=False``): host-mode external-kernel boundaries
-      legitimately stage host tensors via ``_staged_input`` on cuda, else
-      the asdevicearray fallback (non-cuda, incl. rocm).
+      legitimately stage host tensors via ``_staged_input`` on cuda and rocm
+      (``device_kind`` selects the kind's fast path), else the asdevicearray
+      fallback (non-GPU kinds, llvm-cpu).
     """
     import numpy as np
     import iree.runtime as rt
@@ -1880,7 +2085,9 @@ def _build_buffers(
                 "llvm-cpu device with host ndarray inputs"
             )
         elif staged_inputs is not None:
-            staged = _staged_input(staged_inputs, runtime_device, i, tensor)
+            staged = _staged_input(
+                staged_inputs, runtime_device, i, tensor, device_kind
+            )
             if staged is not None:
                 buffers.append(staged)
                 continue
@@ -1904,12 +2111,13 @@ class _IreeSegmentExecutable:
     device-resident output wrapping (shared helpers), against the segment's
     own input specs.
 
-    The ``cuda`` flag enables the per-call persistent staging fast path
-    (pinned/DMA tiers + the pool anchor) used when a host-mode external
-    kernel's boundary stages host tensors; on the rocm/hip kind a host-mode
-    boundary uploads through the generic ``rt.asdevicearray`` path instead
-    (correct — the same representation an llvm-cpu segment uses — but with
-    no persistent staging buffers).
+    The ``device_kind`` (the NORMALIZED kind — ``"hip"`` already folded to
+    ``"rocm"``) enables the per-call persistent staging fast path used when
+    a host-mode external kernel's boundary stages host tensors: the cuda
+    two-tier pinned/DMA path (+ the pool anchor) for ``"cuda"``, the rocm
+    host-local source + queue_copy path for ``"rocm"``. ``llvm-cpu``
+    segments keep ``_staged_inputs=None`` and stage through the generic
+    ``rt.asdevicearray`` representation (host->host ABI adaptation).
     """
 
     def __init__(
@@ -1918,30 +2126,35 @@ class _IreeSegmentExecutable:
         runtime_device: Any,
         core_device: Device,
         input_specs: tuple,
-        cuda: bool,
+        device_kind: str,
     ) -> None:
         self.module = module
         self.runtime_device = runtime_device
         self.core_device = core_device
         self.input_specs = input_specs
+        self.device_kind = device_kind
         self._entry: Any = None
-        # CUDA-only per-call fast path (R6.2: removed from the plain
-        # IreeExecutable — retained HERE, one cache per segment, because
-        # host-mode external-kernel boundaries legitimately stage host
-        # tensors at kernel boundaries): the same two-tier persistent
-        # staging machinery as the placement provider's one-shot uploads.
+        # Per-call fast path (R6.2: removed from the plain IreeExecutable —
+        # retained HERE, one cache per segment, because host-mode
+        # external-kernel boundaries legitimately stage host tensors at
+        # kernel boundaries): the kind's persistent staging machinery, the
+        # same one the placement provider's one-shot uploads use.
         self._staged_inputs: dict | None = None
         self._pool_anchor: Any = None
-        if cuda:
-            import iree.runtime as rt
-
+        if device_kind in _GPU_DEVICE_KINDS:
             self._staged_inputs = {}
-            try:
-                self._pool_anchor = runtime_device.allocator.allocate_buffer(
-                    rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
-                )
-            except Exception:
-                self._pool_anchor = None  # best-effort perf anchor, never fatal
+            if device_kind == "cuda":
+                # cuda-only classic-allocator pool anchor (see the staging
+                # notes at the top of this module) — the rocm path needs no
+                # anchor.
+                import iree.runtime as rt
+
+                try:
+                    self._pool_anchor = runtime_device.allocator.allocate_buffer(
+                        rt.MemoryType.DEVICE_LOCAL, rt.BufferUsage.DEFAULT, 4096
+                    )
+                except Exception:
+                    self._pool_anchor = None  # best-effort perf anchor, no-op
 
     def _entry_function(self) -> Any:
         """Resolve the segment's "main" entry function (cached once)."""
@@ -1982,6 +2195,7 @@ class _IreeSegmentExecutable:
             self.runtime_device,
             self.core_device,
             self._staged_inputs,
+            device_kind=self.device_kind,
         )
         results = self._entry_function()(*buffers)
         if results is None:
@@ -2388,22 +2602,25 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
     2. Runtime flags: ``ETL_IREE_RUNTIME_ARGS`` is honored exactly like
        ``load`` does (same env parsing via ``_runtime_args_from_env``; loud
        parse errors) so placement respects process-global HAL flags.
-    3. HAL device: acquired through ``_acquire_runtime_device`` — the same
-       path ``load`` uses (``"hip"`` driver + 1-based ``device_id =
-       index + 1`` for rocm). Each call acquires a FRESH HAL device
-       instance; feeding such buffers into a separately-loaded executable
-       on the same physical device works (iree accepts same-physical-device
-       buffers across instances — verified empirically, see the R6.4 note
-       in ``etl/backends/adapters/CONTEXT.md``), so no process-wide instance
-       cache exists.
-    4. Upload: a ONE-SHOT host->device copy. On cuda that is
-       ``_staged_input`` with a FRESH per-call staging dict (fresh buffers,
-       no cache) — the correctness-pinned pinned/DMA tiers (the DMA tier's
-       fresh-semaphore wait is load-bearing) — falling back to
-       ``rt.asdevicearray`` for oversized/unmappable inputs. On rocm the
-       copy is ``rt.asdevicearray`` directly: the pinned/DMA staging tiers
-       are built on the cuda HAL's host-mapped/queue_copy machinery and are
-       not wired for the hip driver.
+    3. HAL device: cuda keeps acquiring a FRESH HAL device instance per call
+       through ``_acquire_runtime_device`` (the same path ``load`` uses;
+       feeding such buffers into a separately-loaded executable on the same
+       physical device works — iree accepts same-physical-device buffers
+       across instances, verified empirically, see the R6.4 note in
+       ``etl/backends/adapters/CONTEXT.md``). rocm instead reuses ONE
+       THREAD-LOCAL HAL device per ``(index, runtime args)``
+       (``_acquire_cached_rocm_device``): the hip driver's ``create_device``
+       measured ~46 ms per call and does not warm up, so a fresh device per
+       placement was the dominant cost of every rocm upload. The cache is
+       thread-local because HAL devices are thread-affine (the ``etl.io``
+       worker thread uploads separately and must get its own device).
+    4. Upload: a ONE-SHOT host->device copy through ``_staged_input`` with a
+       FRESH per-call staging dict (fresh DESTINATION buffers, no cache —
+       the returned tensor owns its buffer): the correctness-pinned
+       pinned/DMA tiers on cuda (the DMA tier's fresh-semaphore wait is
+       load-bearing), the host-local-source + queue_copy path on rocm — both
+       falling back to ``rt.asdevicearray`` for oversized/unmappable inputs
+       or any failure on the fast path.
     5. Wrap the resulting ``DeviceArray`` in ``IreeDevicePayload``.
 
     Failures surface as ``core.DeviceError`` / ``core.BackendError`` with an
@@ -2439,11 +2656,18 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
             "t.to(core.Device('cpu', 0)) first, then .to(target)."
         )
     # Runtime flags exactly like load (env ETL_IREE_RUNTIME_ARGS; loud
-    # parse errors), then the same HAL-device acquisition path.
+    # parse errors), then the HAL-device acquisition: cuda keeps the
+    # fresh-per-call path, rocm reuses one THREAD-LOCAL device
+    # (create_device measured ~46 ms per call on the hip driver).
     runtime_args = _runtime_args_from_env()
     _apply_iree_runtime_args(runtime_args)
     try:
-        runtime_device = _acquire_runtime_device(device_kind, device, runtime_args)
+        if device_kind == "rocm":
+            runtime_device = _acquire_cached_rocm_device(device, runtime_args)
+        else:
+            runtime_device = _acquire_runtime_device(
+                device_kind, device, runtime_args
+            )
     except core.ETLError:
         raise
     except Exception as exc:
@@ -2452,15 +2676,14 @@ def upload_tensor(tensor: core.Tensor, device: Device) -> core.Tensor:
             f"for {device!r} (the {IreeBackend.name} placement provider): "
             f"{exc}"
         ) from exc
-    # One-shot upload: a FRESH staging dict per call (fresh buffers, no
-    # cache — the pinned/DMA tiers with the load-bearing fresh-semaphore
-    # wait) on cuda, falling back to asdevicearray for oversized/unmappable
-    # inputs; asdevicearray directly on rocm (the staging tiers are
-    # cuda-only HAL machinery).
+    # One-shot upload: a FRESH staging dict per call, so the DESTINATION
+    # buffer is fresh every time (the returned tensor owns it) while the
+    # reusable SOURCE machinery is the kind's fast path (pinned/DMA on cuda
+    # with the load-bearing fresh-semaphore wait; host-local source +
+    # queue_copy on rocm). Falls back to asdevicearray for
+    # oversized/unmappable inputs or any failure on the fast path.
     try:
-        staged = None
-        if device_kind == "cuda":
-            staged = _staged_input({}, runtime_device, 0, tensor)
+        staged = _staged_input({}, runtime_device, 0, tensor, device_kind)
         if staged is None:
             staged = rt.asdevicearray(runtime_device, tensor.numpy())
     except core.ETLError:
