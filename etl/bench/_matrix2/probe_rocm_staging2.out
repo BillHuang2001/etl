@@ -1,0 +1,81 @@
+=== (a) host->device upload: etl.tensor(np.zeros(n, f32)).to(rocm:0) ===
+  full expr etl.tensor+to  n=1000 (4 KB)               best=  0.0520 ms  median=  0.0543 ms
+  .to(rocm) alone        n=1000 (4 KB)                 best=  0.0497 ms  median=  0.0511 ms
+  full expr etl.tensor+to  n=1000000 (3906 KB)         best=  0.4261 ms  median=  0.4385 ms
+  .to(rocm) alone        n=1000000 (3906 KB)           best=  0.4221 ms  median=  0.4261 ms
+  4 KB  bit-exact round-trip: True
+  4 MB  bit-exact round-trip: True
+
+=== (b)/(c) `matmul` example on iree/rocm:0 ===
+  resolved options: {'target_backends': "['rocm']", 'opt_level': "'O3'"}
+  correctness: max_abs=0 vs numpy ref
+  (b) harness pattern place+run (run_fn)               best=  0.1775 ms  median=  0.1817 ms
+  (b') place+run+readback (.to(cpu))                   best=  0.2671 ms  median=  0.2781 ms
+     placement only (etl.tensor+to x2)                 best=  0.1013 ms  median=  0.1033 ms
+     readback only (D2H x1, .to(cpu))                  best=  0.0693 ms  median=  0.0747 ms
+  (c) run only, device-resident in+out                 best=  0.0584 ms  median=  0.0609 ms
+
+=== compact table ===
+  case                                              best ms  median ms
+  full expr etl.tensor+to  n=1000 (4 KB)             0.0520     0.0543
+  .to(rocm) alone        n=1000 (4 KB)               0.0497     0.0511
+  full expr etl.tensor+to  n=1000000 (3906 KB)       0.4261     0.4385
+  .to(rocm) alone        n=1000000 (3906 KB)         0.4221     0.4261
+  (b) harness pattern place+run (run_fn)             0.1775     0.1817
+  (b') place+run+readback (.to(cpu))                 0.2671     0.2781
+     placement only (etl.tensor+to x2)               0.1013     0.1033
+     readback only (D2H x1, .to(cpu))                0.0693     0.0747
+  (c) run only, device-resident in+out               0.0584     0.0609
+
+Prior (pre-fix) reference numbers: 4 KB ~0.05 ms, 4 MB ~0.43 ms, (b) ~0.28 ms
+PROBE_DONE
+nanobind: leaked 190 instances!
+nanobind: leaked 189 keep_alive records!
+nanobind: leaked 5 types!
+ - leaked type "iree._runtime_libs._runtime.HalBuffer"
+ - leaked type "iree._runtime_libs._runtime.MappedMemory"
+ - leaked type "iree._runtime_libs._runtime.HalDevice"
+ - leaked type "iree._runtime_libs._runtime.HalAllocator"
+ - leaked type "iree._runtime_libs._runtime.HalDriver"
+nanobind: leaked 39 functions!
+ - leaked function "dump_device_info"
+ - leaked function "__repr__"
+ - leaked function "create_semaphore"
+ - leaked function "create_device"
+ - leaked function "allocate_buffer_copy"
+ - leaked function "__repr__"
+ - leaked function ""
+ - leaked function "create_device_by_uri"
+ - leaked function "map"
+ - leaked function "create_view"
+ - leaked function ""
+ - leaked function "queue_execute"
+ - leaked function ""
+ - leaked function "asarray"
+ - leaked function "queue_alloca"
+ - leaked function "create_default_device"
+ - leaked function "queue_copy"
+ - leaked function "__iree_vm_type__"
+ - leaked function "__eq__"
+ - leaked function ""
+ - leaked function "query"
+ - leaked function "from_dlpack_capsule"
+ - leaked function ""
+ - leaked function "allocate_buffer"
+ - leaked function "begin_profiling"
+ - leaked function "byte_length"
+ - leaked function "trim"
+ - leaked function "memory_type"
+ - leaked function "create_dlpack_capsule"
+ - leaked function "fill_zero"
+ - leaked function ""
+ - leaked function "allocate_host_staging_buffer_copy"
+ - leaked function "flush_profiling"
+ - leaked function "query_available_devices"
+ - leaked function "end_profiling"
+ - leaked function "queue_dealloca"
+ - leaked function "__iree_vm_cast__"
+ - leaked function "allowed_usage"
+ - leaked function "query_buffer_compatibility"
+nanobind: this is likely caused by a reference counting issue in the binding code.
+See https://nanobind.readthedocs.io/en/latest/refleaks.html
