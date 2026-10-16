@@ -123,7 +123,10 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
         )
     message = str(excinfo.value)
     assert "the iree backend does not recognize the compile option 'bogus'" in message
-    assert "lower: rng_bit_generator, sort_emission, while_init_rewrite" in message
+    assert (
+        "lower: dot_precision, rng_bit_generator, sort_emission, while_init_rewrite"
+        in message
+    )
     assert "compile: iree_compile_args, opt_level, target_backends" in message
     assert "load: iree_runtime_args" in message
     assert "run: (none)" in message
@@ -150,7 +153,12 @@ def test_adapter_known_options_declarations():
     contract)."""
     assert iree_adapt.IreeBackend.KNOWN_OPTIONS == {
         "lower": frozenset(
-            {"rng_bit_generator", "sort_emission", "while_init_rewrite"}
+            {
+                "dot_precision",
+                "rng_bit_generator",
+                "sort_emission",
+                "while_init_rewrite",
+            }
         ),
         "compile": frozenset(
             {"target_backends", "iree_compile_args", "opt_level"}
@@ -159,7 +167,7 @@ def test_adapter_known_options_declarations():
         "run": frozenset(),
     }
     assert xla_adapt.XlaBackend.KNOWN_OPTIONS == {
-        "lower": frozenset({"rng_bit_generator"}),
+        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
         "compile": frozenset(
             {"plugin_path", "xla_compile_options", "opt_level"}
         ),
@@ -167,7 +175,7 @@ def test_adapter_known_options_declarations():
         "run": frozenset(),
     }
     assert tvm_adapt.TvmBackend.KNOWN_OPTIONS == {
-        "lower": frozenset({"rng_bit_generator"}),
+        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
         "compile": frozenset(
             {"tvm_target", "tvm_pass_configs", "opt_level"}
         ),
