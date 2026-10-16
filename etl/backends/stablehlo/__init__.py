@@ -65,7 +65,20 @@ def export(graph_or_module, options: dict | None = None) -> str:
             is known-broken on iree-cuda at invoke (deterministic dealloca
             ``INVALID_ARGUMENT`` at n=10, SIGSEGV at n=50, under BOTH
             allocators) — hence the default is OFF; option-on remains
-            available as an llvm-cpu opt-in.
+            available as an llvm-cpu opt-in. ``dot_precision`` selects the
+            precision hint emitted on every ``stablehlo.dot_general`` op:
+            ``"DEFAULT"`` (also used when the key is absent or ``None``;
+            case-insensitive) emits NO ``precision_config`` attribute —
+            byte-identical to the pre-option output — while ``"HIGH"`` /
+            ``"HIGHEST"`` emit ``precision_config = [#stablehlo<precision
+            <CFG>>, #stablehlo<precision <CFG>>]`` (one entry per operand)
+            on EVERY dot shape (batched / non-batched / broadcast /
+            size-1-squeezed). ``"HIGHEST"`` is the value that disables
+            TF32-class reduced-precision fp32 matmul on XLA (measured on a
+            real ROCm PJRT plugin: max-abs error vs fp64 0.1228 ->
+            0.000203 at n=1024); ``"HIGH"`` does NOT help there. Any other
+            value raises `core.BackendError` naming the option, the
+            offending value, and the accepted forms.
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external

@@ -180,6 +180,29 @@ def _normalize_sort_emission(value) -> str:
     return value
 
 
+_DOT_PRECISION_MODES = ("DEFAULT", "HIGH", "HIGHEST")
+
+
+def _normalize_dot_precision(value) -> str:
+    """Validate the ``dot_precision`` exporter option (see
+    ``Writer.__init__``): ``"DEFAULT"`` | ``"HIGH"`` | ``"HIGHEST"``
+    (case-insensitive, whitespace-stripped; ``None`` -> ``"DEFAULT"``)."""
+    if value is None:
+        return "DEFAULT"
+    if not isinstance(value, str):
+        raise BackendError(
+            f"stablehlo export: invalid dot_precision option {value!r} "
+            f"(expected one of {', '.join(_DOT_PRECISION_MODES)})"
+        )
+    mode = value.strip().upper()
+    if mode not in _DOT_PRECISION_MODES:
+        raise BackendError(
+            f"stablehlo export: invalid dot_precision option {value!r} "
+            f"(expected one of {', '.join(_DOT_PRECISION_MODES)})"
+        )
+    return mode
+
+
 class Writer:
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
@@ -237,6 +260,18 @@ class Writer:
         #: ``IreeBackend._exporter_options``).
         self._sort_emission = _normalize_sort_emission(
             (options or {}).get("sort_emission", "pair")
+        )
+        #: dot_precision exporter option (``"DEFAULT"`` | ``"HIGH"`` |
+        #: ``"HIGHEST"``, case-insensitive; default ``"DEFAULT"``): when
+        #: not ``"DEFAULT"``, every emitted ``stablehlo.dot_general`` op
+        #: carries a ``precision_config = [#stablehlo<precision <CFG>>,
+        #: #stablehlo<precision <CFG>>]`` attribute (one entry per operand).
+        #: ``"HIGHEST"`` disables TF32-class reduced-precision fp32 matmul
+        #: on XLA/ROCm (measured: max-abs error vs fp64 0.1228 -> 0.000203
+        #: at n=1024; ``"HIGH"`` does NOT help there). ``"DEFAULT"`` emits
+        #: NO attribute — byte-identical to the pre-option output.
+        self._dot_precision = _normalize_dot_precision(
+            (options or {}).get("dot_precision", "DEFAULT")
         )
         #: Ops already emitted at a hoisted position (by ``_emit_if``'s
         #: while-in-if workaround, see ``_hoist_if_branch_whiles``): their
@@ -3403,9 +3438,20 @@ class Writer:
         elem_dtype = np.dtype(a.type.dtype)
         dot_type = self._type_str(elem_dtype, op.result.type.shape)
         dot_name = self._new_name()
+        # ``attribute_config`` is empty in the default case (byte-identical
+        # output); with a non-default ``dot_precision`` every dot carries the
+        # per-operand precision hint (one entry per operand).
+        if self._dot_precision == "DEFAULT":
+            precision_attr = ""
+        else:
+            precision_attr = (
+                f"precision_config = [#stablehlo<precision "
+                f"{self._dot_precision}>, #stablehlo<precision "
+                f"{self._dot_precision}>], "
+            )
         lines.append(
             f'{dot_name} = "stablehlo.dot_general"({a_name}, '
-            f"{b_name}) {{dot_dimension_numbers = {dnums}}} : "
+            f"{b_name}) {{{precision_attr}dot_dimension_numbers = {dnums}}} : "
             f"({self._type_str(a.type.dtype, a_shape)}, "
             f"{self._type_str(b.type.dtype, b_shape)}) -> "
             f"{dot_type}"
