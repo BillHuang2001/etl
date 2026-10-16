@@ -2,8 +2,9 @@
 
 The harness resolves the backend options dict passed to ``etl.build`` (and to
 every ``Example.runner`` factory): the device-derived ``target_backends``
-default for every non-numpy backend, and the ``opt_level`` harness default
-``"O3"`` — injected for every non-numpy backend unless an explicit
+default for every non-numpy backend (``["cuda"]`` / ``["rocm"]`` for a rocm or
+``"hip"`` device / ``["llvm-cpu"]`` otherwise), and the ``opt_level`` harness
+default ``"O3"`` — injected for every non-numpy backend unless an explicit
 ``opt_level`` is present or the ``ETL_OPT_LEVEL`` env var is set/blank-checked
 (injection is skipped when the env var is set, so the pipeline's env
 machinery applies it at compile; env unset/blank -> the O3 harness default is
@@ -17,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from etl import core
-from etl.bench._util import resolve_backend_options
+from etl.bench._util import resolve_backend_options, resolve_device
 from etl.pipeline_options import apply_env_options
 
 
@@ -115,3 +116,66 @@ def test_none_backend_options_treated_as_empty():
     assert opts["opt_level"] == "O3"
     assert opts["target_backends"] == ["llvm-cpu"]
     assert resolve_backend_options("numpy", core.Device("cpu", 0), None) == {}
+
+
+# --------------------------------------------------------------------------
+# ROCm / HIP device plumbing (device-free pins: NO GPU needed).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "device",
+    [core.Device("rocm", 0), core.Device("rocm", 3), core.Device("hip", 1)],
+)
+@pytest.mark.parametrize("backend", ["iree", "xla", "tvm"])
+def test_rocm_device_derives_rocm_target_backends(backend, device):
+    """A rocm device (and its equivalent 'hip' alias) derives
+    target_backends == ["rocm"] for every compiler backend — the AMD GPU
+    target counterpart of the cuda / llvm-cpu device default. The O3 harness
+    default is injected exactly as for any other device."""
+    opts = resolve_backend_options(backend, device, {})
+    assert opts["target_backends"] == ["rocm"]
+    assert opts["opt_level"] == "O3"
+
+
+def test_rocm_explicit_target_backends_wins():
+    """An explicit target_backends is never overridden on a rocm device."""
+    opts = resolve_backend_options(
+        "iree", core.Device("rocm", 0), {"target_backends": ["llvm-cpu"]}
+    )
+    assert opts["target_backends"] == ["llvm-cpu"]
+
+
+def test_rocm_device_leaves_numpy_untouched():
+    """numpy is the reference interpreter: a rocm device does NOT make it a
+    compiler backend — the options dict passes through untouched."""
+    assert resolve_backend_options("numpy", core.Device("rocm", 0), {}) == {}
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("rocm", core.Device("rocm", 0)),
+        ("rocm:3", core.Device("rocm", 3)),
+        # The "hip" alias is an equivalent spelling: the kind is PRESERVED as
+        # given (never rewritten to "rocm") — only the derived
+        # target_backends normalizes to ["rocm"].
+        ("hip", core.Device("hip", 0)),
+        ("hip:0", core.Device("hip", 0)),
+    ],
+)
+def test_resolve_device_accepts_rocm_and_hip(text, expected):
+    """ROCm devices parse as ``"KIND[:INDEX]"`` with the kind preserved."""
+    assert resolve_device(text) == expected
+
+
+def test_resolve_device_documented_failure_messages_mention_rocm_hip():
+    """The unsupported-kind help text lists the AMD kinds ('rocm' + the
+    'hip' alias) — both for a string device and for a pre-built Device."""
+    with pytest.raises(ValueError, match=r"rocm") as string_case:
+        resolve_device("tpu")
+    assert "hip" in str(string_case.value)
+
+    with pytest.raises(ValueError, match=r"rocm") as device_case:
+        resolve_device(core.Device("tpu", 0))
+    assert "hip" in str(device_case.value)

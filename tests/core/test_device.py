@@ -14,8 +14,16 @@ Non-host targets (cuda, or cpu with index != 0) and device-payload sources
 raise ``DeviceError`` with the explicit-transfer remedy (never a raw
 ``AttributeError`` on a payload); axis/divisibility/type errors are unchanged
 for valid host sources.
+
+The ``devices()`` **ROCm** pins (hip/rocm alias, rocm presence in the unfiltered
+list, the unknown-kind message, and "probe failure → ``[]``") inject FAKE
+``iree``/``torch`` modules through ``monkeypatch`` so the probe is deterministic
+without any ROCm runtime; a separate real leg skips cleanly when no ROCm runtime
+is detectable in this process.
 """
 
+import sys
+import types
 from dataclasses import FrozenInstanceError
 
 import numpy as np
@@ -46,6 +54,72 @@ class _DummyDevicePayload:
         self.shape = (2, 3)
         self.dtype = np.float32
         self.device = device
+
+
+# --- ROCm device-enumeration pins -------------------------------------------
+#
+# ``devices("rocm")`` and ``devices("hip")`` both delegate to ``_rocm_devices()``,
+# whose probes run *inside* the function (``import iree.runtime as rt``) and
+# which is documented to return ``[]`` whenever nothing is detectable (every
+# probe is wrapped).  The mocked pins therefore install FAKE ``iree`` /
+# ``iree.runtime`` (and a host-only ``torch``) module objects via the
+# ``monkeypatch`` fixture: the in-function imports resolve through
+# ``sys.modules``, so the fake is used whether or not the real, optional
+# packages are installed.  ``monkeypatch`` restores ``sys.modules`` afterwards
+# — the real modules are never mutated.
+
+_ROCM_FAKE_COUNT = 3
+
+
+class _FakeIreeHIPDriver:
+    """Minimal stand-in for an IREE HAL driver: one info dict per device."""
+
+    def __init__(self, count: int, name: str = "hip"):
+        self.count = count
+        self.name = name
+
+    def query_available_devices(self):
+        # IREE HAL device ids are 1-based; etl only uses the list LENGTH.
+        return [{"device_id": i + 1} for i in range(self.count)]
+
+
+def _inject_fake_iree_hip(monkeypatch, *, count=_ROCM_FAKE_COUNT, raises=False):
+    """Install a FAKE ``iree.runtime`` whose HIP driver reports ``count`` devices.
+
+    ``raises=True`` makes ``get_driver`` raise instead — the "probe failure"
+    branch.  ``fake_iree.runtime`` is set as an *attribute* as well as a
+    ``sys.modules`` entry because ``import iree.runtime as rt`` resolves the
+    attribute on the parent package after the import returns.
+    """
+    fake_rt = types.ModuleType("iree.runtime")
+
+    def get_driver(name):
+        if raises:
+            raise RuntimeError("fake iree: HIP driver unavailable")
+        assert name == "hip", name
+        return _FakeIreeHIPDriver(count, name)
+
+    fake_rt.get_driver = get_driver
+    fake_iree = types.ModuleType("iree")
+    fake_iree.runtime = fake_rt
+    monkeypatch.setitem(sys.modules, "iree", fake_iree)
+    monkeypatch.setitem(sys.modules, "iree.runtime", fake_rt)
+
+
+def _inject_fake_host_only_torch(monkeypatch):
+    """Install a FAKE ``torch`` reporting NO ROCm build and NO CUDA device.
+
+    ``_rocm_devices()`` falls back to a ROCm-capable torch build only when the
+    IREE probe yields nothing, and ``devices("cuda")`` consults ``torch.cuda``
+    — this fake neutralizes both, so the mocked pins stay deterministic even on
+    a machine with a real ROCm-capable torch build.
+    """
+    fake_torch = types.ModuleType("torch")
+    fake_torch.version = types.SimpleNamespace(hip=None, cuda=None)
+    fake_torch.cuda = types.SimpleNamespace(
+        is_available=lambda: False, device_count=lambda: 0
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
 
 # --- Device -----------------------------------------------------------------
@@ -137,6 +211,63 @@ class TestDevices:
     def test_unknown_kind_raises(self, kind):
         with pytest.raises(DeviceError, match="Unknown device kind"):
             devices(kind)
+
+    def test_hip_is_alias_of_rocm(self):
+        # "hip" is accepted as an alias/equivalent filter for "rocm" (both
+        # call the same probe), so the two lists are ALWAYS equal — with or
+        # without a ROCm runtime detectable in this process.
+        assert devices("hip") == devices("rocm")
+
+    def test_rocm_devices_all_mocked(self, monkeypatch):
+        # Portable form of the "rocm appears in devices(None)" pin: the rocm
+        # probe is made deterministic with fake iree/torch modules, so this
+        # asserts the same thing on a non-ROCm machine.  devices(None)
+        # composes cpu + cuda + rocm; every faked rocm index must appear,
+        # asserted order-independently (membership), with cpu still first.
+        _inject_fake_iree_hip(monkeypatch, count=_ROCM_FAKE_COUNT)
+        _inject_fake_host_only_torch(monkeypatch)
+        expected = [Device("rocm", i) for i in range(_ROCM_FAKE_COUNT)]
+        assert devices("rocm") == expected
+        assert devices("hip") == expected
+        all_devices = devices(None)
+        assert all_devices[0] == Device("cpu", 0)
+        for device in expected:
+            assert device in all_devices
+
+    def test_rocm_devices_all_real(self):
+        # Real leg: only meaningful where a ROCm runtime is actually
+        # detectable (the IREE HIP HAL driver, else a ROCm-capable torch
+        # build); skips cleanly on a non-ROCm host.
+        rocm = devices("rocm")
+        if not rocm:
+            pytest.skip("no ROCm (HIP) runtime detectable in this process")
+        all_devices = devices(None)
+        assert all_devices[0] == Device("cpu", 0)
+        for device in rocm:
+            assert device in all_devices
+
+    def test_unknown_kind_error_mentions_rocm(self):
+        # The canonical unknown-kind error enumerates the recognized kinds,
+        # including rocm and its hip alias — assert the fragments, not the
+        # whole sentence.
+        with pytest.raises(DeviceError) as excinfo:
+            devices("bogus-kind")
+        message = str(excinfo.value)
+        assert "Unknown device kind" in message
+        assert "rocm" in message
+        assert "hip" in message
+
+    def test_rocm_probe_failure_yields_empty(self, monkeypatch):
+        # Documented contract: a failing probe means "not detectable" — no
+        # exception leak and no invented device.  The fake host-only torch
+        # build neutralizes the ROCm-capable-torch fallback, which is only
+        # consulted when the IREE probe yields nothing.
+        _inject_fake_iree_hip(monkeypatch, raises=True)
+        _inject_fake_host_only_torch(monkeypatch)
+        assert devices("rocm") == []
+        assert devices("hip") == []
+        # With both probes neutralized, the unfiltered list is cpu only.
+        assert devices(None) == [Device("cpu", 0)]
 
 
 # --- split_tensor -----------------------------------------------------------
