@@ -36,11 +36,13 @@ __all__ = ["Device", "devices", "split_tensor", "replicate_tensor"]
 class Device:
     """A physical device: a kind plus an optional index.
 
-    v1 kinds: ``"cpu"`` (always available); ``"cuda"`` may be listed by
-    ``devices()`` when a CUDA runtime is detectable (see ``devices``).
+    v1 kinds: ``"cpu"`` (always available); ``"cuda"`` and ``"rocm"`` may be
+    listed by ``devices()`` when a CUDA / ROCm runtime is detectable (see
+    ``devices``; ``"hip"`` is accepted as an alias/equivalent filter for the
+    ``"rocm"`` kind).
 
     Attributes:
-        kind: Device kind string, e.g. ``"cpu"`` or ``"cuda"``.
+        kind: Device kind string, e.g. ``"cpu"``, ``"cuda"`` or ``"rocm"``.
         index: Device index within the kind (default 0).
     """
 
@@ -68,14 +70,67 @@ def _tensor(data: np.ndarray, device: Device) -> "Tensor":
     return Tensor(data, device=device)
 
 
+def _rocm_devices() -> List[Device]:
+    """Detect ROCm (AMD HIP) devices, honestly and defensively.
+
+    A single source decides the count (the probes are never combined, so
+    devices are never double-counted):
+
+    1. the IREE HIP HAL driver (``iree.runtime.get_driver("hip")``) — the
+       runtime the etl iree adapter drives for device payloads; its
+       ``query_available_devices()`` returns one info dict per device and
+       allocates no device (side-effect free);
+    2. a ROCm-capable torch build (``torch.version.hip is not None`` marks
+       one; a CUDA build reports ``None``), which enumerates HIP devices
+       through ``torch.cuda`` — consulted only when the IREE probe yields
+       nothing usable.
+
+    IREE HAL device ids are 1-based, but etl's ``Device.index`` is 0-based
+    within the kind, so a count ``N`` maps to ``[Device("rocm", i) for i in
+    range(N)]`` (mirroring how ``devices("cuda")`` uses
+    ``range(torch.cuda.device_count())``).
+
+    Every probe is wrapped so *any* probing error (missing dependency, a
+    missing/stale ROCm runtime, a query error) yields an empty list for the
+    rocm kind — never a raw exception leak and never an invented device. A
+    host with no ROCm at all honestly returns ``[]``.
+    """
+    count: Optional[int] = None
+    # 1) IREE HIP HAL driver (preferred): query_available_devices() returns a
+    #    list whose LENGTH is the device count and needs no device allocation.
+    try:
+        import iree.runtime as rt  # lazy: iree is an optional extra
+
+        count = len(rt.get_driver("hip").query_available_devices())
+    except Exception:  # defensive probe: any failure means "not detectable"
+        count = None
+    # 2) A ROCm-capable torch build — only consulted when the IREE probe
+    #    found nothing usable (a CUDA-only torch build reports hip None).
+    if not count:
+        try:
+            import torch  # lazy: torch is an optional interop extra
+
+            if getattr(torch.version, "hip", None) is not None and torch.cuda.is_available():
+                count = torch.cuda.device_count()
+        except Exception:  # defensive probe: any failure means "not detectable"
+            count = None
+    if not count:
+        return []
+    return [Device("rocm", i) for i in range(count)]
+
+
 def devices(kind: Optional[str] = None) -> List[Device]:
     """Enumerate the devices actually available to this process.
 
     v1 semantics (honest, minimal): ``kind=None`` lists all detectable
     devices; the CPU device (``Device("cpu", 0)``) is *always* present;
     ``"cuda"`` devices are listed only if a CUDA runtime is detectable in
-    this process (e.g. torch with CUDA) — otherwise the cuda list is empty.
-    No devices are invented, and etl never requires a GPU.
+    this process (e.g. torch with CUDA) and ``"rocm"`` devices only if a
+    ROCm runtime is detectable (the IREE HIP HAL driver, else a
+    ROCm-capable torch build) — otherwise the corresponding list is empty.
+    ``"hip"`` is accepted as an alias/equivalent filter for the ``"rocm"``
+    kind (both return the canonical ``Device("rocm", i)`` list). No devices
+    are invented, and etl never requires a GPU.
 
     Args:
         kind: Optional filter; only devices of this kind are returned.
@@ -96,10 +151,13 @@ def devices(kind: Optional[str] = None) -> List[Device]:
         if torch.cuda.is_available():
             return [Device("cuda", i) for i in range(torch.cuda.device_count())]
         return []
+    if kind == "rocm" or kind == "hip":
+        return _rocm_devices()
     if kind is None:
-        return [Device("cpu", 0)] + devices("cuda")
+        return [Device("cpu", 0)] + devices("cuda") + devices("rocm")
     raise DeviceError(
-        f"Unknown device kind {kind!r}; recognized kinds are 'cpu' and 'cuda'."
+        f"Unknown device kind {kind!r}; recognized kinds are 'cpu', 'cuda' and "
+        f"'rocm' (alias 'hip')."
     )
 
 
