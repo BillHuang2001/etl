@@ -52,19 +52,20 @@ __all__ = [
 
 
 # --- device-transfer provider registration (explicit placement) --------------
-# ``Tensor.to(Device('cuda', N))`` dispatches through the core registries
-# (``core.register_device_transfer_provider`` / the per-backend slots);
-# core never imports backends. This package registers the flat DEFAULT
-# "cuda" slot at import time as a LAZY thunk over the iree adapter: the
-# adapter module is imported only on first transfer, and the adapter's
-# module-level ``upload_tensor(tensor, device)`` is looked up by name at
-# call time (implemented by the iree adapter). Optional adapters (iree/xla)
-# register their own DIRECT provider under PER-BACKEND slots
+# ``Tensor.to(Device('cuda', N))`` / ``Tensor.to(Device('rocm', N))``
+# (kind ``"hip"`` is the alias kind for the same AMD/ROCm targets) dispatch
+# through the core registries (``core.register_device_transfer_provider`` /
+# the per-backend slots); core never imports backends. This package registers
+# the flat DEFAULT "cuda" / "rocm" / "hip" slots at import time as LAZY thunks
+# over the iree adapter: the adapter module is imported only on first transfer,
+# and the adapter's module-level ``upload_tensor(tensor, device)`` is looked up
+# by name at call time (implemented by the iree adapter). Optional adapters
+# (iree/xla) register their own DIRECT provider under PER-BACKEND slots
 # (``core.register_backend_device_transfer_provider``) when they activate —
-# they never overwrite this flat slot or each other, so activation/import
+# they never overwrite these flat slots or each other, so activation/import
 # order cannot clobber any backend's provider. ``registry.get(name)``
 # records the preferred transfer backend per kind, and ``Tensor.to``
-# resolves the preferred backend's slot first, falling back to this thunk.
+# resolves the preferred backend's slot first, falling back to these thunks.
 
 def _cuda_transfer_thunk(tensor, device):
     """Lazy "cuda" placement provider: delegates to the iree adapter.
@@ -94,4 +95,36 @@ def _cuda_transfer_thunk(tensor, device):
     return upload_tensor(tensor, device)
 
 
+def _rocm_transfer_thunk(tensor, device):
+    """Lazy "rocm" / "hip" placement provider: delegates to the iree adapter.
+
+    Imports ``etl.backends.adapters.iree`` on first call and delegates to
+    its module-level ``upload_tensor(tensor, device)``. Any import or
+    availability failure surfaces as a clean ``core.DeviceError`` with a
+    pip hint — never a raw ``ModuleNotFoundError`` or other exception.
+    Registered for both the canonical ``"rocm"`` kind and its ``"hip"``
+    alias.
+    """
+    try:
+        from etl.backends.adapters import iree as _iree_adapter
+    except Exception as exc:  # noqa: BLE001 — always a clean DeviceError
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the rocm "
+            "device-transfer provider requires the etl iree backend (the "
+            "iree-base-compiler + iree-base-runtime packages), which is "
+            f"unavailable: {exc}. Install it with `pip install etl[iree]`"
+        ) from exc
+    upload_tensor = getattr(_iree_adapter, "upload_tensor", None)
+    if not callable(upload_tensor):
+        raise DeviceError(
+            f"Tensor.to cannot place data on {device!r}: the iree adapter "
+            "does not expose upload_tensor(tensor, device), so the rocm "
+            "device-transfer provider is unavailable (the iree adapter "
+            "registers it when activated)"
+        )
+    return upload_tensor(tensor, device)
+
+
 register_device_transfer_provider("cuda", _cuda_transfer_thunk)
+register_device_transfer_provider("rocm", _rocm_transfer_thunk)
+register_device_transfer_provider("hip", _rocm_transfer_thunk)

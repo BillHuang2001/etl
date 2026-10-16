@@ -304,8 +304,9 @@ def _resolve_backend(backend):
 
 def _normalize_device(device):
     """Normalize a device argument: None -> ``core.Device("cpu", 0)`` (v1
-    default); str -> ``core.Device(name)``; ``core.Device`` -> as-is;
-    anything else -> ``core.DeviceError``."""
+    default); str -> ``core.Device(name)`` (any kind string is accepted,
+    e.g. ``'cpu'``, ``'cuda'``, ``'rocm'``/``'hip'``); ``core.Device`` ->
+    as-is; anything else -> ``core.DeviceError``."""
     if device is None:
         return core.Device("cpu", 0)
     if isinstance(device, str):
@@ -330,10 +331,12 @@ def _parse_env_device(var: str, value: str) -> core.Device:
     """Parse an ``ETL_DEVICE`` value ``"kind[:index]"`` into a ``core.Device``.
 
     ``"cpu"`` -> ``Device("cpu", 0)``, ``"cuda:0"`` -> ``Device("cuda", 0)``,
-    ``"cuda:3"`` -> ``Device("cuda", 3)``. A malformed value (empty kind,
-    non-integer or negative index, stray colons) raises ``core.DeviceError``
-    naming the environment variable and the bad value (``from None`` — the
-    raw parse error never leaks).
+    ``"cuda:3"`` -> ``Device("cuda", 3)``, ``"rocm:0"`` -> ``Device("rocm", 0)``,
+    ``"hip:2"`` -> ``Device("hip", 2)`` — any kind string is accepted, so AMD
+    ROCm devices are spelled ``"rocm"`` or the equivalent ``"hip"`` alias. A
+    malformed value (empty kind, non-integer or negative index, stray colons)
+    raises ``core.DeviceError`` naming the environment variable and the bad
+    value (``from None`` — the raw parse error never leaks).
     """
     kind, sep, index = value.partition(":")
     kind = kind.strip()
@@ -364,8 +367,9 @@ def _resolve_backend_device(backend, device, options):
       values are treated as unset). Unset ``backend``/``device`` are resolved
       through the same registry/device normalization as explicit arguments.
     - ``ETL_DEVICE`` — device string ``"kind[:index]"`` (e.g. ``"cpu"``,
-      ``"cuda:0"``), parsed into a ``core.Device``; a malformed value raises
-      ``core.DeviceError`` naming the variable and the value.
+      ``"cuda:0"``, ``"rocm:0"``/``"hip:0"``), parsed into a ``core.Device``;
+      a malformed value raises ``core.DeviceError`` naming the variable and
+      the value.
     - ``ETL_TARGET_BACKENDS`` — comma-separated ``target_backends`` compile
       option list, applied when ``target_backends`` was not passed
       explicitly (any backend; those that ignore the option are unaffected).
@@ -373,8 +377,9 @@ def _resolve_backend_device(backend, device, options):
     When neither an explicit ``target_backends`` nor ``ETL_TARGET_BACKENDS``
     is present, an iree-family backend (resolved backend name starting with
     ``"iree"``) infers it from the resolved device: ``"cuda"`` ->
-    ``["cuda"]``, ``"cpu"`` -> ``["llvm-cpu"]`` — mirroring the explicit
-    probe spelling ``target_backends=["cuda"]``. The numpy default path
+    ``["cuda"]``, ``"rocm"``/``"hip"`` -> ``["rocm"]`` (the IREE HIP/ROCm
+    target), ``"cpu"`` -> ``["llvm-cpu"]`` — mirroring the explicit probe
+    spelling ``target_backends=["cuda"]``. The numpy default path
     (no env set) is unchanged: ``numpy_backend``, ``Device("cpu", 0)``,
     options untouched.
 
@@ -400,6 +405,8 @@ def _resolve_backend_device(backend, device, options):
         elif backend.name.startswith("iree"):
             if device.kind == "cuda":
                 options["target_backends"] = ["cuda"]
+            elif device.kind in ("rocm", "hip"):
+                options["target_backends"] = ["rocm"]
             elif device.kind == "cpu":
                 options["target_backends"] = ["llvm-cpu"]
     return backend, device, options
@@ -946,13 +953,15 @@ def _check_run_device(tensor: "core.Tensor", expected_device, path) -> None:
     """Run-boundary device enforcement for one tensor leaf.
 
     Binding design principle: no implicit device↔host transfer. Every run
-    input tensor must ALREADY be at the executable's device — a cuda
-    executable never silently stages host inputs. A tensor whose device
-    differs from the executable's device raises ``core.DeviceError`` naming
-    the input tree path, BOTH devices, and the explicit transfer remedy,
-    before the backend is dispatched. When the executable reports no device
-    (``expected_device is None`` — a device-less backend executable) no
-    enforcement is possible and the check passes.
+    input tensor must ALREADY be at the executable's device — a non-cpu
+    (cuda/rocm) executable never silently stages host inputs. A tensor whose
+    device differs from the executable's device raises ``core.DeviceError``
+    naming the input tree path, BOTH devices, and the explicit transfer
+    remedy, before the backend is dispatched. When the executable reports no
+    device (``expected_device is None`` — a device-less backend executable)
+    no enforcement is possible and the check passes. The comparison is plain
+    ``core.Device`` dataclass equality — kind-neutral, so it already covers
+    ``cuda``/``rocm``/``hip`` alike with no kind-specific logic.
     """
     if expected_device is None:
         return
@@ -1237,8 +1246,8 @@ def run(executable, *args, **options):
     (DTypeError/ShapeError/DeviceError/TraceError), and enforces the
     run-boundary device contract: every tensor leaf must ALREADY be at the
     executable's device — no implicit device↔host transfer ever happens at
-    the run boundary, so a cuda executable rejects cpu/host inputs
-    (including raw numpy ndarrays, which are cpu:0 tensors) with a
+    the run boundary, so a non-cpu (cuda/rocm) executable rejects cpu/host
+    inputs (including raw numpy ndarrays, which are cpu:0 tensors) with a
     ``core.DeviceError`` naming the input path and both devices. Then calls
     the backend executable with flat tensors, and reconstructs the
     structured outputs (including recorded static output leaves).
@@ -1375,13 +1384,14 @@ def build(fn, *specs, backend=None, device=None, **options):
     Default resolution (explicit kwargs always win; environment variables
     are read lazily at call time): an unset ``backend`` resolves from
     ``ETL_BACKEND`` (backend name; default ``"numpy"`` when unset), an unset
-    ``device`` from ``ETL_DEVICE`` (``"kind[:index]"``, e.g. ``"cpu"`` or
-    ``"cuda:0"``, parsed into a ``core.Device``; a malformed value raises
-    ``core.DeviceError`` naming the variable and the value). When
-    ``target_backends`` is not passed explicitly, ``ETL_TARGET_BACKENDS``
-    (comma-separated list) supplies it; otherwise an iree-family backend
-    infers it from the resolved device — ``"cuda"`` -> ``["cuda"]``,
-    ``"cpu"`` -> ``["llvm-cpu"]``. Per-backend option env vars
+    ``device`` from ``ETL_DEVICE`` (``"kind[:index]"``, e.g. ``"cpu"``,
+    ``"cuda:0"`` or ``"rocm:0"``/``"hip:0"``, parsed into a ``core.Device``;
+    a malformed value raises ``core.DeviceError`` naming the variable and the
+    value). When ``target_backends`` is not passed explicitly,
+    ``ETL_TARGET_BACKENDS`` (comma-separated list) supplies it; otherwise an
+    iree-family backend infers it from the resolved device — ``"cuda"`` ->
+    ``["cuda"]``, ``"rocm"``/``"hip"`` -> ``["rocm"]``, ``"cpu"`` ->
+    ``["llvm-cpu"]``. Per-backend option env vars
     (``ETL_IREE_COMPILE_ARGS``, ``ETL_IREE_RUNTIME_ARGS``,
     ``ETL_XLA_COMPILE_OPTIONS``, ``ETL_TVM_TARGET``/``ETL_TVM_PASS_CONFIGS``
     — see ``etl.pipeline_options``) are applied per stage for option keys

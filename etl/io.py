@@ -279,9 +279,9 @@ class AsyncCopy:
 
 
 def _bootstrap_worker_context(device):
-    """One-time, best-effort CUDA-context bootstrap for the worker thread.
+    """One-time, best-effort CUDA/ROCm-context bootstrap for the worker thread.
 
-    A fresh thread's first allocating HAL op on a CUDA device created by
+    A fresh thread's first allocating HAL op on a CUDA/ROCm device created by
     another thread fails with ``CUDA_ERROR_INVALID_CONTEXT`` (iree does not
     push its stored context per call). Creating a throwaway HAL device on
     the same GPU from the worker makes the shared primary context current
@@ -296,9 +296,12 @@ def _bootstrap_worker_context(device):
     try:
         import iree.runtime as rt  # lazy: only non-cpu-kind copies reach here
 
+        # etl device kind -> iree HAL driver name. AMD ROCm devices are kind
+        # "rocm" (aliased "hip") but iree's HIP driver is registered as "hip".
+        driver_name = "hip" if device.kind in ("rocm", "hip") else device.kind
         # The iree adapter's exact 1-based HAL device-id mapping
         # (etl/backends/adapters/iree.py, _acquire_runtime_device).
-        dev = rt.get_driver(device.kind).create_device(device_id=device.index + 1)
+        dev = rt.get_driver(driver_name).create_device(device_id=device.index + 1)
         _bootstrap_devices.append(dev)  # keep alive: the context stays current
     except Exception:
         pass  # best-effort only — the copy's own error still surfaces

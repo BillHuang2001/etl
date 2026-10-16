@@ -60,7 +60,7 @@ class ConformanceReport:
     error and passed every executed comparison (numpy always; torch only when
     it ran). ``backend`` is the etl backend the graphs ran on (default
     ``"numpy"``); ``device`` is the formatted device string (``"cpu"`` or
-    e.g. ``"cuda:3"``).
+    e.g. ``"cuda:3"``/``"rocm:0"``).
     """
 
     results: List[ExampleResult]
@@ -104,7 +104,7 @@ class BenchmarkReport:
     runs (best-of-N; see :func:`etl.bench.benchmark`). ``use_torch`` is the
     resolved mode (``"auto"`` | ``"enabled"`` | ``"disabled"``). ``backend``
     is the etl backend the graphs ran on (default ``"numpy"``); ``device``
-    is the formatted device string (``"cpu"`` or e.g. ``"cuda:3"``).
+    is the formatted device string (``"cpu"`` or e.g. ``"cuda:3"``/``"rocm:0"``).
     """
 
     results: List[ExampleResult]
