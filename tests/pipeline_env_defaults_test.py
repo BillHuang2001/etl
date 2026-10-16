@@ -6,7 +6,8 @@ Validates the process-wide defaulting added to ``etl.build``/``etl.evaluate``
 unset ``backend``/``device`` resolve from ``ETL_BACKEND`` / ``ETL_DEVICE``
 (read lazily at call time); unset ``target_backends`` resolves from
 ``ETL_TARGET_BACKENDS`` or, for an iree-family backend, is inferred from the
-resolved device (``cuda`` -> ``["cuda"]``, ``cpu`` -> ``["llvm-cpu"]``).
+resolved device (``cuda`` -> ``["cuda"]``, ``rocm``/``hip`` -> ``["rocm"]``,
+``cpu`` -> ``["llvm-cpu"]``).
 
 The env variables are read lazily at call time, so every test drives them
 with ``monkeypatch`` after ``import etl`` — no module-level env snapshot.
@@ -244,10 +245,19 @@ def test_env_backend_empty_treated_as_unset(monkeypatch):
         ("cuda", "cuda", 0),
         ("cpu", "cpu", 0),
         ("cpu:0", "cpu", 0),
+        ("rocm:0", "rocm", 0),
+        ("rocm:3", "rocm", 3),
+        ("rocm", "rocm", 0),
+        ("hip:2", "hip", 2),
     ],
 )
 def test_env_device_parsing(monkeypatch, value, kind, index):
-    """ETL_DEVICE parses ``kind[:index]`` into a core.Device."""
+    """ETL_DEVICE parses ``kind[:index]`` into a core.Device.
+
+    Any kind string is accepted, so the ROCm spellings ``"rocm"`` and the
+    equivalent ``"hip"`` alias parse too — the kind is preserved verbatim
+    (``Device.kind`` is never normalized; only the target-backends inference
+    below maps both to the IREE ``"rocm"`` target)."""
     monkeypatch.setenv("ETL_DEVICE", value)
     backend, device, options = _resolve_backend_device(None, None, {})
     assert device == core.Device(kind, index)
@@ -275,6 +285,23 @@ def test_env_device_parse_directly():
     assert _parse_env_device("ETL_DEVICE", "cuda:0") == core.Device("cuda", 0)
     assert _parse_env_device("ETL_DEVICE", "cpu") == core.Device("cpu", 0)
     assert _parse_env_device("ETL_DEVICE", " cuda : 3 ") == core.Device("cuda", 3)
+
+
+def test_env_device_parse_rocm_directly():
+    """``_parse_env_device`` parses the ROCm spellings ``"rocm"`` / ``"hip"``
+    (``"kind[:index]"``) to a ``core.Device`` with the kind PRESERVED verbatim
+    — the parser does not normalize the ``"hip"`` alias to ``"rocm"`` (both
+    are exactly what ``core.Device`` accepts; only the iree target-backends
+    inference maps them to the ``"rocm"`` compile target)."""
+    assert _parse_env_device("ETL_DEVICE", "rocm") == core.Device("rocm", 0)
+    assert _parse_env_device("ETL_DEVICE", "rocm:0") == core.Device("rocm", 0)
+    assert _parse_env_device("ETL_DEVICE", "rocm:3") == core.Device("rocm", 3)
+    assert _parse_env_device("ETL_DEVICE", "hip") == core.Device("hip", 0)
+    assert _parse_env_device("ETL_DEVICE", "hip:2") == core.Device("hip", 2)
+    # The kind is the raw string — no aliasing at the parser level (and thus
+    # `hip:2` is not Device("rocm", 2)).
+    assert _parse_env_device("ETL_DEVICE", "hip:2").kind == "hip"
+    assert _parse_env_device("ETL_DEVICE", "hip:2") != core.Device("rocm", 2)
 
 
 def test_env_device_empty_treated_as_unset(monkeypatch):
@@ -367,6 +394,53 @@ def test_iree_inference_cpu():
     _assert_no_new_iree_import()
 
 
+def test_iree_inference_rocm():
+    """iree-family backend + rocm device -> target_backends == ["rocm"] (the
+    IREE HIP/ROCm target), a list of one exact string."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("rocm", 0), {}
+    )
+    assert options == {"target_backends": ["rocm"]}
+    # Exact shape pin: a plain list of one exact lowercase string.
+    assert isinstance(options["target_backends"], list)
+    assert options["target_backends"] == ["rocm"]
+    _assert_no_new_iree_import()
+
+
+def test_iree_inference_hip_alias_normalized_to_rocm():
+    """iree-family backend + ``hip`` device (the ROCm alias) -> the SAME
+    target_backends == ["rocm"]: the alias is normalized to the canonical
+    IREE ``"rocm"`` target string, while the resolved device keeps kind
+    ``"hip"`` (the inference does not rewrite the device)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("hip", 0), {}
+    )
+    assert options == {"target_backends": ["rocm"]}
+    assert device == core.Device("hip", 0)
+    _assert_no_new_iree_import()
+
+
+def test_iree_inference_rocm_index_irrelevant():
+    """The inference depends only on the device KIND: a nonzero index still
+    yields target_backends == ["rocm"] (the target list carries no index)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("rocm", 5), {}
+    )
+    assert options == {"target_backends": ["rocm"]}
+    _assert_no_new_iree_import()
+
+
+def test_rocm_inference_only_for_iree_family():
+    """Non-iree backend + rocm/hip device -> no target_backends key (the
+    inference is iree-family only, exactly like the cuda/cpu cases)."""
+    for kind in ("rocm", "hip"):
+        backend, device, options = _resolve_backend_device(
+            None, core.Device(kind, 0), {}
+        )
+        assert options == {}
+    _assert_no_new_iree_import()
+
+
 def test_numpy_backend_no_inference_for_cuda():
     """Non-iree backend (numpy) + cuda device -> no target_backends key."""
     backend, device, options = _resolve_backend_device(
@@ -444,6 +518,33 @@ def test_full_path_env_iree_cuda(monkeypatch, iree_stub_registered):
     assert exe.device == core.Device("cuda", 3)
     assert iree_stub_registered.recorded_compile_options[-1]["target_backends"] == [
         "cuda"
+    ]
+    _assert_no_new_iree_import()
+
+
+def test_full_path_env_iree_rocm(monkeypatch, iree_stub_registered):
+    """ETL_BACKEND=iree + ETL_DEVICE=rocm:3 routes the whole build: the device
+    is honored (kind preserved) and target_backends == ["rocm"] reaches the
+    compile stage (no real adapter import, no GPU needed)."""
+    monkeypatch.setenv("ETL_BACKEND", "iree")
+    monkeypatch.setenv("ETL_DEVICE", "rocm:3")
+    exe = etl.build(_linear, *_LINEAR_SPECS)
+    assert exe.device == core.Device("rocm", 3)
+    assert iree_stub_registered.recorded_compile_options[-1]["target_backends"] == [
+        "rocm"
+    ]
+    _assert_no_new_iree_import()
+
+
+def test_full_path_env_iree_hip_alias(monkeypatch, iree_stub_registered):
+    """ETL_DEVICE=hip:1 (the ROCm alias) keeps kind "hip" on the resolved
+    device while the inferred compile target is the canonical ["rocm"]."""
+    monkeypatch.setenv("ETL_BACKEND", "iree")
+    monkeypatch.setenv("ETL_DEVICE", "hip:1")
+    exe = etl.build(_linear, *_LINEAR_SPECS)
+    assert exe.device == core.Device("hip", 1)
+    assert iree_stub_registered.recorded_compile_options[-1]["target_backends"] == [
+        "rocm"
     ]
     _assert_no_new_iree_import()
 
