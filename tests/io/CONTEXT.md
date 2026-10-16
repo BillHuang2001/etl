@@ -20,18 +20,20 @@ order, and worker-thread re-entry raises `RuntimeError`.
 | File | Covers |
 |---|---|
 | `test_io_worker_bootstrap.py` | 15 tests: device-free plumbing pins for the worker's non-cpu context bootstrap (fake `iree` PACKAGE **and** `iree.runtime` submodule installed via `monkeypatch.setitem(sys.modules, ...)` — only `iree.runtime` is not enough), driven through the REAL process-global worker by `io.AsyncCopy(device, direction)` + `io._submit(handle, lambda: None)` (never `prefetch`/`sink`: kinds `cuda`/`rocm`/`hip` own REAL lazy transfer providers) — the driver-name mapping (`"rocm"`/`"hip"` → `"hip"`, `"cuda"` → `"cuda"`) × the 1-based `device_id = index + 1`, the throwaway device kept alive in `io._bootstrap_devices`; laziness (a cpu-kind handle calls `get_driver` never and leaves `_bootstrapped` empty); the `(kind, index)` dedup (`_bootstrapped`) — once per key, again per new index/kind, and `"hip"`/`"rocm"` as DISTINCT keys despite one driver; best-effort failure (`get_driver` or `create_device` raising, and the not-retried-after-failure behavior since `_bootstrapped.add(key)` precedes the try) never altering the copy's outcome. |
-| `test_io.py` | 37 tests: module surface/exports (incl. no iree at import, no handle `__del__`); schedule-time validation (raw ndarray → `TypeError` naming `etl.tensor(...)`; non-`core.Device` target → `TypeError` naming `etl.Device(kind, index)`; payload-backed prefetch source → `DeviceError` with the `.to(cpu)` hint; prefetch to cpu:0 or the source device → `DeviceError` "no copy needed"; sink of host ndarray-backed → `DeviceError` "already host data"; sink of cpu-kind payload → `DeviceError` "use t.numpy()" hint; validation failures never start the worker); success flows (prefetch→sink roundtrip, numerics, `.done` transitions, wait-idempotence, `result()` identity — no re-copy); worker failures re-raised VERBATIM at wait/result/wait_all (same exception object) incl. the unregistered-kind provider `DeviceError`; wait timeouts (handle pending, later wait succeeds, `wait_all(timeout=)` likewise); wait_all snapshot excludes late submissions + first-failure-in-issue-order; FIFO completion order in BOTH directions (staggered delays, strictly increasing completion times, serialized total); GC never auto-waits (dropped handles, `gc.collect()` prompt, worker completes independently, wait_all drains GC'd handles); worker-thread guards (`RuntimeError` with pinned message prefixes for prefetch/sink/wait/wait_all from the worker, worker survives guard failures); per-backend provider slot (`register_backend_device_transfer_provider` wins over the flat slot once `_note_backend_transfer_preference` fires, mirroring what `etl.backends.registry.get` calls); interpreter-exit pins via subprocess (os._exit with a 30 s copy in flight returns instantly; normal exit best-effort-drains a finite in-flight copy — never hangs). |
+| `test_io.py` | 37 tests: module surface/exports (incl. no iree at import — pinned in a FRESH subprocess interpreter (`_run_python_snippet`, also reused by the exit pins) so it is independent of this process's import history, since an earlier suite may already have pulled `iree.runtime` in via `etl.core.devices()`; no handle `__del__`); schedule-time validation (raw ndarray → `TypeError` naming `etl.tensor(...)`; non-`core.Device` target → `TypeError` naming `etl.Device(kind, index)`; payload-backed prefetch source → `DeviceError` with the `.to(cpu)` hint; prefetch to cpu:0 or the source device → `DeviceError` "no copy needed"; sink of host ndarray-backed → `DeviceError` "already host data"; sink of cpu-kind payload → `DeviceError` "use t.numpy()" hint; validation failures never start the worker); success flows (prefetch→sink roundtrip, numerics, `.done` transitions, wait-idempotence, `result()` identity — no re-copy); worker failures re-raised VERBATIM at wait/result/wait_all (same exception object) incl. the unregistered-kind provider `DeviceError`; wait timeouts (handle pending, later wait succeeds, `wait_all(timeout=)` likewise); wait_all snapshot excludes late submissions + first-failure-in-issue-order; FIFO completion order in BOTH directions (staggered delays, strictly increasing completion times, serialized total); GC never auto-waits (dropped handles, `gc.collect()` prompt, worker completes independently, wait_all drains GC'd handles); worker-thread guards (`RuntimeError` with pinned message prefixes for prefetch/sink/wait/wait_all from the worker, worker survives guard failures); per-backend provider slot (`register_backend_device_transfer_provider` wins over the flat slot once `_note_backend_transfer_preference` fires, mirroring what `etl.backends.registry.get` calls); interpreter-exit pins via subprocess (os._exit with a 30 s copy in flight returns instantly; normal exit best-effort-drains a finite in-flight copy — never hangs). |
 
 ## Constraints
 
 - Device-free / CPU-only / no GPU: fake device kinds (`fio_*` — never `"cuda"`, which
   owns a lazy iree thunk), duck-typed `_DummyPayload`s, and registered
   device-transfer providers (the `tests/core/test_tensor.py` idiom) stand in for
-  real devices. No real iree required: `test_io.py` leaves the worker's lazy
-  bootstrap unexercised (it merely attempts-and-swallows a fake-driver create when
-  iree happens to be importable), while `test_io_worker_bootstrap.py` pins the
-  bootstrap itself against a fake `iree`/`iree.runtime` installed in `sys.modules`.
-  Full suite ~7 s incl. 2 subprocess spawns.
+  real devices. No real iree required: `test_io.py` reaches the worker's lazy
+  bootstrap only incidentally through its non-cpu fake kinds (the import plus a
+  failing `get_driver` for a fake kind are swallowed), while
+  `test_io_worker_bootstrap.py` pins the bootstrap itself against a fake
+  `iree`/`iree.runtime` installed in `sys.modules`.
+  Full suite ~6.5 s incl. 3 subprocess spawns (the two interpreter-exit pins
+  + the no-iree import pin, all via `_run_python_snippet`).
 - Registries are cleaned in `finally` (`_DEVICE_TRANSFER_PROVIDERS` /
   `_BACKEND_DEVICE_TRANSFER_PROVIDERS` / `_PREFERRED_TRANSFER_BACKENDS` pops); the
   autouse `_drain_outstanding` fixture polls `io._outstanding` empty after every
@@ -44,10 +46,12 @@ order, and worker-thread re-entry raises `RuntimeError`.
   queue-put in one critical section ⇒ issue order == execution order). `atexit`
   best-effort drain joins FINITE in-flight copies at normal interpreter exit
   (os._exit skips atexit → daemon dies with the process, instant — never hangs).
-  First non-cpu-kind copy triggers a one-time lazy best-effort CUDA primary-context
-  bootstrap (`import iree.runtime`, `get_driver(kind).create_device(device_id=index
-  + 1)` — iree's 1-based mapping; all failures swallowed, devices kept alive
-  process-globally). v1 wording: copies are "async relative to the caller, no strict
+  First non-cpu-kind copy triggers a one-time lazy best-effort CUDA/ROCm
+  primary-context bootstrap (`import iree.runtime`, `get_driver(kind).create_device(device_id=index
+  + 1)` — the etl kind maps to the iree HAL driver name (`"rocm"`/`"hip"` →
+  `"hip"`, else the kind verbatim) and iree's 1-based mapping; all failures
+  swallowed, devices kept alive process-globally, at most once per
+  `(kind, index)`). v1 wording: copies are "async relative to the caller, no strict
   same-device overlap guarantee" (the single worker serializes everything). Buffer
   lifetime is user-controlled: the worker holds only a bound-method thunk
   (`tensor.to(device)` / `.to(cpu:0)`) — the caller must keep source buffers alive
