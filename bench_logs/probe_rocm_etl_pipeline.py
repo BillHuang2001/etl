@@ -2,16 +2,17 @@
 """Full etl pipeline (trace -> lower -> compile -> load -> run) on a ROCm PJRT plugin.
 
 Exercises the xla adapter end-to-end against the ``jax-rocm7-pjrt`` plugin on an
-AMD Instinct MI300X (gfx942), and reports the adapter's device-kind gate:
+AMD Instinct MI300X (gfx942). ``"rocm"`` (alias ``"hip"``) is a first-class
+accelerator kind, validated against the plugin's ``platform_name``:
 
   A. ``etl.build(fn, *specs, backend="xla", plugin_path=<so>)`` with the DEFAULT
      device (None -> Device("cpu", 0) — host-staged execution on the plugin's
      device 0) + ``etl.run`` vs the numpy backend.
   B. the same with ``device=core.Device("rocm", 0)`` / ``Device("hip", 0)`` —
-     expected to be REJECTED by the adapter's device-kind gate (verbatim error).
-  C. the same with ``device=core.Device("cuda", 0)`` — the adapter's only
-     non-cpu kind; records whether the label alone drives the device-resident
-     path on a ROCm plugin.
+     device-resident: inputs are placed explicitly with ``Tensor.to`` and the
+     outputs stay on the device.
+  C. the same with ``device=core.Device("cuda", 0)`` — expected to be REJECTED:
+     ``"cuda"`` is not a kind the ROCm plugin's platform serves.
 
 Usage:
   ETL_PJRT_PLUGIN=/path/to/xla_rocm_plugin.so python3 probe_rocm_etl_pipeline.py
@@ -84,30 +85,33 @@ def main() -> int:
             exe = etl.build(kernel, spec, spec, backend="xla",
                             plugin_path=PLUGIN, device=core.Device(kind, 0))
             if kind == "cuda":
+                # A "cuda" label must not be accepted by a ROCm plugin.
+                record("C. etl.build(device=Device('cuda',0))", "FAIL",
+                       "accepted 'cuda' through a ROCm plugin (expected a "
+                       "platform-kind rejection)")
+            else:
                 # device-resident: inputs must be placed explicitly.
-                xt = core.Tensor(x).to(core.Device("cuda", 0))
-                yt = core.Tensor(y).to(core.Device("cuda", 0))
+                xt = core.Tensor(x).to(core.Device(kind, 0))
+                yt = core.Tensor(y).to(core.Device(kind, 0))
                 out = etl.run(exe, xt, yt)
                 host = out.to(core.Device("cpu", 0)) if hasattr(out, "to") else out
                 host = np.asarray(
                     host.numpy() if hasattr(host, "numpy") else host)
                 ok = bool(np.allclose(host, reference, rtol=1e-6, atol=1e-6))
-                record(f"C. etl.build(device=Device({kind!r},0)) device-resident",
+                record(f"B. etl.build(device=Device({kind!r},0)) device-resident",
                        "PASS" if ok else "FAIL",
                        f"device-resident output -> host = {host.tolist()}\n"
                        f"       numpy expected = {reference.tolist()}\n"
                        f"       allclose: {ok}")
-            else:
-                out = np.asarray(etl.run(exe, x, y))
-                record(f"B. etl.build(device=Device({kind!r},0))", "PASS",
-                       f"output = {out.tolist()}")
             try:
                 exe.close()
             except Exception:
                 pass
         except Exception as exc:
-            record(f"{'B' if kind != 'cuda' else 'C'}. "
-                   f"etl.build(device=Device({kind!r},0))", "REJECTED",
+            expected = kind == "cuda"
+            record(f"{'C' if expected else 'B'}. "
+                   f"etl.build(device=Device({kind!r},0))",
+                   "REJECTED" if expected else "FAIL",
                    f"{type(exc).__name__}: {exc}")
 
     print()

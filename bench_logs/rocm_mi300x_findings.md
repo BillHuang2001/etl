@@ -5,13 +5,18 @@ ROCm 7.1.0 (`/opt/rocm`), no NVIDIA GPU (`nvidia-smi` absent). Python 3.14.8
 (uv venv, `uv sync --all-extras`): numpy 2.5.2, jaxlib 0.10.2, apache-tvm
 0.26.0, torch 2.13.0+cu130, iree-base-* 3.11.0, pytest 9.1.1.
 
+Conformance + performance results for the whole `etl.bench` registry across
+numpy/cpu, iree/llvm-cpu, iree/rocm:0 and xla/rocm:0:
+`./etl/bench/rocm_mi300x_results.md` (raw harness JSON in
+`./etl/bench/rocm_mi300x_data/`).
+
 ## TL;DR
 
 | Question | Answer |
 |---|---|
 | Does etl's XLA/PJRT driver work against a ROCm plugin? | **YES** — raw driver probe 7/7 PASS (load, ABI gate, client, compile, execute bit-exact) |
 | Does the full etl `xla` pipeline run on ROCm? | **YES** — `etl.build(..., backend="xla")` + `etl.run` give numpy-parity results, host-staged *and* device-resident |
-| Is the ROCm plugin wired as a first-class device kind? | **NO** — `Device("rocm"/"hip", 0)` is rejected; the adapter accepts only `"cpu"`/`"cuda"`. The existing `"cuda"` label happens to work on ROCm (it is only a dispatch label) |
+| Is the ROCm plugin wired as a first-class device kind? | **YES** — `Device("rocm", 0)` (alias `"hip"`) is a first-class accelerator kind, validated device-resident on the real MI300X; the kind is checked against the plugin's `platform_name` (`xla.py` `_PLATFORM_KINDS`), so a `"cuda"` label on a ROCm plugin is rejected rather than mislabelled |
 | Can TVM RUN on ROCm here? | **NO** — the installed wheel is built `USE_ROCM=OFF`; it *compiles* for gfx942 but cannot launch kernels (verbatim error below) |
 | Any blocker? | **YES (one):** the ROCm PJRT plugin corrupts the heap at **process exit** — every process that created a PJRT client aborts with `malloc_consolidate(): invalid chunk size` (or SIGSEGV) *after* all work has completed successfully |
 
@@ -148,49 +153,38 @@ Graph: `etl.sum(etl.sin(x) * y, axes=(1,)) + etl.sum(x, axes=(1,))`,
 `x`,`y`: `float32[4,3]`, compared against the numpy reference
 (`rtol=atol=1e-6`).
 
+`"rocm"` (alias `"hip"`) is a first-class accelerator kind: the adapter derives
+the acceptable kinds from the plugin's own `platform_name`
+(`xla.py` `_PLATFORM_KINDS`), so a kind the platform does not serve is rejected
+rather than mislabelled.
+
 | Case | `device=` | Result |
 |---|---|---|
 | A | omitted → `Device("cpu", 0)` (host-staged execution on the plugin's device 0) | **PASS** — `etl.build(fn, spec, spec, backend="xla", plugin_path=<so>)` + `etl.run` → `allclose: True` |
-| B | `core.Device("rocm", 0)` | **REJECTED** — `BackendError: the xla adapter supports CPU ('cpu') and GPU ('cuda') devices, got Device(kind='rocm', index=0)` |
-| B | `core.Device("hip", 0)` | **REJECTED** — same message with `Device(kind='hip', index=0)` |
-| C | `core.Device("cuda", 0)` | **PASS** — device-resident: `Tensor.to(Device("cuda",0))` placement, outputs stay device-resident, `.to(cpu)` + `.numpy()` round trip → `allclose: True` |
+| B | `core.Device("rocm", 0)` | **PASS** — device-resident: `Tensor.to(Device("rocm",0))` placement, outputs stay device-resident, `.to(cpu)` + `.numpy()` round trip → `allclose: True` |
+| B | `core.Device("hip", 0)` | **PASS** — same; `"hip"` is an accepted alias of the canonical `"rocm"` kind |
+| C | `core.Device("cuda", 0)` | **REJECTED** — `BackendError`: the plugin reports platform `'rocm'`, which serves `"rocm"`/`"hip"`, not `"cuda"` — an honest rejection (never mislabel where the data lives) |
 
-So the pipeline itself is ROCm-ready; only the device-kind *vocabulary* is not.
-(`core.Device` accepts arbitrary kinds — the gate is purely in the adapter.)
+### Current state
 
-### What the follow-up adapter change needs (NOT done here — `etl/` untouched)
+The device kind is validated against the plugin's platform: after
+`check_available()`, the adapter queries the plugin's `platform_info()` and
+accepts only a kind the platform serves (`rocm`/`hip` on a ROCm plugin, `cuda`
+on a CUDA plugin, `cpu` always the host-staged path), rejecting a mismatch
+instead of mislabelling. `upload_tensor` is registered per non-cpu kind
+(`register_backend_device_transfer_provider` for `"cuda"`, `"rocm"` and
+`"hip"`), so explicit `Tensor.to(Device("rocm", N))` placement works. The
+device-resident run path
+(`device_resident = self.device is not None and self.device.kind != "cpu"`) is
+kind-agnostic. The whole `etl.bench` matrix ran on this hardware with
+`Device("rocm", 0)` — numpy/cpu 98/98 PASS, iree/llvm-cpu 75 PASS,
+iree/rocm:0 70 PASS, xla/rocm:0 59 PASS, zero numeric failures beyond the
+documented deferrals — see `./etl/bench/rocm_mi300x_results.md` (raw JSON in
+`./etl/bench/rocm_mi300x_data/`).
 
-The device kind is only a **label / dispatch selector**; the physical device is
-the plugin's device index (`xla.py` never asks the plugin for its platform).
-That is why the `"cuda"` label already works on ROCm. The change is therefore
-small and localized in `etl/backends/adapters/xla.py`:
-
-| Line | Today | Needed |
-|---|---|---|
-| `443` | `if device.kind not in ("cpu", "cuda")` → `BackendError` | accept the ROCm kind(s) — e.g. `"rocm"` (the plugin's own `platform_name`) and optionally `"hip"` as an alias |
-| `452` | `device_index = effective_device.index if effective_device.kind == "cuda" else None` | derive the index for **any non-cpu kind** (not just `"cuda"`) |
-| `904` | placement provider's defensive `if device.kind != "cuda"` → `DeviceError` | allow the same kind set (or key the check off the executable's device kind) |
-| `962` | `register_backend_device_transfer_provider("cuda", xla_backend.name, upload_tensor)` | register `upload_tensor` for each supported device kind (e.g. also `"rocm"`), so explicit `Tensor.to(Device("rocm", N))` placement works |
-
-Already generic (no change needed): `639`
-(`device_resident = self.device is not None and self.device.kind != "cpu"`) and
-the whole device-resident run path.
-
-Two design choices for the follow-up:
-1. **Platform-derived kind** (cleaner, matches etl's "a Tensor's device says
-   where its data actually lives"): after `self.check_available()`, query
-   `acquire_client(plugin).platform_info()` → `"rocm"` / `"cuda"` / `"cpu"`,
-   and accept a device whose kind matches the plugin's platform (with `"cpu"`
-   always meaning the host-staged path). This would also stop a `Device("cuda",0)`
-   on a ROCm plugin from *lying* about where the data lives — today it works but
-   is mislabelled.
-2. **Static kind list** (minimal): accept `("cpu", "cuda", "rocm", "hip")`.
-   Simpler, but keeps the mislabelling and accepts `"cuda"` on a ROCm plugin.
-
-Also note: the placement provider calls `_load_plugin()` **with no options**
-(`xla.py:917`), so `Tensor.to(Device(...))` discovers the plugin only via
-`ETL_PJRT_PLUGIN` / well-known paths — `plugin_path` is a compile/load option
-only. In case C above the env var was set, so placement worked.
+Also note: the placement provider calls `_load_plugin()` **with no options**, so
+`Tensor.to(Device(...))` discovers the plugin only via `ETL_PJRT_PLUGIN` /
+well-known paths — `plugin_path` is a compile/load option only.
 
 ## 6. TVM on ROCm — `probe_rocm_tvm.py` — **cannot run**
 
@@ -233,7 +227,7 @@ default `tvm_target` is `"llvm"`).
 | `probe_rocm_raw_pjrt.py` | raw PJRT viability through etl's driver (7 steps); `--stop-after=load\|client\|compile\|execute`, `--hard-exit` for the teardown A/B |
 | `probe_rocm_device_info.py` | platform + device inventory (kind / debug string); `--repeat=N`; ends in `os._exit(0)` on purpose |
 | `probe_rocm_teardown_minimal.py` | **pure-ctypes, imports no etl** — attributes the exit crash to the plugin; `--destroy`, `--hard-exit` |
-| `probe_rocm_etl_pipeline.py` | full `etl.build`/`etl.run` on ROCm (host-staged + device-resident) and the device-kind gate |
+| `probe_rocm_etl_pipeline.py` | full `etl.build`/`etl.run` on ROCm — host-staged + device-resident on `Device("rocm"\|"hip", 0)` — and the plugin-platform kind check (`Device("cuda",0)` on a ROCm plugin rejected) |
 | `probe_rocm_tvm.py` | TVM/ROCm build-vs-run verdict with verbatim errors |
 
 Reproduce (all from the repo root, `ETL_PJRT_PLUGIN` set to the path in §1):
@@ -265,7 +259,7 @@ device info, --repeat=5           : 5 identical clean rounds, exit 0
 minimal pure-ctypes, normal exit  : err=None everywhere, then malloc_consolidate -> 134
 minimal pure-ctypes, --destroy    : PJRT_Client_Destroy err=None, then abort -> 134
 minimal pure-ctypes, --hard-exit  : exit 0
-etl pipeline                      : A PASS, B REJECTED (rocm/hip), C PASS, then abort -> 134
+etl pipeline                      : A PASS, B device-resident PASS (rocm/hip), C REJECTED (cuda on rocm plugin), then abort -> 134
 pytest tests/backends/test_adapter_xla.py : 10 passed, then abort -> 134
 tvm probe                         : 2 PASS / 3 FAIL + 1 SKIPPED, exit 0
 ```
