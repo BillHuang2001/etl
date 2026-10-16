@@ -148,6 +148,8 @@ def _check_kind_served(
                 f"serve {device!r} — the device kind must match where the "
                 "data physically lives"
             )
+
+
 class XlaBackend(CompilerBackend):
     """XLA-via-PJRT backend: StableHLO MLIR -> XLA CPU executable.
 
