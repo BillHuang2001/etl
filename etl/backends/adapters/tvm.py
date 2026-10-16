@@ -135,9 +135,17 @@ class TvmBackend(CompilerBackend):
     #: build without the parameter raises BackendError naming the option,
     #: the installed TVM version and the mechanism limitation, never
     #: silently dropped). No load/run options in v1 (a non-empty options
-    #: dict at those stages raises BackendError).
+    #: dict at those stages raises BackendError). The reserved exporter
+    #: lower option ``dot_precision`` (``"DEFAULT"``/``"HIGH"``/
+    #: ``"HIGHEST"``, default ``"DEFAULT"``) is consumed by the shared
+    #: CompilerBackend (see ../compiler.py) and declared here so it passes
+    #: validation: the TVM StableHLO frontend tolerates the emitted
+    #: ``precision_config`` dot attribute and the lowered result is
+    #: BIT-IDENTICAL to the ``"DEFAULT"`` export (probed on llvm); the
+    #: attribute only hints reduced-precision relaxations a backend may
+    #: apply, and TVM's llvm target applies none here.
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
-        "lower": frozenset({"rng_bit_generator"}),
+        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
         "compile": frozenset({"tvm_target", "tvm_pass_configs", "opt_level"}),
         "load": frozenset(),
         "run": frozenset(),

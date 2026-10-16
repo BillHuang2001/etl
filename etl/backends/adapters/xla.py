@@ -177,8 +177,18 @@ class XlaBackend(CompilerBackend):
     #: the conflict rule, never both); ``plugin_path`` is also honored at
     #: load (plugin re-discovery for deserialization). No run options in
     #: v1 (a non-empty run options dict raises BackendError).
+    #: The reserved exporter lower option ``dot_precision``
+    #: (``"DEFAULT"``/``"HIGH"``/``"HIGHEST"``, default ``"DEFAULT"``) is
+    #: consumed by the shared CompilerBackend (see ../compiler.py) and
+    #: declared here so it passes validation. Only ``"HIGHEST"`` disables
+    #: XLA/ROCm's TF32-class reduced-precision fp32 ``dot``: measured
+    #: against a real MI300X + jax_rocm7_pjrt 0.11.2 (n=1024 fp32 matmul
+    #: vs an fp64 reference) default -> max_abs 0.1228 vs ``"HIGHEST"`` ->
+    #: 0.000203 (true fp32); ``"HIGH"`` does NOT disable TF32 on this XLA
+    #: version. ``"DEFAULT"`` emits no ``precision_config`` attribute, so
+    #: the export is byte-identical to the pre-option output.
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
-        "lower": frozenset({"rng_bit_generator"}),
+        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
         "compile": frozenset(
             {"plugin_path", "xla_compile_options", "opt_level"}
         ),

@@ -799,12 +799,23 @@ class IreeBackend(CompilerBackend):
     #: the load option ``iree_runtime_args`` (iree runtime/loader flags,
     #: parsed loudly at load). No run options in v1 (a non-empty run options
     #: dict raises BackendError). The reserved exporter lower options
-    #: ``sort_emission``/``while_init_rewrite`` are consumed by the shared
-    #: CompilerBackend (see ../compiler.py) and declared here so they pass
-    #: validation.
+    #: ``sort_emission``/``while_init_rewrite``/``dot_precision`` are
+    #: consumed by the shared CompilerBackend (see ../compiler.py) and
+    #: declared here so they pass validation. ``dot_precision``
+    #: (``"DEFAULT"``/``"HIGH"``/``"HIGHEST"``, default ``"DEFAULT"``)
+    #: emits a ``precision_config`` attribute on every ``dot_general``:
+    #: iree-compile PARSES, COMPILES and RUNS it on llvm-cpu and the
+    #: result is BIT-IDENTICAL to the ``"DEFAULT"`` export (probed), so it
+    #: is accepted — it only matters on reduced-precision fp32 matmul
+    #: accelerators (the XLA/ROCm TF32 class).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset(
-            {"rng_bit_generator", "sort_emission", "while_init_rewrite"}
+            {
+                "rng_bit_generator",
+                "sort_emission",
+                "while_init_rewrite",
+                "dot_precision",
+            }
         ),
         "compile": frozenset(
             {"target_backends", "iree_compile_args", "opt_level"}
