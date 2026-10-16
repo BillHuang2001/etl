@@ -85,8 +85,43 @@ creation). iree-cuda runs use 3.11.0 — crash-repro clean, see below. For HLO d
 --xla_dump_hlo_as_text` to XLA_FLAGS (compile-time dumps land even if the run
 fails). `graph`-command outputs live on CPU (numpy backend) — no GPU needed.
 
+## Finding (MI300X / ROCm 7.1 / jax-rocm7-pjrt 0.11.2): etl's xla driver WORKS on ROCm; the plugin corrupts the heap at process exit; TVM cannot run
+Full report: `./rocm_mi300x_findings.md`; probes in this dir:
+`probe_rocm_raw_pjrt.py`, `probe_rocm_device_info.py`,
+`probe_rocm_teardown_minimal.py`, `probe_rocm_etl_pipeline.py`,
+`probe_rocm_tvm.py` — set `ETL_PJRT_PLUGIN` to the venv's
+`jax_plugins/xla_rocm7/xla_rocm_plugin.so`.
+On an AMD Instinct MI300X VF (`gfx942`, ROCm 7.1.0, no NVIDIA GPU;
+`uv pip install jax-rocm7-pjrt` = 0.11.2, jaxlib stays 0.10.2) the plugin passes
+etl's vendored-header ABI gate (plugin `PJRT_Api.struct_size` = 1144 = the
+driver's `sizeof(PJRT_Api)`; API minor 115 vs the vendored 114 — appended
+fields only, no rejection/offset mismatch) and the raw driver probe is **7/7
+PASS** deterministically (discovery, dlopen/`GetPjrtApi`, initialize, client,
+`platform_name='rocm'`, compile, bit-exact execute). The full
+`etl.build(..., backend="xla")` pipeline runs with numpy parity both
+host-staged and device-resident; `pytest tests/backends/test_adapter_xla.py`
+passes 10/10 with this plugin. Two gaps: (a) `Device("rocm"/"hip", 0)` is
+REJECTED by the adapter's kind vocabulary (`etl/backends/adapters/xla.py:443`
+gate, `:452` index derivation, `:904` placement-provider kind check, `:962`
+provider registration) — the existing `"cuda"` label works on ROCm only because
+it is a dispatch label, so the follow-up is a platform-derived (or extended)
+kind set; (b) **the plugin corrupts the heap at process exit** — any process
+that created a PJRT client aborts with `malloc_consolidate(): invalid chunk
+size` (SIGABRT 134, sometimes SIGSEGV 139) AFTER all work succeeds (no-client
+runs exit 0; `probe_rocm_teardown_minimal.py` reproduces it with **pure ctypes
+importing no etl at all**, and explicit `PJRT_Client_Destroy` does not help,
+while `os._exit(0)` is always clean) — so it is plugin/runtime-side, not the
+driver. TVM: the apache-tvm 0.26.0 wheel is `USE_ROCM=OFF` — it compiles for
+`rocm`/`gfx942` but `tvm.runtime.device("rocm",0).exist` is False and the VM run
+fails with `RuntimeError: ROCm runtime is not linked into this build; cannot
+launch kernels.` (`rocm_fallback_module.cc:59`); etl's tvm adapter is
+additionally CPU-only by design (`adapters/tvm.py:304`).
+
 ## Known gotchas
 
+- MI300X/ROCm runs of anything touching a PJRT client abort at process exit
+  (see the finding above) — read the PASS output, not the exit code; probe
+  scripts that must exit cleanly use `os._exit(0)` or `--hard-exit`.
 - Device-transfer provider registration is per-backend and order-independent
   (fixed in 55a1d2c): each adapter registers its `upload_tensor` under its own
   `(kind, backend)` per-backend slot, `etl.backends.registry.get` records the
