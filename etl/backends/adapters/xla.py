@@ -33,8 +33,9 @@ docstring for provenance) and the driver in ``xla_util.py``. The full flow:
 - **Buffers**: ``PJRT_Client_BufferFromHostBuffer`` (dense row-major numpy
   arrays, all 14 etl dtypes incl. complex64/128) -> execute ->
   ``PJRT_Buffer_ToHostBuffer`` -> ``core.Tensor`` exactly like the numpy
-  interpreter (the CPU path). Device-resident executables (loaded on
-  ``Device("cuda", N)``) pass ``XlaDevicePayload`` inputs through with
+  interpreter (the CPU path). Device-resident executables (loaded on an
+  accelerator ``Device`` — ``"cuda"``/``"rocm"``, alias ``"hip"``) pass
+  ``XlaDevicePayload`` inputs through with
   zero host staging and return ``XlaDevicePayload`` outputs that stay on
   the device (see the ``XlaDevicePayload`` class + ``upload_tensor``).
 - **Persistence**: ``PJRT_Executable_Serialize`` /
@@ -106,6 +107,47 @@ __all__ = [
 
 #: Payload format tag recorded into the CompiledArtifact payload.
 _ARTIFACT_FORMAT = "xla-serialized-executable"
+
+#: Accelerator device kinds the adapter serves ("rocm" canonical, "hip" alias).
+_NON_CPU_KINDS: tuple[str, ...] = ("cuda", "rocm", "hip")
+
+#: PJRT plugin platform name -> the device kinds it physically serves. A
+#: platform NOT listed is PERMISSIVE (presumed to serve whatever non-cpu kind
+#: the user named) — keeps the test-only fake plugin (platform "fake") working
+#: with Device("cuda", 0) and lets future platforms work unchanged.
+_PLATFORM_KINDS: dict[str, tuple[str, ...]] = {
+    "cuda": ("cuda",),
+    "rocm": ("rocm", "hip"),
+    "hip": ("rocm", "hip"),
+    "cpu": (),
+}
+
+
+def _check_kind_served(
+    device: core.Device, platform_name: str | None = None
+) -> None:
+    """Reject device kinds the adapter (or the active plugin) cannot serve.
+
+    A kind outside ``_NON_CPU_KINDS`` raises a ``core.BackendError`` containing
+    ``supports CPU`` (the pre-ROCm wording). When ``platform_name`` is given, a
+    listed platform must physically serve the requested kind (honest
+    rejection: ``Device("cuda", 0)`` on a ROCm plugin would mislabel where the
+    data lives).
+    """
+    if device.kind not in _NON_CPU_KINDS:
+        raise core.BackendError(
+            "the xla adapter supports CPU ('cpu') and accelerator "
+            f"('cuda'/'rocm', alias 'hip') devices, got {device!r}"
+        )
+    if platform_name is not None:
+        served = _PLATFORM_KINDS.get(platform_name.lower())
+        if served is not None and device.kind not in served:
+            raise core.BackendError(
+                f"the xla PJRT plugin reports platform {platform_name!r}, "
+                f"which serves device kind(s) {served or ()!r}; it cannot "
+                f"serve {device!r} — the device kind must match where the "
+                "data physically lives"
+            )
 
 
 class XlaBackend(CompilerBackend):
@@ -399,10 +441,13 @@ class XlaBackend(CompilerBackend):
           outputs back via ``PJRT_Buffer_ToHostBuffer`` (the historical
           behavior, unchanged). A non-zero cpu index is a
           ``core.DeviceError`` (only ``Device('cpu', 0)`` exists).
-        - ``Device("cuda", N)``: a device-resident executable on the
+        - ``Device("cuda", N)`` / ``Device("rocm", N)`` (alias
+          ``"hip"``): a device-resident executable on the
           client's addressable device N (``core.BackendError`` naming the
           index and the device count when out of range; other kinds are a
-          ``core.BackendError`` naming the supported set). Its inputs must
+          ``core.BackendError`` naming the supported set; a kind the
+          plugin's platform does not physically serve — e.g. ``"cuda"`` on
+          a ROCm plugin — is also a ``core.BackendError``). Its inputs must
           be device-resident ``XlaDevicePayload`` tensors on the same
           device (host inputs raise ``core.DeviceError`` — never staged),
           and its outputs stay on the device as ``XlaDevicePayload``
@@ -440,16 +485,19 @@ class XlaBackend(CompilerBackend):
                     "only Device('cpu', 0) exists for kind 'cpu' — a CPU "
                     f"executable always runs on the host, got {device!r}"
                 )
-            if device.kind not in ("cpu", "cuda"):
-                raise core.BackendError(
-                    "the xla adapter supports CPU ('cpu') and GPU ('cuda') "
-                    f"devices, got {device!r}"
-                )
+            if device.kind != "cpu":
+                # Non-cpu kinds (cuda/rocm/hip) are validated against the
+                # accepted accelerator set here (WITHOUT a platform name —
+                # the client is not acquired yet); a bad kind like "gpu"
+                # raises the "supports CPU" BackendError. The
+                # platform-consistency check runs below once the client
+                # exists.
+                _check_kind_served(device)
         effective_device = (
             device if device is not None else core.Device("cpu", 0)
         )
         device_index = (
-            effective_device.index if effective_device.kind == "cuda" else None
+            effective_device.index if effective_device.kind != "cpu" else None
         )
 
         payload = artifact.payload
@@ -474,6 +522,11 @@ class XlaBackend(CompilerBackend):
             # (None for CPU — execute stays on the compile-time device).
             execute_device: int | None = None
             if device_index is not None:
+                # Honest device-kind validation: the plugin's platform must
+                # physically serve the requested kind (e.g. a Device("cuda",
+                # 0) on a ROCm plugin is rejected rather than mislabelled).
+                platform_name = client.platform_info()[0]
+                _check_kind_served(effective_device, platform_name)
                 devices = client.addressable_devices()
                 if device_index >= len(devices):
                     raise core.BackendError(
@@ -517,14 +570,15 @@ class XlaExecutable(CompilerExecutable):
       executed, and the output buffers are copied back via
       ``PJRT_Buffer_ToHostBuffer`` and wrapped as ``core.Tensor`` exactly
       like the numpy interpreter (``core.Tensor(np.asarray(...))``).
-    - **Device-resident executable** (``Device("cuda", N)``): every input
+    - **Device-resident executable** (accelerator ``Device`` —
+      ``"cuda"``/``"rocm"``, alias ``"hip"``): every input
       must already be a device-resident ``core.Tensor`` carrying an
       ``XlaDevicePayload`` on this executable's device (and from the same
       client) — its PJRT buffer is handed to
       ``PJRT_LoadedExecutable_Execute`` DIRECTLY with zero host staging; a
       host input raises ``core.DeviceError`` (never staged — there is no
       implicit host->device transfer; place it explicitly via
-      ``t.to(Device('cuda', N))``). Outputs are wrapped as
+      ``t.to(Device('cuda'|'rocm', N))``). Outputs are wrapped as
       ``XlaDevicePayload`` tensors that STAY on the device (their
       ``.numpy()`` raises the standard ``core.DeviceError``; read them back
       via the explicit ``t.to(cpu).numpy()``).
@@ -793,7 +847,7 @@ class XlaDevicePayload:
 
     The ``.data`` of device-resident ``core.Tensor`` outputs of
     device-resident ``XlaExecutable`` runs and of the explicit placement
-    path ``t.to(Device('cuda', N))`` (``upload_tensor``). The wrapped
+    path ``t.to(Device('cuda'|'rocm', N))`` (``upload_tensor``). The wrapped
     ``PJRT_Buffer`` stays alive for the payload's lifetime; the payload
     holds one reference on the process-global shared client
     (``acquire_client``) and releases it — destroying the buffer BEFORE
@@ -871,41 +925,46 @@ xla_backend = XlaBackend()
 
 
 def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
-    """The core device-transfer provider for kind ``"cuda"`` (explicit placement).
+    """The core device-transfer provider for accelerator kinds (explicit placement).
 
-    Registered by ``register()`` — overwriting whatever provider currently
-    serves kind ``"cuda"`` (idempotent, last-wins — the same pattern as the
-    iree adapter: in a mixed process, whichever adapter activated LAST owns
-    "cuda" placement; the other backend rejects foreign payloads with a
-    clear ``core.DeviceError``). The contract (``core.Tensor.to``):
+    Registered by ``register()`` for every kind in ``_NON_CPU_KINDS``
+    (``"cuda"``/``"rocm"``/``"hip"``) — overwriting whatever provider
+    currently serves those kinds (idempotent, last-wins — the iree adapter's
+    pattern; the other backend rejects foreign payloads with a clear
+    ``core.DeviceError``). The contract (``core.Tensor.to``):
 
     - the source must be a HOST ndarray-backed tensor on ``Device("cpu",
       0)`` — anything else raises ``core.DeviceError`` suggesting the
       explicit two-hop ``t.to(cpu).to(target)`` (no cross-device copies in
       v1);
-    - the target must be a ``Device("cuda", N)`` with N below the plugin
-      client's addressable-device count (``core.BackendError`` naming the
-      count otherwise) — the plugin is discovered via ``ETL_PJRT_PLUGIN`` /
+    - the target must be an accelerator ``Device`` (kind ``"cuda"`` /
+      ``"rocm"`` / ``"hip"``) with an index below the plugin client's
+      addressable-device count (``core.BackendError`` naming the count
+      otherwise), and the plugin platform must physically serve the
+      requested kind (``core.BackendError`` otherwise — e.g. ``"cuda"`` on
+      a ROCm plugin) — the plugin is discovered via ``ETL_PJRT_PLUGIN`` /
       well-known paths (``Tensor.to`` passes no options);
     - the upload is ONE-SHOT: ``PJRT_Client_BufferFromHostBuffer`` on the
       shared client (fresh buffer, no cache), returning a fresh
       device-resident ``core.Tensor`` wrapping an ``XlaDevicePayload``.
 
-    This is the bootstrap for device-resident loops: place the seed state
-    once with ``state.to(Device('cuda', N))``, then feed each run's
-    device-resident outputs back as the next inputs — zero host
-    round-trips after the first placement.
+    The bootstrap for device-resident loops: place the seed once with
+    ``state.to(Device('cuda'|'rocm', N))``, then feed each run's
+    device-resident outputs back as the next inputs — zero host round-trips
+    after the first placement.
     """
     if not isinstance(tensor, core.Tensor):
         raise core.DeviceError(
             "the xla placement provider expects a core.Tensor, got "
             f"{type(tensor).__name__}"
         )
-    if device.kind != "cuda":
-        # Defensive: the provider is registered for kind "cuda" only.
+    if device.kind not in _NON_CPU_KINDS:
+        # Defensive: the provider is registered for the accelerator kinds
+        # (cuda/rocm/hip) only.
         raise core.DeviceError(
-            f"the xla placement provider places data on 'cuda' devices "
-            f"only, got {device!r}"
+            "the xla placement provider places data on accelerator "
+            "('cuda'/'rocm', alias 'hip') devices only, got "
+            f"{device!r}"
         )
     if tensor.device != core.Device("cpu", 0):
         raise core.DeviceError(
@@ -917,6 +976,11 @@ def upload_tensor(tensor: core.Tensor, device: core.Device) -> core.Tensor:
     plugin = _load_plugin()
     client = acquire_client(plugin)
     try:
+        # Honest device-kind validation: the plugin's platform must
+        # physically serve the requested kind (e.g. placing on Device("cuda",
+        # 0) through a ROCm plugin is rejected rather than mislabelled).
+        platform_name = client.platform_info()[0]
+        _check_kind_served(device, platform_name)
         devices = client.addressable_devices()
         if not 0 <= device.index < len(devices):
             raise core.BackendError(
@@ -947,8 +1011,9 @@ def register() -> None:
     ``options["plugin_path"]`` or the ``ETL_PJRT_PLUGIN`` environment
     variable. Does nothing observable when already registered.
 
-    Registers this adapter's ``upload_tensor`` under the PER-BACKEND slot
-    (kind ``"cuda"``, backend ``"xla"``): ``t.to(Device('cuda', N))`` then
+    Registers this adapter's ``upload_tensor`` under the PER-BACKEND slots
+    (every kind in ``_NON_CPU_KINDS`` — ``"cuda"``/``"rocm"``/``"hip"`` —
+    backend ``"xla"``): ``t.to(Device('cuda'|'rocm', N))`` then
     stages host data onto the PJRT plugin's device N through the shared
     client, returning an ``XlaDevicePayload`` tensor — the explicit
     bootstrap for device-resident xla loops — whenever xla is the preferred
@@ -958,6 +1023,7 @@ def register() -> None:
     """
     XlaBackend.check_available()
     _registry_register(xla_backend)
-    core.register_backend_device_transfer_provider(
-        "cuda", xla_backend.name, upload_tensor
-    )
+    for _kind in _NON_CPU_KINDS:
+        core.register_backend_device_transfer_provider(
+            _kind, xla_backend.name, upload_tensor
+        )
