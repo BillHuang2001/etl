@@ -1,14 +1,21 @@
 """etl.bench backend-options resolution contract (``_util.resolve_backend_options``).
 
 The harness resolves the backend options dict passed to ``etl.build`` (and to
-every ``Example.runner`` factory): the device-derived ``target_backends``
-default for every non-numpy backend (``["cuda"]`` / ``["rocm"]`` for a rocm or
-``"hip"`` device / ``["llvm-cpu"]`` otherwise), and the ``opt_level`` harness
-default ``"O3"`` — injected for every non-numpy backend unless an explicit
-``opt_level`` is present or the ``ETL_OPT_LEVEL`` env var is set/blank-checked
-(injection is skipped when the env var is set, so the pipeline's env
-machinery applies it at compile; env unset/blank -> the O3 harness default is
-injected). numpy is the reference interpreter — NEVER affected.
+every ``Example.runner`` factory):
+
+- ``target_backends`` is an **iree-only** lower option (the xla, tvm, and numpy
+  backends reject it — it is declared in no stage of theirs), so the
+  device-derived default is injected ONLY for the iree backend family, gated on
+  the ``backend.startswith("iree")`` name convention — ``["cuda"]`` for a cuda
+  device, ``["rocm"]`` for a rocm (or its ``"hip"`` alias) device,
+  ``["llvm-cpu"]`` otherwise. xla, tvm, and numpy receive NO
+  ``target_backends``.
+- the ``opt_level`` harness default ``"O3"`` is injected for EVERY non-numpy
+  backend (numpy is the only interpreter backend) — iree, xla AND tvm — unless
+  an explicit ``opt_level`` is present or the ``ETL_OPT_LEVEL`` env var is set
+  (injection is skipped when the env var is set, so the pipeline's env
+  machinery applies it at compile; env unset/blank -> the O3 harness default is
+  injected). numpy is the reference interpreter — NEVER affected.
 
 Pure-python unit tests (no compiler, no torch): ``import etl.bench._util`` is
 torch-safe (torch is imported lazily inside function bodies only).
@@ -21,21 +28,60 @@ from etl import core
 from etl.bench._util import resolve_backend_options, resolve_device
 from etl.pipeline_options import apply_env_options
 
+_ALL_DEVICE_KINDS = [
+    core.Device("cpu", 0),
+    core.Device("cuda", 0),
+    core.Device("cuda", 3),
+    core.Device("rocm", 0),
+    core.Device("hip", 1),
+]
 
-def test_numpy_backend_never_gets_opt_level():
+
+@pytest.mark.parametrize("device", _ALL_DEVICE_KINDS)
+def test_numpy_backend_never_gets_opt_level(device):
     """numpy is the reference interpreter: no target_backends, no opt_level —
-    the options dict passes through untouched (even when user options exist)."""
-    assert resolve_backend_options("numpy", core.Device("cpu", 0), {}) == {}
+    the options dict passes through untouched (even when user options exist),
+    for every device kind (cpu / cuda / rocm / hip)."""
+    assert resolve_backend_options("numpy", device, {}) == {}
     given = {"opt_level": "O1", "target_backends": ["cuda"]}
-    assert resolve_backend_options("numpy", core.Device("cpu", 0), given) == given
+    assert resolve_backend_options("numpy", device, given) == given
 
 
-@pytest.mark.parametrize("backend", ["iree", "xla", "tvm"])
-def test_compiler_backend_gets_O3_by_default(backend):
-    """Every non-numpy backend gets the O3 harness default injected."""
-    opts = resolve_backend_options(backend, core.Device("cpu", 0), {})
+def test_iree_backend_gets_O3_and_llvm_cpu_default():
+    """The literal iree backend gets the O3 harness default plus the
+    device-derived target_backends default (llvm-cpu for a cpu device)."""
+    opts = resolve_backend_options("iree", core.Device("cpu", 0), {})
     assert opts["opt_level"] == "O3"
     assert opts["target_backends"] == ["llvm-cpu"]
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["iree", "iree-cuda", "iree_llvm_cpu", "iree_rocm"],
+)
+def test_iree_family_name_convention_gets_target_backends(backend):
+    """target_backends injection is gated on the ``backend.startswith("iree")``
+    name convention (the pipeline's own env-default convention) — iree-family
+    names beyond the literal "iree" also receive the device-derived default."""
+    opts = resolve_backend_options(backend, core.Device("cuda", 0), {})
+    assert opts["target_backends"] == ["cuda"]
+    assert opts["opt_level"] == "O3"
+
+
+@pytest.mark.parametrize(
+    "device",
+    _ALL_DEVICE_KINDS,
+)
+@pytest.mark.parametrize("backend", ["xla", "tvm"])
+def test_non_iree_compiler_backend_gets_O3_without_target_backends(
+    backend, device
+):
+    """Every non-numpy compiler backend gets the O3 harness default, but the
+    iree-only target_backends default is NOT injected for xla/tvm — on ANY
+    device (cpu / cuda / rocm / hip)."""
+    opts = resolve_backend_options(backend, device, {})
+    assert opts["opt_level"] == "O3"
+    assert "target_backends" not in opts
 
 
 def test_explicit_opt_level_wins_never_overridden():
@@ -127,14 +173,26 @@ def test_none_backend_options_treated_as_empty():
     "device",
     [core.Device("rocm", 0), core.Device("rocm", 3), core.Device("hip", 1)],
 )
-@pytest.mark.parametrize("backend", ["iree", "xla", "tvm"])
-def test_rocm_device_derives_rocm_target_backends(backend, device):
+def test_iree_family_rocm_device_derives_rocm_target_backends(device):
     """A rocm device (and its equivalent 'hip' alias) derives
-    target_backends == ["rocm"] for every compiler backend — the AMD GPU
+    target_backends == ["rocm"] for the iree backend family — the AMD GPU
     target counterpart of the cuda / llvm-cpu device default. The O3 harness
     default is injected exactly as for any other device."""
-    opts = resolve_backend_options(backend, device, {})
+    opts = resolve_backend_options("iree", device, {})
     assert opts["target_backends"] == ["rocm"]
+    assert opts["opt_level"] == "O3"
+
+
+@pytest.mark.parametrize(
+    "device",
+    [core.Device("rocm", 0), core.Device("rocm", 3), core.Device("hip", 1)],
+)
+@pytest.mark.parametrize("backend", ["xla", "tvm"])
+def test_rocm_device_does_not_add_target_backends_for_xla_tvm(backend, device):
+    """The rocm target_backends derivation is iree-only: xla/tvm get the O3
+    harness default but NO target_backends key, even on a rocm/hip device."""
+    opts = resolve_backend_options(backend, device, {})
+    assert "target_backends" not in opts
     assert opts["opt_level"] == "O3"
 
 
@@ -144,12 +202,6 @@ def test_rocm_explicit_target_backends_wins():
         "iree", core.Device("rocm", 0), {"target_backends": ["llvm-cpu"]}
     )
     assert opts["target_backends"] == ["llvm-cpu"]
-
-
-def test_rocm_device_leaves_numpy_untouched():
-    """numpy is the reference interpreter: a rocm device does NOT make it a
-    compiler backend — the options dict passes through untouched."""
-    assert resolve_backend_options("numpy", core.Device("rocm", 0), {}) == {}
 
 
 @pytest.mark.parametrize(
