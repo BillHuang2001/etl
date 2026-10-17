@@ -42,6 +42,7 @@ pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
 import etl
+import etl.numpy as enp
 
 # ---------------------------------------------------------------------------
 # data (fixed seed — same draws as probe_new_emitters.py)
@@ -624,3 +625,109 @@ def test_iree_cuda_smoke(fn, specs, args, ref):
         fn, *specs, args=args, exact=True, ref=ref,
         device=etl.core.Device("cuda", 5), target_backends=["cuda"],
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. sort inside a nested region — the `gather(v, argsort(v))` permutation
+# composition (llvm-cpu only)
+#
+# An `etl.argsort` is emitted as a 2-operand pair sort (keys + iota). That
+# form is unreliable inside an `if`/`while` region whose index operand is
+# hoisted out of the region: the index column can return as the UNSORTED
+# iota, so the following `gather` silently yields the unsorted data. The
+# exporter therefore emits the COUNT composition (no `stablehlo.sort` at
+# all — `_count_argsort_active` in `etl/backends/stablehlo/writer.py`) for
+# every sort emitted inside a region, whatever `sort_emission` says. The two
+# cases below pin that emission numerically, BIT-EXACT:
+#
+# * `test_sort_permutation_inside_while_body` — the composition in a while
+#   body, i.e. `_region_depth > 0` ⇒ the count composition (the emission the
+#   region rule selects);
+# * `test_sort_permutation_top_level` — the flat-block control for the same
+#   graph. With `SORT_N = 64` (sorted axis >= 32) the iree adapter's
+#   `sort_emission="auto"` default also selects the count composition, so
+#   both cases exercise the same composition and differ only in emission
+#   site.
+# ---------------------------------------------------------------------------
+
+SORT_N = 64      # sorted-axis extent; >= 32 so "auto" picks count at top level
+SORT_ITERS = 3   # small fixed trip count for the region case
+
+#: Continuous draws ⇒ no ties, so the argsort permutation — and therefore the
+#: whole composition — is STABILITY-INDEPENDENT.
+SV = _RNG.standard_normal(SORT_N).astype(np.float32)
+SW = _RNG.standard_normal(SORT_N).astype(np.float32)
+
+SORT_PERM_SPECS = (
+    etl.TensorSpec((SORT_N,), etl.float32),
+    etl.TensorSpec((SORT_N,), etl.float32),
+)
+
+
+def _sort_perm_step(v, w):
+    """One `argsort` → `gather` permutation step.
+
+    ``gather(v, argsort(v))`` is the SORTED ``v``; ``w`` is co-permuted with
+    it and the two are combined elementwise. The product has mixed signs, so
+    the step is NOT idempotent and every loop iteration really re-orders the
+    carried values.
+    """
+    idx = etl.argsort(v)
+    return etl.multiply(etl.gather(v, idx), etl.gather(w, idx))
+
+
+def _sort_perm_body(carry):
+    v, w, i = carry
+    return _sort_perm_step(v, w), w, i + 1
+
+
+def _sort_perm_in_while(v, w):
+    """The permutation composition INSIDE a while body (a nested region)."""
+    def cond_fn(carry):
+        return carry[2] < SORT_ITERS
+
+    out, _, _ = etl.while_loop(
+        cond_fn, _sort_perm_body, (v, w, enp.zeros((), etl.int64))
+    )
+    return out
+
+
+def _sort_perm_top(v, w):
+    """The same composition in the flat top-level block (the control)."""
+    return _sort_perm_step(v, w)
+
+
+def _sort_perm_ref(v, w, steps=1):
+    """Explicit numpy reference: `np.argsort(kind="stable")` + `np.sort`-style
+    gather, repeated ``steps`` times."""
+    v = np.asarray(v, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float32)
+    for _ in range(steps):
+        idx = np.argsort(v, kind="stable")
+        v = v[idx] * w[idx]
+    return v
+
+
+def test_sort_permutation_inside_while_body():
+    """`gather(v, argsort(v))` in a while body — the region sort pin.
+
+    Exercises the COUNT argsort composition inside the `stablehlo.while`
+    body (region depth > 0), i.e. the emission with no `stablehlo.sort` in
+    it. Any desynchronized index column (the unsorted iota) makes the
+    gathered values differ from the reference, so the comparison is exact.
+    """
+    ref = _sort_perm_ref(SV, SW, steps=SORT_ITERS)
+    _parity(_sort_perm_in_while, *SORT_PERM_SPECS, args=(SV, SW),
+            exact=True, ref=ref)
+
+
+def test_sort_permutation_top_level():
+    """Flat-block control: the same composition with no region in sight.
+
+    Same graph, same count composition (`sort_emission="auto"` at extent 64),
+    emitted in the top-level block — so the region form is pinned against the
+    plain form as well as against numpy.
+    """
+    ref = _sort_perm_ref(SV, SW, steps=1)
+    _parity(_sort_perm_top, *SORT_PERM_SPECS, args=(SV, SW),
+            exact=True, ref=ref)
