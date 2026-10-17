@@ -697,12 +697,20 @@ def _build_input_plan(signature, bound: dict):
     - ``expected_tree`` — the structure run-time arguments must match: the
       full ``signature.input_tree`` for a plain executable, the bound-leaf-
       reduced tree for a ``BoundExecutable``.
-    - ``entries`` — one ``(is_tensor, path, spec, recorded, leaf_index)``
-      tuple per leaf of the FULL input tree in pre-order (``path`` is the
-      pre-rendered pytree path string, ``spec`` the tensor spec or ``None``,
-      ``recorded`` the recorded static value or ``None``, ``leaf_index`` the
-      flat leaf index — bound lookups stay live via the ``bound`` dict, so
-      the plan is independent of the bound values).
+    - ``entries`` — one ``(is_tensor, path, spec_dtype, spec_shape,
+      static_shape, spec_device, recorded, leaf_index)`` tuple per leaf of
+      the FULL input tree in pre-order. The EXPECTED per-leaf metadata
+      (``spec.dtype``/``spec.shape``/``spec.device``, plus ``static_shape`` =
+      the spec shape as a plain int tuple when every dim is static, else
+      ``None`` — see ``_static_spec_shape``) is captured ONCE here so the
+      per-call hot path never re-enters the spec's properties; it is still
+      COMPARED against every runtime leaf (dtype/shape/device — caching the
+      expectation, never trusting it). ``path`` is the pytree key-path
+      tuple, rendered via ``_format_path`` only when an error message needs
+      it. ``recorded`` is the recorded static value (``None`` for tensor
+      leaves) and ``leaf_index`` the flat leaf index — bound lookups stay
+      live via the ``bound`` dict, so the plan is independent of the bound
+      values.
     - ``total`` / ``n_bound`` — feed the leaf-count error message.
     - ``bound_keys`` — the sorted bound leaf indices (freshness guard for
       ``BoundExecutable`` plans).
@@ -720,9 +728,23 @@ def _build_input_plan(signature, bound: dict):
     static_values = iter(signature.static_values)
     for leaf_spec, leaf_index, path in _walk_leaves(input_tree):
         if _is_tensor_leaf_spec(leaf_spec):
-            entries.append((True, _format_path(path), next(tensor_specs), None, leaf_index))
+            spec = next(tensor_specs)
+            entries.append(
+                (
+                    True,
+                    path,
+                    spec.dtype,
+                    spec.shape,
+                    _static_spec_shape(spec.shape),
+                    spec.device,
+                    None,
+                    leaf_index,
+                )
+            )
         else:
-            entries.append((False, _format_path(path), None, next(static_values), leaf_index))
+            entries.append(
+                (False, path, None, None, None, None, next(static_values), leaf_index)
+            )
     return (expected_tree, tuple(entries), total, n_bound, bound_keys)
 
 
@@ -879,6 +901,21 @@ def _reduce_tree(spec: "core.TreeSpec", bound: set, counter) -> "core.TreeSpec |
     )
 
 
+def _static_spec_shape(spec_shape):
+    """``spec_shape`` as a plain shape tuple if EVERY dim is a static ``int``.
+
+    Returns ``None`` as soon as a ``core.Dim``/``core.DimExpr``/``None`` dim
+    appears: those need the per-dim walk in ``_check_shape`` (a symbolic dim
+    may be runtime-dynamic, have a known size, or be an expression that needs
+    bindings). Computed ONCE per tensor spec when a plan is built, so the hot
+    path pays for it never.
+    """
+    for entry in spec_shape:
+        if type(entry) is not int:
+            return None
+    return spec_shape
+
+
 def _check_shape(actual_shape, spec_shape, path) -> None:
     """Validate a concrete shape against a spec's (symbolic) shape.
 
@@ -888,13 +925,25 @@ def _check_shape(actual_shape, spec_shape, path) -> None:
     evaluated without bindings — when it resolves it must match, when it
     needs bindings (named symbolic dims) it is accepted (v1 has no binding
     environment).
+
+    Fast path: when every spec dim is a static ``int`` — and the actual shape
+    is a tuple — the whole check is ONE C-level tuple comparison. Any
+    mismatch falls through to the per-dim walk below, so non-static specs and
+    every error message are byte-identical to the plain walk.
     """
     if len(actual_shape) != len(spec_shape):
         raise core.ShapeError(
-            f"rank mismatch for input at path {path}: spec shape "
+            f"rank mismatch for input at path {_format_path(path)}: spec shape "
             f"{tuple(spec_shape)} has rank {len(spec_shape)}, got shape "
             f"{tuple(actual_shape)} with rank {len(actual_shape)}"
         )
+    if type(spec_shape) is tuple and type(actual_shape) is tuple:
+        for entry in spec_shape:
+            if type(entry) is not int:
+                break
+        else:
+            if actual_shape == spec_shape:
+                return
     for axis, entry in enumerate(spec_shape):
         if entry is None:
             continue
@@ -911,10 +960,23 @@ def _check_shape(actual_shape, spec_shape, path) -> None:
                 continue  # symbolic expression needing bindings — accepted in v1
         if expected != actual_shape[axis]:
             raise core.ShapeError(
-                f"shape mismatch for input at path {path}: spec shape "
+                f"shape mismatch for input at path {_format_path(path)}: spec shape "
                 f"{tuple(spec_shape)} vs actual shape {tuple(actual_shape)} "
                 f"(dim {axis} must be {entry!r}, got {actual_shape[axis]})"
             )
+
+
+def _check_static_shape(actual_shape, static_shape, spec_shape, path) -> None:
+    """All-static shape check for the run hot path: ONE tuple comparison.
+
+    ``static_shape`` is the plan-cached spec shape (``_static_spec_shape``),
+    so it is only ever non-``None`` when every expected dim is a static
+    ``int``; a mismatch therefore always raises inside the canonical per-dim
+    walk of ``_check_shape`` (rank error or first-bad-dim error), keeping the
+    message byte-identical to the general path.
+    """
+    if actual_shape != static_shape:
+        _check_shape(actual_shape, spec_shape, path)
 
 
 def _validate_tensor(spec: "core.TensorSpec", leaf: Any, path) -> "core.Tensor":
@@ -924,28 +986,66 @@ def _validate_tensor(spec: "core.TensorSpec", leaf: Any, path) -> "core.Tensor":
     ``core.from_numpy`` (documented convenience); anything else →
     ``core.TraceError``. Checks dtype (``core.DTypeError``), shape
     (``core.ShapeError``, see ``_check_shape``) and device
-    (``core.DeviceError``).
+    (``core.DeviceError``). ``path`` is the pytree key-path tuple, rendered
+    only when an error message is built.
+
+    Thin wrapper deriving the spec metadata for ``_validate_tensor_meta``
+    (the run hot path passes the plan-cached metadata directly).
     """
-    if isinstance(leaf, core.Tensor):
-        tensor = leaf
-    elif isinstance(leaf, np.ndarray):
-        tensor = core.from_numpy(leaf)
+    return _validate_tensor_meta(
+        leaf,
+        path,
+        spec.dtype,
+        spec.shape,
+        _static_spec_shape(spec.shape),
+        spec.device,
+    )
+
+
+def _validate_tensor_meta(
+    leaf, path, spec_dtype, spec_shape, static_shape, spec_device
+) -> "core.Tensor":
+    """Validate one runtime leaf against PRE-COMPUTED spec metadata.
+
+    ``spec_dtype``/``spec_shape``/``spec_device`` are the expected
+    ``core.TensorSpec`` fields and ``static_shape`` its all-static form
+    (``_static_spec_shape``, ``None`` when symbolic). The metadata only
+    avoids re-reading the spec's properties on every call — every leaf is
+    still COMPARED against it (dtype equality, shape check via the 1-tuple
+    fast path, spec device when the spec declares one), and all errors are
+    raised with the same types and wording as ``_validate_tensor``.
+    """
+    if type(leaf) is not core.Tensor:
+        if isinstance(leaf, core.Tensor):  # a core.Tensor subclass instance
+            tensor = leaf
+        elif isinstance(leaf, np.ndarray):
+            tensor = core.from_numpy(leaf)
+        else:
+            raise core.TraceError(
+                f"input at path {_format_path(path)} must be a core.Tensor "
+                f"(or a numpy ndarray, wrapped via core.from_numpy), got "
+                f"{type(leaf).__qualname__}"
+            )
     else:
-        raise core.TraceError(
-            f"input at path {path} must be a core.Tensor (or a numpy ndarray, "
-            f"wrapped via core.from_numpy), got {type(leaf).__qualname__}"
-        )
-    if tensor.dtype != spec.dtype:
+        tensor = leaf
+    actual_dtype = tensor.dtype
+    if actual_dtype is not spec_dtype and actual_dtype != spec_dtype:
         raise core.DTypeError(
-            f"dtype mismatch for input at path {path}: spec dtype {spec.dtype}, "
-            f"got {tensor.dtype}"
+            f"dtype mismatch for input at path {_format_path(path)}: spec dtype "
+            f"{spec_dtype}, got {actual_dtype}"
         )
-    _check_shape(tensor.shape, spec.shape, path)
-    if spec.device is not None and tensor.device != spec.device:
-        raise core.DeviceError(
-            f"device mismatch for input at path {path}: spec device "
-            f"{spec.device}, got {tensor.device}"
-        )
+    actual_shape = tensor.shape
+    if static_shape is not None:
+        _check_static_shape(actual_shape, static_shape, spec_shape, path)
+    else:
+        _check_shape(actual_shape, spec_shape, path)
+    if spec_device is not None:
+        actual_device = tensor.device
+        if actual_device is not spec_device and actual_device != spec_device:
+            raise core.DeviceError(
+                f"device mismatch for input at path {_format_path(path)}: spec "
+                f"device {spec_device}, got {actual_device}"
+            )
     return tensor
 
 
@@ -960,15 +1060,18 @@ def _check_run_device(tensor: "core.Tensor", expected_device, path) -> None:
     remedy, before the backend is dispatched. When the executable reports no
     device (``expected_device is None`` — a device-less backend executable)
     no enforcement is possible and the check passes. The comparison is plain
-    ``core.Device`` dataclass equality — kind-neutral, so it already covers
-    ``cuda``/``rocm``/``hip`` alike with no kind-specific logic.
+    ``core.Device`` equality (identical object short-circuits it) —
+    kind-neutral, so it already covers ``cuda``/``rocm``/``hip`` alike with
+    no kind-specific logic. ``path`` is the pytree key-path tuple, rendered
+    only when the error message is built.
     """
     if expected_device is None:
         return
-    if tensor.device != expected_device:
+    actual_device = tensor.device
+    if actual_device is not expected_device and actual_device != expected_device:
         raise core.DeviceError(
-            f"input at path {path} is on device {tensor.device}, but the "
-            f"executable runs on device {expected_device}: no implicit "
+            f"input at path {_format_path(path)} is on device {actual_device}, "
+            f"but the executable runs on device {expected_device}: no implicit "
             f"device-to-host or host-to-device transfer happens at the run "
             f"boundary — move the tensor to the executable's device "
             f"explicitly via t.to({expected_device!r})"
@@ -1045,10 +1148,8 @@ def _prepare_flat_inputs_slow(signature, bound: dict, args, expected_device) -> 
             if leaf_index in bound:
                 tensor = bound[leaf_index]
             else:
-                tensor = _validate_tensor(
-                    spec, next(user_iter), _format_path(path)
-                )
-            _check_run_device(tensor, expected_device, _format_path(path))
+                tensor = _validate_tensor(spec, next(user_iter), path)
+            _check_run_device(tensor, expected_device, path)
             tensors.append(tensor)
         else:
             recorded = next(static_values)
@@ -1086,14 +1187,17 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None,
     is dispatched.
 
     Fast path: ``plan`` (from ``_build_input_plan``, cached on the
-    executable) precomputes the per-leaf layout, so structure checking and
-    leaf collection run in ONE pass over the raw arguments
-    (``_fast_structure_walk``) with no runtime TreeSpec built and no
-    per-leaf path re-rendering. All checks and error messages are identical
-    to the slow path: flatten-style errors (unorderable dict keys) raise at
-    the same traversal point, and any structural divergence falls back to
-    ``_prepare_flat_inputs_slow``, which rebuilds the runtime tree and
-    raises the canonical structure-mismatch error.
+    executable) precomputes the per-leaf layout AND the expected per-leaf
+    dtype/shape/device metadata, so structure checking and leaf collection run
+    in ONE pass over the raw arguments (``_fast_structure_walk``) with no
+    runtime TreeSpec built, no re-entry into the spec properties, and no
+    per-leaf path rendering (a path string is built only on a failure
+    branch). The runtime leaves are still fully validated against the cached
+    metadata. All checks and error messages are identical to the slow path:
+    flatten-style errors (unorderable dict keys) raise at the same traversal
+    point, and any structural divergence falls back to
+    ``_prepare_flat_inputs_slow``, which rebuilds the runtime tree and raises
+    the canonical structure-mismatch error.
     """
     if plan is None:
         plan = _build_input_plan(signature, bound)
@@ -1118,13 +1222,29 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None,
         )
     tensors = []
     user_iter = iter(user_leaves)
-    for is_tensor, path, spec, recorded, leaf_index in entries:
+    for (
+        is_tensor,
+        path,
+        spec_dtype,
+        spec_shape,
+        static_shape,
+        spec_device,
+        recorded,
+        leaf_index,
+    ) in entries:
         if is_tensor:
             bound_tensor = bound.get(leaf_index)
             if bound_tensor is not None:
                 tensor = bound_tensor
             else:
-                tensor = _validate_tensor(spec, next(user_iter), path)
+                tensor = _validate_tensor_meta(
+                    next(user_iter),
+                    path,
+                    spec_dtype,
+                    spec_shape,
+                    static_shape,
+                    spec_device,
+                )
             _check_run_device(tensor, expected_device, path)
             tensors.append(tensor)
         else:
@@ -1138,7 +1258,7 @@ def _prepare_flat_inputs(signature, bound: dict, args, plan=None,
                 raise core.TraceError(
                     f"graph was specialized on {recorded!r} (a "
                     f"{type(recorded).__qualname__}); run-time argument "
-                    f"{leaf!r} (a {kind}) at path {path} does "
+                    f"{leaf!r} (a {kind}) at path {_format_path(path)} does "
                     f"not match"
                 )
     return tensors
@@ -1172,25 +1292,22 @@ def _normalize_leaf_types(spec: "core.TreeSpec") -> "core.TreeSpec":
     )
 
 
-def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
-    """Wrap flat backend results as ``core.Tensor``\\s and rebuild the
-    structured output per ``signature.output_tree``.
+def _wrap_flat_outputs(flat_outputs):
+    """Wrap flat backend results as ``core.Tensor``\\s, in order.
 
-    Tensor leaves (per ``_is_tensor_leaf_spec``) consume the backend outputs
-    in order — ``core.Tensor`` passes through, numpy ``ndarray`` is wrapped
-    via ``core.from_numpy``, anything else raises ``core.BackendError``
-    naming the flat index. Static leaves consume
-    ``signature.output_static_values`` in order. The tree is normalized via
-    ``_normalize_leaf_types`` before ``core.unflatten``.
-
-    Fast path: ``plan`` (from ``_build_output_plan``, cached on the
-    executable) carries the once-normalized output tree and the per-leaf
-    tensor/static flags, so the per-call normalization copy and leaf-kind
-    counting walks are skipped. All checks and error messages are identical.
+    ``core.Tensor`` passes through, numpy ``ndarray`` is wrapped via
+    ``core.from_numpy``, anything else raises ``core.BackendError`` naming the
+    flat index. When EVERY entry already is a ``core.Tensor`` the backend's
+    own sequence is returned as-is (no per-leaf isinstance/append pass, no
+    copy); otherwise the mixed sequence is rebuilt exactly as before, so the
+    first offending flat index still raises in traversal order.
     """
-    if plan is None:
-        plan = _build_output_plan(signature)
-    normalized_tree, flags, tensor_count, static_count = plan
+    if isinstance(flat_outputs, (list, tuple)):
+        for element in flat_outputs:
+            if not isinstance(element, core.Tensor):
+                break
+        else:
+            return flat_outputs
     wrapped = []
     for i, element in enumerate(flat_outputs):
         if isinstance(element, core.Tensor):
@@ -1203,6 +1320,32 @@ def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
                 f"expected core.Tensor or numpy ndarray, got "
                 f"{type(element).__qualname__}"
             )
+    return wrapped
+
+
+def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
+    """Wrap flat backend results as ``core.Tensor``\\s and rebuild the
+    structured output per ``signature.output_tree``.
+
+    Tensor leaves (per ``_is_tensor_leaf_spec``) consume the backend outputs
+    in order — ``core.Tensor`` passes through, numpy ``ndarray`` is wrapped
+    via ``core.from_numpy``, anything else raises ``core.BackendError``
+    naming the flat index (see ``_wrap_flat_outputs``). Static leaves consume
+    ``signature.output_static_values`` in order. The tree is normalized via
+    ``_normalize_leaf_types`` before ``core.unflatten``.
+
+    Fast path: ``plan`` (from ``_build_output_plan``, cached on the
+    executable) carries the once-normalized output tree and the per-leaf
+    tensor/static flags, so the per-call normalization copy and leaf-kind
+    counting walks are skipped; a backend that already returns
+    ``core.Tensor``\\s is neither re-checked nor copied per leaf, and an
+    output tree with no static leaves skips the flag interleave entirely. All
+    checks and error messages are identical.
+    """
+    if plan is None:
+        plan = _build_output_plan(signature)
+    normalized_tree, flags, tensor_count, static_count = plan
+    wrapped = _wrap_flat_outputs(flat_outputs)
     if tensor_count != len(wrapped):
         raise core.BackendError(
             f"signature/output mismatch: the output tree has {tensor_count} "
@@ -1216,14 +1359,19 @@ def _unflatten_outputs(signature, flat_outputs, plan=None) -> Any:
             f"{len(output_static_values)} output static values"
         )
 
-    leaves = []
-    tensor_iter = iter(wrapped)
-    static_iter = iter(output_static_values)
-    for flag in flags:
-        if flag:
-            leaves.append(next(tensor_iter))
-        else:
-            leaves.append(next(static_iter))
+    if static_count:
+        leaves = []
+        tensor_iter = iter(wrapped)
+        static_iter = iter(output_static_values)
+        for flag in flags:
+            if flag:
+                leaves.append(next(tensor_iter))
+            else:
+                leaves.append(next(static_iter))
+    else:
+        # Every leaf is a tensor position: the wrapped sequence IS the leaf
+        # list, in pre-order (no per-leaf flag walk, no copy).
+        leaves = wrapped
     try:
         return core.unflatten(leaves, normalized_tree)
     except ValueError as exc:
@@ -1348,7 +1496,8 @@ def bind(executable, **bindings):
                 f"{available}"
             )
         leaf_index, spec = entry
-        path = _format_path((name,))
+        # pytree key-path tuple — rendered only if a check fails.
+        path = (name,)
         tensor = _validate_tensor(spec, value, path)
         _check_run_device(tensor, executable.device, path)
         bound[leaf_index] = tensor
