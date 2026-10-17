@@ -1599,6 +1599,12 @@ class IreeExecutable(CompilerExecutable):
         self._output_specs = (
             tuple(signature.output_specs) if signature is not None else ()
         )
+        # Per-call validation contracts, derived ONCE here (specs are
+        # immutable): the input plan of ``(dtype, shape, needs_dim_walk)``
+        # entries and the flat tuple of expected output dtypes. Plans hold no
+        # values — ``run`` compares its actual argument metadata against them.
+        self._input_plan = _input_plan(self._input_specs)
+        self._output_dtypes = tuple(spec.dtype for spec in self._output_specs)
         self._entry: Any = None
         # R6.2: plain runs carry NO staging machinery (no _staged_inputs
         # cache, no _pool_anchor anchor) — inputs must already be on this
@@ -1633,50 +1639,93 @@ class IreeExecutable(CompilerExecutable):
         validate_options(options, self.KNOWN_OPTIONS, self.backend_name, "run")
 
         input_specs = self._input_specs
-        output_specs = self._output_specs
-        if len(flat_input_tensors) != len(input_specs):
+        input_plan = self._input_plan
+        n_inputs = len(input_specs)
+        if len(flat_input_tensors) != n_inputs:
             raise core.BackendError(
-                f"program expects {len(input_specs)} input tensor(s), got "
+                f"program expects {n_inputs} input tensor(s), got "
                 f"{len(flat_input_tensors)}"
             )
+        core_device = self._core_device
+        runtime_device = self.runtime_device
+        np, rt = _runtime_modules()
+        reject_foreign = core_device.kind != "cpu"
+        # Pre-sized buffers filled by index: per-IO leaf work (validate +
+        # buffer build) is the dominant non-invoke cost, so it happens in ONE
+        # pass instead of a validation walk followed by a ``_build_buffers``
+        # walk over the same list.
+        buffers = [None] * n_inputs
         for i, tensor in enumerate(flat_input_tensors):
             if not isinstance(tensor, core.Tensor):
                 raise core.BackendError(
                     f"input {i} must be a core.Tensor, got "
                     f"{type(tensor).__name__}"
                 )
-            spec = input_specs[i]
-            if tensor.dtype != spec.dtype:
+            data = tensor.data
+            want_dtype, want_shape, needs_dim_walk = input_plan[i]
+            # dtype: one comparison in the steady state (all payload/ndarray
+            # dtypes are numpy dtypes); anything exotic is normalized exactly
+            # like ``Tensor.dtype`` before the verdict, so the comparison —
+            # and a ``core.DTypeError`` for a non-normalizable dtype — is
+            # unchanged. The message is built from the same expressions as
+            # before (on the failure path only).
+            dtype = data.dtype
+            if dtype != want_dtype and core.dtype(dtype) != want_dtype:
                 raise core.BackendError(
-                    f"input {i}: expected dtype {spec.dtype}, got "
+                    f"input {i}: expected dtype {input_specs[i].dtype}, got "
                     f"{tensor.dtype} — never silently coerce"
                 )
-            shape = tensor.shape
-            if spec.shape != shape:
-                # Static-shape fast path: an all-static spec whose tuple
-                # EQUALS the runtime shape needs no per-dim walk (the common
-                # steady-state case). Any symbolic/dynamic/None entry makes
-                # the tuples unequal and falls into the walk, which applies
-                # the exact per-dim semantics (symbolic passes, None skipped,
-                # mismatches raise core.ShapeError).
-                _validate_input_shape(i, spec.shape, shape)
+            shape = data.shape
+            if type(shape) is not tuple:
+                shape = tuple(shape)
+            # Static specs (the steady state) pass on one tuple compare; any
+            # non-int declared dim goes straight to the walker, which applies
+            # the exact per-dim semantics (symbolic passes, ``None`` skipped,
+            # a static-dim mismatch raises ``core.ShapeError``).
+            if needs_dim_walk or shape != want_shape:
+                _validate_input_shape(i, want_shape, shape)
 
-        # R6.2: plain runs build FRESH buffers every call — no staging
-        # cache. Same-device payload/DeviceArray inputs pass through;
-        # host ndarray inputs take the asdevicearray representation path on
-        # an llvm-cpu executable and are REJECTED with core.DeviceError on a
-        # cuda/rocm executable (no implicit host-to-device transfer; the
-        # pipeline run-boundary check rejects them first — this is
-        # defense-in-depth).
-        buffers = _build_buffers(
-            flat_input_tensors,
-            input_specs,
-            self.runtime_device,
-            self._core_device,
-            None,  # plain runs never stage
-            reject_foreign=self._core_device.kind != "cpu",
-            device_kind=_normalize_device_kind(self._core_device.kind),
-        )
+            # Buffer build, fused into this pass — the plain-run form of
+            # ``_build_buffers`` below, same branch order: a same-device
+            # payload/raw-DeviceArray input passes through with ZERO
+            # ``asdevicearray``/``numpy()`` calls, a non-pass-through input on
+            # a cuda/rocm executable is rejected (no implicit host-to-device
+            # transfer), and an llvm-cpu executable takes the asdevicearray
+            # representation path (host->host ABI adaptation). Plain runs
+            # never stage, so there is no staging-cache branch here.
+            if isinstance(data, IreeDevicePayload):
+                if tensor.device == core_device:
+                    buffers[i] = data.device_array
+                    continue
+            elif (
+                not isinstance(data, np.ndarray)
+                and isinstance(data, rt.DeviceArray)
+                and tensor.device == core_device
+            ):
+                buffers[i] = data
+                continue
+            if reject_foreign:
+                # Plain cuda/rocm run with a non-pass-through input
+                # (ndarray-backed host tensor or a payload on another device).
+                # Normally unreachable — the pipeline run-boundary check
+                # rejects wrong-device inputs first; this guards direct
+                # backend-level users of the executable.
+                raise core.DeviceError(
+                    f"input {i} is not a device-resident tensor on this "
+                    f"executable's device ({core_device!r}) and plain GPU runs "
+                    "(cuda/rocm) never stage host inputs: there is no implicit "
+                    "host-to-device transfer at the run boundary. Place the "
+                    f"input on the device explicitly first, e.g. "
+                    f"t.to({core_device!r}), or run the executable on the "
+                    "llvm-cpu device with host ndarray inputs"
+                )
+            # llvm-cpu host input -> HAL buffer (host->host ABI
+            # representation). A foreign DEVICE payload reaching here fails
+            # inside ``tensor.numpy()`` with core's own DeviceError (no
+            # implicit device-to-host transfer) — normally unreachable (the
+            # run-boundary check rejects first).
+            buffers[i] = rt.asdevicearray(runtime_device, tensor.numpy())
+
         entry = self._entry_function()
         results = entry(*buffers)
         if results is None:
@@ -1685,25 +1734,31 @@ class IreeExecutable(CompilerExecutable):
             results = (results,)
         # Device-resident outputs: wrap the returned DeviceArrays (already on
         # the device) in core.Tensor with the lazy IreeDevicePayload — the
-        # D2H copy happens only if/when .numpy() is called.
-        core_device = self._core_device
-        outputs = [
-            core.Tensor(IreeDevicePayload(result, core_device))
-            for result in results
-        ]
-
+        # D2H copy happens only if/when .numpy() is called. Wrapping and the
+        # dtype check share ONE pass over a pre-sized output list.
+        output_specs = self._output_specs
+        n_results = len(results)
+        outputs = [None] * n_results
         if self.signature is not None:
-            if len(outputs) != len(output_specs):
+            if n_results != len(output_specs):
                 raise core.BackendError(
-                    f"program produced {len(outputs)} output tensor(s), "
+                    f"program produced {n_results} output tensor(s), "
                     f"expected {len(output_specs)}"
                 )
-            for i, (tensor, spec) in enumerate(zip(outputs, output_specs)):
-                if tensor.dtype != spec.dtype:
+            output_dtypes = self._output_dtypes
+            for i, result in enumerate(results):
+                payload = IreeDevicePayload(result, core_device)
+                tensor = core.Tensor(payload)
+                outputs[i] = tensor
+                dtype = payload._dtype
+                if dtype != output_dtypes[i] and core.dtype(dtype) != output_dtypes[i]:
                     raise core.BackendError(
-                        f"output {i}: expected dtype {spec.dtype}, got "
+                        f"output {i}: expected dtype {output_specs[i].dtype}, got "
                         f"{tensor.dtype} — never silently coerce"
                     )
+        else:
+            for i, result in enumerate(results):
+                outputs[i] = core.Tensor(IreeDevicePayload(result, core_device))
         return outputs
 
     # ------------------------------------------------------------- internals
@@ -2057,24 +2112,30 @@ def _build_buffers(
 ) -> list:
     """Build the HAL buffers for one invoke from validated input tensors.
 
-    Shared by ``IreeExecutable.run`` and the per-segment executor. An input
-    tensor already living on THIS device (payload-backed with a matching
-    ``core.Device`` — our own ``IreeDevicePayload`` (run outputs of this or
-    another iree executable, unwrapped to the underlying DeviceArray) or a
-    raw iree ``DeviceArray``) is handed to the invoke as-is — no host
+    Serves the per-segment executor (``_IreeSegmentExecutable.run``).
+    ``IreeExecutable.run`` performs the PLAIN-RUN form of these branches
+    inline, fused into its single validation pass; the branch order, the
+    pass-through rule and every error are identical, so a change here must be
+    mirrored there (and vice versa).
+
+    An input tensor already living on THIS device (payload-backed with a
+    matching ``core.Device`` — our own ``IreeDevicePayload`` (run outputs of
+    this or another iree executable, unwrapped to the underlying DeviceArray)
+    or a raw iree ``DeviceArray``) is handed to the invoke as-is — no host
     round-trip, no re-upload; the caller's validation loop already proved
     dtype/shape, so the payload is guaranteed correct.
 
     Foreign (non-pass-through) input handling depends on the caller (R6.2 —
     explicit device placement, no implicit host<->device transfers):
 
-    * plain ``IreeExecutable`` runs pass ``staged_inputs=None``: a host
-      ndarray-backed input takes the ``rt.asdevicearray`` representation
-      path on an llvm-cpu executable (host->host ABI adaptation), and is
-      REJECTED with ``core.DeviceError`` on a cuda/rocm executable
-      (``reject_foreign=True`` — defensive: the pipeline run-boundary
-      check normally rejects foreign-device inputs first with its own
-      message; place inputs explicitly via ``t.to(Device('cuda'|'rocm', N))``).
+    * plain runs (``staged_inputs=None`` — now inlined in
+      ``IreeExecutable.run``): a host ndarray-backed input takes the
+      ``rt.asdevicearray`` representation path on an llvm-cpu executable
+      (host->host ABI adaptation), and is REJECTED with ``core.DeviceError``
+      on a cuda/rocm executable (``reject_foreign=True`` — defensive: the
+      pipeline run-boundary check normally rejects foreign-device inputs
+      first with its own message; place inputs explicitly via
+      ``t.to(Device('cuda'|'rocm', N))``).
     * segment executables pass their per-segment staging cache
       (``reject_foreign=False``): host-mode external-kernel boundaries
       legitimately stage host tensors via ``_staged_input`` on cuda and rocm
@@ -2481,6 +2542,73 @@ class IreeExternalExecutable(CompilerExecutable):
         return core.Tensor(entry)
 
 
+# ---------------------------------------------------------------------------
+# Per-call run-path helpers
+# ---------------------------------------------------------------------------
+# Nothing here caches VALUES or runtime tensors: the entries below are static
+# metadata (plans, dtype mappings) or module handles, re-checked against the
+# ACTUAL run arguments on every call.
+#
+# ``numpy`` / ``iree.runtime`` memoized once for the run path: the heavy-import
+# rule keeps them out of module top level, but a per-call ``import`` statement
+# still pays a ``sys.modules`` lookup on every run.
+_RUNTIME_MODULES: list = []
+
+
+def _runtime_modules() -> tuple[Any, Any]:
+    """Return the memoized ``(numpy, iree.runtime)`` module pair."""
+    mods = _RUNTIME_MODULES
+    if not mods:
+        import numpy as np
+
+        import iree.runtime as rt
+
+        mods += (np, rt)
+    return mods[0], mods[1]
+
+
+# HAL element-type int -> numpy dtype, resolved lazily through iree's own
+# mapping helper and memoized per element type (a STATIC mapping: an element
+# type's numpy dtype never changes).
+_HAL_ELEMENT_DTYPES: dict[int, Any] = {}
+
+
+def _hal_element_dtype(element_type: int) -> Any:
+    """numpy dtype for an IREE HAL element-type int (memoized lookup).
+
+    ``DeviceArray.dtype`` resolves this through nanobind on EVERY access
+    (~0.4-0.5 us, measured) — the dominant cost of wrapping run outputs in
+    ``IreeDevicePayload`` before the memo existed.
+    """
+    dtype = _HAL_ELEMENT_DTYPES.get(element_type)
+    if dtype is None:
+        from iree.runtime.array_interop import HalElementType
+
+        dtype = HalElementType.map_to_dtype(element_type)
+        _HAL_ELEMENT_DTYPES[element_type] = dtype
+    return dtype
+
+
+def _input_plan(input_specs: tuple) -> tuple:
+    """Static per-input validation contract, derived ONCE per executable.
+
+    Entries are ``(dtype, shape, needs_dim_walk)`` from the declared specs
+    (``TensorSpec`` normalizes ``dtype`` to a numpy dtype and ``shape`` to a
+    tuple), where ``needs_dim_walk`` is True iff the declared shape holds a
+    non-``int`` entry (symbolic ``Dim``/``DimExpr`` or ``None``) — such a spec
+    can never tuple-match a concrete runtime shape, so the per-dim walker runs
+    instead of a plain tuple compare.
+    """
+    return tuple(
+        (
+            spec.dtype,
+            spec.shape,
+            any(not isinstance(dim, int) for dim in spec.shape),
+        )
+        for spec in input_specs
+    )
+
+
 def _validate_input_shape(index: int, declared: tuple[Any, ...], actual: tuple[int, ...]) -> None:
     """Walk a declared input shape against the concrete shape.
 
@@ -2549,17 +2677,40 @@ class IreeDevicePayload:
     __slots__ = ("_array", "_shape", "_dtype", "device")
 
     def __init__(self, array: Any, device: Device) -> None:
-        self._array = array
         # Metadata cached at construction: an iree runtime ``DeviceArray`` is
         # immutable in shape/dtype for its lifetime (run outputs, staged
         # inputs, and external-kernel results are all created once with fixed
         # metadata), and every access to the raw ``DeviceArray`` shape/dtype
-        # is a nanobind round-trip through iree's array_interop. The hot
-        # ``IreeExecutable.run`` validation loops read tensor dtype/shape
-        # several times per call (per-input validation + output validation),
-        # so resolving once here keeps the per-call Python overhead flat.
-        self._shape = tuple(array.shape)
-        self._dtype = array.dtype
+        # is a nanobind round-trip through iree's array_interop. ``run`` reads
+        # a payload's dtype/shape on every call and user code reads
+        # ``.shape``/``.dtype`` freely, so resolving once here keeps the
+        # per-call Python overhead flat.
+        #
+        # Resolved from the HAL BUFFER VIEW rather than through the public
+        # ``DeviceArray.shape`` / ``.dtype`` accessors: those go through
+        # numpy's ``__array_function__`` dispatch and iree's nanobind dtype
+        # mapping (~0.35 us + ~0.4 us, measured — the largest component of
+        # output wrapping at 12 outputs). The buffer view is the same source
+        # those accessors read: the shape is a tuple of ints and the dtype is
+        # the element-type int resolved through the module-level memo.
+        self._array = array
+        try:
+            view = array._buffer_view
+            # ``DeviceArray``'s explicit dtype override WINS whenever set,
+            # exactly as ``DeviceArray.dtype`` does (bool results and other
+            # dtypes the HAL element type cannot express).
+            dtype = array._override_dtype
+            if dtype is None:
+                dtype = _hal_element_dtype(view.element_type)
+            shape = tuple(view.shape)
+        except (AttributeError, ValueError):
+            # Defensive: a runtime without the private buffer-view protocol —
+            # fall back to the public accessors (cached afterwards either
+            # way, so the payload protocol is unchanged).
+            shape = tuple(array.shape)
+            dtype = array.dtype
+        self._shape = shape
+        self._dtype = dtype
         self.device = device
 
     @property
