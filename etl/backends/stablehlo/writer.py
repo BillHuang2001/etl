@@ -1080,7 +1080,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- Reductions ---
 
     def _emit_reduce(self, op: Op) -> str:
-        """reduce_sum/max/min/prod → `stablehlo.reduce` (+ init constant)."""
+        """reduce_sum/max/min/prod → `stablehlo.reduce` (+ init constant).
+
+        ``sum``/``prod`` PROMOTE the operand to the DECLARED result dtype —
+        numpy's accumulator dtype (bool/int8/int16/int32 → int64,
+        uint8/uint16/uint32 → uint64, int64/uint64/floats keep their own) —
+        BEFORE the reduce: `stablehlo.reduce` keeps the operand element type,
+        so reducing first accumulates in the narrow type (`stablehlo.add` on
+        `tensor<i1>` is logical OR, so a bool popcount collapses to 0/1, and
+        an i32 sum/product wraps at 32 bits before any widening convert).
+        ``min``/``max`` preserve the operand dtype in numpy (the i1
+        ``any``/``all`` guard shapes) and are never promoted.
+        """
         x = op.operands[0]
         kind = op.attributes["reduce_op"]
         axes = tuple(op.attributes.get("axes", ()))
@@ -1093,18 +1104,26 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 "complex dtype is not supported in v1 — complex-number "
                 "computation beyond cast is deferred"
             )
+        out_dtype = np.dtype(op.result.type.dtype)
+        accum_dtype = (
+            out_dtype
+            if kind in ("sum", "prod") and out_dtype != elem_dtype
+            else elem_dtype
+        )
         lines, red_name, reduced_shape = self._reduce_core_with_split(
-            x, dims, kind
+            x, dims, kind, accum_dtype=accum_dtype
         )
         cur = red_name
-        # numpy promotion guard: stablehlo.reduce keeps the operand dtype;
-        # etl sum/prod promote (ints → int64, bool → int64).
-        if np.dtype(op.result.type.dtype) != elem_dtype:
+        # Safety net, not a live path: the promote-before-reduce above means
+        # sum/prod already produce the declared dtype, and min/max preserve
+        # the operand dtype in numpy (the i1 any/all guards), so
+        # `out_dtype == accum_dtype` for every kind shipped today.
+        if out_dtype != accum_dtype:
             converted = self._new_name()
             lines.append(
                 f"{converted} = stablehlo.convert {cur} : "
-                f"({self._type_str(elem_dtype, reduced_shape)}) -> "
-                f"{self._type_str(op.result.type.dtype, reduced_shape)}"
+                f"({self._type_str(accum_dtype, reduced_shape)}) -> "
+                f"{self._type_str(out_dtype, reduced_shape)}"
             )
             cur = converted
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
@@ -1127,7 +1146,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return "\n".join(lines)
 
     def _emit_reduce_mean(self, op: Op) -> str:
-        """reduce_mean → reduce-sum, then divide by the (static) count."""
+        """reduce_mean → reduce-sum, then divide by the (static) count.
+
+        The SUM is accumulated in the DECLARED result dtype — numpy's mean
+        accumulator (bool/ints → float64, floats keep their own) — because
+        numpy's ``mean`` sums in widened precision: a huge int32 array must
+        not wrap at 32 bits before the divide, and a bool ``mean`` is the
+        popcount over the element count. Floats keep the unchanged path
+        (including the historical self-``convert``)."""
         x = op.operands[0]
         axes = tuple(op.attributes.get("axes", ()))
         keepdims = bool(op.attributes.get("keepdims", False))
@@ -1149,15 +1175,23 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         for i in dims:
             count *= x.type.shape[i]
         out_dtype = np.dtype(op.result.type.dtype)
+        elem_dtype = np.dtype(x.type.dtype)
+        accum_dtype = out_dtype if out_dtype != elem_dtype else elem_dtype
         lines, sum_name, reduced_shape = self._reduce_core_with_split(
-            x, dims, "sum"
+            x, dims, "sum", accum_dtype=accum_dtype
         )
-        converted = self._new_name()
-        lines.append(
-            f"{converted} = stablehlo.convert {sum_name} : "
-            f"({self._type_str(x.type.dtype, reduced_shape)}) -> "
-            f"{self._type_str(out_dtype, reduced_shape)}"
-        )
+        cur = sum_name
+        converted = sum_name
+        if accum_dtype == elem_dtype:
+            # Unchanged path (byte-identical): convert the operand-dtype sum
+            # to the result dtype — for floats that is a self-convert.
+            converted = self._new_name()
+            lines.append(
+                f"{converted} = stablehlo.convert {cur} : "
+                f"({self._type_str(elem_dtype, reduced_shape)}) -> "
+                f"{self._type_str(out_dtype, reduced_shape)}"
+            )
+            cur = converted
         # The divisor constant is scalar; StableHLO elementwise ops require
         # equal shapes, so broadcast it when the reduced tensor is not.
         # A dynamic reduced shape (non-reduced symbolic dims) sources the
@@ -1194,19 +1228,26 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         self._names[id(op.result)] = cur
         return "\n".join(lines)
 
-    def _emit_reduce_core(self, x: Value, dims: list, kind: str):
-        """Emit `stablehlo.reduce` (+ init constant + reducer region);
-        returns ``(lines, result_name, reduced_shape)`` with the operand
-        element dtype (callers add convert/reshape as needed)."""
-        elem_dtype = np.dtype(x.type.dtype)
-        init_value = self._reduce_init(kind, elem_dtype)
+    def _emit_reduce_core(
+        self, operand: str, dtype, shape: tuple, dims: list, kind: str
+    ):
+        """Emit `stablehlo.reduce` (+ init constant + reducer region) over the
+        NAMED ``operand`` in ``dtype``; returns
+        ``(lines, result_name, reduced_shape)`` with the OPERAND element dtype
+        (callers add convert/reshape as needed). Taking the ``(name, dtype,
+        shape)`` triple instead of an ``ir.Value`` is what lets the callers
+        reduce in a PROMOTED accumulator dtype (see ``_emit_reduce``) without
+        re-deriving it from a value whose type is the narrow one."""
+        dtype = np.dtype(dtype)
+        shape = tuple(shape)
+        init_value = self._reduce_init(kind, dtype)
         body_mnemonic = _REDUCE_BODY_MNEMONIC[kind]
-        elem_type = self._elem_type(elem_dtype)
+        elem_type = self._elem_type(dtype)
         lines = []
         init_name = self._new_name()
         lines.append(
             f"{init_name} = stablehlo.constant "
-            f"{self._constant_text(np.asarray(init_value, dtype=elem_dtype))}"
+            f"{self._constant_text(np.asarray(init_value, dtype=dtype))}"
             f" : {elem_type}"
         )
         body_name = self._new_name()
@@ -1224,14 +1265,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             "  })"
         )
         reduced_shape = tuple(
-            d for i, d in enumerate(x.type.shape) if i not in set(dims)
+            d for i, d in enumerate(shape) if i not in set(dims)
         )
-        reduced_type = self._type_str(elem_dtype, reduced_shape)
+        reduced_type = self._type_str(dtype, reduced_shape)
         result_name = self._new_name()
         lines.append(
-            f'{result_name} = "stablehlo.reduce"({self._name(x)}, '
+            f'{result_name} = "stablehlo.reduce"({operand}, '
             f"{init_name}) {region} {{dimensions = {self._i64_array(dims)}}}"
-            f" : ({self._vt(x.type)}, {elem_type}) -> {reduced_type}"
+            f" : ({self._type_str(dtype, shape)}, {elem_type}) -> {reduced_type}"
         )
         return lines, result_name, reduced_shape
 
