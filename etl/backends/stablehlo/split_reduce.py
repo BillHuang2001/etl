@@ -380,13 +380,22 @@ class SplitReductionMixin:
 
     # -- eligibility ---------------------------------------------------
 
-    def _split_reduce_plan(self, x: "Value", dims, kind: str, dtype) -> dict | None:
-        """Decide whether a plain ``sum``/``max``/``min``/``prod`` reduce is
-        split; returns the plan dict or ``None`` (today's text)."""
+    def _split_reduce_plan(self, shape, dims, kind: str, dtype) -> dict | None:
+        """Decide whether a plain ``sum``/``max``/``min``/``prod`` reduce over
+        a named operand of ``shape``/``dtype`` is split; returns the plan dict
+        or ``None`` (today's text).
+
+        PURE (no emission): the writer's SSA name counter must not be consumed
+        when a reduce keeps the single-stage text. ``shape``/``dtype`` describe
+        the operand the reduce actually runs over — i.e. the PROMOTED
+        (accumulator) dtype for ``sum``/``prod``, never the narrow graph-input
+        dtype (promotion happens once, BEFORE the split, so the stage geometry
+        and the exactness classes are computed on the promoted operand)."""
         if not self._split_reduction:
             return None
-        shape = tuple(x.type.shape)
+        shape = tuple(shape)
         dims = sorted(int(d) for d in dims)
+        dtype = np.dtype(dtype)
         if not shape or not dims:
             return None
         if not all(_is_static_extent(d) for d in shape):
@@ -525,25 +534,62 @@ class SplitReductionMixin:
 
     # -- the hooked entry points ---------------------------------------
 
-    def _reduce_core_with_split(self, x: "Value", dims, kind: str):
-        """Emit a plain reduce — two-stage when eligible, else the existing
-        single-stage ``_emit_reduce_core`` (byte-identical). Returns
-        ``(lines, result_name, reduced_shape)``."""
-        dtype = np.dtype(x.type.dtype)
-        plan = self._split_reduce_plan(x, dims, kind, dtype)
-        if plan is None:
-            return self._emit_reduce_core(x, dims, kind)
-        return self._emit_split_reduce_core(x, plan, kind, dtype)
+    def _promote_reduce_operand(self, x: "Value", dtype, lines: list) -> tuple:
+        """The ``(name, dtype, shape)`` triple a reduce should run over.
 
-    def _emit_split_reduce_core(self, x: "Value", plan: dict, kind: str, dtype):
+        When ``dtype`` (the accumulator dtype the caller decided on) differs
+        from the operand's own element dtype, emit ``stablehlo.convert`` of the
+        OPERAND first — the promotion has to happen ONCE, BEFORE padding /
+        reshaping / reducing, so the whole emission runs in the accumulator
+        dtype. Returns the operand unchanged (no emission, no consumable-name
+        churn) otherwise."""
+        dtype = np.dtype(dtype)
+        in_dtype = np.dtype(x.type.dtype)
+        shape = tuple(x.type.shape)
+        name = self._name(x)
+        if dtype == in_dtype:
+            return name, in_dtype, shape
+        promoted = self._new_name()
+        lines.append(
+            f"{promoted} = stablehlo.convert {name} : "
+            f"({self._type_str(in_dtype, shape)}) -> "
+            f"{self._type_str(dtype, shape)}"
+        )
+        return promoted, dtype, shape
+
+    def _reduce_core_with_split(self, x: "Value", dims, kind: str, accum_dtype=None):
+        """Emit a plain reduce — two-stage when eligible, else the existing
+        single-stage ``_emit_reduce_core`` (byte-identical).
+
+        ``accum_dtype`` (optional) is the ACCUMULATOR dtype the reduce must run
+        in; when it differs from the operand's element dtype the operand is
+        promoted with a ``stablehlo.convert`` FIRST, so neither the single-stage
+        nor the split emission ever accumulates in the narrow type. Returns
+        ``(lines, result_name, reduced_shape)`` — the result is in
+        ``accum_dtype``."""
+        in_dtype = np.dtype(x.type.dtype)
+        dtype = in_dtype if accum_dtype is None else np.dtype(accum_dtype)
+        lines: list[str] = []
+        operand, dtype, shape = self._promote_reduce_operand(x, dtype, lines)
+        plan = self._split_reduce_plan(shape, dims, kind, dtype)
+        if plan is None:
+            core = self._emit_reduce_core(operand, dtype, shape, dims, kind)
+        else:
+            core = self._emit_split_reduce_core(operand, plan, kind, dtype)
+        out_lines, result_name, reduced_shape = core
+        if lines:
+            return lines + out_lines, result_name, reduced_shape
+        return out_lines, result_name, reduced_shape
+
+    def _emit_split_reduce_core(self, operand: str, plan: dict, kind: str, dtype):
         """The two-stage ``sum``/``max``/``min``/``prod`` emission (see the
         module docstring for the ``(R, C)`` choice and the padding rule)."""
+        dtype = np.dtype(dtype)
         shape = plan["shape"]
         pivot, n, r, c, pad = (
             plan["pivot"], plan["n"], plan["r"], plan["c"], plan["pad"],
         )
         lines: list[str] = []
-        operand = self._name(x)
         in_shape = shape
         if pad:
             operand, in_shape = self._emit_split_pad(
