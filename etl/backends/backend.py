@@ -57,12 +57,16 @@ class Capabilities:
             ``"philox4x32_10"`` (splitmix64 has no native form — always the
             exporter's inline expansion). The empty set = inline expansions
             only. Per-adapter status: iree ``{"threefry2x32"}`` (native
-            THREE_FRY verified bit-exact on llvm-cpu AND cuda; PHILOX fails
-            iree legalization on both targets), xla
-            ``{"threefry2x32", "philox4x32_10"}`` by design — re-validate
-            with a real PJRT plugin, tvm ``frozenset()`` (no
-            rng_bit_generator support), numpy ``frozenset()`` (no StableHLO
-            emission).
+            THREE_FRY verified bit-exact on llvm-cpu AND cuda; native PHILOX
+            fails iree legalization on both targets), xla ``frozenset()``
+            (dropped after real-plugin validation: XLA's ``THREE_FRY`` is
+            threefry2x64 and its ``PHILOX`` is 2-word philox4x32-10 — different
+            ciphers than etl's threefry2x32 / 4-word philox4x32_10, so native
+            bit-exactness is impossible by design; the bit-exact inline
+            expansions are the default), tvm ``frozenset()`` (the TVM StableHLO
+            frontend has no rng_bit_generator support), numpy ``frozenset()``
+            (no StableHLO emission). The per-call ``rng_bit_generator`` lower
+            option overrides this set for one ``lower()``/``build()`` call.
     """
 
     dynamic_shapes: bool = False

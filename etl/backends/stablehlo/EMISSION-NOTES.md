@@ -129,7 +129,7 @@ Parity matrix, 770 cases (shapes `(10001,)`, `(10000,100)` ax0/ax1, `(7,)`, `(10
 
 R/C geometry is insensitive: forcing `64×157` / `128×79` / `100×101` / `50×201` / `256×40` against the implemented `73×137` for `(10001,)` f32 `min` on iree/rocm spans 0.167–0.188 ms (best alternative = 1.01× the implemented pick, within noise), all bit-exact.
 
-`split_reduction=False` byte-identity was verified on 53 graphs (the pre-option text).
+`split_reduction=False` byte-identity was verified on 53 graphs against the single-stage text.
 
 ## 8. Promote-before-reduce — probe detail
 
@@ -141,7 +141,7 @@ iree-llvm-cpu parity after the promotion: 1020 checks with only the 8 pre-existi
 
 Unsigned end-to-end validated on the **tvm** adapter (iree's capability gate rejects every uint dtype): 14/14 OK with promotion vs 12/14 failing without.
 
-Consequence recorded in the contract: int/bool `mean` at reduced extents ≥ 1024 no longer takes the split path (accumulator f64, and float `sum` is not split by default) — the `bool_split_mean_2000` export marker count is 0 (an i1 split was numerically wrong anyway).
+Consequence recorded in the contract: int/bool `mean` at reduced extents ≥ 1024 does not take the split path (accumulator f64, and float `sum` is not split by default) — the `bool_split_mean_2000` export marker count is 0 (an i1 split would be numerically wrong anyway).
 
 ## 9. Upstream iree 3.11 ROCm miscompile: signed narrow-int `minimum` at extent ≡ 0 (mod 64)
 
