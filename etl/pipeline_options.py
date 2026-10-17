@@ -19,28 +19,56 @@ The env-option table (backend, stage) -> (env var, option key, parser):
 | ``ETL_TVM_TARGET``          | tvm     | compile | ``tvm_target``        | TVM target string                             |
 | ``ETL_TVM_PASS_CONFIGS``    | tvm     | compile | ``tvm_pass_configs``  | JSON object (must parse to a dict)            |
 | ``ETL_OPT_LEVEL``           | iree/tvm/xla | compile | ``opt_level``      | 'O0'..'O3' (case-insensitive), '0'..'3', or 0..3 (validated — etl-defined value) |
+| ``ETL_EIGH_ALGORITHM``      | iree/tvm/xla | lower | ``eigh_algorithm``    | ``jacobi`` or ``jacobi_batched`` (whitespace-stripped; the value is validated by the stablehlo Writer) |
+| ``ETL_SPLIT_REDUCTION``     | iree/tvm/xla | lower | ``split_reduction``   | bool: ``1``/``0``/``true``/``false``/``yes``/``no``/``on``/``off`` (case-insensitive; coerced by ``normalize_bool_option``) |
 
 Naming convention: ``ETL_<BACKEND>_COMPILE_ARGS`` / ``ETL_<BACKEND>_RUNTIME_ARGS``
-for flag lists; backend-specific names for non-list options. The env vars are
-read LAZILY at call time (no import-time snapshot) and applied ONLY for
-option keys absent from the caller's dict. An empty/whitespace value is
-treated as unset. A malformed value raises ``core.BackendError`` naming the
-variable, the value, and the parse error — never a raw shlex/base64/json
-exception, never silent. Option VALUES are never validated here — the
-compiler validates them (the single exception is ``opt_level``, an
-etl-defined option whose value is normalized and validated by
-``etl.backends.options.normalize_opt_level`` via the ``_parse_opt_level``
-parser; precedence explicit > env > default, malformed → ``BackendError``
-naming the variable and value).
+for flag lists; backend-specific names for non-list options. An option that
+every compiler adapter accepts IDENTICALLY gets ONE backend-agnostic spelling
+(``ETL_OPT_LEVEL``, ``ETL_EIGH_ALGORITHM``, ``ETL_SPLIT_REDUCTION``) rather
+than one variable per backend — such a row is repeated under each backend's
+table key. The env vars are read LAZILY at call time (no import-time
+snapshot) and applied ONLY for option keys absent from the caller's dict. An
+empty/whitespace value is treated as unset. A malformed value raises
+``core.BackendError`` naming the variable, the value, and the parse error —
+never a raw shlex/base64/json exception, never silent.
+
+Option VALUES are not re-validated here beyond TYPE COERCION — the consumer
+validates them (the compiler, or the stablehlo Writer for the reserved
+exporter options): an unknown/illegal value raises a loud ``core.BackendError``
+from the consumer naming the accepted forms. The exceptions are the options
+whose value type etl itself defines:
+
+- ``opt_level`` — normalized and validated by
+  ``etl.backends.options.normalize_opt_level`` via ``_parse_opt_level``;
+- BOOL-valued options (``ETL_SPLIT_REDUCTION``) — coerced to a real ``bool``
+  by the shared ``etl.backends.options.normalize_bool_option`` via
+  ``_parse_bool_option``, so an env string can never fall into the
+  ``bool("0") is True`` trap, and a non-bool spelling is rejected loudly.
+
+Both keep the same precedence and error contract: explicit > env > default,
+malformed → ``BackendError`` naming the variable and value.
+
+The ``lower``-stage rows were added with the reserved exporter options
+``eigh_algorithm`` / ``split_reduction`` (declared by all three compiler
+adapters in ``KNOWN_OPTIONS["lower"]`` and forwarded to the exporter by
+``CompilerBackend._exporter_options``); ``etl.pipeline.lower`` calls
+``apply_env_options(backend.name, options, "lower")``, so these rows take
+effect immediately. ``split_reduction_threshold`` / ``split_reduction_non_exact``
+deliberately have NO env rows: they are ``stablehlo.export``-only Writer
+knobs, NOT forwarded by ``CompilerBackend._exporter_options`` and NOT in any
+adapter's ``KNOWN_OPTIONS``, so an env-supplied value would make
+``lower(..., backend="iree")`` fail key validation — pass them directly to
+``stablehlo.export(graph, options=...)`` instead.
 
 The staging-level env vars ``ETL_BACKEND`` / ``ETL_DEVICE`` /
 ``ETL_TARGET_BACKENDS`` are resolved separately by
 ``etl.pipeline._resolve_backend_device`` (build/evaluate only, unchanged).
 This module never imports ``etl.backends`` at module level (env resolution
-must not trigger adapter imports); the one exception is the ``opt_level``
-parser's lazy function-body import of ``etl.backends.options`` — by the time
-``apply_env_options`` runs, ``etl`` is fully imported, and that module pulls
-only core/ir/numpy, never the optional adapters.
+must not trigger adapter imports); the exceptions are the ``opt_level`` and
+bool parsers' lazy function-body imports of ``etl.backends.options`` — by the
+time ``apply_env_options`` runs, ``etl`` is fully imported, and that module
+pulls only core/ir/numpy, never the optional adapters.
 """
 from __future__ import annotations
 
@@ -116,6 +144,25 @@ def _parse_opt_level(var: str, value: str) -> int:
         raise BackendError(f"invalid {var}={value!r}: {exc}") from None
 
 
+def _parse_bool_option(var: str, value: str) -> bool:
+    """Parse a bool-valued option (``"1"``/``"0"``/``"true"``/``"false"``/...).
+
+    Delegates to the shared ``etl.backends.options.normalize_bool_option`` —
+    the ONE bool coercion in etl (so an env-style string never falls into the
+    ``bool("0") is True`` trap and there is no second bool parser to keep in
+    sync). The import is lazy inside the body for the same reason as
+    ``_parse_opt_level``: this module must not import ``etl.backends`` at
+    module level. The re-raise names the env VARIABLE and the raw value in
+    addition to ``normalize_bool_option``'s accepted-forms message.
+    """
+    from etl.backends.options import normalize_bool_option
+
+    try:
+        return normalize_bool_option(var, value)
+    except BackendError as exc:
+        raise BackendError(f"invalid {var}={value!r}: {exc}") from None
+
+
 #: (backend name, stage) -> tuple of (env var, option key, parser) entries
 #: (a stage may have several env-var options, e.g. tvm compile).
 ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
@@ -135,6 +182,25 @@ ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
         ("ETL_TVM_PASS_CONFIGS", "tvm_pass_configs", _parse_json_object),
         ("ETL_OPT_LEVEL", "opt_level", _parse_opt_level),
     ),
+    # The reserved stablehlo-exporter lower options (all three compiler
+    # adapters declare them in KNOWN_OPTIONS["lower"] and forward them to the
+    # exporter, so ONE backend-agnostic spelling per option — the env row is
+    # repeated under each adapter's key). ``eigh_algorithm``'s VALUE is
+    # validated by the stablehlo Writer (loud BackendError listing the
+    # accepted values) — the framework validates KEYS only; only the
+    # whitespace is stripped here, like ``ETL_TVM_TARGET``.
+    ("iree", "lower"): (
+        ("ETL_EIGH_ALGORITHM", "eigh_algorithm", lambda var, value: value.strip()),
+        ("ETL_SPLIT_REDUCTION", "split_reduction", _parse_bool_option),
+    ),
+    ("xla", "lower"): (
+        ("ETL_EIGH_ALGORITHM", "eigh_algorithm", lambda var, value: value.strip()),
+        ("ETL_SPLIT_REDUCTION", "split_reduction", _parse_bool_option),
+    ),
+    ("tvm", "lower"): (
+        ("ETL_EIGH_ALGORITHM", "eigh_algorithm", lambda var, value: value.strip()),
+        ("ETL_SPLIT_REDUCTION", "split_reduction", _parse_bool_option),
+    ),
 }
 
 
@@ -144,8 +210,8 @@ def apply_env_options(
     """Return a COPY of ``options`` with env-supplied keys added when absent.
 
     Precedence: an explicit option key always wins over the env var. A
-    backend/stage with no table entry (e.g. the numpy backend, the lower and
-    run stages in v1) is a no-op. The env vars are read lazily at call time;
+    backend/stage with no table entry (e.g. the numpy backend, the run stage
+    in v1) is a no-op. The env vars are read lazily at call time;
     an empty/whitespace value is unset; a malformed value raises
     ``core.BackendError`` naming the variable and value. The caller's dict
     is never mutated.
