@@ -143,9 +143,19 @@ class TvmBackend(CompilerBackend):
     #: ``precision_config`` dot attribute and the lowered result is
     #: BIT-IDENTICAL to the ``"DEFAULT"`` export (probed on llvm); the
     #: attribute only hints reduced-precision relaxations a backend may
-    #: apply, and TVM's llvm target applies none here.
+    #: apply, and TVM's llvm target applies none here. The reserved exporter
+    #: lower options ``eigh_algorithm`` and ``split_reduction`` are declared
+    #: alongside it so they pass validation (the Writer validates their
+    #: values).
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
-        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
+        "lower": frozenset(
+            {
+                "rng_bit_generator",
+                "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
+            }
+        ),
         "compile": frozenset({"tvm_target", "tvm_pass_configs", "opt_level"}),
         "load": frozenset(),
         "run": frozenset(),

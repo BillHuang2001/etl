@@ -807,7 +807,20 @@ class IreeBackend(CompilerBackend):
     #: iree-compile PARSES, COMPILES and RUNS it on llvm-cpu and the
     #: result is BIT-IDENTICAL to the ``"DEFAULT"`` export (probed), so it
     #: is accepted — it only matters on reduced-precision fp32 matmul
-    #: accelerators (the XLA/ROCm TF32 class).
+    #: accelerators (the XLA/ROCm TF32 class). Two more reserved exporter
+    #: lower options are declared for validation only (the Writer validates
+    #: their values): ``eigh_algorithm`` (``"jacobi"`` | ``"jacobi_batched"``,
+    #: case-insensitive, default ``"jacobi_batched"``) selects the ``eigh``
+    #: cyclic-Jacobi while composition — the batched composition applies all
+    #: mutually disjoint rotations of an odd-even round-robin round per while
+    #: iteration and measures 65-74x faster at n=100 and 4-5.7x at n=10
+    #: (n=100 iree/llvm-cpu 9532 ms -> 128 ms on an MI300X host), and it
+    #: avoids an iree/llvm-cpu compile crash at n in {4,8,12,16};
+    #: ``"jacobi"`` is the single-pair-per-iteration composition (byte-identical
+    #: to the pre-option text). ``split_reduction`` (bool, default ``True``)
+    #: emits the two-stage split reductions for rank-0-result reductions
+    #: (7.1-8.1x on those ops, 2.7-3.5x end-to-end on population-scale SO
+    #: steps); ``False`` emits the byte-identical single-stage text.
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
         "lower": frozenset(
             {
@@ -815,6 +828,8 @@ class IreeBackend(CompilerBackend):
                 "sort_emission",
                 "while_init_rewrite",
                 "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
             }
         ),
         "compile": frozenset(

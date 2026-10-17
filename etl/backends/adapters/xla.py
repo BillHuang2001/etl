@@ -187,9 +187,21 @@ class XlaBackend(CompilerBackend):
     #: vs an fp64 reference) default -> max_abs 0.1228 vs ``"HIGHEST"`` ->
     #: 0.000203 (true fp32); ``"HIGH"`` does NOT disable TF32 on this XLA
     #: version. ``"DEFAULT"`` emits no ``precision_config`` attribute, so
-    #: the export is byte-identical to the pre-option output.
+    #: the export is byte-identical to the pre-option output. The reserved
+    #: exporter lower options ``eigh_algorithm`` (``"jacobi"`` |
+    #: ``"jacobi_batched"``, default ``"jacobi_batched"`` — 65-74x faster at
+    #: n=100) and ``split_reduction`` (bool, default ``True`` — two-stage
+    #: split reductions for rank-0-result reductions) are likewise declared
+    #: here so they pass validation; the Writer validates their values.
     KNOWN_OPTIONS: dict[str, frozenset[str]] = {
-        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
+        "lower": frozenset(
+            {
+                "rng_bit_generator",
+                "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
+            }
+        ),
         "compile": frozenset(
             {"plugin_path", "xla_compile_options", "opt_level"}
         ),
