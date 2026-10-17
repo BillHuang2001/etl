@@ -440,29 +440,101 @@ def test_split_reduction_invalid_value_is_a_backend_error(bad_value):
 
 
 @pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
-@pytest.mark.parametrize(
-    "option", ["split_reduction_threshold", "split_reduction_non_exact"]
-)
-def test_split_reduction_sub_options_not_declared_in_known_options(
-    name, backend_cls, option
-):
-    """CURRENT state (reported upward as a gap, NOT a contract we endorse): the
-    StableHLO Writer accepts the ``split_reduction_threshold`` /
-    ``split_reduction_non_exact`` exporter sub-options, but no adapter declares
-    them in ``KNOWN_OPTIONS`` and ``CompilerBackend._exporter_options`` does
-    not forward them — so they are unreachable through the pipeline. Passing
-    them is LOUD (never silently ignored): the unknown-option BackendError
-    names the option."""
-    assert option not in backend_cls.KNOWN_OPTIONS["lower"]
+def test_unknown_lower_option_error_is_loud_naming_key(name, backend_cls):
+    """An unknown lower option is LOUD, never silently ignored: the
+    ``core.BackendError`` names the rejected key, the stage and the declared
+    options per stage — while the DECLARED ``split_reduction`` family key
+    itself is accepted at lower (no compiler needed: the shared
+    ``CompilerBackend`` validates before exporting)."""
     graph = etl.trace(_min_fn, _MIN_SPEC)
     with pytest.raises(core.BackendError) as excinfo:
-        backend_cls().lower(graph, {option: 2048})
+        backend_cls().lower(graph, {"no_such_lower_option": 2048})
     message = str(excinfo.value)
-    assert f"does not recognize the lower option '{option}'" in message
+    assert (
+        "does not recognize the lower option 'no_such_lower_option'" in message
+    )
+    assert "does not recognize the lower option" in message
+    assert "no_such_lower_option" in message
     assert "known options by stage" in message
     assert "split_reduction" in message  # the declared family member is listed
     # ... and the plain ``split_reduction`` key itself IS accepted at lower.
-    backend_cls().lower(graph, {"split_reduction": False})# ---------------------------------------------------------------------------
+    backend_cls().lower(graph, {"split_reduction": False})
+
+
+# The two reduction-shape sub-options, as the StableHLO Writer spells them.
+_SPLIT_REDUCTION_SUB_OPTIONS = (
+    "split_reduction_threshold",
+    "split_reduction_non_exact",
+)
+
+
+def _sum_10001_fn(x):
+    return etl.sum(x)
+
+
+#: ``sum`` over 10001 f32 elements: a rank-0-result FLOAT reduction, so the
+#: default keeps ONE reduce and ``split_reduction_non_exact=True`` splits it.
+_SUM_10001_SPEC = etl.TensorSpec((10001,), etl.float32)
+
+#: ``min`` over 10001 i32 elements: rank-0 result above the default 1024
+#: threshold, so the default splits and a threshold past the extent does not.
+_MIN_10001_SPEC = etl.TensorSpec((10001,), etl.int32)
+
+# BUG(etl): `split_reduction_threshold` / `split_reduction_non_exact` are
+# exporter-only — the StableHLO Writer accepts them
+# (`etl/backends/stablehlo/split_reduce.py::normalize_split_reduction_threshold`
+# / `normalize_split_reduction_non_exact`) but NO adapter declares them in
+# `KNOWN_OPTIONS["lower"]` and `CompilerBackend._exporter_options` does not
+# forward them, so they are unreachable through the pipeline. Repro:
+#   etl.lower(etl.trace(lambda x: etl.min(x), etl.TensorSpec((10001,), np.float32)),
+#             backend="iree", split_reduction_threshold=2048)
+#   -> BackendError: the iree backend does not recognize the lower option
+#      'split_reduction_threshold' ...
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG(etl): split_reduction_threshold / split_reduction_non_exact are "
+    "exporter-only — not declared in KNOWN_OPTIONS['lower'] nor forwarded by "
+    "CompilerBackend._exporter_options, so they are unreachable through the "
+    "pipeline",
+)
+@pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
+def test_split_reduction_sub_options_forwarded_through_lower(name, backend_cls):
+    """The DESIRED contract for the two reduction-shape sub-options of the
+    ``split_reduction`` family: they are declared at the LOWER stage of every
+    compiler adapter and reach the exporter through the shared
+    ``CompilerBackend._exporter_options`` — so they visibly change the emitted
+    text through the public pipeline:
+
+    * ``split_reduction_non_exact=True`` on a FLOAT ``sum`` over 10001
+      elements yields the two-stage text (two ``stablehlo.reduce`` ops) while
+      the default stays single-stage;
+    * ``split_reduction_threshold=10002`` on ``min`` over 10001 elements
+      (above the reduced extent) keeps the single-stage text where the default
+      splits.
+    """
+    for option in _SPLIT_REDUCTION_SUB_OPTIONS:
+        assert option in backend_cls.KNOWN_OPTIONS["lower"]
+
+    backend = backend_cls()
+
+    sum_graph = etl.trace(_sum_10001_fn, _SUM_10001_SPEC)
+    single_stage = backend.lower(sum_graph, {}).payload["mlir_text"]
+    non_exact_split = backend.lower(
+        sum_graph, {"split_reduction_non_exact": True}
+    ).payload["mlir_text"]
+    assert single_stage.count('"stablehlo.reduce"') == 1
+    assert non_exact_split.count('"stablehlo.reduce"') == 2
+
+    min_graph = etl.trace(_min_fn, _MIN_10001_SPEC)
+    default_split = backend.lower(min_graph, {}).payload["mlir_text"]
+    above_threshold = backend.lower(
+        min_graph, {"split_reduction_threshold": 10002}
+    ).payload["mlir_text"]
+    assert default_split.count('"stablehlo.reduce"') == 2
+    assert above_threshold.count('"stablehlo.reduce"') == 1
+
+
+# ---------------------------------------------------------------------------
 # 2. iree compile-flag policy (pure helpers — no IREE dependency)
 # ---------------------------------------------------------------------------
 
