@@ -26,6 +26,7 @@ Mirror the package: `tests/core/`, `tests/ir/`, `tests/ops/`, `tests/numpy/`, `t
   - Python values → Python semantics (static specialization; `if etl.sum(x) > 0` fails at trace)
   - collectives (`etl.dist.*`) are explicit IR ops only — no implicit insertion
   - explicit device placement (`TestExplicitPlacement`, group 15, 7 tests): placement is explicit — host memory cannot be relabeled (`Tensor`/concrete-creator `device=` non-cpu → `DeviceError`), `.numpy()` on a non-cpu-kind payload raises (no implicit device-to-host transfer), `Tensor.to` is the only transfer API (same-device → self; to-cpu materializes a fresh host copy), and the run/bind/`etl.constant` boundaries reject foreign-device tensors with the explicit-transfer remedy
+  - sparse explicitness (`TestSparseExplicitness`, group 14, 21 tests): sparse tensors obey the SAME discipline — ops/converters build IR inside a trace (no eager numerical mode), polymorphic creators take concrete OR symbolic components but never a `TensorSpec` or a mix, symbolic sparse leaves have no concrete escape hatches, `etl.constant` is rejected, closure-captured sparse values raise, static leaves are snapshotted and run-validated, `etl.evaluate` derives a `SparseTensorSpec` from concrete args, and the v1 deferrals are explicit (sparse@sparse matmul, whole-sparse `bind`, some vjps)
   - error messages include source locations (`file.py:line`)
 
 ## Constraints

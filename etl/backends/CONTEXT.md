@@ -118,6 +118,7 @@ Every pipeline stage — `lower`, `compile`, `load`, `run` (plus the `build`/`ev
   `STAGES = ("lower", "compile", "load", "run")`.
 - **Precedence (binding): explicit kwarg > env var (`ETL_<BACKEND>_*`) > etl default.** Env vars are read lazily at call time by `etl.pipeline_options.apply_env_options` (table in `etl/pipeline_options.py::ENV_OPTION_TABLE`); empty/whitespace env = unset; malformed env values raise `core.BackendError` naming the variable and value.
   Env application is stage-scoped (e.g. `ETL_IREE_RUNTIME_ARGS` applies only at the load stage).
+  Value formats (parsers in `etl/pipeline_options.py`): the flag-list rows `ETL_IREE_COMPILE_ARGS`/`ETL_IREE_RUNTIME_ARGS` are split with `shlex.split` — QUOTING IS PROCESSED, so a quoted flag survives as one entry — and must yield ≥1 flag; `ETL_XLA_COMPILE_OPTIONS` is base64 of the serialized proto bytes; `ETL_TVM_PASS_CONFIGS` is a JSON object; `ETL_OPT_LEVEL`/`ETL_EIGH_ALGORITHM`/`ETL_SPLIT_REDUCTION` are backend-agnostic spellings (ONE row per compiler adapter, same option key).
   Full env-name table + precedence doc: `etl/pipeline_options.py` and `../CONTEXT.md` ("Backend options override").
 - **Backend defaults are minimal, documented, and OVERRIDABLE.** A user flag with the same NAME as an etl default drops the default (never both) — etl must never force flags users cannot override.
   The numpy reference backend documents-ignores unknown options (`run(..., rank_context=...)` still flows through the options dict; the caller's dict is never mutated).
