@@ -78,6 +78,7 @@ https://openxla.org/stablehlo/spec and stablehlo/dialect/StablehloOps.td):
 
 from __future__ import annotations
 
+import re
 from itertools import count
 from typing import TYPE_CHECKING
 
@@ -90,6 +91,7 @@ from . import random_export
 from .eigh_batched import EighBatchedMixin
 from .split_reduce import (
     SplitReductionMixin,
+    _arg_reduce_region,
     normalize_split_reduction,
     normalize_split_reduction_non_exact,
     normalize_split_reduction_threshold,
@@ -139,6 +141,163 @@ def _re_split_exp(text: str):
         if ch in "eE":
             return text[:i], text[i + 1 :]
     return text, ""
+
+
+class _Emitted(str):
+    """Emitted op text carrying a PRELUDE of lines that must be emitted
+    BEFORE the op.
+
+    Region-aware emission (see ``Writer._split_region_invariants``): an op
+    that emits a nested region (``while``/``if``/``eigh``) may produce
+    setup lines that are INVARIANT with respect to the enclosing region —
+    all ``stablehlo.constant``/``stablehlo.iota`` definitions and every op
+    derived only from them. iree 3.11 mis-hoists a constant (or an op
+    consuming one) that appears inside a region into an undefined
+    ``util.global`` (``'util.global.load' op undefined global:
+    @__hoisted_*``), so those lines must be emitted at the ENCLOSING scope
+    and captured lexically by the region. They travel up as ``prelude``
+    instead of into the enclosing hoist target because only the enclosing
+    block knows which names are visible at its own prelude point; the
+    enclosing block flattens the prelude into its own line list and lets
+    its own region split decide (``Writer._block_body_lines``).
+    """
+
+    __slots__ = ("prelude",)
+
+    def __new__(cls, prelude, text: str):
+        self = super().__new__(cls, text)
+        self.prelude = list(prelude)
+        return self
+
+
+#: StableHLO mnemonics that are PURE, region-free and therefore safe to
+#: lift out of an enclosing region (``Writer._split_region_invariants``).
+_HOISTABLE_MNEMONICS = frozenset(
+    {
+        "stablehlo.constant",
+        "stablehlo.iota",
+        "stablehlo.convert",
+        "stablehlo.compare",
+        "stablehlo.select",
+        "stablehlo.add",
+        "stablehlo.subtract",
+        "stablehlo.multiply",
+        "stablehlo.divide",
+        "stablehlo.remainder",
+        "stablehlo.maximum",
+        "stablehlo.minimum",
+        "stablehlo.negate",
+        "stablehlo.abs",
+        "stablehlo.sqrt",
+        "stablehlo.broadcast_in_dim",
+        "stablehlo.dynamic_broadcast_in_dim",
+        "stablehlo.reshape",
+        "stablehlo.transpose",
+        "stablehlo.concatenate",
+        "stablehlo.slice",
+        "stablehlo.pad",
+        "stablehlo.and",
+        "stablehlo.or",
+        "stablehlo.xor",
+        "stablehlo.not",
+        "stablehlo.shift_left",
+        "stablehlo.shift_right_arithmetic",
+        "stablehlo.shift_right_logical",
+        "stablehlo.reverse",
+    }
+)
+
+#: LHS of an op line: ``%3 = `` / ``%7, %8 = `` (multi-result).
+_SSA_DEF_RE = re.compile(r"\s*((?:%\d+,\s*)*%\d+)\s*=")
+_SSA_NAME_RE = re.compile(r"%(\d+)")
+#: ``^bb0(%12: tensor<...>, %13: tensor<...>)`` block-argument declarations.
+_BLOCK_ARG_RE = re.compile(r"\^bb\d+\(([^)]*)\)")
+#: Emitted StableHLO mnemonic of a line, in either printer form
+#: (``%5 = stablehlo.add ...`` / ``%5 = "stablehlo.reduce"(...)``).
+_MNEMONIC_RE = re.compile(
+    r'^\s*(?:%\d+(?:,\s*%\d+)*\s*=\s*)?"?(stablehlo\.[a-z_0-9]+)"?'
+)
+
+
+def _split_atomic_units(text: str) -> list:
+    """Split ONE emitted op's text into ATOMIC UNITS for the region-aware
+    invariant hoist (see ``Writer._split_region_invariants``).
+
+    A unit is either a single op line at nesting depth 0, or a whole
+    region-bearing group — ``%7 = "stablehlo.while"(...) ({ ... })`` /
+    ``%9 = "stablehlo.reduce"(...) ({ ... })`` — kept INTACT: a region is
+    never split, so a region-bearing op can never be lifted (only the
+    plain setup lines emitted around it can). Depth is tracked with the
+    ``({`` / ``})`` region delimiters, which no attribute value contains."""
+    if "\n" not in text:
+        return [text]
+    units, buf, depth = [], [], 0
+    for line in text.split("\n"):
+        buf.append(line)
+        depth += line.count("({") - line.count("})")
+        if depth <= 0:
+            units.append("\n".join(buf))
+            buf, depth = [], 0
+    if buf:
+        units.append("\n".join(buf))
+    return units
+
+
+def _defined_names(text: str) -> set:
+    """SSA names DEFINED by an atomic unit (``%n = ...``, incl. the
+    multi-result LHS list) — never a region block argument (see
+    ``_block_arg_names``)."""
+    names = set()
+    for line in text.split("\n"):
+        match = _SSA_DEF_RE.match(line)
+        if match:
+            names.update(_SSA_NAME_RE.findall(match.group(1)))
+    return names
+
+
+def _block_arg_names(text: str) -> set:
+    """SSA names introduced as REGION BLOCK ARGUMENTS inside ``text``."""
+    names = set()
+    for group in _BLOCK_ARG_RE.findall(text):
+        names.update(_SSA_NAME_RE.findall(group))
+    return names
+
+
+def _is_hoistable_unit(unit: str) -> bool:
+    """True when an atomic unit may be lifted out of an enclosing region:
+    a SINGLE depth-0 line (no region, no continuation) whose emitted
+    mnemonic is pure and region-free. Anything unrecognized stays put."""
+    if "\n" in unit or "({" in unit:
+        return False
+    match = _MNEMONIC_RE.match(unit)
+    return bool(match) and match.group(1) in _HOISTABLE_MNEMONICS
+
+
+#: IR op names whose EMITTED text contains a ``stablehlo.while``: the
+#: ``while`` op itself and ``eigh``, whose cyclic-Jacobi compositions are
+#: emitted as one (``_emit_eigh`` / ``./eigh_batched.py``). These are the
+#: ops that must not be wrapped in a ``stablehlo.if`` region (see
+#: ``Writer._emit_if_select``). A ``reduce``/``sort`` comparator region is
+#: NOT a while and does not trigger the fallback (probed: a reduce-bearing
+#: `if` executes correctly).
+_WHILE_EMITTING_OPS = frozenset({"while", "eigh"})
+
+
+def _region_contains_while(region) -> bool:
+    """True when a region's body contains an op that emits a
+    ``stablehlo.while`` (``_WHILE_EMITTING_OPS``), directly or in a nested
+    region (see ``Writer._emit_if_select``).
+
+    This is the trigger for the `cond` select-fallback: iree 3.11's
+    `local-task` driver mis-executes a ``stablehlo.if`` whose regions hold a
+    ``stablehlo.while``, so such an `if` must not be emitted."""
+    for block in region.blocks:
+        for op in block.ops:
+            if op.name in _WHILE_EMITTING_OPS:
+                return True
+            if any(_region_contains_while(inner) for inner in op.regions):
+                return True
+    return False
 
 
 def _is_static_dim(dim) -> bool:
@@ -324,12 +483,23 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         self._dot_precision = _normalize_dot_precision(
             (options or {}).get("dot_precision", "DEFAULT")
         )
-        #: Ops already emitted at a hoisted position (by ``_emit_if``'s
-        #: while-in-if workaround, see ``_hoist_if_branch_whiles``): their
-        #: result names are bound, so ``_block_body_lines`` must SKIP them
-        #: when the branch regions are emitted (their lines already landed
-        #: BEFORE the enclosing ``stablehlo.if``).
-        self._hoisted_ops: set[int] = set()
+        #: Region nesting depth of the block currently being emitted (0 =
+        #: the function entry block). ``_block_body_lines`` only lifts a
+        #: block's region-invariant prelude when this is > 0, so a
+        #: non-region export stays BYTE-IDENTICAL to the flat line list
+        #: (see ``_split_region_invariants``).
+        self._region_depth = 0
+        #: Nesting depth of the INLINE branch scope of a while-bearing
+        #: ``cond`` (``_emit_if_select``/``_emit_branch_inline``): the
+        #: branch body is emitted at the ENCLOSING scope rather than inside
+        #: an ``if`` region, so ``_region_depth`` stays 0 there — but the
+        #: same iree 3.11 2-operand-``sort`` mis-execution applies (the
+        #: ``eigh`` post-loop tail's eigenvalue sort + gather lives in that
+        #: scope, and its index operand is a value computed by the branch
+        #: rather than a region argument), so the count composition is
+        #: selected for sorts emitted here too (see
+        #: ``_count_argsort_active``).
+        self._select_inline_depth = 0
         #: while_init_rewrite exporter option (bool, default True): replace
         #: ALL-ZERO rank>=1 constant while-INIT operands with computed zeros
         #: (``not``/``and`` + a dtype-changing ``convert`` + ``reduce`` over a
@@ -406,12 +576,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         results, then the entry block's ops in program order and a
         `func.return` of the terminator's operands."""
         entry = fn.entry_block
+        self._region_depth = 0
+        self._select_inline_depth = 0
         for i, arg in enumerate(entry.arguments):
             self._names[id(arg)] = f"%arg{i}"
         # Emit the body FIRST: op emission populates per-value type
         # overrides (collective axis dims) that the function signature
         # rendering below must already see.
-        body = self._block_body_lines(entry, terminator="func.return")
+        prelude, body = self._block_body_lines(entry, terminator="func.return")
         args = ", ".join(
             f"%arg{i}: {self._vt(arg.type)}"
             for i, arg in enumerate(entry.arguments)
@@ -426,7 +598,7 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             results = f" -> {self._vt_value(outputs[0])}"
         else:
             results = " -> (" + ", ".join(self._vt_value(t) for t in outputs) + ")"
-        text = "\n".join(body)
+        text = "\n".join(prelude + body)
         indented = self._indent(text, 1) if text else ""
         return f"func.func @{fn.name}({args}){results} {{\n{indented}\n}}"
 
@@ -1080,7 +1252,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- Reductions ---
 
     def _emit_reduce(self, op: Op) -> str:
-        """reduce_sum/max/min/prod → `stablehlo.reduce` (+ init constant)."""
+        """reduce_sum/max/min/prod → `stablehlo.reduce` (+ init constant).
+
+        ``sum``/``prod`` PROMOTE the operand to the DECLARED result dtype —
+        numpy's accumulator dtype (bool/int8/int16/int32 → int64,
+        uint8/uint16/uint32 → uint64, int64/uint64/floats keep their own) —
+        BEFORE the reduce: `stablehlo.reduce` keeps the operand element type,
+        so reducing first accumulates in the narrow type (`stablehlo.add` on
+        `tensor<i1>` is logical OR, so a bool popcount collapses to 0/1, and
+        an i32 sum/product wraps at 32 bits before any widening convert).
+        ``min``/``max`` preserve the operand dtype in numpy (the i1
+        ``any``/``all`` guard shapes) and are never promoted.
+        """
         x = op.operands[0]
         kind = op.attributes["reduce_op"]
         axes = tuple(op.attributes.get("axes", ()))
@@ -1093,18 +1276,26 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 "complex dtype is not supported in v1 — complex-number "
                 "computation beyond cast is deferred"
             )
+        out_dtype = np.dtype(op.result.type.dtype)
+        accum_dtype = (
+            out_dtype
+            if kind in ("sum", "prod") and out_dtype != elem_dtype
+            else elem_dtype
+        )
         lines, red_name, reduced_shape = self._reduce_core_with_split(
-            x, dims, kind
+            x, dims, kind, accum_dtype=accum_dtype
         )
         cur = red_name
-        # numpy promotion guard: stablehlo.reduce keeps the operand dtype;
-        # etl sum/prod promote (ints → int64, bool → int64).
-        if np.dtype(op.result.type.dtype) != elem_dtype:
+        # Safety net, not a live path: the promote-before-reduce above means
+        # sum/prod already produce the declared dtype, and min/max preserve
+        # the operand dtype in numpy (the i1 any/all guards), so
+        # `out_dtype == accum_dtype` for every kind shipped today.
+        if out_dtype != accum_dtype:
             converted = self._new_name()
             lines.append(
                 f"{converted} = stablehlo.convert {cur} : "
-                f"({self._type_str(elem_dtype, reduced_shape)}) -> "
-                f"{self._type_str(op.result.type.dtype, reduced_shape)}"
+                f"({self._type_str(accum_dtype, reduced_shape)}) -> "
+                f"{self._type_str(out_dtype, reduced_shape)}"
             )
             cur = converted
         if keepdims and tuple(op.result.type.shape) != tuple(reduced_shape):
@@ -1127,7 +1318,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return "\n".join(lines)
 
     def _emit_reduce_mean(self, op: Op) -> str:
-        """reduce_mean → reduce-sum, then divide by the (static) count."""
+        """reduce_mean → reduce-sum, then divide by the (static) count.
+
+        The SUM is accumulated in the DECLARED result dtype — numpy's mean
+        accumulator (bool/ints → float64, floats keep their own) — because
+        numpy's ``mean`` sums in widened precision: a huge int32 array must
+        not wrap at 32 bits before the divide, and a bool ``mean`` is the
+        popcount over the element count. Floats keep the unchanged path
+        (including the historical self-``convert``)."""
         x = op.operands[0]
         axes = tuple(op.attributes.get("axes", ()))
         keepdims = bool(op.attributes.get("keepdims", False))
@@ -1149,15 +1347,23 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         for i in dims:
             count *= x.type.shape[i]
         out_dtype = np.dtype(op.result.type.dtype)
+        elem_dtype = np.dtype(x.type.dtype)
+        accum_dtype = out_dtype if out_dtype != elem_dtype else elem_dtype
         lines, sum_name, reduced_shape = self._reduce_core_with_split(
-            x, dims, "sum"
+            x, dims, "sum", accum_dtype=accum_dtype
         )
-        converted = self._new_name()
-        lines.append(
-            f"{converted} = stablehlo.convert {sum_name} : "
-            f"({self._type_str(x.type.dtype, reduced_shape)}) -> "
-            f"{self._type_str(out_dtype, reduced_shape)}"
-        )
+        cur = sum_name
+        converted = sum_name
+        if accum_dtype == elem_dtype:
+            # Unchanged path (byte-identical): convert the operand-dtype sum
+            # to the result dtype — for floats that is a self-convert.
+            converted = self._new_name()
+            lines.append(
+                f"{converted} = stablehlo.convert {cur} : "
+                f"({self._type_str(elem_dtype, reduced_shape)}) -> "
+                f"{self._type_str(out_dtype, reduced_shape)}"
+            )
+            cur = converted
         # The divisor constant is scalar; StableHLO elementwise ops require
         # equal shapes, so broadcast it when the reduced tensor is not.
         # A dynamic reduced shape (non-reduced symbolic dims) sources the
@@ -1194,19 +1400,26 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         self._names[id(op.result)] = cur
         return "\n".join(lines)
 
-    def _emit_reduce_core(self, x: Value, dims: list, kind: str):
-        """Emit `stablehlo.reduce` (+ init constant + reducer region);
-        returns ``(lines, result_name, reduced_shape)`` with the operand
-        element dtype (callers add convert/reshape as needed)."""
-        elem_dtype = np.dtype(x.type.dtype)
-        init_value = self._reduce_init(kind, elem_dtype)
+    def _emit_reduce_core(
+        self, operand: str, dtype, shape: tuple, dims: list, kind: str
+    ):
+        """Emit `stablehlo.reduce` (+ init constant + reducer region) over the
+        NAMED ``operand`` in ``dtype``; returns
+        ``(lines, result_name, reduced_shape)`` with the OPERAND element dtype
+        (callers add convert/reshape as needed). Taking the ``(name, dtype,
+        shape)`` triple instead of an ``ir.Value`` is what lets the callers
+        reduce in a PROMOTED accumulator dtype (see ``_emit_reduce``) without
+        re-deriving it from a value whose type is the narrow one."""
+        dtype = np.dtype(dtype)
+        shape = tuple(shape)
+        init_value = self._reduce_init(kind, dtype)
         body_mnemonic = _REDUCE_BODY_MNEMONIC[kind]
-        elem_type = self._elem_type(elem_dtype)
+        elem_type = self._elem_type(dtype)
         lines = []
         init_name = self._new_name()
         lines.append(
             f"{init_name} = stablehlo.constant "
-            f"{self._constant_text(np.asarray(init_value, dtype=elem_dtype))}"
+            f"{self._constant_text(np.asarray(init_value, dtype=dtype))}"
             f" : {elem_type}"
         )
         body_name = self._new_name()
@@ -1224,14 +1437,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             "  })"
         )
         reduced_shape = tuple(
-            d for i, d in enumerate(x.type.shape) if i not in set(dims)
+            d for i, d in enumerate(shape) if i not in set(dims)
         )
-        reduced_type = self._type_str(elem_dtype, reduced_shape)
+        reduced_type = self._type_str(dtype, reduced_shape)
         result_name = self._new_name()
         lines.append(
-            f'{result_name} = "stablehlo.reduce"({self._name(x)}, '
+            f'{result_name} = "stablehlo.reduce"({operand}, '
             f"{init_name}) {region} {{dimensions = {self._i64_array(dims)}}}"
-            f" : ({self._vt(x.type)}, {elem_type}) -> {reduced_type}"
+            f" : ({self._type_str(dtype, shape)}, {elem_type}) -> {reduced_type}"
         )
         return lines, result_name, reduced_shape
 
@@ -1818,15 +2031,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         tie-break) — here it is irrelevant. Bool operands sort via an i8
         key (StableHLO compare on i1 only supports EQ/NE).
 
-        Emission mode: in STRICT ``sort_emission="count"`` mode the sorted
-        values come from ``_emit_stable_argsort``'s count composition (the
-        sorted-VALUES column — bit-exact vs numpy on llvm-cpu AND cuda, and
-        on iree-cuda it dodges the single-threaded O(n²) kernel the
-        1-operand pair form lowers to; see stablehlo/CONTEXT.md). ``"pair"``
-        and ``"auto"`` keep the 1-operand emission (unchanged llvm-cpu
-        behavior: the count values-composition is ~1.6× slower than its
-        1-operand sort at n ≥ 10000, so the count routing is gated to the
-        strict mode — the iree adapter passes it on cuda targets)."""
+        Emission mode (``_count_sort_active``): the sorted values come from
+        ``_emit_stable_argsort``'s count composition (the sorted-VALUES
+        column — bit-exact vs numpy on llvm-cpu AND cuda, and on iree-cuda it
+        dodges the single-threaded O(n²) kernel the 1-operand pair form lowers
+        to; see stablehlo/CONTEXT.md) in the STRICT ``sort_emission="count"``
+        mode AND for every sort emitted inside a region (the region-nested
+        2-operand mis-execution — see ``_count_argsort_active``). ``"pair"``
+        and ``"auto"`` keep the 1-operand emission at region depth 0
+        (unchanged llvm-cpu behavior: the count values-composition is ~1.6×
+        slower than its 1-operand sort at n ≥ 10000, so the extent-gated
+        routing is left to the strict mode — the iree adapter passes it on
+        cuda targets)."""
         x = op.operands[0]
         rank = x.type.rank
         axis = self._normalize_axis(op.attributes.get("axis", -1), rank, "sort.axis")
@@ -1844,8 +2060,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 f"{self._type_str(np.dtype('int8'), x_shape)}"
             )
             key_name, keys_dtype = t, np.dtype("int8")
-        if self._sort_emission == "count":
-            # Count mode: reuse the count-based STABLE argsort composition's
+        if self._count_sort_active():
+            # Count composition: reuse the count-based STABLE argsort's
             # sorted-VALUES column (the index column is discarded). The
             # values are the same regardless of the tie order.
             cur, _ = self._emit_stable_argsort(
@@ -1935,13 +2151,24 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         ``keys_shape``; the iota column is int64). Shared by the ``argsort``
         op, the permutation expansion, and the ``eigh`` eigenvalue sort.
 
-        Emission mode (writer option ``sort_emission``): ``"pair"`` (this
+        Emission mode (writer option ``sort_emission`` combined with the
+        emission SITE, see ``_count_argsort_active``): ``"pair"`` (this
         two-operand sort — iree-cuda cannot bufferize multi-operand sorts
         whenever the sorted-axis extent is >= 32, upstream iree 3.11.0
         bug), ``"count"`` (the count-based O(n^2) composition with NO sort
         op — bit-exact vs numpy on both llvm-cpu and cuda), or ``"auto"``
         (per call: ``"count"`` when the sorted-axis extent >= 32, else
-        ``"pair"``). The iree adapter defaults to ``"auto"``."""
+        ``"pair"``). The iree adapter defaults to ``"auto"``.
+        INDEPENDENT of the mode, a sort emitted INSIDE a region (region
+        depth > 0) always takes the count composition: iree 3.11.0
+        mis-executes a 2-operand ``stablehlo.sort`` that lives inside an
+        ``if``/``while`` region when its index operand is a
+        region-INVARIANT value hoisted to the enclosing scope — the
+        index column comes back as the unsorted iota, so a following
+        ``gather`` silently yields the unsorted data (the ``eigh``
+        post-loop tail's eigenvalue sort + column reorder is exactly that
+        shape). The count composition contains no ``sort`` op at all, so
+        the defect class cannot arise."""
         if self._count_argsort_active(keys_shape, axis):
             return self._emit_count_argsort(
                 keys_name, keys_dtype, keys_shape, axis, lines
@@ -1981,14 +2208,51 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- eigh (while-loop cyclic-Jacobi) ---
     def _count_argsort_active(self, keys_shape: tuple, axis: int) -> bool:
         """Whether the count-based argsort emission applies for this call
-        under the configured ``sort_emission`` mode."""
+        under the configured ``sort_emission`` mode AND the emission site.
+
+        The count composition is used wherever a 2-operand sort would be
+        emitted OUTSIDE a plain flat top-level block: ``_region_depth > 0``
+        (inside an ``if``/``while`` region) OR inside the INLINE branch
+        scope of a while-bearing ``cond`` (``_select_inline_depth > 0`` —
+        ``_emit_if_select``/``_emit_branch_inline`` emit both branch bodies
+        at the enclosing scope, so ``_region_depth`` stays 0 there).
+        iree 3.11.0 mis-executes a 2-operand ``stablehlo.sort`` in BOTH
+        positions when its index operand is not a region argument — a
+        loop-carried value sorted in a body and then gathered with the
+        returned index silently yields the UNSORTED input (measured on a
+        minimal ``argsort`` + ``gather`` loop body), and the ``eigh``
+        post-loop tail (eigenvalue sort, then a gather of V's columns) hits
+        exactly that shape inside the inline branch scope. No ``sort`` op is
+        emitted by the count composition, so the whole defect class
+        disappears, and the extents involved (eigenvalue counts) are small
+        enough that its O(n^2) cost is negligible. Everything in a flat
+        function block keeps the mode's own choice, so a bare/top-level
+        export is byte-identical."""
         mode = self._sort_emission
         if mode == "count":
+            return True
+        if self._region_depth > 0 or self._select_inline_depth > 0:
             return True
         if mode == "pair":
             return False
         extent = keys_shape[axis]
         return _is_static_dim(extent) and extent >= 32
+
+    def _count_sort_active(self) -> bool:
+        """Whether the VALUES-sort emission uses the count composition —
+        the strict ``sort_emission="count"`` mode, or any sort emitted
+        inside a region / inline branch scope (see
+        ``_count_argsort_active`` for the rule; a 1-operand
+        ``stablehlo.sort`` never hits the 2-operand mis-execution, but
+        routing it through the same count composition keeps one rule for
+        every sort emission site). A flat top-level block keeps the
+        1-operand pair form under ``"auto"`` — byte-identical to the
+        pre-rule text and cheaper on llvm-cpu at large extents."""
+        return (
+            self._sort_emission == "count"
+            or self._region_depth > 0
+            or self._select_inline_depth > 0
+        )
 
     def _emit_count_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
                             axis: int, lines: list) -> tuple[str, str]:
@@ -1997,7 +2261,11 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         iree 3.11.0 cannot bufferize multi-operand ``stablehlo.sort`` on
         cuda whenever the sorted-axis extent is >= 32 (upstream bug; every
         iota dtype / is_stable / operand-order variant fails — llvm-cpu is
-        unaffected, 1-operand sorts are unaffected). This composition
+        unaffected, 1-operand sorts are unaffected), and mis-executes a
+        2-operand ``stablehlo.sort`` nested in an ``if``/``while`` region
+        whose index operand is a region-invariant hoisted value (the index
+        column returns as the UNSORTED iota — this composition is what the
+        region-nested emission uses, see ``_count_argsort_active``). It
         computes the stable rank of every element by counting, then
         inverts the rank permutation:
 
@@ -3167,9 +3435,13 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         matching ``np.argmax``/``np.argmin`` (index init 0 keeps the
         reduce consistent: an element equal to the init never beats index
         0). axis=None flattens first (numpy); keepdims reshapes after.
-        Float NaN: numpy returns the FIRST NaN position; StableHLO
-        comparisons with NaN are false, so NaN never beats a finite value
-        — divergence documented (evox fitnesses are finite)."""
+        Float NaN: the comparator is the shared
+        ``split_reduce._arg_reduce_region`` predicate, which for FLOAT keys
+        is the total preorder numpy implements — NaN beats every non-NaN
+        and the smallest index wins among NaNs, so the result is numpy's
+        FIRST NaN index for any reduce-tree association (including the
+        split two-stage path). Integer/bool keys keep the plain comparator
+        (no extra ops)."""
         split_text = self._emit_split_arg_reduce(op)
         if split_text is not None:
             return split_text
@@ -3216,30 +3488,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         )
         direction = "GT" if kind == "max" else "LT"
         key_elem = self._elem_type(keys_dtype)
-        a, b, c, d = (self._new_name() for _ in range(4))
-        c1, c2, c3, c4, c5 = (self._new_name() for _ in range(5))
-        sel_v, sel_i = self._new_name(), self._new_name()
-        region = (
-            "({\n"
-            f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
-            f"{c}: {key_elem}, {d}: tensor<i64>):\n"
-            f'    {c1} = "stablehlo.compare"({a}, {c}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
-            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
-            f'    {c2} = "stablehlo.compare"({a}, {c}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
-            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
-            f'    {c3} = "stablehlo.compare"({b}, {d}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
-            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
-            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
-            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
-            f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
-            f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
-            f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
-            f"(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>\n"
-            f"    stablehlo.return {sel_v}, {sel_i} : {key_elem}, tensor<i64>\n"
-            "  })"
+        region = _arg_reduce_region(
+            self, key_elem, direction, nan_aware=keys_dtype.kind == "f"
         )
         red_shape_out = tuple(
             d for i, d in enumerate(red_shape_in) if i != axis
@@ -3811,128 +4061,223 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
 
     # --- Control flow ---
 
-    # iree 3.11 mis-lowers a `stablehlo.while` nested inside a
-    # `stablehlo.if` region (upstream; garbage binding descriptor at
-    # invoke — `IndexError OUT_OF_RANGE ... binding length=...` on BOTH
-    # llvm-cpu and cuda at every opt level; proven with raw
-    # `iree-compile` + `iree-run-module` on the identical mlir with and
-    # without the if wrapper; minimal repro `probe_min_while_if.mlir`).
-    # `_emit_eigh`'s cyclic-Jacobi composition contains a while, so any
-    # `etl.cond` wrapping an eigh decomposition (the evox CMAES fused
-    # tell) used to emit exactly that crash shape.
+    # REGION-SCOPED EMISSION — the region contract (iree 3.11 regional
+    # defects; see `_split_region_invariants`). Three independent rules:
     #
-    # WORKAROUND: `_emit_if` HOISTS every while-producing subgraph out of
-    # the branch regions — the branch-block prefix up to the last
-    # while-producing op (``eigh`` / ``while`` / an ``if`` whose regions
-    # recursively contain one) is emitted BEFORE the ``stablehlo.if`` and
-    # the branch regions reference the hoisted values lexically
-    # (StableHLO regions capture enclosing values). Safe because every op
-    # that reaches the exporter is pure (effectful ops — collectives,
-    # runtime_call/external_call — defer with BackendError, so nothing
-    # with side effects can be moved). The hoisted prefix may compute
-    # unconditionally what a branch computed conditionally — pure
-    # semantics are preserved. The eigh composition stays a single while
-    # (O(1) emitted text — no compile blowup at dim 50).
+    # (1) REGION-LOCAL CONSTANTS. iree 3.11 hoists a `stablehlo.constant`
+    # (or an op consuming one) placed inside a region into a `util.global`
+    # nothing defines — `'util.global.load' op undefined global:
+    # @__hoisted_tensor_3x3xf32` at compile (reproduced on `eigh` under
+    # `etl.cond`, whose cyclic-Jacobi composition emits a pre-loop prelude
+    # of constants and iotas — the eye, the sweep counters, the index
+    # lattices). FIX: every region-emitting emitter prints its setup lines
+    # at the TOP of its returned text, and the region emitters split each
+    # region block into atomic units and lift the REGION-INVARIANT ones into
+    # a PRELUDE emitted BEFORE the enclosing `if`/`while` header
+    # (`_split_region_invariants`, driven by `_region_lines`), so constants
+    # live in the enclosing scope and the regions capture them lexically.
+    # Safe because every op reaching the exporter is pure (effectful ops —
+    # collectives, runtime_call/external_call — defer with BackendError).
+    # DOMINANCE (binding): a lifted unit lands at the ENCLOSING scope, where
+    # only enclosing-scope names are visible — NOT the region's block
+    # arguments, not anything any unit of this block (or of the sibling
+    # region of the same `if`/`while`) defines, and not anything a nested
+    # region inside a unit defines. `_split_region_invariants` therefore
+    # FORBIDS all of those, and lifts only units that use none of them (a
+    # unit derived from an already-lifted constant still lifts, so an
+    # `eigh` prelude lifts as one chain). Lifting bubbles outward one
+    # region level at a time, so an `eigh` inside a cond inside a cond, and
+    # an `eigh` inside a `while` BODY, both end up with their constants at
+    # function scope — while a unit that depends on a region-local value
+    # correctly STAYS in the region.
     #
-    # Known residual: an eigh/while nested inside a cond inside a cond
-    # (the inner if is inside the outer REGION, not the outer block
-    # prefix) still emits while-in-if — upstream; restructure or
-    # precompute. eigh inside a while BODY is not hoisted (semantics:
-    # per-iteration) — while-in-while is a separate upstream question.
+    # (2) NO `stablehlo.sort` IN A REGION OR AN INLINE BRANCH SCOPE. A
+    # 2-operand `stablehlo.sort` there executes with the sort result and
+    # its consumers out of sync (index correct, gather of the same operand
+    # unsorted), so every sort/argsort emitted at `_region_depth > 0` OR
+    # `_select_inline_depth > 0` uses the count composition — see
+    # `_count_argsort_active`.
+    #
+    # (3) NO `stablehlo.while` INSIDE A `stablehlo.if`. iree 3.11's
+    # `local-task` driver mis-executes such a module (correct 6/6 under
+    # `local-sync`; the implicit-capture-mis-binding hypothesis is
+    # REFUTED), so a `cond` whose branch regions contain a while-emitting
+    # op is emitted INLINE + `select` instead (`_emit_if_select`, which
+    # runs both branches — see its docstring for the cost). Region-free and
+    # reduce-only branches keep the `stablehlo.if` emission byte for byte;
+    # the trigger is derived from the IR (`_region_contains_while`), no
+    # writer state flag, and `_region_depth` is not incremented on the
+    # inline path (the branch units become ordinary units of the enclosing
+    # block, so that block's split lifts their constants normally).
+    # The eigh composition stays a single while (O(1) emitted text — no
+    # compile blowup at dim 50).
 
     def _emit_if(self, op: Op) -> str:
+        if any(_region_contains_while(region) for region in op.regions):
+            return self._emit_if_select(op)
         pred = op.operands[0]
-        # Bind the branch block args to the if operands BEFORE any hoisting
-        # so the hoisted prefix resolves branch-local references to the
-        # enclosing operand names (they dominate the hoist point — the if's
-        # operands are emitted by the enclosing block before this op).
+        # Bind the branch block args to the if operands BEFORE emitting the
+        # regions so branch-local references resolve to the enclosing
+        # operand names (they dominate the if — its operands are emitted by
+        # the enclosing block before this op).
         for region in op.regions:
             for block in region.blocks:
                 for arg, operand in zip(block.arguments, op.operands):
                     self._names[id(arg)] = self._name(operand)
-        lines = []
-        self._hoist_if_branch_whiles(op, lines)
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
+        true_blocks, true_local = self._emit_if_region(op.regions[0], op)
+        false_blocks, false_local = self._emit_if_region(op.regions[1], op)
+        # Both branches' region-invariant prefixes land BEFORE the `if`
+        # (see the comment above) — iree 3.11 cannot compile a region-local
+        # constant. Both are emitted from the SAME enclosing point, so a
+        # lifted unit may not use ANY name either branch introduces.
+        shared = true_local | false_local
+        true_prelude, true_region = self._region_lines(true_blocks, shared)
+        false_prelude, false_region = self._region_lines(false_blocks, shared)
+        lines = list(true_prelude) + list(false_prelude)
         lines.append(f'{lhs}"stablehlo.if"({self._name(pred)}) ({{')
-        lines.append(self._emit_if_region(op.regions[0], op))
+        lines.append(true_region)
         lines.append("  }, {")
-        lines.append(self._emit_if_region(op.regions[1], op))
+        lines.append(false_region)
         lines.append(
             f"  }}) : ({self._vt(pred.type)}) -> "
             f"{self._result_types_str(op.results)}"
         )
         return "\n".join(lines)
 
-    def _hoist_if_branch_whiles(self, op: Op, lines: list) -> None:
-        """Hoist every while-producing subgraph out of an ``if``'s branch
-        regions (the iree 3.11 while-in-if workaround — see the comment
-        above). For each branch block, the prefix up to and including the
-        LAST while-producing op is emitted into ``lines`` (the enclosing
-        block, just before the ``if``) and marked in ``self._hoisted_ops``
-        so ``_block_body_lines`` skips it when the region is emitted."""
-        for region in op.regions:
-            for block in region.blocks:
-                ops = list(block.ops)
-                last = None
-                for i, bop in enumerate(ops):
-                    if bop.name == "return":
-                        break
-                    if self._is_while_producing(bop):
-                        last = i
-                if last is None:
-                    continue
-                for bop in ops[: last + 1]:
-                    self._hoisted_ops.add(id(bop))
-                    text = self._emit_op(bop)
-                    if text:
-                        lines.append(text)
+    def _emit_if_region(self, region, op: Op):
+        """One `if` branch, emitted into ATOMIC UNITS (see
+        ``_emit_while_region``): no block args (StableHLO branches capture
+        the enclosing values implicitly) — the etl entry args bind to the op
+        operands, so references resolve to the enclosing SSA names.
 
-    def _is_while_producing(self, bop: Op) -> bool:
-        """True when emitting ``bop`` produces a ``stablehlo.while``:
-        the ``eigh`` composition (one while), a direct ``while`` op, or an
-        ``if`` whose regions recursively contain one."""
-        if bop.name in ("eigh", "while"):
-            return True
-        if bop.name == "if":
-            return any(
-                self._region_has_while_producing(region)
-                for region in bop.regions
-            )
-        return False
-
-    def _region_has_while_producing(self, region) -> bool:
-        return any(
-            self._is_while_producing(bop)
-            for block in region.blocks
-            for bop in block.ops
-            if bop.name != "return"
-        )
-
-    def _emit_if_region(self, region, op: Op) -> str:
-        """One `if` branch: no block args (StableHLO branches capture the
-        enclosing values implicitly) — the etl entry args bind to the op
-        operands, so references resolve to the enclosing SSA names."""
-        out = []
+        Returns ``(blocks, local)``: ``blocks`` is a list of
+        ``(header, units)`` pairs and ``local`` is the EMPTY set (an `if`
+        branch introduces no SSA names of its own — its block args alias
+        enclosing operands). The caller splits each branch into
+        prelude/body with ``_region_lines`` AFTER both branches are
+        emitted, so a lifted unit from either branch is checked against
+        both branches' locals."""
+        blocks = []
         for i, block in enumerate(region.blocks):
             for arg, operand in zip(block.arguments, op.operands):
                 self._names[id(arg)] = self._name(operand)
-            out.append(f"  ^bb{i}:")
-            out.extend("    " + line for line in self._block_body_lines(block))
-        return "\n".join(out)
+            self._region_depth += 1
+            try:
+                units = self._block_units(block)
+            finally:
+                self._region_depth -= 1
+            blocks.append((f"  ^bb{i}:", units))
+        return blocks, set()
+
+    def _emit_if_select(self, op: Op) -> str:
+        """A `cond` whose branches contain a ``while`` — emitted as INLINE
+        branches combined with ``stablehlo.select`` instead of
+        ``stablehlo.if`` (see ``_region_contains_while``).
+
+        Both branch bodies are emitted at the ENCLOSING scope, in order, and
+        each result i becomes ``select(broadcast(pred), true_i, false_i)``:
+        no ``if`` region, and both ``while`` ops sit at function (or
+        enclosing-block) level, where iree executes them correctly — the
+        same shape a bare ``eigh`` emits. Every op reaching the exporter is
+        pure (effectful ops — collectives, `runtime_call`/`external_call` —
+        defer with ``BackendError``), so running both branches is
+        semantics-preserving: only the selected value reaches the
+        consumers. The cost is that the UNSELECTED branch is computed too —
+        its ``while`` runs its full iteration count — so a while-bearing
+        `cond` costs the sum of both branches rather than one of them.
+
+        Reason: iree 3.11's ``local-task`` driver mis-executes a
+        ``stablehlo.if`` whose regions contain a ``stablehlo.while`` — the
+        SAME compiled module returns zeros for both results on some runs
+        (the identical module is always correct under ``local-sync``), which
+        is what made an ``eigh`` inside an ``etl.cond`` branch unusable on
+        the default CPU driver. The defect is not about capture binding
+        (minimal probes refuted that), and a ``reduce``-bearing branch is
+        NOT affected — hence the narrow ``while``-only trigger: region-free
+        and reduce-only branches keep the ``stablehlo.if`` emission, byte
+        for byte.
+        """
+        pred = op.operands[0]
+        result_names = self._bind_results(op)
+        lines, branches = [], []
+        for region in op.regions:
+            units, returned = self._emit_branch_inline(region, op)
+            lines.extend(units)
+            branches.append(returned)
+        true_values, false_values = branches
+        for result, name, true_value, false_value in zip(
+            op.results, result_names, true_values, false_values
+        ):
+            shape = tuple(result.type.shape)
+            pred_name, extra = self._equalize_operand(
+                pred, shape, self._shape_source([true_value, false_value], shape)
+            )
+            lines.extend(extra)
+            lines.append(
+                f"{name} = stablehlo.select {pred_name}, "
+                f"{self._name(true_value)}, {self._name(false_value)} : "
+                f"({self._type_str(pred.type.dtype, shape)}, "
+                f"{self._vt_value(true_value)}, {self._vt_value(false_value)})"
+                f" -> {self._vt_value(result)}"
+            )
+        return "\n".join(lines)
+
+    def _emit_branch_inline(self, region, op: Op):
+        """One `cond` branch emitted at the ENCLOSING scope (see
+        ``_emit_if_select``): the branch's block ops become ordinary units of
+        the enclosing block in program order, so they inherit its scope and
+        the enclosing region split lifts their constants exactly as it would
+        for a `while` emitted there (no region-local constant, hence no
+        ``@__hoisted_`` failure).
+
+        Returns ``(units, returned)``: the branch body WITHOUT its
+        terminator (``stablehlo.return`` is only valid inside a region) and
+        the SSA names the branch returns — the values the fallback
+        ``stablehlo.select`` combines."""
+        units, returned = [], []
+        for block in region.blocks:
+            for arg, operand in zip(block.arguments, op.operands):
+                self._names[id(arg)] = self._name(operand)
+            # Mark the INLINE branch scope: sorts emitted here must use the
+            # count composition even though `_region_depth` stays 0 (see
+            # `_count_argsort_active`).
+            self._select_inline_depth += 1
+            try:
+                block_units = self._block_units(block)
+            finally:
+                self._select_inline_depth -= 1
+            terminator = block.ops[-1] if block.ops else None
+            if terminator is not None and terminator.name == "return":
+                returned = list(terminator.operands)
+                block_units = block_units[:-1]
+            units.extend(block_units)
+        return units, returned
 
     def _emit_while(self, op: Op) -> str:
-        lines = []
+        init_lines = []
         operand_names = [
-            self._rewrite_while_init(op, v, lines) for v in op.operands
+            self._rewrite_while_init(op, v, init_lines) for v in op.operands
         ]
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
         types = ", ".join(self._vt(v.type) for v in op.operands)
+        cond_blocks, cond_local = self._emit_while_region(op.regions[0])
+        body_blocks, body_local = self._emit_while_region(op.regions[1])
+        # The init rewrite first (its values are the while's operands), then
+        # the two regions' region-invariant prefixes, all BEFORE the
+        # `stablehlo.while` header. Both prefixes are emitted from the SAME
+        # enclosing point, so a lifted unit may not use ANY name either
+        # region introduces (its own block args included).
+        shared = cond_local | body_local
+        cond_prelude, cond_region = self._region_lines(cond_blocks, shared)
+        body_prelude, body_region = self._region_lines(body_blocks, shared)
+        lines = list(init_lines) + list(cond_prelude) + list(body_prelude)
         lines.append(f'{lhs}"stablehlo.while"({", ".join(operand_names)}) ({{')
-        lines.append(self._emit_while_region(op.regions[0]))
+        lines.append(cond_region)
         lines.append("  }, {")
-        lines.append(self._emit_while_region(op.regions[1]))
+        lines.append(body_region)
         lines.append(f"  }}) : ({types}) -> ({types})")
         return "\n".join(lines)
 
@@ -4109,21 +4454,62 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             cur = r
         return cur
 
-    def _emit_while_region(self, region) -> str:
-        """One `while` region (cond/body): block args bound positionally to
-        the loop-carried operands. Args use FRESH counter names (never
-        `%argN` — MLIR SSA names are function-scoped and would collide
-        with the enclosing function's entry arguments / nested regions)."""
-        out = []
+    def _emit_while_region(self, region):
+        """One `while` region (cond/body), emitted into ATOMIC UNITS. Block
+        args use FRESH counter names (never `%argN` — MLIR SSA names are
+        function-scoped and would collide with the enclosing function's
+        entry arguments / nested regions).
+
+        Returns ``(blocks, local)``: ``blocks`` is a list of
+        ``(header, units)`` pairs — the ``^bbN(...)`` header plus the
+        block's atomic units (the constants/iotas an `eigh` decomposition
+        emits before its own `while` are among them) — and ``local`` is the
+        set of SSA names the region introduces ITSELF (its block
+        arguments). The caller splits the region into prelude/body with
+        ``_region_lines`` AFTER both regions are emitted, and passes the
+        union of both regions' locals as the split's ``forbidden`` set: the
+        two prefixes are emitted at the same enclosing point, so neither
+        may reference the other region's locals."""
+        blocks, local = [], set()
         for i, block in enumerate(region.blocks):
             args = []
             for arg in block.arguments:
                 name = self._new_name()
                 self._names[id(arg)] = name
                 args.append(f"{name}: {self._vt(arg.type)}")
-            out.append(f"  ^bb{i}({', '.join(args)}):")
-            out.extend("    " + line for line in self._block_body_lines(block))
-        return "\n".join(out)
+                # bare SSA ids (``_SSA_NAME_RE`` group form) — the form
+                # ``_defined_names``/``_block_arg_names`` report, so the
+                # split's ``forbidden`` set compares like with like.
+                local.update(_SSA_NAME_RE.findall(name))
+            self._region_depth += 1
+            try:
+                units = self._block_units(block)
+            finally:
+                self._region_depth -= 1
+            blocks.append((f"  ^bb{i}({', '.join(args)}):", units))
+        return blocks, local
+
+    def _region_lines(self, blocks, forbidden=()):
+        """Render one already-emitted region (see ``_emit_while_region`` /
+        ``_emit_if_region``) as ``(prelude, text)``.
+
+        ``prelude`` is the region's REGION-INVARIANT prefix, lifted OUT of
+        the region and emitted by the caller BEFORE the enclosing
+        ``stablehlo.if``/``stablehlo.while`` header (the regions then
+        capture it lexically — see the region-scoped-emission comment
+        above); ``text`` is the region body. ``forbidden`` carries the SSA
+        names that are NOT visible at that enclosing point (the sibling
+        region's locals) and is extended inside ``_split_region_invariants``
+        by everything this region defines. Lifted units keep block/emission
+        order, so at the enclosing scope a lifted name always precedes its
+        uses."""
+        prelude, out = [], []
+        for header, units in blocks:
+            lifted, lines = self._split_region_invariants(units, forbidden)
+            prelude.extend(lifted)
+            out.append(header)
+            out.extend("    " + line for line in lines)
+        return prelude, "\n".join(out)
 
     # --- Collectives ---
 
@@ -4285,23 +4671,98 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- Block/region emission ---
 
     def _block_body_lines(self, block: Block, terminator: str = "stablehlo.return"):
-        """The op lines of one block, ending with its terminator line."""
-        lines = []
+        """Return ``(prelude, body)`` for one block.
+
+        ``body`` is the block's atomic units (see ``_block_units``), ending
+        with its terminator line. ``prelude`` is the block's
+        region-invariant prefix lifted OUT of the enclosing region — see
+        ``_split_region_invariants`` — and the caller emits it BEFORE the
+        enclosing ``if``/``while`` header. For the function entry block
+        (``_region_depth == 0``) nothing is lifted and ``prelude`` is
+        empty, so a region-free export is byte-identical to the flat line
+        list. This is the ENTRY-block path only; the region emitters
+        (`_emit_while_region`/`_emit_if_region`) emit their blocks into
+        units FIRST and split them together via ``_region_lines``, because
+        the split's ``forbidden`` set needs BOTH regions' locals."""
+        units = self._block_units(block, terminator)
+        if self._region_depth == 0:
+            return [], units
+        return self._split_region_invariants(units)
+
+    def _block_units(self, block: Block, terminator: str = "stablehlo.return"):
+        """Emit one block's ops into ATOMIC UNITS: one element per
+        depth-0 emitted line, with a multi-line ``while``/``if``/``reduce``
+        group kept as ONE element (``_split_atomic_units``), terminated by
+        the block's terminator line."""
+        units = []
         for op in block.ops:
             if op.name == "return":
                 if op.operands:
                     values = ", ".join(self._name(v) for v in op.operands)
                     types = ", ".join(self._vt_value(v) for v in op.operands)
-                    lines.append(f"{terminator} {values} : {types}")
+                    units.append(f"{terminator} {values} : {types}")
                 else:
-                    lines.append(terminator)
+                    units.append(terminator)
                 break
-            if id(op) in self._hoisted_ops:
-                continue  # already emitted before the enclosing `if`
             text = self._emit_op(op)
             if text:
-                lines.append(text)
-        return lines
+                units.extend(_split_atomic_units(text))
+        return units
+
+    def _split_region_invariants(self, units, forbidden=()):
+        """Split one REGION block's atomic units into ``(prelude, body)``:
+        the region-invariant prefix that is lifted out of the region and
+        the lines that must stay inside it.
+
+        iree 3.11 cannot compile a ``stablehlo.constant`` (or an op
+        consuming one) that lives INSIDE a region — it hoists it into an
+        undefined ``util.global`` (``'util.global.load' op undefined
+        global: @__hoisted_tensor_...``), so the constants/iotas an
+        ``eigh`` decomposition emits before its ``while`` must sit in the
+        ENCLOSING scope, where the region captures them lexically (a
+        hand-written probe of a ``stablehlo.if`` whose branches each
+        contain their own ``stablehlo.while`` over enclosing-scope
+        constants compiles AND runs correctly on iree 3.11 — the previously
+        assumed "while-inside-if" defect was this region-local-constant
+        defect).
+
+        DOMINANCE RULE (binding): the prelude is emitted BEFORE the
+        enclosing ``if``/``while`` header, i.e. at a point where NOTHING
+        this block or its sibling regions define is visible — only the
+        enclosing scope is. So a unit is lifted iff it is a single depth-0
+        line whose emitted mnemonic is pure and region-free
+        (``_HOISTABLE_MNEMONICS``) AND it uses NO FORBIDDEN SSA name, where
+        ``forbidden`` starts as the caller-supplied sibling-region locals
+        (``_region_lines``) PLUS every name defined anywhere in this
+        block's units — including the region's own BLOCK ARGUMENTS (they
+        are emitted with the region header, never by a unit) and every name
+        a NESTED region inside any unit defines (block arguments
+        included). A lifted unit RELEASES the names it defines, so a chain
+        derived from a lifted constant lifts together — which is what keeps
+        an ``eigh`` prelude hoisted as one prefix. The scan runs ONCE in
+        emission order: a block is def-before-use ordered, so the single
+        forward pass already IS the fixpoint of that monotone rule and
+        never lifts a unit on the strength of a name a LATER unit defines
+        (which would put the prelude out of dominance order).
+        Refusing to lift is always safe — the unit then simply stays in the
+        region, where its operands are visible. Pure ⇒ hoisting cannot
+        duplicate a side effect; computing unconditionally what a branch
+        computed conditionally preserves the semantics.
+        """
+        forbidden = set(forbidden)
+        for unit in units:
+            forbidden |= _defined_names(unit)
+            forbidden |= _block_arg_names(unit)
+        prelude, body = [], []
+        for unit in units:
+            defined = _defined_names(unit)
+            used = set(_SSA_NAME_RE.findall(unit)) - defined
+            if _is_hoistable_unit(unit) and not (used & forbidden):
+                prelude.append(unit)
+                forbidden -= defined
+                continue
+            body.append(unit)
+        return prelude, body
 
     # --- Naming & formatting helpers ---
 

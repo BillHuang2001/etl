@@ -263,30 +263,97 @@ def _simple_reduce_region(writer, elem_type: str, mnemonic: str) -> str:
     )
 
 
-def _arg_reduce_region(writer, key_elem: str, direction: str) -> str:
-    """Comparator region for the ``(value, index)`` arg-reduce stages:
-    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)`` — first
+def _arg_reduce_region(
+    writer, key_elem: str, direction: str, nan_aware: bool = False,
+) -> str:
+    """Comparator region for the ``(value, index)`` arg-reduce stages —
+    the ONE predicate shared by the single-stage emitter
+    (``writer._emit_arg_reduce``) and both stages of the split one:
+    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)``, i.e. first
     occurrence wins on ties (matching ``np.argmax``/``np.argmin``). Two
     operands GROUP their reduce-block args (operand0_lhs, operand1_lhs,
-    operand0_rhs, operand1_rhs)."""
+    operand0_rhs, operand1_rhs).
+
+    ``nan_aware`` (FLOAT keys only) upgrades that into a TOTAL PREORDER
+    reproducing numpy exactly. ``np.argmin``/``np.argmax`` return the index
+    of the FIRST NaN, and every IEEE comparison against a NaN is false, so
+    in the plain form a NaN can never win and the result collapses to a
+    real extremum. The NaN-aware form makes NaN beat every non-NaN while
+    the SMALLEST index wins among NaNs::
+
+        wins = (isnan(a) AND NOT isnan(c))                      # NaN beats all
+               OR (a GT|LT c)                                   # plain value
+               OR ((a EQ c OR (isnan(a) AND isnan(c)))          # equal-in-class
+                   AND b_idx LT d_idx)                          # -> first index
+
+    Both NaN terms make the order association-independent, so ANY reduce
+    tree (single stage, the two split stages, reassociated) yields numpy's
+    first NaN. ``isnan`` is ``compare NE x, x`` — StableHLO/XLA NE is
+    IEEE-unordered, so ``NaN NE NaN`` is true and the opset's missing
+    ``stablehlo.isnan`` is not needed. NOTE: that same IEEE rule makes
+    ``NOT (a NE c)`` "numerically equal", NOT "equal in class" (two NaNs
+    are NE), so the equal-in-class term is spelled out as
+    ``(a EQ c) OR (isnan(a) AND isnan(c))``. Seven extra combiner ops for
+    float keys; integer/bool keys keep the plain form with NO extra ops
+    (byte-identical legacy text)."""
     a, b, c, d = (writer._new_name() for _ in range(4))
-    c1, c2, c3, c4, c5 = (writer._new_name() for _ in range(5))
+    if not nan_aware:
+        c1, c2, c3, c4, c5 = (writer._new_name() for _ in range(5))
+        sel_v, sel_i = writer._new_name(), writer._new_name()
+        return (
+            "({\n"
+            f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
+            f"{c}: {key_elem}, {d}: tensor<i64>):\n"
+            f'    {c1} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c2} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c3} = "stablehlo.compare"({b}, {d}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
+            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
+            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+            f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
+            f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
+            f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
+            f"(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>\n"
+            f"    stablehlo.return {sel_v}, {sel_i} : {key_elem}, tensor<i64>\n"
+            "  })"
+        )
+    c1, c2, c3, nan_a, nan_c = (writer._new_name() for _ in range(5))
+    not_nan_c, nan_first, both_nan, equal, tie_i, first, c5 = (
+        writer._new_name() for _ in range(7)
+    )
     sel_v, sel_i = writer._new_name(), writer._new_name()
+    key_type = f"({key_elem}, {key_elem}) -> tensor<i1>"
     return (
         "({\n"
         f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
         f"{c}: {key_elem}, {d}: tensor<i64>):\n"
         f'    {c1} = "stablehlo.compare"({a}, {c}) '
         f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
-        f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+        f" : {key_type}\n"
         f'    {c2} = "stablehlo.compare"({a}, {c}) '
         f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
-        f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+        f" : {key_type}\n"
         f'    {c3} = "stablehlo.compare"({b}, {d}) '
         f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
         f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
-        f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
-        f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+        f'    {nan_a} = "stablehlo.compare"({a}, {a}) '
+        f"{{comparison_direction = #stablehlo<comparison_direction NE>}}"
+        f" : {key_type}\n"
+        f'    {nan_c} = "stablehlo.compare"({c}, {c}) '
+        f"{{comparison_direction = #stablehlo<comparison_direction NE>}}"
+        f" : {key_type}\n"
+        f"    {not_nan_c} = stablehlo.not {nan_c} : tensor<i1>\n"
+        f"    {nan_first} = stablehlo.and {nan_a}, {not_nan_c} : tensor<i1>\n"
+        f"    {both_nan} = stablehlo.and {nan_a}, {nan_c} : tensor<i1>\n"
+        f"    {equal} = stablehlo.or {c2}, {both_nan} : tensor<i1>\n"
+        f"    {tie_i} = stablehlo.and {equal}, {c3} : tensor<i1>\n"
+        f"    {first} = stablehlo.or {c1}, {nan_first} : tensor<i1>\n"
+        f"    {c5} = stablehlo.or {first}, {tie_i} : tensor<i1>\n"
         f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
         f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
         f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
@@ -313,13 +380,22 @@ class SplitReductionMixin:
 
     # -- eligibility ---------------------------------------------------
 
-    def _split_reduce_plan(self, x: "Value", dims, kind: str, dtype) -> dict | None:
-        """Decide whether a plain ``sum``/``max``/``min``/``prod`` reduce is
-        split; returns the plan dict or ``None`` (today's text)."""
+    def _split_reduce_plan(self, shape, dims, kind: str, dtype) -> dict | None:
+        """Decide whether a plain ``sum``/``max``/``min``/``prod`` reduce over
+        a named operand of ``shape``/``dtype`` is split; returns the plan dict
+        or ``None`` (today's text).
+
+        PURE (no emission): the writer's SSA name counter must not be consumed
+        when a reduce keeps the single-stage text. ``shape``/``dtype`` describe
+        the operand the reduce actually runs over — i.e. the PROMOTED
+        (accumulator) dtype for ``sum``/``prod``, never the narrow graph-input
+        dtype (promotion happens once, BEFORE the split, so the stage geometry
+        and the exactness classes are computed on the promoted operand)."""
         if not self._split_reduction:
             return None
-        shape = tuple(x.type.shape)
+        shape = tuple(shape)
         dims = sorted(int(d) for d in dims)
+        dtype = np.dtype(dtype)
         if not shape or not dims:
             return None
         if not all(_is_static_extent(d) for d in shape):
@@ -458,25 +534,62 @@ class SplitReductionMixin:
 
     # -- the hooked entry points ---------------------------------------
 
-    def _reduce_core_with_split(self, x: "Value", dims, kind: str):
-        """Emit a plain reduce — two-stage when eligible, else the existing
-        single-stage ``_emit_reduce_core`` (byte-identical). Returns
-        ``(lines, result_name, reduced_shape)``."""
-        dtype = np.dtype(x.type.dtype)
-        plan = self._split_reduce_plan(x, dims, kind, dtype)
-        if plan is None:
-            return self._emit_reduce_core(x, dims, kind)
-        return self._emit_split_reduce_core(x, plan, kind, dtype)
+    def _promote_reduce_operand(self, x: "Value", dtype, lines: list) -> tuple:
+        """The ``(name, dtype, shape)`` triple a reduce should run over.
 
-    def _emit_split_reduce_core(self, x: "Value", plan: dict, kind: str, dtype):
+        When ``dtype`` (the accumulator dtype the caller decided on) differs
+        from the operand's own element dtype, emit ``stablehlo.convert`` of the
+        OPERAND first — the promotion has to happen ONCE, BEFORE padding /
+        reshaping / reducing, so the whole emission runs in the accumulator
+        dtype. Returns the operand unchanged (no emission, no consumable-name
+        churn) otherwise."""
+        dtype = np.dtype(dtype)
+        in_dtype = np.dtype(x.type.dtype)
+        shape = tuple(x.type.shape)
+        name = self._name(x)
+        if dtype == in_dtype:
+            return name, in_dtype, shape
+        promoted = self._new_name()
+        lines.append(
+            f"{promoted} = stablehlo.convert {name} : "
+            f"({self._type_str(in_dtype, shape)}) -> "
+            f"{self._type_str(dtype, shape)}"
+        )
+        return promoted, dtype, shape
+
+    def _reduce_core_with_split(self, x: "Value", dims, kind: str, accum_dtype=None):
+        """Emit a plain reduce — two-stage when eligible, else the existing
+        single-stage ``_emit_reduce_core`` (byte-identical).
+
+        ``accum_dtype`` (optional) is the ACCUMULATOR dtype the reduce must run
+        in; when it differs from the operand's element dtype the operand is
+        promoted with a ``stablehlo.convert`` FIRST, so neither the single-stage
+        nor the split emission ever accumulates in the narrow type. Returns
+        ``(lines, result_name, reduced_shape)`` — the result is in
+        ``accum_dtype``."""
+        in_dtype = np.dtype(x.type.dtype)
+        dtype = in_dtype if accum_dtype is None else np.dtype(accum_dtype)
+        lines: list[str] = []
+        operand, dtype, shape = self._promote_reduce_operand(x, dtype, lines)
+        plan = self._split_reduce_plan(shape, dims, kind, dtype)
+        if plan is None:
+            core = self._emit_reduce_core(operand, dtype, shape, dims, kind)
+        else:
+            core = self._emit_split_reduce_core(operand, plan, kind, dtype)
+        out_lines, result_name, reduced_shape = core
+        if lines:
+            return lines + out_lines, result_name, reduced_shape
+        return out_lines, result_name, reduced_shape
+
+    def _emit_split_reduce_core(self, operand: str, plan: dict, kind: str, dtype):
         """The two-stage ``sum``/``max``/``min``/``prod`` emission (see the
         module docstring for the ``(R, C)`` choice and the padding rule)."""
+        dtype = np.dtype(dtype)
         shape = plan["shape"]
         pivot, n, r, c, pad = (
             plan["pivot"], plan["n"], plan["r"], plan["c"], plan["pad"],
         )
         lines: list[str] = []
-        operand = self._name(x)
         in_shape = shape
         if pad:
             operand, in_shape = self._emit_split_pad(
@@ -629,7 +742,8 @@ class SplitReductionMixin:
             f"{self._constant_text(np.asarray(0, dtype=i64))} : tensor<i64>"
         )
         region = _arg_reduce_region(
-            self, key_elem, "GT" if kind == "max" else "LT"
+            self, key_elem, "GT" if kind == "max" else "LT",
+            nan_aware=keys_dtype.kind == "f",
         )
         partial_shape = tuple(
             d for i, d in enumerate(in_shape) if i != axis + 1
