@@ -13,7 +13,11 @@ The env variables are read lazily at call time, so every test drives them
 with ``monkeypatch`` after ``import etl`` — no module-level env snapshot.
 No test imports (or triggers the import of) a real compiler adapter: the
 iree-family paths use stub ``Backend`` instances (helper-level) or a
-functional stub registered under the name ``"iree"`` (full-path).
+functional stub registered under the name ``"iree"`` (full-path), and
+``_assert_no_new_iree_import()`` pins it — the guard's baseline is captured
+PER TEST by an autouse fixture (never at module import), so an adapter import
+that another module of the same process legitimately performs can never make
+the guard fire, while any import triggered by the test body itself fails it.
 
 The contract under test is ``etl/CONTEXT.md`` ("Staging & pipeline") and
 ``etl/pipeline.py`` docstrings; the resolution implementation lives in
@@ -31,15 +35,25 @@ import etl
 from etl import core
 from etl.pipeline import _parse_env_device, _resolve_backend_device
 
-#: Was the iree adapter already imported before this module ran (e.g. by an
-#: earlier test in the same process)? Our tests must never be the cause.
-_IREE_IMPORTED_BEFORE = "etl.backends.adapters.iree" in sys.modules
+#: Did the real iree adapter already sit in ``sys.modules`` when the CURRENT
+#: test started? Refreshed by the autouse fixture below so the guard is
+#: order-independent: another module collected/run in the same process may
+#: legitimately have imported the adapter already.
+_iree_imported_at_test_start = "etl.backends.adapters.iree" in sys.modules
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_adapter_import_state():
+    global _iree_imported_at_test_start
+    _iree_imported_at_test_start = "etl.backends.adapters.iree" in sys.modules
+    yield
 
 
 def _assert_no_new_iree_import():
-    """Our resolution/tests must never import the iree adapter."""
-    if not _IREE_IMPORTED_BEFORE:
-        assert "etl.backends.adapters.iree" not in sys.modules
+    """This test must not be the one that imports the real iree adapter."""
+    assert (
+        "etl.backends.adapters.iree" in sys.modules
+    ) == _iree_imported_at_test_start
 
 
 # ---------------------------------------------------------------------------

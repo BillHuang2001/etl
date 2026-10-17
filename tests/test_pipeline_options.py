@@ -38,12 +38,15 @@ Pinned here:
 
 Only the FINAL end-to-end export pins (the ``lower``-stage
 ``eigh_algorithm`` / ``split_reduction`` rows) touch the real iree adapter:
-those two tests import ``iree.compiler``/``iree.runtime`` inside their bodies,
-skip when absent, and are placed at the very END of the module so the import
-can never leak into the stub full-path tests above them. Every other test
-stays adapter-free — the iree-family paths use stub ``Backend`` instances
-(helper-level) or a functional stub registered under the name ``"iree"``
-(full-path). The backend half of the contract (per-adapter ``KNOWN_OPTIONS``
+they import ``iree.compiler``/``iree.runtime`` inside their bodies, skip when
+absent, and never call the import guard. Every other test stays adapter-free —
+the iree-family paths use stub ``Backend`` instances (helper-level) or a
+functional stub registered under the name ``"iree"`` (full-path) — and
+``_assert_no_new_iree_import()`` pins it: the guard's baseline is captured
+PER TEST by an autouse fixture (never at module import), so an adapter import
+that another module of the same process legitimately performs can never make
+the guard fire, while any import triggered by the test body itself fails it.
+The backend half of the contract (per-adapter ``KNOWN_OPTIONS``
 validation) is pinned by ``tests/backends/test_options_override.py``.
 """
 
@@ -78,15 +81,25 @@ OPTION_ENV_VARS = (
     "ETL_SPLIT_REDUCTION",
 )
 
-#: Was the iree adapter already imported before this module ran (e.g. by an
-#: earlier test in the same process)? Our tests must never be the cause.
-_IREE_IMPORTED_BEFORE = "etl.backends.adapters.iree" in sys.modules
+#: Did the real iree adapter already sit in ``sys.modules`` when the CURRENT
+#: test started? Refreshed by the autouse fixture below so the guard is
+#: order-independent: another module collected/run in the same process may
+#: legitimately have imported the adapter already.
+_iree_imported_at_test_start = "etl.backends.adapters.iree" in sys.modules
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_adapter_import_state():
+    global _iree_imported_at_test_start
+    _iree_imported_at_test_start = "etl.backends.adapters.iree" in sys.modules
+    yield
 
 
 def _assert_no_new_iree_import():
-    """Our resolution/tests must never import the iree adapter."""
-    if not _IREE_IMPORTED_BEFORE:
-        assert "etl.backends.adapters.iree" not in sys.modules
+    """This test must not be the one that imports the real iree adapter."""
+    assert (
+        "etl.backends.adapters.iree" in sys.modules
+    ) == _iree_imported_at_test_start
 
 
 @pytest.fixture(autouse=True)
@@ -806,8 +819,9 @@ def test_bound_executable_backend_property(monkeypatch, iree_stub_registered):
 # End-to-end export pins through the REAL iree adapter (gated, last in module)
 #
 # These are the only tests here that import a real compiler adapter — imported
-# inside the test bodies so they skip (rather than fail) when iree is absent,
-# and placed after every ``_assert_no_new_iree_import()`` call site.
+# inside the test bodies so they skip (rather than fail) when iree is absent.
+# They never call the import guard: the guard's baseline is refreshed per test
+# by the autouse fixture, so placement is grouping, not correctness.
 # ---------------------------------------------------------------------------
 
 
