@@ -454,12 +454,17 @@ SHAPE_CASES = [
         ),
     ),
     Case(
+        # ``argmin`` carries many more lines than the plain ``min`` case (52 vs
+        # 19 split, 27 vs 11 single-stage): the NaN-aware arg-reduce emits its
+        # NaN-selecting compare/select chain (the ``x != x`` / ``acc != acc``
+        # test pair feeding the index tie-break) INSIDE the reduce region, which
+        # is 14 of the extra split lines and 7 of the extra single-stage ones.
         "argmin_10001_f32",
         _fn_argmin,
         (etl.TensorSpec((10001,), F32),),
         True,
-        (2, 0, 38),
-        (1, 0, 20),
+        (2, 0, 52),
+        (1, 0, 27),
         (
             _split_comment(0, 10001, 73, 137),
             "(tensor<10001xf32>) -> tensor<73x137xf32>",
