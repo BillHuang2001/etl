@@ -90,6 +90,7 @@ from . import random_export
 from .eigh_batched import EighBatchedMixin
 from .split_reduce import (
     SplitReductionMixin,
+    _arg_reduce_region,
     normalize_split_reduction,
     normalize_split_reduction_non_exact,
     normalize_split_reduction_threshold,
@@ -3167,9 +3168,13 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         matching ``np.argmax``/``np.argmin`` (index init 0 keeps the
         reduce consistent: an element equal to the init never beats index
         0). axis=None flattens first (numpy); keepdims reshapes after.
-        Float NaN: numpy returns the FIRST NaN position; StableHLO
-        comparisons with NaN are false, so NaN never beats a finite value
-        — divergence documented (evox fitnesses are finite)."""
+        Float NaN: the comparator is the shared
+        ``split_reduce._arg_reduce_region`` predicate, which for FLOAT keys
+        is the total preorder numpy implements — NaN beats every non-NaN
+        and the smallest index wins among NaNs, so the result is numpy's
+        FIRST NaN index for any reduce-tree association (including the
+        split two-stage path). Integer/bool keys keep the plain comparator
+        (no extra ops)."""
         split_text = self._emit_split_arg_reduce(op)
         if split_text is not None:
             return split_text
@@ -3216,30 +3221,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         )
         direction = "GT" if kind == "max" else "LT"
         key_elem = self._elem_type(keys_dtype)
-        a, b, c, d = (self._new_name() for _ in range(4))
-        c1, c2, c3, c4, c5 = (self._new_name() for _ in range(5))
-        sel_v, sel_i = self._new_name(), self._new_name()
-        region = (
-            "({\n"
-            f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
-            f"{c}: {key_elem}, {d}: tensor<i64>):\n"
-            f'    {c1} = "stablehlo.compare"({a}, {c}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
-            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
-            f'    {c2} = "stablehlo.compare"({a}, {c}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
-            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
-            f'    {c3} = "stablehlo.compare"({b}, {d}) '
-            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
-            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
-            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
-            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
-            f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
-            f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
-            f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
-            f"(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>\n"
-            f"    stablehlo.return {sel_v}, {sel_i} : {key_elem}, tensor<i64>\n"
-            "  })"
+        region = _arg_reduce_region(
+            self, key_elem, direction, nan_aware=keys_dtype.kind == "f"
         )
         red_shape_out = tuple(
             d for i, d in enumerate(red_shape_in) if i != axis

@@ -263,30 +263,97 @@ def _simple_reduce_region(writer, elem_type: str, mnemonic: str) -> str:
     )
 
 
-def _arg_reduce_region(writer, key_elem: str, direction: str) -> str:
-    """Comparator region for the ``(value, index)`` arg-reduce stages:
-    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)`` — first
+def _arg_reduce_region(
+    writer, key_elem: str, direction: str, nan_aware: bool = False,
+) -> str:
+    """Comparator region for the ``(value, index)`` arg-reduce stages —
+    the ONE predicate shared by the single-stage emitter
+    (``writer._emit_arg_reduce``) and both stages of the split one:
+    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)``, i.e. first
     occurrence wins on ties (matching ``np.argmax``/``np.argmin``). Two
     operands GROUP their reduce-block args (operand0_lhs, operand1_lhs,
-    operand0_rhs, operand1_rhs)."""
+    operand0_rhs, operand1_rhs).
+
+    ``nan_aware`` (FLOAT keys only) upgrades that into a TOTAL PREORDER
+    reproducing numpy exactly. ``np.argmin``/``np.argmax`` return the index
+    of the FIRST NaN, and every IEEE comparison against a NaN is false, so
+    in the plain form a NaN can never win and the result collapses to a
+    real extremum. The NaN-aware form makes NaN beat every non-NaN while
+    the SMALLEST index wins among NaNs::
+
+        wins = (isnan(a) AND NOT isnan(c))                      # NaN beats all
+               OR (a GT|LT c)                                   # plain value
+               OR ((a EQ c OR (isnan(a) AND isnan(c)))          # equal-in-class
+                   AND b_idx LT d_idx)                          # -> first index
+
+    Both NaN terms make the order association-independent, so ANY reduce
+    tree (single stage, the two split stages, reassociated) yields numpy's
+    first NaN. ``isnan`` is ``compare NE x, x`` — StableHLO/XLA NE is
+    IEEE-unordered, so ``NaN NE NaN`` is true and the opset's missing
+    ``stablehlo.isnan`` is not needed. NOTE: that same IEEE rule makes
+    ``NOT (a NE c)`` "numerically equal", NOT "equal in class" (two NaNs
+    are NE), so the equal-in-class term is spelled out as
+    ``(a EQ c) OR (isnan(a) AND isnan(c))``. Seven extra combiner ops for
+    float keys; integer/bool keys keep the plain form with NO extra ops
+    (byte-identical legacy text)."""
     a, b, c, d = (writer._new_name() for _ in range(4))
-    c1, c2, c3, c4, c5 = (writer._new_name() for _ in range(5))
+    if not nan_aware:
+        c1, c2, c3, c4, c5 = (writer._new_name() for _ in range(5))
+        sel_v, sel_i = writer._new_name(), writer._new_name()
+        return (
+            "({\n"
+            f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
+            f"{c}: {key_elem}, {d}: tensor<i64>):\n"
+            f'    {c1} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c2} = "stablehlo.compare"({a}, {c}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
+            f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+            f'    {c3} = "stablehlo.compare"({b}, {d}) '
+            f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
+            f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
+            f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
+            f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+            f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
+            f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
+            f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
+            f"(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>\n"
+            f"    stablehlo.return {sel_v}, {sel_i} : {key_elem}, tensor<i64>\n"
+            "  })"
+        )
+    c1, c2, c3, nan_a, nan_c = (writer._new_name() for _ in range(5))
+    not_nan_c, nan_first, both_nan, equal, tie_i, first, c5 = (
+        writer._new_name() for _ in range(7)
+    )
     sel_v, sel_i = writer._new_name(), writer._new_name()
+    key_type = f"({key_elem}, {key_elem}) -> tensor<i1>"
     return (
         "({\n"
         f"  ^bb0({a}: {key_elem}, {b}: tensor<i64>, "
         f"{c}: {key_elem}, {d}: tensor<i64>):\n"
         f'    {c1} = "stablehlo.compare"({a}, {c}) '
         f"{{comparison_direction = #stablehlo<comparison_direction {direction}>}}"
-        f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+        f" : {key_type}\n"
         f'    {c2} = "stablehlo.compare"({a}, {c}) '
         f"{{comparison_direction = #stablehlo<comparison_direction EQ>}}"
-        f" : ({key_elem}, {key_elem}) -> tensor<i1>\n"
+        f" : {key_type}\n"
         f'    {c3} = "stablehlo.compare"({b}, {d}) '
         f"{{comparison_direction = #stablehlo<comparison_direction LT>}}"
         f" : (tensor<i64>, tensor<i64>) -> tensor<i1>\n"
-        f"    {c4} = stablehlo.and {c2}, {c3} : tensor<i1>\n"
-        f"    {c5} = stablehlo.or {c1}, {c4} : tensor<i1>\n"
+        f'    {nan_a} = "stablehlo.compare"({a}, {a}) '
+        f"{{comparison_direction = #stablehlo<comparison_direction NE>}}"
+        f" : {key_type}\n"
+        f'    {nan_c} = "stablehlo.compare"({c}, {c}) '
+        f"{{comparison_direction = #stablehlo<comparison_direction NE>}}"
+        f" : {key_type}\n"
+        f"    {not_nan_c} = stablehlo.not {nan_c} : tensor<i1>\n"
+        f"    {nan_first} = stablehlo.and {nan_a}, {not_nan_c} : tensor<i1>\n"
+        f"    {both_nan} = stablehlo.and {nan_a}, {nan_c} : tensor<i1>\n"
+        f"    {equal} = stablehlo.or {c2}, {both_nan} : tensor<i1>\n"
+        f"    {tie_i} = stablehlo.and {equal}, {c3} : tensor<i1>\n"
+        f"    {first} = stablehlo.or {c1}, {nan_first} : tensor<i1>\n"
+        f"    {c5} = stablehlo.or {first}, {tie_i} : tensor<i1>\n"
         f"    {sel_v} = stablehlo.select {c5}, {a}, {c} : "
         f"(tensor<i1>, {key_elem}, {key_elem}) -> {key_elem}\n"
         f"    {sel_i} = stablehlo.select {c5}, {b}, {d} : "
@@ -629,7 +696,8 @@ class SplitReductionMixin:
             f"{self._constant_text(np.asarray(0, dtype=i64))} : tensor<i64>"
         )
         region = _arg_reduce_region(
-            self, key_elem, "GT" if kind == "max" else "LT"
+            self, key_elem, "GT" if kind == "max" else "LT",
+            nan_aware=keys_dtype.kind == "f",
         )
         partial_shape = tuple(
             d for i, d in enumerate(in_shape) if i != axis + 1
