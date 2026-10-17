@@ -783,24 +783,43 @@ def test_matching_dtype_graphs_emit_no_convert(fn, specs):
 
 # eigh/diag have no mnemonic StableHLO op (StableHLO 1.0 removed
 # eigh/qr/svd; there is no diag), so the writer emits multi-op compositions
-# (SPECIAL_EMITTERS "eigh"/"diag"): eigh = a `stablehlo.while` cyclic-Jacobi
-# eigensolver — ONE while loop carrying (a, v, p, q, k) applies the adaptive
-# sweep schedule (fp32: dim-based 3-7; f64: 8 — see writer.py
-# `_eigh_sweeps`) rotation by rotation, with dynamic (p, q) indexing via
-# gathers (never `stablehlo.slice` — its start indices must be static) and
-# constants/iota hoisted outside the loop, so the emitted text is O(1) in n
-# (the unrolled predecessor's O(n^2·sweeps) text is gone) + a stable
-# pair-sort for the ascending eigenvalue order + a gather column reorder of
-# V; diag = iota-EQ mask + select (rank-1 → diagonal matrix) or flatten +
-# constant-index gather (rank-2 → main diagonal). These tests pin the
-# composition markers, the dtype rules, and the dynamic-dims rejection;
-# iree-llvm-cpu round-trip correctness lives in
+# (SPECIAL_EMITTERS "eigh"/"diag"). `eigh` has TWO compositions, selected by
+# the `eigh_algorithm` exporter option:
+#
+# - "jacobi_batched" (DEFAULT — `eigh_batched.py`): ONE `stablehlo.while`
+#   carrying (a, v, k) applies ALL m mutually-disjoint rotations of one
+#   odd-even round per iteration, so a sweep costs L iterations instead of
+#   n(n-1)/2 (L = n-1 for even n, which rotates around the fixed vertex n-1;
+#   L = n for odd n, whose slot 0 is a BYE). The partner map and the per-slot
+#   angles are derived ARITHMETICALLY from hoisted iotas (no scatters, no
+#   masks), so the body's op count is constant in n and `total = sweeps * L`.
+# - "jacobi" (the sequential one-rotation-per-iteration composition —
+#   `_emit_eigh_jacobi`, the pre-option text, kept for compatibility):
+#   ONE while loop carrying (a, v, p, q, k) with dynamic (p, q) indexing via
+#   gathers and `total = sweeps * n(n-1)/2`.
+#
+# Both share the adaptive sweep schedule (fp32: dim-based 3-7; f64: 8 — see
+# writer.py `_eigh_sweeps`), the `eigh_early_exit` machinery, the hoisted
+# constants/iotas (never `stablehlo.slice` — its start indices must be
+# static, so dynamic indexing is gathers), the stable pair-sort for the
+# ascending eigenvalue order and the gather column reorder of V, and the
+# `n < 2` fallback to the sequential path (the batched schedule needs
+# n >= 2). diag = iota-EQ mask + select (rank-1 → diagonal matrix) or
+# flatten + constant-index gather (rank-2 → main diagonal). These tests pin
+# the composition markers, the option handling, the dtype rules, and the
+# dynamic-dims rejection; iree-llvm-cpu round-trip correctness lives in
 # `test_iree_eigh_diag_parity.py`.
 
 
 def _fn_eigh(x):
     w, v = etl.eigh(x)
     return w, v
+
+
+def _eigh_mlir(n, dtype=etl.float32, **options):
+    """Export ``eigh`` of an ``(n, n)`` tensor; kwargs are exporter options."""
+    return _export(_fn_eigh, etl.TensorSpec((n, n), dtype),
+                   options=options or None)
 
 
 def test_eigh_exports_jacobi_composition():
@@ -857,8 +876,13 @@ def test_eigh_early_exit_option_emits_sweep_check():
     # mask / rotations-per-sweep 45 / squared tol (3e-5)^2 / done-init
     # constants, ONE nested sweep-boundary stablehlo.if, two energy
     # reduces, k-clamp.
+    # `eigh_algorithm="jacobi"` (the sequential composition) is pinned here
+    # on purpose: the five-carry signature below is composition-specific
+    # (the default "jacobi_batched" carries (a, v, k) — ONE, see
+    # `test_eigh_batched_early_exit_golden`).
     mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32),
-                   options={"eigh_early_exit": True})
+                   options={"eigh_early_exit": True,
+                            "eigh_algorithm": "jacobi"})
     assert "dense<[[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]," in mlir
     assert "stablehlo.constant dense<45> : tensor<i64>" in mlir          # rps
     assert "stablehlo.constant dense<9.000000189551827E-10> : tensor<f32>" in mlir  # tol^2
@@ -870,10 +894,15 @@ def test_eigh_early_exit_option_emits_sweep_check():
 
 
 def test_eigh_early_exit_default_emits_pre_option_text():
-    # The DEFAULT (no options) == byte-identical pre-option (344d3eb)
-    # text — none of the machinery may appear while the plain composition
-    # stays intact (the default flip b227e44; option-on is llvm-cpu-only).
-    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
+    # The `eigh_early_exit` DEFAULT (False) emits the pre-option (344d3eb)
+    # SEQUENTIAL text — none of the machinery may appear while the plain
+    # composition stays intact (the default flip b227e44; option-on is
+    # llvm-cpu-only). `eigh_algorithm="jacobi"` selects that sequential
+    # composition explicitly (the DEFAULT "jacobi_batched" is pinned by
+    # `test_eigh_batched_default_composition_golden`), so the loop total is
+    # the sequential `sweeps * n(n-1)/2` = 5 x 45 = 225.
+    mlir = _export(_fn_eigh, etl.TensorSpec((10, 10), etl.float32),
+                   options={"eigh_algorithm": "jacobi"})
     assert "stablehlo.if" not in mlir
     assert "stablehlo.remainder" not in mlir
     assert '"stablehlo.reduce"' not in mlir
@@ -886,6 +915,231 @@ def test_eigh_early_exit_default_emits_pre_option_text():
     assert "stablehlo.sort" in mlir and "stablehlo.gather" in mlir and "stablehlo.iota" in mlir
     assert "stablehlo.slice" not in mlir
     assert "-> (tensor<10xf32>, tensor<10x10xf32>)" in mlir
+
+
+#: Batched-composition golden: (n, L rounds/sweep, m slots/round, total
+#: iterations = sweeps*L, the SEQUENTIAL composition's total =
+#: sweeps*n(n-1)/2, emitted line count). f32 sweep counts are dim-based
+#: (writer.py `_eigh_sweeps`): n=10 -> 5, n=25 -> 6, n=50 -> 7, n=100 -> 8,
+#: so the totals are 5*9, 6*25, 7*49 and 8*99. The loop body's op count is
+#: constant in n, so only the hoisted constants change — that is the whole
+#: point of the batched schedule.
+EIGH_BATCHED_SIZE_CASES = [
+    (10, 9, 5, 45, 225, 148),
+    (25, 25, 13, 150, 1800, 139),
+    (50, 49, 25, 343, 8575, 148),
+    (100, 99, 50, 792, 39600, 148),
+]
+
+
+def test_eigh_batched_default_composition_golden():
+    # The DEFAULT eigh_algorithm ("jacobi_batched") is the batched cyclic
+    # Jacobi solver: ONE while loop with THREE carries (a, v, k) applies all
+    # m = 5 disjoint rotations of a round per iteration (n=10 is even ->
+    # L = n-1 = 9 rounds/sweep around the fixed vertex 9), 5 f32 sweeps ->
+    # total = 5*9 = 45 iterations instead of the sequential 5*45 = 225.
+    # The partner/angle maps are pure arithmetic on hoisted iotas (the
+    # `stablehlo.remainder` sites and the extra transposes of the batched
+    # half-steps), so there is no `stablehlo.if`, no `reduce` and no `slice`
+    # (`remainder` is emitted in its UNQUOTED `stablehlo.remainder %a, %b`
+    # form, unlike the quoted generic-op mnemonics).
+    mlir = _eigh_mlir(10)
+    assert mlir.count("stablehlo.remainder") == 5
+    assert mlir.count("stablehlo.transpose") == 6
+    assert "stablehlo.if" not in mlir
+    assert "stablehlo.reduce" not in mlir
+    assert "stablehlo.slice" not in mlir
+    assert mlir.count('"stablehlo.while"') == 1
+    # The 3-carry loop signature (the sequential composition carries 5).
+    assert (
+        "(tensor<10x10xf32>, tensor<10x10xf32>, tensor<i64>) -> "
+        "(tensor<10x10xf32>, tensor<10x10xf32>, tensor<i64>)"
+    ) in mlir
+    assert "stablehlo.constant dense<9> : tensor<i64>" in mlir   # L rounds/sweep
+    assert "stablehlo.constant dense<45> : tensor<i64>" in mlir  # sweeps * L
+    assert "dense<225> : tensor<i64>" not in mlir                # sequential total
+    assert "stablehlo.iota dim = 0 : tensor<5xi64>" in mlir      # m slots
+    assert "-> (tensor<10xf32>, tensor<10x10xf32>)" in mlir
+    assert len(mlir.splitlines()) == 148
+
+
+@pytest.mark.parametrize(
+    "n,rounds,slots,total,sequential_total,lines",
+    EIGH_BATCHED_SIZE_CASES,
+    ids=[f"n={case[0]}" for case in EIGH_BATCHED_SIZE_CASES],
+)
+def test_eigh_batched_size_discriminators(n, rounds, slots, total,
+                                          sequential_total, lines):
+    # Size scaling of the batched composition: `sweeps * L` (not
+    # `sweeps * n(n-1)/2`) is the loop total, `m` slots drive the slot iota,
+    # and the emitted text length is flat in n (148 / 139 / 148 / 148 lines
+    # for n = 10 / 25 / 50 / 100 — only the hoisted iota/constant types and
+    # their dense payloads grow). Lower() only — nothing is compiled or run.
+    mlir = _eigh_mlir(n)
+    assert f"stablehlo.constant dense<{rounds}> : tensor<i64>" in mlir
+    assert f"stablehlo.constant dense<{total}> : tensor<i64>" in mlir
+    assert f"dense<{sequential_total}> : tensor<i64>" not in mlir
+    assert f"stablehlo.iota dim = 0 : tensor<{slots}xi64>" in mlir
+    assert "stablehlo.slice" not in mlir
+    assert len(mlir.splitlines()) == lines
+
+
+def test_eigh_sequential_reference_golden():
+    # eigh_algorithm="jacobi" still exports the pre-option SEQUENTIAL
+    # composition verbatim: 132 lines / 13558 chars, ONE rotation per
+    # iteration with dynamic (p, q) gathers, no remainder anywhere (the
+    # sequential body derives p, q from k without a modulo), 4 transposes,
+    # the matrix-shaped iotas for the (p, q) index maps and the sequential
+    # total 5 x 45 = 225.
+    mlir = _eigh_mlir(10, eigh_algorithm="jacobi")
+    assert len(mlir.splitlines()) == 132
+    assert len(mlir) == 13558
+    assert mlir.count("stablehlo.remainder") == 0
+    assert mlir.count("stablehlo.transpose") == 4
+    assert "stablehlo.iota dim = 1 : tensor<10x10xi64>" in mlir
+    assert "stablehlo.iota dim = 0 : tensor<5xi64>" not in mlir  # no slot iota
+    assert "stablehlo.constant dense<225> : tensor<i64>" in mlir
+    assert (
+        "(tensor<10x10xf32>, tensor<10x10xf32>, tensor<i64>) -> "
+        "(tensor<10x10xf32>, tensor<10x10xf32>, tensor<i64>)"
+    ) not in mlir
+    assert mlir.count("(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>") == 4
+
+
+def test_eigh_batched_early_exit_golden():
+    # eigh_early_exit=True on the DEFAULT (batched) algorithm: the shared
+    # sweep-boundary convergence check wraps the batched body in ONE
+    # stablehlo.if with two energy reduces, the k-clamp adds a sixth
+    # remainder site, and the text is 176 lines (still no `stablehlo.slice`
+    # and still a single while loop).
+    mlir = _eigh_mlir(10, eigh_early_exit=True)
+    assert len(mlir.splitlines()) == 176
+    assert mlir.count('"stablehlo.if"') == 1
+    assert mlir.count('"stablehlo.reduce"') == 2
+    assert mlir.count("stablehlo.remainder") == 6
+    assert "stablehlo.slice" not in mlir
+    assert mlir.count('"stablehlo.while"') == 1
+    assert mlir.count("(tensor<i1>, tensor<i64>, tensor<i64>) -> tensor<i64>") == 1
+    assert "stablehlo.constant dense<false> : tensor<i1>" in mlir        # done init
+    assert "stablehlo.constant dense<9.000000189551827E-10> : tensor<f32>" in mlir  # tol^2
+    assert "stablehlo.constant dense<45> : tensor<i64>" in mlir          # rps
+    assert "dense<9> : tensor<i64>" in mlir                              # L rounds
+    assert "-> (tensor<10xf32>, tensor<10x10xf32>)" in mlir
+
+
+def test_eigh_algorithm_option_default_and_spelling():
+    # The default IS "jacobi_batched" (byte-identical to an explicit
+    # selection), and the option normalizes case/whitespace like the other
+    # exporter options.
+    default = _eigh_mlir(10)
+    assert default == _eigh_mlir(10, eigh_algorithm="jacobi_batched")
+    assert default == _eigh_mlir(10, eigh_algorithm="  JACOBI_BATCHED ")
+    assert default != _eigh_mlir(10, eigh_algorithm="jacobi")
+
+
+def test_eigh_algorithm_option_invalid_value_rejected():
+    # An unknown spelling fails loudly at export with the canonical message
+    # (never a silent fallback to a default composition).
+    graph = etl.trace(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.backends.stablehlo.export(graph, options={"eigh_algorithm": "nope"})
+    assert str(excinfo.value) == (
+        "stablehlo export: invalid eigh_algorithm option 'nope' "
+        "(expected one of jacobi, jacobi_batched)"
+    )
+    # Non-string values are rejected by the same normalizer.
+    with pytest.raises(etl.BackendError, match="invalid eigh_algorithm option"):
+        etl.backends.stablehlo.export(graph, options={"eigh_algorithm": 3})
+
+
+def test_eigh_algorithm_option_invalid_value_rejected_at_lower():
+    # The option reaches the same Writer under the compiler adapters (per-call
+    # lower() options override the defaults), so a bad spelling fails at the
+    # LOWER stage too — before any compilation work. Pinned on the iree
+    # adapter (gated; the export-path pins above always run).
+    pytest.importorskip("iree.compiler")
+    pytest.importorskip("iree.runtime")
+    graph = etl.trace(_fn_eigh, etl.TensorSpec((10, 10), etl.float32))
+    with pytest.raises(etl.BackendError) as excinfo:
+        etl.lower(graph, backend="iree", eigh_algorithm="nope")
+    assert str(excinfo.value) == (
+        "stablehlo export: invalid eigh_algorithm option 'nope' "
+        "(expected one of jacobi, jacobi_batched)"
+    )
+
+
+def test_eigh_n_lt_2_falls_back_to_sequential():
+    # The batched round-robin schedule needs n >= 2, so the degenerate 1x1
+    # case uses the SEQUENTIAL composition even under the default option —
+    # byte-identical to the explicit "jacobi" export, remainder-free.
+    default = _eigh_mlir(1)
+    sequential = _eigh_mlir(1, eigh_algorithm="jacobi")
+    assert default == sequential
+    assert default.count("stablehlo.remainder") == 0
+    # NOT the batched 3-carry loop (the composition discriminator).
+    assert (
+        "(tensor<1x1xf32>, tensor<1x1xf32>, tensor<i64>) -> "
+        "(tensor<1x1xf32>, tensor<1x1xf32>, tensor<i64>)"
+    ) not in default
+    assert "-> (tensor<1xf32>, tensor<1x1xf32>)" in default
+
+
+#: ``eigh_batched_schedule(n) -> (L, m, fixed)`` for representative n:
+#: L rounds per sweep, m slots per round, and the fixed vertex for an even n
+#: (None for an odd n, which rotates a BYE in slot 0 instead).
+EIGH_BATCHED_SCHEDULE_CASES = [
+    (2, 1, 1, 1),
+    (3, 3, 2, None),
+    (4, 3, 2, 3),
+    (5, 5, 3, None),
+    (6, 5, 3, 5),
+    (7, 7, 4, None),
+    (8, 7, 4, 7),
+    (10, 9, 5, 9),
+    (25, 25, 13, None),
+    (50, 49, 25, 49),
+]
+
+
+@pytest.mark.parametrize(
+    "n,rounds,slots,fixed",
+    EIGH_BATCHED_SCHEDULE_CASES,
+    ids=[f"n={case[0]}" for case in EIGH_BATCHED_SCHEDULE_CASES],
+)
+def test_eigh_batched_schedule_table(n, rounds, slots, fixed):
+    from etl.backends.stablehlo.eigh_batched import eigh_batched_schedule
+
+    assert eigh_batched_schedule(n) == (rounds, slots, fixed)
+    # Parity rules: even n rotates n-1 rounds around the fixed vertex n-1
+    # with n//2 slots; odd n rotates n rounds whose slot 0 is a BYE, with
+    # (n+1)//2 slots.
+    if n % 2 == 0:
+        assert (rounds, slots, fixed) == (n - 1, n // 2, n - 1)
+    else:
+        assert (rounds, slots, fixed) == (n, (n + 1) // 2, None)
+    # The schedule covers EVERY unordered pair exactly once per sweep
+    # (rounds x slots entries: n(n-1)/2 real rotations + the odd-n byes).
+    pairs = []
+    for r in range(rounds):
+        for i in range(slots):
+            if fixed is not None:
+                pair = (fixed, r) if i == 0 else ((r + i) % rounds,
+                                                 (r - i) % rounds)
+            else:
+                pair = (r, r) if i == 0 else ((r + i) % n, (r - i) % n)
+            pairs.append(frozenset(pair))
+    real = [pair for pair in pairs if len(pair) == 2]
+    assert len(pairs) == rounds * slots
+    assert len(real) == n * (n - 1) // 2
+    assert set(real) == {frozenset((a, b)) for a in range(n) for b in range(a + 1, n)}
+
+
+def test_eigh_batched_schedule_rejects_n_lt_2():
+    from etl.backends.stablehlo.eigh_batched import eigh_batched_schedule
+
+    for n in (1, 0, -3):
+        with pytest.raises(etl.BackendError, match="n >= 2"):
+            eigh_batched_schedule(n)
 
 
 def test_diag_rank1_exports_iota_select_composition():

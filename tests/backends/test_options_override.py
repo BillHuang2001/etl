@@ -3,7 +3,13 @@
 Pins the per-backend option machinery of the options-override contract:
 ``etl/backends/options.py::validate_options`` (option NAMES validated against
 the UNION of the per-stage ``KNOWN_OPTIONS`` sets; option VALUES are never
-validated by etl — the compiler validates them), every adapter's
+validated by etl — the compiler validates them), ``normalize_bool_option``
+(the shared VALUE coercion for bool-typed options — ``split_reduction`` /
+``while_init_rewrite`` — so an env-style string value like ``"0"`` can never
+fall into the ``bool("0") is True`` trap), the performance-option plumbing
+(``eigh_algorithm`` and ``split_reduction`` are declared at the LOWER stage of
+every compiler adapter and reach the StableHLO exporter through the shared
+``CompilerBackend._exporter_options``), every adapter's
 ``KNOWN_OPTIONS`` declaration, the iree compile-flag policy
 (``_resolve_iree_compile_args``: minimal defaults, each default overridable
 by name collision, the small documented deny list), the iree runtime-flag
@@ -14,8 +20,11 @@ loud parsing), the tvm ``tvm_target`` / ``tvm_pass_configs`` options
 ``test_pjrt_ctypes_plugin.py`` fixture), and the numpy documented-ignore.
 
 The env half (``etl.pipeline_options``, precedence explicit > env > default,
-stub full-path) is pinned by ``tests/test_pipeline_options.py``.
-
+stub full-path) is pinned by ``tests/test_pipeline_options.py``. NOTE: the two
+performance lower options have NO env-var rows yet (``ENV_OPTION_TABLE`` has
+no ``ETL_EIGH_ALGORITHM`` / ``ETL_SPLIT_REDUCTION`` entry — indeed no
+``("iree", "lower")`` entry at all), so this file carries no env-override
+coverage for them; add it here once those rows exist.
 Adapter-test conventions (same as ``test_adapter_{iree,xla,tvm}.py``): real
 compilers run, so the 2s-per-file rule does NOT apply — keep compile counts
 low (module-scoped fixtures; small graphs). The iree/tvm sections gate with
@@ -33,7 +42,8 @@ import pytest
 
 import etl
 from etl import core
-from etl.backends.options import validate_options
+from etl.backends import options as options_module
+from etl.backends.options import normalize_bool_option, validate_options
 from etl.backends.adapters import iree as iree_adapt
 from etl.backends.adapters import tvm as tvm_adapt
 from etl.backends.adapters import xla as xla_adapt
@@ -71,6 +81,36 @@ def _while_fn(init):
 
 
 _WHILE_SPEC = etl.TensorSpec((), etl.float32)
+
+
+# ``eigh`` exercises the ``eigh_algorithm`` exporter option (two different
+# cyclic-Jacobi compositions) — tiny 3x3 so the export stays cheap.
+def _eigh_fn(x):
+    return etl.eigh(x)[0]
+
+
+_EIGH_SPEC = etl.TensorSpec((3, 3), etl.float32)
+
+# ``min`` over 1024 elements exercises the ``split_reduction`` exporter option:
+# a rank-0-result INTEGER extrema reduce with a reduced extent >= the 1024
+# threshold splits into two stages by default, so the two option values emit
+# visibly different MLIR text.
+def _min_fn(x):
+    return etl.min(x)
+
+
+_MIN_SPEC = etl.TensorSpec((1024,), etl.int32)
+_MIN_INPUT = np.arange(1024, 0, -1, dtype="int32")
+_MIN_EXPECTED = int(_MIN_INPUT.min())
+
+#: The three compiler adapters (option-domain pins run on all of them; only
+#: the MLIR-text assertions need a single concrete adapter).
+_ADAPTERS = (
+    ("iree", iree_adapt.IreeBackend),
+    ("xla", xla_adapt.XlaBackend),
+    ("tvm", tvm_adapt.TvmBackend),
+)
+_ADAPTER_IDS = [name for name, _ in _ADAPTERS]
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +164,8 @@ def test_validate_options_unknown_key_lists_known_options_per_stage():
     message = str(excinfo.value)
     assert "the iree backend does not recognize the compile option 'bogus'" in message
     assert (
-        "lower: dot_precision, rng_bit_generator, sort_emission, while_init_rewrite"
-        in message
+        "lower: dot_precision, eigh_algorithm, rng_bit_generator, "
+        "sort_emission, split_reduction, while_init_rewrite" in message
     )
     assert "compile: iree_compile_args, opt_level, target_backends" in message
     assert "load: iree_runtime_args" in message
@@ -155,8 +195,10 @@ def test_adapter_known_options_declarations():
         "lower": frozenset(
             {
                 "dot_precision",
+                "eigh_algorithm",
                 "rng_bit_generator",
                 "sort_emission",
+                "split_reduction",
                 "while_init_rewrite",
             }
         ),
@@ -167,7 +209,14 @@ def test_adapter_known_options_declarations():
         "run": frozenset(),
     }
     assert xla_adapt.XlaBackend.KNOWN_OPTIONS == {
-        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
+        "lower": frozenset(
+            {
+                "rng_bit_generator",
+                "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
+            }
+        ),
         "compile": frozenset(
             {"plugin_path", "xla_compile_options", "opt_level"}
         ),
@@ -175,7 +224,14 @@ def test_adapter_known_options_declarations():
         "run": frozenset(),
     }
     assert tvm_adapt.TvmBackend.KNOWN_OPTIONS == {
-        "lower": frozenset({"rng_bit_generator", "dot_precision"}),
+        "lower": frozenset(
+            {
+                "rng_bit_generator",
+                "dot_precision",
+                "eigh_algorithm",
+                "split_reduction",
+            }
+        ),
         "compile": frozenset(
             {"tvm_target", "tvm_pass_configs", "opt_level"}
         ),
@@ -203,6 +259,210 @@ def test_xla_unknown_load_option_rejected_without_plugin():
 
 
 # ---------------------------------------------------------------------------
+# 1b. normalize_bool_option — the shared bool-VALUE coercion (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_bool_option_is_public():
+    """``normalize_bool_option`` is part of the module's public surface (it is
+    the reuse point for bool ``ETL_*`` env-var parsing)."""
+    assert "normalize_bool_option" in options_module.__all__
+    assert callable(options_module.normalize_bool_option)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("1", True),
+        ("0", False),
+        ("true", True),
+        ("TRUE", True),
+        (" true ", True),
+        ("False", False),
+        ("yes", True),
+        ("no", False),
+        ("on", True),
+        ("off", False),
+        ("  ON  ", True),
+    ],
+)
+def test_normalize_bool_option_accepted_forms(value, expected):
+    """Real bools pass through; the ints 0/1 and the documented string
+    spellings are coerced to a REAL bool (case-insensitive, whitespace-
+    stripped) — so ``"0"`` can never fall into the ``bool("0") is True``
+    trap."""
+    normalized = normalize_bool_option("some_option", value)
+    assert normalized is expected
+    assert type(normalized) is bool
+
+
+@pytest.mark.parametrize(
+    "value",
+    [2, -1, 1.0, 0.0, None, "maybe", "2", "-1", "", "  ", [], {}, object()],
+)
+def test_normalize_bool_option_rejected_loudly(value):
+    """Anything else raises core.BackendError naming the OPTION, the offending
+    value and the accepted forms — never a silent coercion."""
+    with pytest.raises(core.BackendError) as excinfo:
+        normalize_bool_option("some_option", value)
+    message = str(excinfo.value)
+    assert "'some_option'" in message
+    assert repr(value) in message
+    assert "accepted forms" in message
+    assert "True/False" in message
+    assert "'true', 'false', 'yes', 'no', 'on', 'off'" in message
+
+
+# ---------------------------------------------------------------------------
+# 1c. performance options: eigh_algorithm / split_reduction plumbing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
+@pytest.mark.parametrize("stage", ["lower", "compile", "load", "run"])
+def test_performance_options_pass_every_stage(name, backend_cls, stage):
+    """``eigh_algorithm`` and ``split_reduction`` are declared at the LOWER
+    stage of all three compiler adapters — and by the union semantics they
+    are therefore accepted (and ignored) at every other stage too."""
+    assert "eigh_algorithm" in backend_cls.KNOWN_OPTIONS["lower"]
+    assert "split_reduction" in backend_cls.KNOWN_OPTIONS["lower"]
+    validate_options(
+        {"eigh_algorithm": "jacobi", "split_reduction": False},
+        backend_cls.KNOWN_OPTIONS,
+        name,
+        stage,
+    )
+    validate_options(
+        {"eigh_algorithm": "jacobi_batched", "split_reduction": "0"},
+        backend_cls.KNOWN_OPTIONS,
+        name,
+        stage,
+    )
+
+
+@pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
+def test_performance_options_forwarded_to_exporter(name, backend_cls):
+    """The lower stage forwards both options to the StableHLO exporter through
+    the shared ``CompilerBackend._exporter_options``: ``split_reduction`` is
+    COERCED to a real bool (``normalize_bool_option`` — so the string ``"0"``
+    means False, never ``bool("0")``), while ``eigh_algorithm`` is passed
+    through UNVALIDATED (the framework validates KEYS, the Writer validates
+    VALUES)."""
+    backend = backend_cls()
+    assert backend.default_eigh_algorithm == "jacobi_batched"
+    assert backend.default_split_reduction is True
+
+    defaults = backend._exporter_options(None)
+    assert defaults["eigh_algorithm"] == "jacobi_batched"
+    assert defaults["split_reduction"] is True
+
+    forwarded = backend._exporter_options(
+        {"eigh_algorithm": " jacobi ", "split_reduction": "0"}
+    )
+    assert forwarded["eigh_algorithm"] == " jacobi "  # unvalidated pass-through
+    assert forwarded["split_reduction"] is False
+    assert (
+        backend._exporter_options({"split_reduction": "on"})["split_reduction"]
+        is True
+    )
+    assert (
+        backend._exporter_options({"split_reduction": 1})["split_reduction"]
+        is True
+    )
+
+
+def _iree_lower_text(graph, **options):
+    """Lower one graph through the iree adapter and return the MLIR text (the
+    lower stage exports through the shared compiler framework — no
+    ``iree.compiler`` needed, exactly like the unknown-option test above)."""
+    return iree_adapt.IreeBackend().lower(graph, dict(options)).payload["mlir_text"]
+
+
+def test_eigh_algorithm_reaches_the_exporter():
+    """``eigh_algorithm`` reaches the exporter: the default equals the explicit
+    ``"jacobi_batched"`` composition, ``"jacobi"`` (case/whitespace tolerant)
+    selects the OTHER cyclic-Jacobi composition — a different MLIR text — and
+    both stay single-``while`` compositions."""
+    graph = etl.trace(_eigh_fn, _EIGH_SPEC)
+    batched = _iree_lower_text(graph)
+    assert _iree_lower_text(graph, eigh_algorithm="jacobi_batched") == batched
+    sequential = _iree_lower_text(graph, eigh_algorithm=" JACOBI ")
+    assert sequential == _iree_lower_text(graph, eigh_algorithm="jacobi")
+    assert sequential != batched
+    assert "stablehlo.while" in batched
+    assert "stablehlo.while" in sequential
+
+
+@pytest.mark.parametrize("bad_value", ["bogus", "jacobi2", 1, False])
+def test_eigh_algorithm_invalid_value_is_a_backend_error(bad_value):
+    """An invalid ``eigh_algorithm`` VALUE surfaces as core.BackendError naming
+    the option (the exporter's own validation — the framework only validates
+    keys). Full value-domain goldens live in ``test_stablehlo.py``."""
+    graph = etl.trace(_eigh_fn, _EIGH_SPEC)
+    with pytest.raises(core.BackendError) as excinfo:
+        _iree_lower_text(graph, eigh_algorithm=bad_value)
+    message = str(excinfo.value)
+    assert "eigh_algorithm" in message
+    assert "jacobi_batched" in message
+
+
+def test_split_reduction_reaches_the_exporter():
+    """``split_reduction`` reaches the exporter: the default (True) splits the
+    rank-0-result integer ``min`` over 1024 elements into two stages,
+    ``False`` emits the byte-identical single-stage text, and the env-style
+    strings are coerced ("1" == True, "0" == False)."""
+    graph = etl.trace(_min_fn, _MIN_SPEC)
+    default = _iree_lower_text(graph)
+    assert _iree_lower_text(graph, split_reduction=True) == default
+    assert _iree_lower_text(graph, split_reduction="1") == default
+    assert _iree_lower_text(graph, split_reduction="on") == default
+    single_stage = _iree_lower_text(graph, split_reduction=False)
+    assert _iree_lower_text(graph, split_reduction="0") == single_stage
+    assert _iree_lower_text(graph, split_reduction="off") == single_stage
+    assert single_stage != default
+
+
+@pytest.mark.parametrize("bad_value", ["maybe", 2, None])
+def test_split_reduction_invalid_value_is_a_backend_error(bad_value):
+    """An invalid ``split_reduction`` VALUE (``None`` included: bool options
+    have no "unset" spelling — omit the key to get the default) raises
+    core.BackendError naming the option and the value."""
+    graph = etl.trace(_min_fn, _MIN_SPEC)
+    with pytest.raises(core.BackendError) as excinfo:
+        _iree_lower_text(graph, split_reduction=bad_value)
+    message = str(excinfo.value)
+    assert "split_reduction" in message
+    assert repr(bad_value) in message
+
+
+@pytest.mark.parametrize(("name", "backend_cls"), _ADAPTERS, ids=_ADAPTER_IDS)
+@pytest.mark.parametrize(
+    "option", ["split_reduction_threshold", "split_reduction_non_exact"]
+)
+def test_split_reduction_sub_options_not_declared_in_known_options(
+    name, backend_cls, option
+):
+    """CURRENT state (reported upward as a gap, NOT a contract we endorse): the
+    StableHLO Writer accepts the ``split_reduction_threshold`` /
+    ``split_reduction_non_exact`` exporter sub-options, but no adapter declares
+    them in ``KNOWN_OPTIONS`` and ``CompilerBackend._exporter_options`` does
+    not forward them — so they are unreachable through the pipeline. Passing
+    them is LOUD (never silently ignored): the unknown-option BackendError
+    names the option."""
+    assert option not in backend_cls.KNOWN_OPTIONS["lower"]
+    graph = etl.trace(_min_fn, _MIN_SPEC)
+    with pytest.raises(core.BackendError) as excinfo:
+        backend_cls().lower(graph, {option: 2048})
+    message = str(excinfo.value)
+    assert f"does not recognize the lower option '{option}'" in message
+    assert "known options by stage" in message
+    assert "split_reduction" in message  # the declared family member is listed
+    # ... and the plain ``split_reduction`` key itself IS accepted at lower.
+    backend_cls().lower(graph, {"split_reduction": False})# ---------------------------------------------------------------------------
 # 2. iree compile-flag policy (pure helpers — no IREE dependency)
 # ---------------------------------------------------------------------------
 
@@ -461,6 +721,24 @@ def test_iree_lower_reserved_option_while_init_rewrite():
     out = etl.run(exe, np.array(0.0, "float32"))
     assert out.numpy() == 4.0
 
+
+def test_iree_performance_options_end_to_end():
+    """Full path: the performance lower options (``eigh_algorithm`` +
+    ``split_reduction``) survive the lower stage of a real llvm-cpu build — no
+    unknown-option rejection anywhere in the pipeline — and the run matches the
+    numpy reference (the split-reduction path disabled emits the plain
+    ``stablehlo.reduce``)."""
+    _require_iree()
+    exe = etl.build(
+        _min_fn,
+        _MIN_SPEC,
+        backend="iree",
+        eigh_algorithm="jacobi",
+        split_reduction=False,
+    )
+    out = etl.run(exe, _MIN_INPUT)
+    assert out.dtype == np.dtype("int32")
+    assert int(out.numpy()) == _MIN_EXPECTED
 
 # ---------------------------------------------------------------------------
 # 5. tvm (real TVM — version-adaptive pass_configs)
