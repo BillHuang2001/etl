@@ -564,6 +564,45 @@ _execute_scaffolding = threading.local()
 #: Bound on the per-thread scaffolding cache (many executables per process).
 _EXECUTE_SCAFFOLDING_MAX = 64
 
+#: ``ctypes.sizeof`` results per argument-struct class. ``ctypes.sizeof`` is
+#: a Python-level call (~0.14 us); the size of a struct class is IMMUTABLE,
+#: so a hot path (one destroy per output buffer per run) reads it from here.
+_SIZEOF_CACHE: dict[type, int] = {}
+
+
+def _sizeof(cls: type) -> int:
+    """``ctypes.sizeof(cls)``, cached (struct class sizes are immutable)."""
+    size = _SIZEOF_CACHE.get(cls)
+    if size is None:
+        size = _SIZEOF_CACHE[cls] = ctypes.sizeof(cls)
+    return size
+
+
+#: Per-thread reusable handle-destroy argument structs, keyed by args class:
+#: a destroy call then only rewrites the handle field instead of allocating
+#: the struct. Thread-local for the same reason as the execute scaffolding —
+#: concurrent callers must never share mutable ctypes state.
+_destroy_args = threading.local()
+
+
+def _destroy_args_for(args_cls: type) -> Any:
+    """The reusable ``PJRT_*_Destroy_Args`` struct for ``args_cls`` (per thread).
+
+    The struct is created once per thread and per class with its constant
+    fields set; ``PjrtPlugin._destroy`` writes the handle pointer into it
+    before every call. Destroy argument structs are read-only to the plugin
+    during the call (which never re-enters Python), so reuse is safe — but the
+    struct must be THREAD-LOCAL, never shared between concurrent callers.
+    """
+    cache = getattr(_destroy_args, "cache", None)
+    if cache is None:
+        cache = _destroy_args.cache = {}
+    args = cache.get(args_cls)
+    if args is None:
+        args = cache[args_cls] = args_cls(
+            struct_size=_sizeof(args_cls), extension_start=None
+        )
+    return args
 
 # ---------------------------------------------------------------------------
 # Handle wrappers (lifecycle hygiene: every plugin-created object is
@@ -965,12 +1004,14 @@ class _LoadedExecutable(_Handle):
         num_args = len(buffers)
         scaffolding = self._execute_scaffolding(num_args)
         device_ptrs, out_ptrs, args, num_outputs = scaffolding
-        metas = None
-        if output_meta is not None:
+        metas = output_meta
+        if metas is not None:
             # Validate the contract BEFORE invoking: a mismatched
             # ``output_meta`` must never leave the plugin's output buffers
-            # unowned (the driver owns everything it creates).
-            metas = list(output_meta)
+            # unowned (the driver owns everything it creates). A tuple
+            # (the adapter's plan) is used as-is — no per-call copy.
+            if type(metas) is not tuple:
+                metas = list(metas)
             if len(metas) != num_outputs:
                 raise core.BackendError(
                     f"output_meta describes {len(metas)} output(s) but the "
@@ -983,18 +1024,18 @@ class _LoadedExecutable(_Handle):
             self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
             "PJRT_LoadedExecutable_Execute",
         )
+        plugin = self.plugin
+        outputs: list[_Buffer] = [None] * num_outputs
         if metas is None:
-            return [_Buffer(self.plugin, out_ptrs[i]) for i in range(num_outputs)]
-        return [
-            _Buffer(
-                self.plugin,
-                out_ptrs[i],
-                shape=metas[i][0],
-                dtype=metas[i][1],
+            for i in range(num_outputs):
+                outputs[i] = _Buffer(plugin, out_ptrs[i])
+            return outputs
+        for i in range(num_outputs):
+            meta = metas[i]
+            outputs[i] = _Buffer(
+                plugin, out_ptrs[i], shape=meta[0], dtype=meta[1]
             )
-            for i in range(num_outputs)
-        ]
-
+        return outputs
     def _execute_scaffolding(self, num_args: int) -> tuple:
         """Return the (cached) execute scaffolding for ``(self, num_args)``.
 
@@ -1085,17 +1126,21 @@ class _Buffer(_Handle):
         shape: Any = None,
         dtype: Any = None,
     ) -> None:
-        super().__init__(plugin, ptr)
+        # ``_Handle.__init__`` inlined: this is a per-output-buffer hot path.
+        self.plugin = plugin
+        self.ptr = ptr
+        self._closed = False
         self._keepalive = keepalive  # host memory that must outlive the buffer
         self._shape: tuple[int, ...] | None = (
-            None if shape is None else tuple(shape)
+            None
+            if shape is None
+            else (shape if type(shape) is tuple else tuple(shape))
         )
         self._dtype: Any | None = dtype
         # Prefilled (or not-yet-queried) metadata has not been checked
         # against the plugin's real buffer metadata yet; a lazily-queried
         # buffer only ever caches real FFI values, so it starts verified.
         self._verified = shape is None and dtype is None
-
     def close(self) -> None:
         if self._closed:
             return
@@ -1240,13 +1285,16 @@ class PjrtPlugin:
     cached per path by ``_load_plugin``.
     """
 
-    __slots__ = ("path", "_library", "api")
+    __slots__ = ("path", "_library", "api", "_destroy_table")
 
     def __init__(self, path: str, library: ctypes.CDLL, api: pjrt.PJRT_Api) -> None:
         self.path = path
         self._library = library
         self.api = api
-
+        #: ``api_name -> (entry point, args class, handle field name)`` for
+        #: ``_destroy`` — immutable data only, so it is safe to share across
+        #: threads (the reusable args struct itself is thread-local).
+        self._destroy_table: dict[str, tuple] = {}
     # ------------------------------------------------------------- plumbing
 
     def initialize(self) -> None:
@@ -1300,14 +1348,26 @@ class PjrtPlugin:
         self.api.PJRT_Error_Destroy(ctypes.byref(args))
 
     def _destroy(self, api_name: str, args_cls: type, ptr: int) -> None:
-        """Destroy a handle through the given PJRT_*_Destroy entry point."""
+        """Destroy a handle through the given PJRT_*_Destroy entry point.
+
+        Per-call cost discipline: the entry point, the (thread-local,
+        reusable) argument struct and its handle field name are resolved
+        ONCE per ``api_name`` and cached on the plugin, so a call only
+        writes the handle pointer before invoking.
+        """
         if not ptr:
             return
-        fn = getattr(self.api, api_name)
-        args = args_cls(struct_size=pjrt.sizeof(args_cls), extension_start=None)
-        setattr(args, args_cls._fields_[-1][0], ptr)
+        entry = self._destroy_table.get(api_name)
+        if entry is None:
+            entry = self._destroy_table[api_name] = (
+                getattr(self.api, api_name),
+                args_cls,
+                args_cls._fields_[-1][0],
+            )
+        fn, args_cls, field = entry
+        args = _destroy_args_for(args_cls)
+        setattr(args, field, ptr)
         self._check(fn(ctypes.byref(args)), api_name)
-
     # ------------------------------------------------------------ lifecycle
 
     def create_client(self) -> _Client:
