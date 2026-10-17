@@ -48,8 +48,20 @@ def export(graph_or_module, options: dict | None = None) -> str:
             (bool, default True) rewrites all-zero rank>=1 constant while
             INIT operands into computed zeros (the iree 3.11.0
             AffinityAnalysis SEGV workaround — see the Writer).
+            ``eigh_algorithm`` selects the ``eigh`` cyclic-Jacobi
+            composition: ``"jacobi"`` (one (p, q) rotation per
+            ``stablehlo.while`` iteration) or ``"jacobi_batched"`` (the
+            default — every mutually disjoint rotation of an odd-even
+            round-robin round per iteration, so a sweep costs ``L`` rounds
+            instead of ``n(n-1)/2`` rotations and the loop is ONE 3-carry
+            while; same accuracy class, measured 4.0x / 29.2x / 74.4x
+            faster at n = 10 / 50 / 100 on iree-llvm-cpu). Values are
+            case-insensitive and whitespace-stripped, ``None``/absent
+            means the default, ``n < 2`` keeps the sequential composition,
+            and any other value raises `core.BackendError` naming the
+            option, the offending value and the accepted forms.
             ``eigh_early_exit`` (bool, default False) opts INTO the
-            ``eigh`` while-Jacobi composition's convergence-based early
+            ``eigh`` compositions' convergence-based early
             exit: the loop additionally carries an i1 ``done`` flag and, at
             every sweep boundary (inside a nested ``stablehlo.if``), checks
             the scale-aware relative off-diagonal energy of the current A
@@ -59,13 +71,15 @@ def export(graph_or_module, options: dict | None = None) -> str:
             ``tests/backends/test_iree_eigh_diag_parity.py``), exiting
             once converged so converged matrices skip their remaining
             scheduled sweeps (see the Writer's ``_emit_eigh`` /
-            ``_emit_eigh_sweep_check``). ``False`` (the default) emits the
-            exact pre-option 5-carry text — byte-identical on every
-            backend. The convergence exit is validated on llvm-cpu ONLY and
-            is known-broken on iree-cuda at invoke (deterministic dealloca
+            ``_emit_eigh_sweep_check``). Both ``eigh`` compositions support
+            it; ``False`` (the default) emits the plain composition text
+            with no early-exit machinery. The convergence exit is validated
+            on llvm-cpu ONLY and, for the sequential composition, is
+            known-broken on iree-cuda at invoke (deterministic dealloca
             ``INVALID_ARGUMENT`` at n=10, SIGSEGV at n=50, under BOTH
             allocators) — hence the default is OFF; option-on remains
-            available as an llvm-cpu opt-in. ``dot_precision`` selects the
+            available as an llvm-cpu opt-in (the batched composition is
+            unvalidated on cuda). ``dot_precision`` selects the
             precision hint emitted on every ``stablehlo.dot_general`` op:
             ``"DEFAULT"`` (also used when the key is absent or ``None``;
             case-insensitive) emits NO ``precision_config`` attribute —
