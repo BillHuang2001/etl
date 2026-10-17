@@ -489,6 +489,17 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         #: non-region export stays BYTE-IDENTICAL to the flat line list
         #: (see ``_split_region_invariants``).
         self._region_depth = 0
+        #: Nesting depth of the INLINE branch scope of a while-bearing
+        #: ``cond`` (``_emit_if_select``/``_emit_branch_inline``): the
+        #: branch body is emitted at the ENCLOSING scope rather than inside
+        #: an ``if`` region, so ``_region_depth`` stays 0 there — but the
+        #: same iree 3.11 2-operand-``sort`` mis-execution applies (the
+        #: ``eigh`` post-loop tail's eigenvalue sort + gather lives in that
+        #: scope, and its index operand is a value computed by the branch
+        #: rather than a region argument), so the count composition is
+        #: selected for sorts emitted here too (see
+        #: ``_count_argsort_active``).
+        self._select_inline_depth = 0
         #: while_init_rewrite exporter option (bool, default True): replace
         #: ALL-ZERO rank>=1 constant while-INIT operands with computed zeros
         #: (``not``/``and`` + a dtype-changing ``convert`` + ``reduce`` over a
@@ -566,6 +577,7 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         `func.return` of the terminator's operands."""
         entry = fn.entry_block
         self._region_depth = 0
+        self._select_inline_depth = 0
         for i, arg in enumerate(entry.arguments):
             self._names[id(arg)] = f"%arg{i}"
         # Emit the body FIRST: op emission populates per-value type
@@ -2198,23 +2210,28 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         """Whether the count-based argsort emission applies for this call
         under the configured ``sort_emission`` mode AND the emission site.
 
-        The count composition is used whenever the sort sits INSIDE a
-        region (``_region_depth > 0``): iree 3.11.0 mis-executes a
-        2-operand ``stablehlo.sort`` nested in an ``if``/``while`` region
-        when its index operand is a region-invariant value hoisted to the
-        enclosing scope (a loop-carried value sorted in a body, then
-        gathered with the returned index, silently yields the UNSORTED
-        input — measured on a minimal ``argsort`` + ``gather`` loop body
-        and on the ``eigh`` post-loop eigenvalue sort). No ``sort`` op is
+        The count composition is used wherever a 2-operand sort would be
+        emitted OUTSIDE a plain flat top-level block: ``_region_depth > 0``
+        (inside an ``if``/``while`` region) OR inside the INLINE branch
+        scope of a while-bearing ``cond`` (``_select_inline_depth > 0`` —
+        ``_emit_if_select``/``_emit_branch_inline`` emit both branch bodies
+        at the enclosing scope, so ``_region_depth`` stays 0 there).
+        iree 3.11.0 mis-executes a 2-operand ``stablehlo.sort`` in BOTH
+        positions when its index operand is not a region argument — a
+        loop-carried value sorted in a body and then gathered with the
+        returned index silently yields the UNSORTED input (measured on a
+        minimal ``argsort`` + ``gather`` loop body), and the ``eigh``
+        post-loop tail (eigenvalue sort, then a gather of V's columns) hits
+        exactly that shape inside the inline branch scope. No ``sort`` op is
         emitted by the count composition, so the whole defect class
-        disappears, and the region-nested extents involved (eigenvalue
-        counts) are small enough that its O(n^2) cost is negligible.
-        Everything at region depth 0 keeps the mode's own choice, so a
-        bare/top-level export is byte-identical."""
+        disappears, and the extents involved (eigenvalue counts) are small
+        enough that its O(n^2) cost is negligible. Everything in a flat
+        function block keeps the mode's own choice, so a bare/top-level
+        export is byte-identical."""
         mode = self._sort_emission
         if mode == "count":
             return True
-        if self._region_depth > 0:
+        if self._region_depth > 0 or self._select_inline_depth > 0:
             return True
         if mode == "pair":
             return False
@@ -2224,14 +2241,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     def _count_sort_active(self) -> bool:
         """Whether the VALUES-sort emission uses the count composition —
         the strict ``sort_emission="count"`` mode, or any sort emitted
-        inside a region (see ``_count_argsort_active`` for the region
-        rule; a 1-operand ``stablehlo.sort`` never hits the 2-operand
-        mis-execution, but routing it through the same count composition
-        keeps one rule for every sort emission site). ``"auto"`` at
-        region depth 0 keeps the 1-operand pair form — byte-identical to
-        the pre-region-rule text and cheaper on llvm-cpu at large
-        extents."""
-        return self._sort_emission == "count" or self._region_depth > 0
+        inside a region / inline branch scope (see
+        ``_count_argsort_active`` for the rule; a 1-operand
+        ``stablehlo.sort`` never hits the 2-operand mis-execution, but
+        routing it through the same count composition keeps one rule for
+        every sort emission site). A flat top-level block keeps the
+        1-operand pair form under ``"auto"`` — byte-identical to the
+        pre-rule text and cheaper on llvm-cpu at large extents."""
+        return (
+            self._sort_emission == "count"
+            or self._region_depth > 0
+            or self._select_inline_depth > 0
+        )
 
     def _emit_count_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
                             axis: int, lines: list) -> tuple[str, str]:
@@ -4218,7 +4239,14 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         for block in region.blocks:
             for arg, operand in zip(block.arguments, op.operands):
                 self._names[id(arg)] = self._name(operand)
-            block_units = self._block_units(block)
+            # Mark the INLINE branch scope: sorts emitted here must use the
+            # count composition even though `_region_depth` stays 0 (see
+            # `_count_argsort_active`).
+            self._select_inline_depth += 1
+            try:
+                block_units = self._block_units(block)
+            finally:
+                self._select_inline_depth -= 1
             terminator = block.ops[-1] if block.ops else None
             if terminator is not None and terminator.name == "return":
                 returned = list(terminator.operands)
