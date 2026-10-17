@@ -141,6 +141,33 @@ def _re_split_exp(text: str):
     return text, ""
 
 
+class _Emitted(str):
+    """Emitted op text carrying a PRELUDE of lines that must be emitted
+    BEFORE the op.
+
+    Region-aware emission (see ``Writer._split_region_invariants``): an op
+    that emits a nested region (``while``/``if``/``eigh``) may produce
+    setup lines that are INVARIANT with respect to the enclosing region —
+    all ``stablehlo.constant``/``stablehlo.iota`` definitions and every op
+    derived only from them. iree 3.11 mis-hoists a constant (or an op
+    consuming one) that appears inside a region into an undefined
+    ``util.global`` (``'util.global.load' op undefined global:
+    @__hoisted_*``), so those lines must be emitted at the ENCLOSING scope
+    and captured lexically by the region. They travel up as ``prelude``
+    instead of into the enclosing hoist target because only the enclosing
+    block knows which names are visible at its own prelude point; the
+    enclosing block flattens the prelude into its own line list and lets
+    its own region split decide (``Writer._block_body_lines``).
+    """
+
+    __slots__ = ("prelude",)
+
+    def __new__(cls, prelude, text: str):
+        self = super().__new__(cls, text)
+        self.prelude = list(prelude)
+        return self
+
+
 def _is_static_dim(dim) -> bool:
     """True for concrete int dims (bool excluded — it is not a size)."""
     return isinstance(dim, int) and not isinstance(dim, bool)
