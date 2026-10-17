@@ -3989,22 +3989,33 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # iotas — the eye, the sweep counters, the index lattices).
     #
     # FIX: every region-emitting emitter prints its setup lines at the TOP
-    # of its returned text (depth 0), and `_block_body_lines` splits a
-    # region block into atomic units and lifts the REGION-INVARIANT ones
+    # of its returned text (depth 0), and the region emitters split each
+    # region block into atomic units and lift the REGION-INVARIANT ones
     # into a PRELUDE emitted BEFORE the enclosing `if`/`while` header
-    # (`_split_region_invariants`). Constants therefore live in the
-    # enclosing scope and the regions capture them lexically — the shape
-    # iree handles correctly — while the `while` STAYS inside the region.
+    # (`_split_region_invariants`, driven by `_region_lines`). Constants
+    # therefore live in the enclosing scope and the regions capture them
+    # lexically — the shape iree handles correctly — while the `while`
+    # STAYS inside the region.
     # Safe because every op reaching the exporter is pure (effectful ops —
     # collectives, runtime_call/external_call — defer with BackendError),
     # so a lifted prefix cannot duplicate a side effect; it may compute
     # unconditionally what a branch computed conditionally, which pure
-    # semantics preserve. Lifting bubbles outward one region level at a
-    # time (a nested region's prelude joins its enclosing block's units and
-    # that block's own split may lift it further), so an `eigh` inside a
-    # cond inside a cond, and an `eigh` inside a `while` BODY, both end up
-    # with their constants at function scope. The eigh composition stays a
-    # single while (O(1) emitted text — no compile blowup at dim 50).
+    # semantics preserve.
+    # DOMINANCE (binding): a lifted unit lands at the ENCLOSING scope, where
+    # only enclosing-scope names are visible — NOT the region's block
+    # arguments, not anything any unit of this block (or of the sibling
+    # region of the same `if`/`while`) defines, and not anything a nested
+    # region inside a unit defines. `_split_region_invariants` therefore
+    # FORBIDS all of those, and lifts only units that use none of them (a
+    # unit derived from an already-lifted constant still lifts, so an
+    # `eigh` prelude lifts as one chain). Lifting bubbles outward one
+    # region level at a time (a lifted unit joins its enclosing block's
+    # units and that block's own split may lift it further), so an `eigh`
+    # inside a cond inside a cond, and an `eigh` inside a `while` BODY,
+    # both end up with their constants at function scope — while a unit
+    # that depends on a region-local value correctly STAYS in the region.
+    # The eigh composition stays a single while (O(1) emitted text — no
+    # compile blowup at dim 50).
 
     def _emit_if(self, op: Op) -> str:
         pred = op.operands[0]
@@ -4018,10 +4029,15 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                     self._names[id(arg)] = self._name(operand)
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
-        true_prelude, true_region = self._emit_if_region(op.regions[0], op)
-        false_prelude, false_region = self._emit_if_region(op.regions[1], op)
-        # Region-invariant branch lines land BEFORE the `if` (see the
-        # comment above) — iree 3.11 cannot compile a region-local constant.
+        true_blocks, true_local = self._emit_if_region(op.regions[0], op)
+        false_blocks, false_local = self._emit_if_region(op.regions[1], op)
+        # Both branches' region-invariant prefixes land BEFORE the `if`
+        # (see the comment above) — iree 3.11 cannot compile a region-local
+        # constant. Both are emitted from the SAME enclosing point, so a
+        # lifted unit may not use ANY name either branch introduces.
+        shared = true_local | false_local
+        true_prelude, true_region = self._region_lines(true_blocks, shared)
+        false_prelude, false_region = self._region_lines(false_blocks, shared)
         lines = list(true_prelude) + list(false_prelude)
         lines.append(f'{lhs}"stablehlo.if"({self._name(pred)}) ({{')
         lines.append(true_region)
@@ -4034,27 +4050,29 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return "\n".join(lines)
 
     def _emit_if_region(self, region, op: Op):
-        """One `if` branch: no block args (StableHLO branches capture the
-        enclosing values implicitly) — the etl entry args bind to the op
+        """One `if` branch, emitted into ATOMIC UNITS (see
+        ``_emit_while_region``): no block args (StableHLO branches capture
+        the enclosing values implicitly) — the etl entry args bind to the op
         operands, so references resolve to the enclosing SSA names.
 
-        Returns ``(prelude, text)``: ``prelude`` is the branch's
-        region-invariant prefix (``_split_region_invariants``), which the
-        caller emits BEFORE the ``stablehlo.if`` header."""
-        prelude = []
-        out = []
+        Returns ``(blocks, local)``: ``blocks`` is a list of
+        ``(header, units)`` pairs and ``local`` is the EMPTY set (an `if`
+        branch introduces no SSA names of its own — its block args alias
+        enclosing operands). The caller splits each branch into
+        prelude/body with ``_region_lines`` AFTER both branches are
+        emitted, so a lifted unit from either branch is checked against
+        both branches' locals."""
+        blocks = []
         for i, block in enumerate(region.blocks):
             for arg, operand in zip(block.arguments, op.operands):
                 self._names[id(arg)] = self._name(operand)
-            out.append(f"  ^bb{i}:")
             self._region_depth += 1
             try:
-                lifted, lines = self._block_body_lines(block)
+                units = self._block_units(block)
             finally:
                 self._region_depth -= 1
-            prelude.extend(lifted)
-            out.extend("    " + line for line in lines)
-        return prelude, "\n".join(out)
+            blocks.append((f"  ^bb{i}:", units))
+        return blocks, set()
 
     def _emit_while(self, op: Op) -> str:
         init_lines = []
@@ -4064,12 +4082,16 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         result_names = self._bind_results(op)
         lhs = f"{', '.join(result_names)} = " if result_names else ""
         types = ", ".join(self._vt(v.type) for v in op.operands)
-        cond_prelude, cond_region = self._emit_while_region(op.regions[0])
-        body_prelude, body_region = self._emit_while_region(op.regions[1])
+        cond_blocks, cond_local = self._emit_while_region(op.regions[0])
+        body_blocks, body_local = self._emit_while_region(op.regions[1])
         # The init rewrite first (its values are the while's operands), then
-        # the two regions' region-invariant prefixes (pure, so any mutual
-        # dependency would already have been satisfied in emission order),
-        # all BEFORE the `stablehlo.while` header.
+        # the two regions' region-invariant prefixes, all BEFORE the
+        # `stablehlo.while` header. Both prefixes are emitted from the SAME
+        # enclosing point, so a lifted unit may not use ANY name either
+        # region introduces (its own block args included).
+        shared = cond_local | body_local
+        cond_prelude, cond_region = self._region_lines(cond_blocks, shared)
+        body_prelude, body_region = self._region_lines(body_blocks, shared)
         lines = list(init_lines) + list(cond_prelude) + list(body_prelude)
         lines.append(f'{lhs}"stablehlo.while"({", ".join(operand_names)}) ({{')
         lines.append(cond_region)
@@ -4252,31 +4274,59 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         return cur
 
     def _emit_while_region(self, region):
-        """One `while` region (cond/body): block args bound positionally to
-        the loop-carried operands. Args use FRESH counter names (never
-        `%argN` — MLIR SSA names are function-scoped and would collide
-        with the enclosing function's entry arguments / nested regions).
+        """One `while` region (cond/body), emitted into ATOMIC UNITS. Block
+        args use FRESH counter names (never `%argN` — MLIR SSA names are
+        function-scoped and would collide with the enclosing function's
+        entry arguments / nested regions).
 
-        Returns ``(prelude, text)``: ``prelude`` is the region's
-        region-invariant prefix (``_split_region_invariants``) — the
-        constants/iotas an `eigh` decomposition emits before its own
-        `while` — which the caller emits BEFORE the enclosing
-        ``stablehlo.while`` header."""
-        prelude = []
-        out = []
+        Returns ``(blocks, local)``: ``blocks`` is a list of
+        ``(header, units)`` pairs — the ``^bbN(...)`` header plus the
+        block's atomic units (the constants/iotas an `eigh` decomposition
+        emits before its own `while` are among them) — and ``local`` is the
+        set of SSA names the region introduces ITSELF (its block
+        arguments). The caller splits the region into prelude/body with
+        ``_region_lines`` AFTER both regions are emitted, and passes the
+        union of both regions' locals as the split's ``forbidden`` set: the
+        two prefixes are emitted at the same enclosing point, so neither
+        may reference the other region's locals."""
+        blocks, local = [], set()
         for i, block in enumerate(region.blocks):
             args = []
             for arg in block.arguments:
                 name = self._new_name()
                 self._names[id(arg)] = name
                 args.append(f"{name}: {self._vt(arg.type)}")
-            out.append(f"  ^bb{i}({', '.join(args)}):")
+                # bare SSA ids (``_SSA_NAME_RE`` group form) — the form
+                # ``_defined_names``/``_block_arg_names`` report, so the
+                # split's ``forbidden`` set compares like with like.
+                local.update(_SSA_NAME_RE.findall(name))
             self._region_depth += 1
             try:
-                lifted, lines = self._block_body_lines(block)
+                units = self._block_units(block)
             finally:
                 self._region_depth -= 1
+            blocks.append((f"  ^bb{i}({', '.join(args)}):", units))
+        return blocks, local
+
+    def _region_lines(self, blocks, forbidden=()):
+        """Render one already-emitted region (see ``_emit_while_region`` /
+        ``_emit_if_region``) as ``(prelude, text)``.
+
+        ``prelude`` is the region's REGION-INVARIANT prefix, lifted OUT of
+        the region and emitted by the caller BEFORE the enclosing
+        ``stablehlo.if``/``stablehlo.while`` header (the regions then
+        capture it lexically — see the region-scoped-emission comment
+        above); ``text`` is the region body. ``forbidden`` carries the SSA
+        names that are NOT visible at that enclosing point (the sibling
+        region's locals) and is extended inside ``_split_region_invariants``
+        by everything this region defines. Lifted units keep block/emission
+        order, so at the enclosing scope a lifted name always precedes its
+        uses."""
+        prelude, out = [], []
+        for header, units in blocks:
+            lifted, lines = self._split_region_invariants(units, forbidden)
             prelude.extend(lifted)
+            out.append(header)
             out.extend("    " + line for line in lines)
         return prelude, "\n".join(out)
 
@@ -4442,16 +4492,27 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     def _block_body_lines(self, block: Block, terminator: str = "stablehlo.return"):
         """Return ``(prelude, body)`` for one block.
 
-        ``body`` is the block's op lines (each atomic unit an element, so a
-        multi-line ``while``/``if``/``reduce`` group stays ONE element),
-        ending with its terminator line. ``prelude`` is the block's
+        ``body`` is the block's atomic units (see ``_block_units``), ending
+        with its terminator line. ``prelude`` is the block's
         region-invariant prefix lifted OUT of the enclosing region — see
         ``_split_region_invariants`` — and the caller emits it BEFORE the
         enclosing ``if``/``while`` header. For the function entry block
         (``_region_depth == 0``) nothing is lifted and ``prelude`` is
         empty, so a region-free export is byte-identical to the flat line
-        list.
-        """
+        list. This is the ENTRY-block path only; the region emitters
+        (`_emit_while_region`/`_emit_if_region`) emit their blocks into
+        units FIRST and split them together via ``_region_lines``, because
+        the split's ``forbidden`` set needs BOTH regions' locals."""
+        units = self._block_units(block, terminator)
+        if self._region_depth == 0:
+            return [], units
+        return self._split_region_invariants(units)
+
+    def _block_units(self, block: Block, terminator: str = "stablehlo.return"):
+        """Emit one block's ops into ATOMIC UNITS: one element per
+        depth-0 emitted line, with a multi-line ``while``/``if``/``reduce``
+        group kept as ONE element (``_split_atomic_units``), terminated by
+        the block's terminator line."""
         units = []
         for op in block.ops:
             if op.name == "return":
@@ -4465,11 +4526,9 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
             text = self._emit_op(op)
             if text:
                 units.extend(_split_atomic_units(text))
-        if self._region_depth == 0:
-            return [], units
-        return self._split_region_invariants(units)
+        return units
 
-    def _split_region_invariants(self, units):
+    def _split_region_invariants(self, units, forbidden=()):
         """Split one REGION block's atomic units into ``(prelude, body)``:
         the region-invariant prefix that is lifted out of the region and
         the lines that must stay inside it.
@@ -4486,27 +4545,42 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         assumed "while-inside-if" defect was this region-local-constant
         defect).
 
-        A unit is lifted iff it is a single depth-0 line whose emitted
-        mnemonic is pure and region-free (``_HOISTABLE_MNEMONICS``) AND
-        none of the SSA names it uses is defined by a unit that stays in
-        the body (block arguments included). The forward pass runs in
-        emission order, so a lifted name always dominates its uses, and a
-        lifted name stays visible to later units (regions capture the
-        enclosing scope). Pure ⇒ hoisting cannot duplicate a side effect;
-        computing unconditionally what a branch computed conditionally
-        preserves the semantics.
+        DOMINANCE RULE (binding): the prelude is emitted BEFORE the
+        enclosing ``if``/``while`` header, i.e. at a point where NOTHING
+        this block or its sibling regions define is visible — only the
+        enclosing scope is. So a unit is lifted iff it is a single depth-0
+        line whose emitted mnemonic is pure and region-free
+        (``_HOISTABLE_MNEMONICS``) AND it uses NO FORBIDDEN SSA name, where
+        ``forbidden`` starts as the caller-supplied sibling-region locals
+        (``_region_lines``) PLUS every name defined anywhere in this
+        block's units — including the region's own BLOCK ARGUMENTS (they
+        are emitted with the region header, never by a unit) and every name
+        a NESTED region inside any unit defines (block arguments
+        included). A lifted unit RELEASES the names it defines, so a chain
+        derived from a lifted constant lifts together — which is what keeps
+        an ``eigh`` prelude hoisted as one prefix. The scan runs ONCE in
+        emission order: a block is def-before-use ordered, so the single
+        forward pass already IS the fixpoint of that monotone rule and
+        never lifts a unit on the strength of a name a LATER unit defines
+        (which would put the prelude out of dominance order).
+        Refusing to lift is always safe — the unit then simply stays in the
+        region, where its operands are visible. Pure ⇒ hoisting cannot
+        duplicate a side effect; computing unconditionally what a branch
+        computed conditionally preserves the semantics.
         """
+        forbidden = set(forbidden)
+        for unit in units:
+            forbidden |= _defined_names(unit)
+            forbidden |= _block_arg_names(unit)
         prelude, body = [], []
-        body_defined: set[str] = set()
         for unit in units:
             defined = _defined_names(unit)
             used = set(_SSA_NAME_RE.findall(unit)) - defined
-            if _is_hoistable_unit(unit) and not (used & body_defined):
+            if _is_hoistable_unit(unit) and not (used & forbidden):
                 prelude.append(unit)
+                forbidden -= defined
                 continue
             body.append(unit)
-            body_defined |= defined
-            body_defined |= _block_arg_names(unit)
         return prelude, body
 
     # --- Naming & formatting helpers ---
