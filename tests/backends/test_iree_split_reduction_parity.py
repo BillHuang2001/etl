@@ -45,14 +45,20 @@ compiled executable (compile-once cache ``_COMPILED``), and the high-level
 shape matrix is covered with f32 while the dtype matrix rides on the three
 distinct split classes (exact / rank-1 result / padded).
 
-This file also carries three ``# BUG(etl)`` pin tests (see the bottom of the
-module). They are exporter bugs UNRELATED to ``split_reduction`` — each one
-reproduces identically with ``split_reduction=False`` and on shapes far below
-``split_reduction_threshold`` — and they make some of the dtype/NaN coverage
-above silently wrong. Each pin keeps asserting the CORRECT (numpy-backend)
-result and is marked ``xfail(strict=True)``: it is expected to fail while the
-bug lives, and it FAILS LOUDLY (XPASS under ``strict``) the moment the bug is
-fixed, so it can never rot silently into a vacuous pass.
+This file also carries three dtype/NaN PARITY pins at the bottom of the module,
+guarding reduce-emission properties that have nothing to do with
+``split_reduction``: bool ``sum``/``mean`` PROMOTE to the numpy accumulator
+dtype (i64 / f64) before reducing, so a bool sum is the popcount rather than a
+single truth bit; integer ``sum``/``prod`` accumulate in i64, so
+``prod(arange(1, 14, int32))`` is 6227020800 (13!) instead of a 32-bit wrap;
+and ``argmin``/``argmax`` are NaN-aware, returning the index of the FIRST NaN
+exactly as ``np.argmin``/``np.argmax`` do (int/bool keys keep the plain
+comparator). Each pin asserts the numpy-backend result against the compiler
+result AND reproduces identically with ``split_reduction=False`` (and on shapes
+far below ``split_reduction_threshold``), which is what proves the behaviour is
+not split-path behaviour. Because those semantics match numpy, the parity
+matrix above covers bool ``sum``/``mean`` and NaN-containing ``argmin``/
+``argmax`` too — see :func:`_checked`.
 """
 
 from __future__ import annotations
@@ -246,9 +252,10 @@ def _pattern(shape, dtype, name):
         if kind == "f":
             return rng.standard_normal(shape).astype(dtype)
         if kind == "i":
-            # Small magnitudes: an int32 sum of 10001 such values stays well
-            # inside int32, so this pattern pins the SPLIT semantics without
-            # tripping the unrelated integer-reduce dtype bug (BUG(etl) #2).
+            # Small magnitudes: the reference accumulator stays exact (and the
+            # summed values stay inside every intermediate range), so this
+            # pattern pins the SPLIT semantics on its own without any overflow
+            # interfering on either side of the comparison.
             return rng.integers(-500, 500, shape).astype(dtype)
         return rng.integers(0, 2, shape).astype(dtype)
     if name == "all_equal":
@@ -294,17 +301,21 @@ def _patterns(dtype):
 def _checked(op, dtype, pattern):
     """Whether ``op`` is asserted for this dtype/pattern.
 
-    ``prod`` is only meaningful on ``prod_safe`` for float/int (see
-    :func:`_pattern`); the remaining exclusions are the ``# BUG(etl)`` cases
-    pinned separately at the bottom of this module.
+    The single exclusion is ``prod`` outside the ``prod_safe`` pattern for
+    float/int (see :func:`_pattern`): that is a numeric-RANGE guard, not a
+    semantics one — a ``prod`` over thousands of standard normals underflows to
+    0, which would make the comparison vacuous.
+
+    Everything else is asserted: the reduce emitters promote bool
+    ``sum``/``mean`` and integer ``sum``/``prod`` to the numpy accumulator dtype
+    before reducing, and ``argmin``/``argmax`` are NaN-aware, so the full
+    dtype/pattern matrix (bool popcounts, integer accumulations and
+    NaN-containing arg-reduces included) is directly comparable against the
+    numpy backend.
     """
     kind = np.dtype(dtype).kind
     if op == "prod" and kind in "fi":
         return pattern == "prod_safe"
-    if kind == "b" and op in ("sum", "mean"):
-        return False  # BUG(etl) #1: bool sum/mean reduce in i1 (logical OR)
-    if kind == "f" and pattern == "nan_mid" and op in ("argmin", "argmax"):
-        return False  # BUG(etl) #3: arg-reduce NaN semantics differ from numpy
     return True
 
 
@@ -672,45 +683,44 @@ def test_arg_ties_resolve_to_first_occurrence_per_column():
 
 
 # ---------------------------------------------------------------------------
-# BUG(etl) pins — genuine exporter bugs, NOT caused by ``split_reduction``.
+# dtype / NaN parity pins — reduce-emission semantics that hold INDEPENDENTLY
+# of ``split_reduction``.
 #
-# Each one reproduces identically with ``split_reduction=False`` AND on
-# shapes far below ``split_reduction_threshold`` (i.e. the single-stage
-# emission, which predates the option, is equally wrong), so these tests must
-# not be confused with a split-reduction regression. Every pin keeps asserting
-# the CORRECT (numpy reference backend) result and is marked
-# ``xfail(strict=True)``: expected to fail while the bug lives, and it turns
-# into a suite failure (XPASS under ``strict``) the moment etl is fixed — the
-# assertion is never weakened. They matter here because they make dtype/NaN
-# coverage of the parity suite above silently wrong: the suite has to EXCLUDE
-# the affected (op, dtype, pattern) combinations in ``_checked``.
+# Three properties of a reduce emitter are pinned here as green regression
+# tests:
+#
+#   * bool ``sum``/``mean`` PROMOTE to the numpy accumulator dtype (i64 / f64)
+#     BEFORE reducing, so the count is a real popcount;
+#   * integer ``sum``/``prod`` PROMOTE to i64 (ui64) before reducing, so a
+#     wide result does not wrap in the operand dtype;
+#   * ``argmin``/``argmax`` are NaN-aware: the index of the FIRST NaN wins,
+#     matching ``np.argmin``/``np.argmax`` (int/bool keys keep the plain
+#     comparator, pinned by the tie-semantics tests above).
+#
+# Each pin runs the graph with ``split_reduction`` on AND off — the two
+# emissions must agree with each other and with the numpy backend, which is
+# what proves the behaviour belongs to the reduce emitter rather than to the
+# split path. The reference accumulator is exact for every case here, so the
+# assertions are bit-exact.
 # ---------------------------------------------------------------------------
 
 
-# BUG(etl): bool sum/mean are reduced in i1 (stablehlo.add on tensor<i1> is
-# logical OR) and only then converted to the declared i64 result dtype, so the
-# popcount collapses to 0/1. Reproduces with split_reduction=False too.
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG(etl): bool sum/mean reduce in i1 (stablehlo.add == OR), so the "
-    "popcount collapses to 0/1 (also with split_reduction=False)",
-)
-def test_bug_bool_sum_reduces_in_i1():
-    """BUG(etl): bool ``sum``/``mean`` reduce in i1 (``stablehlo.add`` == OR).
+def test_bool_sum_matches_numpy_popcount():
+    """bool ``sum``/``mean`` promote to the accumulator dtype (i64 / f64).
 
-    ``etl.sum`` over bool is declared ``int64`` (numpy: the popcount) but the
-    exporter emits the reducer in the OPERAND dtype — ``stablehlo.add`` on
-    ``tensor<i1>`` is logical OR — and only then ``stablehlo.convert``s the
-    single-bit result to i64, so the count collapses to 0/1. ``mean`` (the
-    ``sum / n`` composition) is wrong for the same reason.
+    ``etl.sum`` over bool is declared ``int64`` and ``etl.mean`` ``float64``
+    (numpy's accumulators). The emitter promotes the operand to the
+    accumulator dtype BEFORE reducing, so the reduction is a popcount over
+    every True element — never a bitwise OR in ``i1`` — and ``mean`` (the
+    ``sum / n`` composition) follows from it.
 
-    Minimal repro::
+    Expected values for 7 True out of 2000::
 
         import numpy as np, etl
         f = lambda x: etl.sum(x)
         spec = etl.TensorSpec((2000,), np.bool_)
         x = np.zeros(2000, np.bool_); x[:7] = True
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()   # -> 1
+        etl.run(etl.build(f, spec, backend="iree"), x).numpy()   # -> 7
         etl.evaluate(f, x).numpy()                                # -> 7
     """
     shape, dtype = (2000,), np.bool_
@@ -726,35 +736,29 @@ def test_bug_bool_sum_reduces_in_i1():
         etl.build(fn, spec, backend="iree", split_reduction=False), x
     )
     expected = etl.evaluate(fn, x)
-    # Both emission paths produce the SAME (wrong) answer: not a split bug.
+    # Both emission paths agree: the promotion is a reduce-emitter property.
     np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(split_off[0]))
     np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
     np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(expected[0]))
+    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
+    np.testing.assert_array_equal(etl_np(split_on[0]), np.asarray(7, np.int64))
 
 
-# BUG(etl): int sum/prod are reduced in the OPERAND dtype and then widened, so
-# an int32 reduction wraps at 32 bits before the convert to the declared i64.
-# Reproduces with split_reduction=False too (and far below the split gate).
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG(etl): int sum/prod reduce in the OPERAND dtype and widen "
-    "afterwards, so an int32 reduction wraps at 32 bits",
-)
-def test_bug_integer_reductions_wrap_in_the_operand_dtype():
-    """BUG(etl): int ``sum``/``prod`` reduce in the OPERAND dtype, then widen.
+def test_integer_reductions_accumulate_in_i64():
+    """int ``sum``/``prod`` promote to i64 before reducing — no 32-bit wrap.
 
     ``etl.prod``/``etl.sum`` over int32 are declared ``int64`` (numpy
-    accumulates in int64) but the exporter reduces in i32 and
-    ``stablehlo.convert``s the already-wrapped value to i64, so an int32
-    reduction silently wraps at 32 bits.
+    accumulates in int64), and the emitter promotes the operand to i64 BEFORE
+    reducing, so a product whose value exceeds the int32 range comes out
+    exact.
 
-    Minimal repro::
+    Expected values for ``arange(1, 14, int32)``::
 
         import numpy as np, etl
         f = lambda x: etl.prod(x)
         spec = etl.TensorSpec((13,), np.int32)
-        x = np.arange(1, 14, dtype=np.int32)          # 13! = 6227020800
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> wrapped i32
+        x = np.arange(1, 14, dtype=np.int32)                    # 13! = 6227020800
+        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> 6227020800
         etl.evaluate(f, x).numpy()                              # -> 6227020800
     """
     shape, dtype = (13,), np.int32
@@ -770,41 +774,30 @@ def test_bug_integer_reductions_wrap_in_the_operand_dtype():
     )
     expected = etl.evaluate(fn, x)
     np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
-    # numpy accumulates in int64: 13! = 6227020800, no wrap; iree wraps in i32.
+    # numpy accumulates in int64: 13! = 6227020800, and so does the compiler.
     np.testing.assert_array_equal(etl_np(expected[1]), np.asarray(6227020800, np.int64))
     np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
 
 
-# BUG(etl): the arg-reduce comparator has no NaN case, so argmin/argmax over an
-# array containing NaN return the index of a REAL extremum, while numpy (and the
-# numpy reference backend) return the index of the FIRST NaN. min/max themselves
-# DO propagate NaN correctly. Reproduces with split_reduction=False too.
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG(etl): argmin/argmax ignore NaN while numpy returns the first "
-    "NaN index (min/max propagate NaN correctly)",
-)
-def test_bug_arg_reduce_nan_semantics_do_not_match_numpy():
-    """BUG(etl): ``argmin``/``argmax`` ignore NaN, numpy returns the first NaN.
+def test_arg_reduce_nan_semantics_match_numpy():
+    """``argmin``/``argmax`` are NaN-aware: the FIRST NaN index wins.
 
     ``np.argmin``/``np.argmax`` on an array containing NaN return the index of
     the FIRST NaN (every comparison against NaN is False, so NaN "wins"). The
-    StableHLO arg-reduce comparator is
-    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)``, and both
-    terms are false for a NaN operand, so the NaN never wins and the result
-    is the index of a REAL extremum (which partial happens to win depends on
-    the stage-1 row layout). ``min``/``max`` themselves DO match numpy (NaN
-    propagates, pinned green by the parity suite); only the arg-reduces
-    diverge — and identically with ``split_reduction=False``.
+    StableHLO arg-reduce comparator carries a NaN case alongside
+    ``(value GT|LT rhs) OR (value EQ rhs AND idx LT rhs_idx)``, so a NaN
+    operand wins the reduction and the result is the lowest flat index holding
+    a NaN — the same answer as numpy, on both emission paths. ``min``/``max``
+    propagate NaN as well, so the whole reduce family agrees with numpy.
 
-    Minimal repro::
+    Expected values for a NaN at flat index 5::
 
         import numpy as np, etl
         f = lambda x: etl.argmin(x)
         spec = etl.TensorSpec((10001,), np.float32)
         x = np.random.default_rng(0).standard_normal(10001).astype(np.float32)
         x[5] = np.nan
-        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> int, not 5
+        etl.run(etl.build(f, spec, backend="iree"), x).numpy()  # -> 5
         etl.evaluate(f, x).numpy()                              # -> 5
     """
     shape, dtype = (10001,), np.float32
@@ -824,3 +817,4 @@ def test_bug_arg_reduce_nan_semantics_do_not_match_numpy():
     np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(split_off[1]))
     np.testing.assert_array_equal(etl_np(expected[0]), np.asarray(5, np.int64))
     np.testing.assert_array_equal(etl_np(split_on[0]), etl_np(expected[0]))
+    np.testing.assert_array_equal(etl_np(split_on[1]), etl_np(expected[1]))
