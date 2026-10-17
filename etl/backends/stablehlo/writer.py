@@ -231,6 +231,31 @@ def _normalize_eigh_algorithm(value) -> str:
     return mode
 
 
+#: Round unrolling for the batched ``eigh`` composition (``eigh_unroll``
+#: exporter option, see ``Writer.__init__`` and ``./eigh_batched.py``): the
+#: while BODY applies this many consecutive schedule rounds per iteration
+#: (loop bound ``ceil(total/U)``). Chosen empirically — the composition is
+#: per-iteration-overhead bound, so unrolling removes loop overhead until
+#: the per-round matrix work dominates.
+_EIGH_UNROLL_DEFAULT = 1
+
+
+def _normalize_eigh_unroll(value) -> int:
+    """Validate the ``eigh_unroll`` exporter option (see
+    ``Writer.__init__``): a positive int — the number of cyclic-Jacobi
+    schedule rounds ONE batched ``eigh`` while iteration applies.
+    ``None``/absent -> ``_EIGH_UNROLL_DEFAULT``."""
+    if value is None:
+        return _EIGH_UNROLL_DEFAULT
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise BackendError(
+            f"stablehlo export: invalid eigh_unroll option {value!r} "
+            "(expected an int >= 1 — the number of cyclic-Jacobi rounds "
+            "applied per batched eigh loop iteration)"
+        )
+    return int(value)
+
+
 class Writer(EighBatchedMixin):
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
@@ -304,6 +329,19 @@ class Writer(EighBatchedMixin):
         #: constants/iotas) and the post-loop tail (``_emit_eigh_finish``).
         self._eigh_algorithm = _normalize_eigh_algorithm(
             (options or {}).get("eigh_algorithm", _EIGH_ALGORITHM_DEFAULT)
+        )
+        #: eigh_unroll exporter option (positive int, default
+        #: ``_EIGH_UNROLL_DEFAULT``): the number of consecutive
+        #: cyclic-Jacobi schedule ROUNDS the batched composition's while
+        #: BODY applies per iteration (loop bound ``ceil(total/U)``, the
+        #: tail padded by repeating rounds of the schedule — same rotation
+        #: sequence, same fixed sweep count, same output contract). The
+        #: batched composition is per-iteration-overhead bound (~105-110 µs
+        #: per iteration CONSTANT in n on iree/rocm), so unrolling removes
+        #: loop/dispatch overhead until the per-round matrix work
+        #: dominates. Ignored by the sequential ``"jacobi"`` composition.
+        self._eigh_unroll = _normalize_eigh_unroll(
+            (options or {}).get("eigh_unroll", _EIGH_UNROLL_DEFAULT)
         )
         #: dot_precision exporter option (``"DEFAULT"`` | ``"HIGH"`` |
         #: ``"HIGHEST"``, case-insensitive; default ``"DEFAULT"``): when

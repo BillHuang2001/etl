@@ -35,10 +35,25 @@ Design (mirrors the numpy prototype that pinned the formulas):
   pinned this orientation — a dim-1 V step breaks the eigenvector pairing.
 - **Same loop shape as the sequential path.** One ``stablehlo.while``
   carrying ``(a, v, k)`` (plus the i1 ``done`` flag under
-  ``eigh_early_exit``), cond region EXACTLY ``k < total`` with
-  ``total = sweeps * L``, and every constant/iota hoisted OUTSIDE the loop
-  (iree 3.11 crashes on constants materialized inside while bodies —
-  ``util.global.load`` undefined ``@__hoisted_*``).
+  ``eigh_early_exit``), cond region EXACTLY ``k < iters`` with
+  ``iters = ceil(sweeps * L / U)``, and every constant/iota hoisted OUTSIDE
+  the loop (iree 3.11 crashes on constants materialized inside while bodies
+  — ``util.global.load`` undefined ``@__hoisted_*``).
+- **Round unrolling (``U`` = ``eigh_unroll``, default
+  ``writer._EIGH_UNROLL_DEFAULT``).** One while iteration applies ``U``
+  consecutive schedule rounds — round ``k*U + u`` for ``u in range(U)`` —
+  so the loop body costs ~``U``× the arithmetic but the loop runs
+  ``total/U`` times. The composition is overhead-bound (every iteration is
+  a handful of HAL dispatches + barriers, measured ~105-110 µs per
+  iteration CONSTANT in ``n`` on iree/rocm), so unrolling is a near-linear
+  win until the per-round matrix work starts to dominate. ``total`` is
+  padded up to a multiple of ``U`` by REPEATING the tail rounds of the
+  schedule: a repeated (p, q) rotation is an ordinary similarity transform
+  (never a no-op guarantee failure — the angle formula simply re-zeroes an
+  already-small off-diagonal), so the applied sequence stays the same
+  cyclic-Jacobi schedule over the same fixed sweep count and the output
+  contract (ascending ``w``, ``V``, stable pair-sort + gather column
+  reorder) is unchanged.
 
 This module imports only ``etl.core`` (+ numpy). It deliberately does NOT
 import ``writer`` — ``Writer`` inherits :class:`EighBatchedMixin`, so every
@@ -87,6 +102,32 @@ def eigh_batched_schedule(n: int) -> tuple[int, int, int | None]:
         fixed = None
     m = (L + 1) // 2
     return L, m, fixed
+
+
+class _RoundPrep:
+    """The HOISTED (outside-the-loop) values and static facts ONE batched
+    round emission needs.
+
+    Built once per ``eigh`` op so the unrolled while body can emit ``U``
+    rounds — each with a different runtime round index — without
+    re-deriving the SSA names of the loop-invariant scalar constants,
+    their broadcasts and the hoisted iotas (all referenced lexically from
+    inside the body region; a value materialized INSIDE a while body
+    breaks iree's constant hoisting, see the module docstring).
+    """
+
+    __slots__ = (
+        "i64", "dtype", "n", "m", "batch", "fixed",
+        "pre_shape", "vec_shape",
+        "i_l", "i_two",
+        "ti", "jj", "l_m", "l_n", "two_n", "two_l_n", "zero_n", "zero_m",
+        "f_m", "f_n", "b_true_n", "b_false_n",
+        "two_p", "one_p", "neg_one_p", "zero_p", "is_bye_b",
+    )
+
+    def __init__(self, **kwargs) -> None:
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class EighBatchedMixin:
@@ -203,6 +244,12 @@ class EighBatchedMixin:
         even = fixed is not None
         sweeps = self._eigh_sweeps(n, dtype)
         total = sweeps * L
+        #: Round unrolling: ``U`` schedule rounds per while iteration, so
+        #: the loop runs ``ceil(total / U)`` iterations. The tail is padded
+        #: by REPEATING rounds of the schedule (see the module docstring) —
+        #: same rotation sequence, same fixed sweep count.
+        U = self._eigh_unroll
+        n_iters = -(-total // U)
         t_shape = (n, n) + batch
         pre_shape = (m,) + batch      # per-SLOT values
         vec_shape = (n,) + batch      # per-INDEX values
@@ -261,8 +308,22 @@ class EighBatchedMixin:
         lines.extend(extra)
         i_two_l, extra = self._scalar_constant_for(i64, 2 * L, ())
         lines.extend(extra)
-        i_total, extra = self._scalar_constant_for(i64, total, ())
+        #: The loop bound is the ITERATION count (``ceil(total / U)``); the
+        #: unroll factor is itself a hoisted scalar so each body round can
+        #: derive its global round index ``k*U + u`` without a per-round
+        #: constant.
+        i_iters, extra = self._scalar_constant_for(i64, n_iters, ())
         lines.extend(extra)
+        i_unroll = None
+        u_scalars = [i_zero]
+        if U > 1:
+            i_unroll, extra = self._scalar_constant_for(i64, U, ())
+            lines.extend(extra)
+            u_scalars.append(i_one)
+            for u in range(2, U):
+                i_u, extra = self._scalar_constant_for(i64, u, ())
+                lines.extend(extra)
+                u_scalars.append(i_u)
         # --- hoisted broadcasts of those scalars to (m,)/(n,) -------------
         l_m = self._bcast(i_l, i64, (), (m,), [], lines)
         l_n = self._bcast(i_l, i64, (), (n,), [], lines)
@@ -336,17 +397,116 @@ class EighBatchedMixin:
         carry_types = "(" + ", ".join(arg_types) + ")"
         n_carries = len(arg_types)
         k_index = 2
-        cond_region = self._emit_eigh_cond_region(arg_types, i_total, k_index)
-        # --- the body: one ROUND of disjoint rotations --------------------
+        cond_region = self._emit_eigh_cond_region(arg_types, i_iters, k_index)
+        # --- the body: ``U`` consecutive ROUNDS of disjoint rotations -----
         body_args = [self._new_name() for _ in range(n_carries)]
         bl: list[str] = []
-        p, q, slot, partner, is_p = self._eigh_rotation_maps(
-            body_args[k_index], bl, i64=i64, L=L, m=m, n=n, fixed=fixed,
+        prep = _RoundPrep(
+            i64=i64, dtype=dtype, n=n, m=m, batch=batch, fixed=fixed,
+            pre_shape=pre_shape, vec_shape=vec_shape, i_l=i_l, i_two=i_two,
             ti=ti, jj=jj, l_m=l_m, l_n=l_n, two_n=two_n, two_l_n=two_l_n,
-            zero_n=zero_n, zero_m=zero_m, i_two=i_two, i_l=i_l,
-            f_m=f_m, f_n=f_n, b_true_n=b_true_n, b_false_n=b_false_n,
+            zero_n=zero_n, zero_m=zero_m, f_m=f_m, f_n=f_n,
+            b_true_n=b_true_n, b_false_n=b_false_n, two_p=two_p,
+            one_p=one_p, neg_one_p=neg_one_p, zero_p=zero_p,
+            is_bye_b=is_bye_b,
         )
-        a_name, v_name = body_args[0], body_args[1]
+        a2, v2 = self._eigh_rounds(
+            body_args[k_index], body_args[0], body_args[1], prep, bl,
+            i_unroll=i_unroll, u_scalars=u_scalars,
+        )
+        # --- counter step (+ the early-exit k-clamp) ----------------------
+        k2 = self._ew("add", body_args[k_index], i_one, i64, (), bl)
+        if early_exit:
+            # The sweep check counts ROUNDS, so the unrolled post-increment
+            # iteration counter is scaled back to rounds before it.
+            k_rounds = k2
+            if i_unroll is not None:
+                k_rounds = self._ew("multiply", k2, i_unroll, i64, (), bl)
+            done2 = self._emit_eigh_sweep_check(
+                bl, a2, body_args[k_index + 1], k_rounds, dtype, batch,
+                t_shape, m_neq, tol_sq, z_zero, b_true, i_l, i_zero,
+                i1_scalar,
+            )
+            k2 = self._sel(done2, i_iters, k2, i64, (), bl)
+        ret_values = [a2, v2, k2]
+        if early_exit:
+            ret_values.append(done2)
+        body_region = (
+            "  ^bb0("
+            + ", ".join(f"{nm} : {tp}" for nm, tp in zip(body_args, arg_types))
+            + "):\n"
+            + "\n".join("    " + line for line in bl)
+            + f"\n    stablehlo.return {', '.join(ret_values)} : "
+            + ", ".join(arg_types)
+        )
+        inits = [a, v, i_zero]
+        if early_exit:
+            inits.append(b_false)
+        result_names = [self._new_name() for _ in range(n_carries)]
+        lines.append(
+            f"{', '.join(result_names)} = \"stablehlo.while\"("
+            f"{', '.join(inits)}) ({{\n"
+            + cond_region
+            + "\n  }, {\n"
+            + body_region
+            + f"\n  }}) : {carry_types} -> {carry_types}"
+        )
+        a, v = result_names[0], result_names[1]
+        self._emit_eigh_finish(op, a, v, dtype, x_shape, n, lines)
+        return "\n".join(lines)
+
+    def _eigh_rounds(self, k_name, a_name, v_name, prep, bl, *, i_unroll,
+                     u_scalars):
+        """Apply ``len(u_scalars)`` CONSECUTIVE schedule rounds inside the
+        while body and return the resulting ``(a, v)`` names.
+
+        Each round's GLOBAL index is ``k*U + u`` (``k`` the iteration
+        counter), reduced mod ``L`` to the round number — so the sequence
+        of applied rounds is the plain cyclic-Jacobi schedule
+        ``0, 1, …``, padded at the very end by repeating its tail (see the
+        module docstring). The round count is ``U`` and the loop bound
+        ``ceil(total/U)``; both are hoisted scalars, so the body adds only
+        one ``multiply`` + ``U-1`` ``add`` ops of round-index arithmetic on
+        top of the per-round work.
+        """
+        if i_unroll is None:  # U == 1: the counter IS the round index
+            base = k_name
+        else:
+            base = self._ew("multiply", k_name, i_unroll, prep.i64, (), bl)
+        for u, i_u in enumerate(u_scalars):
+            if u == 0:
+                rnd = base
+            else:
+                rnd = self._ew("add", base, i_u, prep.i64, (), bl)
+            r = self._ew("remainder", rnd, prep.i_l, prep.i64, (), bl)
+            a_name, v_name = self._eigh_round(r, a_name, v_name, prep, bl)
+        return a_name, v_name
+
+    def _eigh_round(self, r, a_name, v_name, prep, bl) -> tuple[str, str]:
+        """Emit ONE schedule round — the ``L``-modulus round index ``r`` is
+        already reduced — and return the new ``(a, v)`` names.
+
+        The round applies its ``m`` mutually-disjoint rotations at once
+        (the per-slot (p, q) pair and the per-index (slot, partner, is_p)
+        maps are derived arithmetically from the hoisted iotas), using the
+        textbook ``tau = (a_qq - a_pp)/(2 a_pq)`` angle formulas: A takes
+        the column then the row half-step, V the single dim-0 step (the
+        carried V is ``V^T``). Every operand this needs is HOISTED — the
+        only per-round inputs are ``r`` and the carried matrices.
+        """
+        n, m, batch, dtype = prep.n, prep.m, prep.batch, prep.dtype
+        pre_shape, vec_shape = prep.pre_shape, prep.vec_shape
+        i64, i1 = prep.i64, np.dtype("bool")
+        p, q, slot, partner, is_p = self._eigh_rotation_maps(
+            r, bl, i64=i64, m=m, n=n, fixed=prep.fixed, ti=prep.ti,
+            jj=prep.jj, l_m=prep.l_m, l_n=prep.l_n, two_n=prep.two_n,
+            two_l_n=prep.two_l_n, zero_n=prep.zero_n, zero_m=prep.zero_m,
+            i_two=prep.i_two, f_m=prep.f_m, f_n=prep.f_n,
+            b_true_n=prep.b_true_n, b_false_n=prep.b_false_n,
+        )
+        two_p, one_p = prep.two_p, prep.one_p
+        neg_one_p, zero_p = prep.neg_one_p, prep.zero_p
+        is_bye_b = prep.is_bye_b
         # --- per-SLOT rotation angles (identical formulas to the
         # sequential body, evaluated for the whole round at once) ---------
         idx_pq = self._eigh_index_pairs(p, q, m, bl)
@@ -395,48 +555,17 @@ class EighBatchedMixin:
                                  batch, dtype, bl)
         v2 = self._eigh_half_step(v_name, cvec, svec, idx_partner, 0, n,
                                  batch, dtype, bl)
-        # --- counter step (+ the early-exit k-clamp) ----------------------
-        k2 = self._ew("add", body_args[k_index], i_one, i64, (), bl)
-        if early_exit:
-            done2 = self._emit_eigh_sweep_check(
-                bl, a2, body_args[k_index + 1], k2, dtype, batch, t_shape,
-                m_neq, tol_sq, z_zero, b_true, i_l, i_zero, i1_scalar,
-            )
-            k2 = self._sel(done2, i_total, k2, i64, (), bl)
-        ret_values = [a2, v2, k2]
-        if early_exit:
-            ret_values.append(done2)
-        body_region = (
-            "  ^bb0("
-            + ", ".join(f"{nm} : {tp}" for nm, tp in zip(body_args, arg_types))
-            + "):\n"
-            + "\n".join("    " + line for line in bl)
-            + f"\n    stablehlo.return {', '.join(ret_values)} : "
-            + ", ".join(arg_types)
-        )
-        inits = [a, v, i_zero]
-        if early_exit:
-            inits.append(b_false)
-        result_names = [self._new_name() for _ in range(n_carries)]
-        lines.append(
-            f"{', '.join(result_names)} = \"stablehlo.while\"("
-            f"{', '.join(inits)}) ({{\n"
-            + cond_region
-            + "\n  }, {\n"
-            + body_region
-            + f"\n  }}) : {carry_types} -> {carry_types}"
-        )
-        a, v = result_names[0], result_names[1]
-        self._emit_eigh_finish(op, a, v, dtype, x_shape, n, lines)
-        return "\n".join(lines)
+        return a2, v2
 
-    def _eigh_rotation_maps(self, k_name, bl, *, i64, L, m, n, fixed, ti, jj,
+    def _eigh_rotation_maps(self, r, bl, *, i64, m, n, fixed, ti, jj,
                             l_m, l_n, two_n, two_l_n, zero_n, zero_m, i_two,
-                            i_l, f_m, f_n, b_true_n, b_false_n):
+                            f_m, f_n, b_true_n, b_false_n):
         """The round-``r`` index maps, derived ARITHMETICALLY from hoisted
         iotas — no scatter, no per-element mask over the matrix.
 
-        ``r = k mod L`` selects the round. Per SLOT (``(m,)`` vectors):
+        ``r`` is the ALREADY-REDUCED round index (``round mod L``, computed
+        by the caller :meth:`_eigh_rounds` from the unrolled iteration
+        counter). Per SLOT (``(m,)`` vectors):
         ``p``/``q`` are the rotation pair. Per INDEX (``(n,)`` vectors):
         ``slot`` (which slot's pair index ``jj`` belongs to), ``partner``
         (its partner vertex) and ``is_p`` (whether ``jj`` is the FIRST
@@ -448,7 +577,6 @@ class EighBatchedMixin:
         never depends on a sign convention. Returns ``(p, q, slot, partner,
         is_p)``.
         """
-        r = self._ew("remainder", k_name, i_l, i64, (), bl)
         r_m = self._bcast(r, i64, (), (m,), [], bl)
         r_n = self._bcast(r, i64, (), (n,), [], bl)
         # --- per-SLOT pair (p, q) -----------------------------------------
