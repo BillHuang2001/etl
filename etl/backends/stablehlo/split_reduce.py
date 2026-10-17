@@ -46,6 +46,14 @@ BYTE-FOR-BYTE):
      the ``split_reduction_non_exact`` exporter option is set True (measured
      gain is in ``stablehlo/CONTEXT.md``).
 
+7. on ROCm, no stage extent may be a multiple of 64 for a SIGNED
+   narrow-integer ``min`` (a pre-existing upstream iree 3.11 miscompile that
+   returns ``-1`` — see :data:`UNSAFE_MIN_EXTENT_MULTIPLE`): the row count is
+   re-picked so both stage extents escape that class (``(10007,)`` i32 ``min``
+   becomes ``127 x 79``, not ``128 x 79``), and when nothing escapes it the
+   single-stage text is kept. Float/``i64``/unsigned/``maximum``/``sum``/
+   ``prod`` splits are unaffected — the guard only covers the measured class.
+
 Both stages keep the caller's dtype, promotion ``convert``, ``keepdims``
 reshape, ``reduce_mean`` divide and the arg-reduce bool->int8 key
 conversion — only the reduce itself is replaced.
@@ -85,6 +93,18 @@ SPLIT_ROWS_MAX = 256
 #: non-reduced work) is small: the result must have at most this many
 #: elements (rank-0 included).
 SPLIT_RESULT_ELEMS_LIMIT = 1024
+#: Upstream iree 3.11 ROCm miscompile guard: a SIGNED narrow-integer
+#: (``i8``/``i16``/``i32``) ``minimum`` reduce whose reduce EXTENT is a
+#: multiple of this value returns ``-1`` instead of the minimum. Measured on
+#: an AMD MI300X (gfx942, iree-base 3.11.0) with hand-written MLIR: extents
+#: 64/128/192/256/320/384/448 (and every power of two >= 64) are WRONG while
+#: 60/61/62/63/65/66/96/100/112/120/127/129/160/200/224/288/352 are right;
+#: ``i64``, the UNSIGNED narrow ints, ``maximum``, ``sum``/``prod``, ``f16``/
+#: ``f32``/``f64`` and ``i1`` are all unaffected, and llvm-cpu is clean at
+#: every extent. The single-stage text hits the same bug, so this guard only
+#: keeps the SPLIT from landing a stage extent inside the broken class (it
+#: often picks a large stage extent where the pre-split graph was exact).
+UNSAFE_MIN_EXTENT_MULTIPLE = 64
 
 
 def _is_static_extent(dim) -> bool:
@@ -181,6 +201,51 @@ def split_extent(n: int) -> tuple[int, int, int] | None:
     if c < 2:
         return None
     return r, c, r * c - n
+
+
+def split_stage_extents(shape, dims, pivot: int, r: int, c: int) -> tuple:
+    """The ``(stage1, stage2)`` reduce EXTENTS of the split emission.
+
+    Stage 1 reduces the ``C`` axis plus every reduced dim after the pivot
+    (those keep their original extent); stage 2 reduces the ``R`` axis.
+    Used by the :data:`UNSAFE_MIN_EXTENT_MULTIPLE` guard."""
+    stage1 = int(c)
+    for d in dims:
+        if int(d) > pivot:
+            stage1 *= int(shape[int(d)])
+    return stage1, int(r)
+
+
+def _signed_narrow_min(dtype, kind: str) -> bool:
+    """True for the reduction class the ROCm ``minimum`` miscompile hits:
+    ``min`` over a SIGNED integer dtype narrower than 64 bits (see
+    :data:`UNSAFE_MIN_EXTENT_MULTIPLE`)."""
+    return kind == "min" and dtype.kind == "i" and dtype.itemsize < 8
+
+
+def split_extent_avoiding_multiple(
+    n: int, r: int, after: int,
+) -> tuple[int, int, int] | None:
+    """``(r, c, pad)`` with NO stage extent a multiple of
+    :data:`UNSAFE_MIN_EXTENT_MULTIPLE`, searched outward from ``r`` in
+    ``[SPLIT_ROWS_MIN, SPLIT_ROWS_MAX]`` (``after`` is the product of the
+    reduced extents past the pivot, which stage 1 also reduces over).
+    ``None`` when no such geometry exists — the caller then keeps the
+    single-stage text."""
+    for delta in range(0, SPLIT_ROWS_MAX + 1):
+        candidates = (r,) if delta == 0 else (r - delta, r + delta)
+        for cand in candidates:
+            if cand < SPLIT_ROWS_MIN or cand > SPLIT_ROWS_MAX:
+                continue
+            c = -(-n // cand)
+            if c < 2:
+                continue
+            if cand % UNSAFE_MIN_EXTENT_MULTIPLE == 0:
+                continue
+            if (c * after) % UNSAFE_MIN_EXTENT_MULTIPLE == 0:
+                continue
+            return cand, c, cand * c - n
+    return None
 
 
 def _simple_reduce_region(writer, elem_type: str, mnemonic: str) -> str:
@@ -285,6 +350,24 @@ class SplitReductionMixin:
         if extent is None:
             return None
         r, c, pad = extent
+        if _signed_narrow_min(dtype, kind):
+            # Avoid the ROCm ``minimum`` miscompile class (see
+            # UNSAFE_MIN_EXTENT_MULTIPLE): re-pick the row count when either
+            # stage extent would land on a multiple of 64, and keep the
+            # single-stage text when no geometry escapes it.
+            after = 1
+            for i in dims:
+                if int(i) > pivot:
+                    after *= int(shape[int(i)])
+            stage1, stage2 = split_stage_extents(shape, dims, pivot, r, c)
+            if (
+                stage1 % UNSAFE_MIN_EXTENT_MULTIPLE == 0
+                or stage2 % UNSAFE_MIN_EXTENT_MULTIPLE == 0
+            ):
+                safe = split_extent_avoiding_multiple(n, r, after)
+                if safe is None:
+                    return None
+                r, c, pad = safe
         return {
             "shape": shape,
             "dims": dims,
