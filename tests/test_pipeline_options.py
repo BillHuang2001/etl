@@ -21,6 +21,11 @@ Pinned here:
   option keys.
 * malformed env values raise ``core.BackendError`` naming the variable and
   the value — never a raw shlex/base64/json exception.
+* the ``lower``-stage rows ``ETL_EIGH_ALGORITHM`` -> ``eigh_algorithm``
+  (whitespace-stripped; the stablehlo Writer validates the value) and
+  ``ETL_SPLIT_REDUCTION`` -> ``split_reduction`` (coerced to a real ``bool``)
+  apply at every compiler backend's lower stage only, obey the same
+  precedence, and reach the exporter end to end (final gated section).
 * an unknown backend / a stage with no table entry is a no-op.
 * full-path stub tests (a functional ``"iree"`` stub registered under the
   adapter name, exactly like ``pipeline_env_defaults_test.py``): the env
@@ -31,11 +36,15 @@ Pinned here:
   options (``rank_context`` still flows through), and
   ``BoundExecutable.backend`` reports the stub's backend name.
 
-No test imports (or triggers the import of) a real compiler adapter: the
-iree-family paths use stub ``Backend`` instances (helper-level) or a
-functional stub registered under the name ``"iree"`` (full-path). The
-backend half of the contract (per-adapter ``KNOWN_OPTIONS`` validation) is
-pinned by ``tests/backends/test_options_override.py``.
+Only the FINAL end-to-end export pins (the ``lower``-stage
+``eigh_algorithm`` / ``split_reduction`` rows) touch the real iree adapter:
+those two tests import ``iree.compiler``/``iree.runtime`` inside their bodies,
+skip when absent, and are placed at the very END of the module so the import
+can never leak into the stub full-path tests above them. Every other test
+stays adapter-free — the iree-family paths use stub ``Backend`` instances
+(helper-level) or a functional stub registered under the name ``"iree"``
+(full-path). The backend half of the contract (per-adapter ``KNOWN_OPTIONS``
+validation) is pinned by ``tests/backends/test_options_override.py``.
 """
 
 from __future__ import annotations
@@ -52,13 +61,21 @@ from etl.backends.options import STAGES
 from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 
 #: The env vars this module drives (cleared by the autouse fixture so no test
-#: ever sees a stray value from the host environment).
+#: ever sees a stray value from the host environment). Grouped by stage and
+#: kept complete for both the vars the tests set and the vars the table
+#: declares under the (backend, stage) keys these tests exercise.
 OPTION_ENV_VARS = (
+    # compile stage
     "ETL_IREE_COMPILE_ARGS",
-    "ETL_IREE_RUNTIME_ARGS",
     "ETL_XLA_COMPILE_OPTIONS",
     "ETL_TVM_TARGET",
     "ETL_TVM_PASS_CONFIGS",
+    "ETL_OPT_LEVEL",
+    # load stage
+    "ETL_IREE_RUNTIME_ARGS",
+    # lower stage (the reserved exporter options)
+    "ETL_EIGH_ALGORITHM",
+    "ETL_SPLIT_REDUCTION",
 )
 
 #: Was the iree adapter already imported before this module ran (e.g. by an
@@ -120,8 +137,11 @@ def test_env_option_table_entries():
     assert set(ENV_OPTION_TABLE) == {
         ("iree", "compile"),
         ("iree", "load"),
+        ("iree", "lower"),
         ("xla", "compile"),
+        ("xla", "lower"),
         ("tvm", "compile"),
+        ("tvm", "lower"),
     }
 
 
@@ -175,6 +195,28 @@ def test_env_option_table_stages_are_canonical():
     for (backend, stage) in ENV_OPTION_TABLE:
         assert backend in ("iree", "xla", "tvm")
         assert stage in STAGES
+
+
+#: The compiler backends whose ``lower`` row repeats the same two
+#: backend-agnostic exporter options.
+_LOWER_BACKENDS = ("iree", "xla", "tvm")
+
+
+def test_env_option_table_lower_rows():
+    """Each compiler backend's lower row carries exactly the two reserved
+    exporter options — the same backend-agnostic spelling everywhere."""
+    for backend in _LOWER_BACKENDS:
+        entries = ENV_OPTION_TABLE[(backend, "lower")]
+        assert len(entries) == 2
+        assert {entry[1] for entry in entries} == {
+            "eigh_algorithm",
+            "split_reduction",
+        }
+        assert {(entry[0], entry[1]) for entry in entries} == {
+            ("ETL_EIGH_ALGORITHM", "eigh_algorithm"),
+            ("ETL_SPLIT_REDUCTION", "split_reduction"),
+        }
+        assert all(callable(entry[2]) for entry in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +453,106 @@ def test_caller_dict_never_mutated(monkeypatch):
         "target_backends": ["llvm-cpu"],
         "iree_compile_args": ["--flag"],
     }
+
+
+# ---------------------------------------------------------------------------
+# The lower-stage rows (reserved exporter options)
+# ---------------------------------------------------------------------------
+
+
+def test_eigh_algorithm_env_parsed(monkeypatch):
+    """ETL_EIGH_ALGORITHM maps to eigh_algorithm at every lower row with only
+    the whitespace stripped — the value is validated by the stablehlo Writer;
+    a blank value is unset."""
+    monkeypatch.setenv("ETL_EIGH_ALGORITHM", "  jacobi  ")
+    for backend in _LOWER_BACKENDS:
+        assert apply_env_options(backend, {}, "lower") == {
+            "eigh_algorithm": "jacobi"
+        }
+    # A blank value is unset (never an empty-string option).
+    for blank in ("", "   "):
+        monkeypatch.setenv("ETL_EIGH_ALGORITHM", blank)
+        for backend in _LOWER_BACKENDS:
+            assert apply_env_options(backend, {}, "lower") == {}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        (" TRUE ", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        (" FALSE ", False),
+    ],
+)
+def test_split_reduction_env_parsed(monkeypatch, value, expected):
+    """ETL_SPLIT_REDUCTION coerces to a real bool at every lower row (never
+    the bool("0") is True trap)."""
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", value)
+    for backend in _LOWER_BACKENDS:
+        assert apply_env_options(backend, {}, "lower") == {
+            "split_reduction": expected
+        }
+
+
+def test_lower_env_blanks_are_unset(monkeypatch):
+    """A blank lower-stage env value is treated as unset for both rows."""
+    for blank in ("", "   ", "\t \n"):
+        monkeypatch.setenv("ETL_EIGH_ALGORITHM", blank)
+        monkeypatch.setenv("ETL_SPLIT_REDUCTION", blank)
+        for backend in _LOWER_BACKENDS:
+            assert apply_env_options(backend, {}, "lower") == {}
+
+
+def test_lower_stage_explicit_wins_env(monkeypatch):
+    """An explicit lower option key always wins over its env var; the other
+    key is still env-supplied."""
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", "1")
+    monkeypatch.setenv("ETL_EIGH_ALGORITHM", "jacobi")
+    assert apply_env_options("iree", {"split_reduction": False}, "lower") == {
+        "split_reduction": False,
+        "eigh_algorithm": "jacobi",
+    }
+    assert apply_env_options(
+        "iree", {"eigh_algorithm": "jacobi_batched"}, "lower"
+    ) == {"eigh_algorithm": "jacobi_batched", "split_reduction": True}
+
+
+def test_lower_env_stage_scoped(monkeypatch):
+    """The lower rows apply at the lower stage only — never at compile, load
+    or run, and never for the numpy backend or an absent backend name."""
+    monkeypatch.setenv("ETL_EIGH_ALGORITHM", "jacobi")
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", "1")
+    for backend in _LOWER_BACKENDS:
+        assert apply_env_options(backend, {}, "lower") == {
+            "eigh_algorithm": "jacobi",
+            "split_reduction": True,
+        }
+        for stage in ("compile", "load", "run"):
+            assert apply_env_options(backend, {}, stage) == {}
+    assert apply_env_options("numpy", {}, "lower") == {}
+    assert apply_env_options(None, {}, "lower") == {}
+
+
+def test_split_reduction_malformed_env_raises_backend_error(monkeypatch):
+    """A non-bool ETL_SPLIT_REDUCTION raises core.BackendError naming the
+    variable, the value and the accepted forms (the shared bool coercer's
+    message)."""
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", "banana")
+    with pytest.raises(core.BackendError) as excinfo:
+        apply_env_options("iree", {}, "lower")
+    message = str(excinfo.value)
+    assert "invalid ETL_SPLIT_REDUCTION='banana'" in message
+    assert (
+        "accepted forms: True/False, 0/1, or one of 'true', 'false', 'yes', "
+        "'no', 'on', 'off' (case-insensitive)"
+    ) in message
 
 
 # ---------------------------------------------------------------------------
@@ -658,3 +800,107 @@ def test_bound_executable_backend_property(monkeypatch, iree_stub_registered):
     x = _linear_inputs()[0]
     np.testing.assert_allclose(etl.run(bound, w, b).numpy(), _ref(x, w, b))
     _assert_no_new_iree_import()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end export pins through the REAL iree adapter (gated, last in module)
+#
+# These are the only tests here that import a real compiler adapter — imported
+# inside the test bodies so they skip (rather than fail) when iree is absent,
+# and placed after every ``_assert_no_new_iree_import()`` call site.
+# ---------------------------------------------------------------------------
+
+
+@etl.defn
+def _eigh10(a):
+    """A (10,10) eigh — the exporter option selects the while-loop shape."""
+    return etl.eigh(a)
+
+
+@etl.defn
+def _reduce_min_10001(x):
+    """A 10001-element reduce_min — above the split-reduction threshold."""
+    return etl.reduce_min(x)
+
+
+def _iree_lower_mlir(graph):
+    """Lower ``graph`` for iree-llvm-cpu (an export, not a compile) and return
+    the exported StableHLO text."""
+    lowered = etl.lower(graph, backend="iree", target_backends=["llvm-cpu"])
+    return lowered.payload["mlir_text"]
+
+
+def _iree_lower_mlir_with_options(graph, options):
+    """The same export with EXPLICIT lower options (the explicit-kwarg half of
+    the precedence contract)."""
+    lowered = etl.lower(
+        graph, backend="iree", target_backends=["llvm-cpu"], **options
+    )
+    return lowered.payload["mlir_text"]
+
+
+def test_eigh_algorithm_invalid_env_raises_at_lower(monkeypatch):
+    """An unknown ETL_EIGH_ALGORITHM raises core.BackendError end to end from
+    the stablehlo Writer (listing the accepted values), not from the option
+    framework — the value is validated by the consumer."""
+    pytest.importorskip("iree.compiler")
+    pytest.importorskip("iree.runtime")
+    monkeypatch.setenv("ETL_EIGH_ALGORITHM", "banana")
+    graph = etl.trace(_eigh10, etl.TensorSpec((10, 10), etl.float32))
+    with pytest.raises(core.BackendError) as excinfo:
+        etl.lower(graph, backend="iree", target_backends=["llvm-cpu"])
+    message = str(excinfo.value)
+    assert "invalid eigh_algorithm option 'banana'" in message
+    assert "expected one of jacobi, jacobi_batched" in message
+
+
+def test_eigh_algorithm_env_reaches_exporter(monkeypatch):
+    """ETL_EIGH_ALGORITHM=jacobi selects the sequential composition in the
+    lowered text: 132 lines instead of the 148-line batched default, and
+    byte-identical to a direct export with the same option."""
+    pytest.importorskip("iree.compiler")
+    pytest.importorskip("iree.runtime")
+    from etl.backends import stablehlo
+
+    graph = etl.trace(_eigh10, etl.TensorSpec((10, 10), etl.float32))
+    default_text = _iree_lower_mlir(graph)
+    assert len(default_text.splitlines()) == 148
+
+    monkeypatch.setenv("ETL_EIGH_ALGORITHM", "jacobi")
+    env_text = _iree_lower_mlir(graph)
+    assert len(env_text.splitlines()) == 132
+    # The env half and the direct-export half are independent: the env is
+    # cleared before the explicit comparison.
+    monkeypatch.delenv("ETL_EIGH_ALGORITHM")
+    explicit_text = _iree_lower_mlir_with_options(
+        graph, {"eigh_algorithm": "jacobi"}
+    )
+    assert env_text == explicit_text
+    assert explicit_text == stablehlo.export(
+        graph, options={"eigh_algorithm": "jacobi"}
+    )
+    assert env_text != default_text
+
+
+def test_split_reduction_env_reaches_exporter(monkeypatch):
+    """ETL_SPLIT_REDUCTION is honored at lower: 0 emits the single plain
+    reduce (no split marker) byte-identically to an explicit option, 1 emits
+    the two-reduce split with its marker comment."""
+    pytest.importorskip("iree.compiler")
+    pytest.importorskip("iree.runtime")
+
+    graph = etl.trace(_reduce_min_10001, etl.TensorSpec((10001,), etl.float32))
+
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", "0")
+    off_text = _iree_lower_mlir(graph)
+    assert off_text.count("stablehlo.reduce") == 1
+    assert off_text.count("// etl split reduction:") == 0
+    # Env cleared before the explicit-option comparison, so independent.
+    monkeypatch.delenv("ETL_SPLIT_REDUCTION")
+    explicit_off = _iree_lower_mlir_with_options(graph, {"split_reduction": False})
+    assert off_text == explicit_off
+
+    monkeypatch.setenv("ETL_SPLIT_REDUCTION", "1")
+    on_text = _iree_lower_mlir(graph)
+    assert on_text.count("stablehlo.reduce") == 2
+    assert on_text.count("// etl split reduction:") == 1
