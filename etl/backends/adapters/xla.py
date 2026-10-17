@@ -93,6 +93,7 @@ from .xla_util import (
     acquire_client,
     release_client,
     release_payload,
+    release_payloads,
     set_opt_level,
 )
 
@@ -568,6 +569,41 @@ class XlaBackend(CompilerBackend):
         )
 
 
+class _XlaRunPlan:
+    """The per-executable run plan (built once, reused by every run).
+
+    Pure derivation from ``signature`` + the artifact's recorded static
+    shapes — no observable behavior: it holds the input/output arity, the
+    per-leaf ``(dtype, shape)`` validation contracts, and the static output
+    metadata handed to the driver so output buffers are created WITHOUT a
+    plugin metadata query (``output_meta``; verified on the executable's
+    first device-resident run).
+    """
+
+    __slots__ = (
+        "num_inputs",
+        "input_contracts",
+        "num_outputs",
+        "output_contracts",
+        "output_meta",
+    )
+
+    def __init__(
+        self,
+        input_contracts: tuple[tuple[Any, tuple[int, ...]], ...],
+        output_contracts: tuple[tuple[Any, tuple[int, ...]], ...],
+    ) -> None:
+        self.num_inputs = len(input_contracts)
+        self.input_contracts = input_contracts
+        self.num_outputs = len(output_contracts)
+        self.output_contracts = output_contracts
+        # Driver-side prefilled output metadata (shape, dtype) — the same
+        # static contract, in the order the plugin returns buffers.
+        self.output_meta = tuple(
+            (shape, dtype) for dtype, shape in output_contracts
+        )
+
+
 class XlaExecutable(CompilerExecutable):
     """Run-time object for the xla backend (satisfies ``Executable``).
 
@@ -628,6 +664,17 @@ class XlaExecutable(CompilerExecutable):
         # The raw PJRT_Device* this executable executes on (None = the
         # compile-time device — the CPU path, unchanged).
         self._execute_device = execute_device
+        # Lazy per-executable run plan (arity, per-leaf dtype/shape
+        # contracts, static output metadata) — built ONCE from the signature
+        # + the artifact's recorded static shapes, so a run never re-derives
+        # them (see ``_build_run_plan``).
+        self._run_plan: _XlaRunPlan | None = None
+        # Device-resident runs prefilled the plugin's output metadata with
+        # the recorded static contract; the FIRST run of this executable
+        # verifies it against the plugin's real buffer metadata (loud
+        # ``core.BackendError`` on a mismatch), then the contract is
+        # trusted — XLA executable output types are static.
+        self._outputs_verified = False
 
     def close(self) -> None:
         """Release the plugin handles (executable first, then the client ref).
@@ -674,6 +721,20 @@ class XlaExecutable(CompilerExecutable):
         the xla run stage has NO known options in v1, so any non-empty
         options dict raises ``core.BackendError`` (loud; never silently
         swallowed).
+
+        Per-call cost design (device-resident hot path): the validation
+        contracts come from a plan built ONCE per executable, the driver
+        reuses a per-thread execute scaffolding and its cached output count,
+        and output buffers are created with the recorded static output
+        metadata prefilled (zero plugin metadata FFI per output). The
+        prefilled metadata is NOT trusted blindly: the FIRST device-resident
+        run of this executable verifies every output buffer against the
+        plugin's real ``PJRT_Buffer_Dimensions``/``PJRT_Buffer_ElementType``
+        metadata (a mismatch raises a loud ``core.BackendError``), then the
+        recorded static contract is trusted because XLA executable output
+        types are static; every explicit host read-back re-verifies too.
+        One shared-client reference (and one finalizer) is taken per run's
+        output set, not per output tensor.
         """
         from ..options import validate_options
 
@@ -688,31 +749,27 @@ class XlaExecutable(CompilerExecutable):
                 "this XlaExecutable has no recorded signature to validate "
                 "inputs against"
             )
-        input_specs = tuple(self.signature.input_specs)
-        if len(flat_input_tensors) != len(input_specs):
+        plan = self._run_plan
+        if plan is None:
+            plan = self._build_run_plan()
+        if len(flat_input_tensors) != plan.num_inputs:
             raise core.BackendError(
-                f"program expects {len(input_specs)} input tensor(s), got "
+                f"program expects {plan.num_inputs} input tensor(s), got "
                 f"{len(flat_input_tensors)}"
             )
-        recorded_input_shapes = self._recorded_shapes(
-            "static_input_shapes", len(input_specs)
-        )
-        expected_shapes = [
-            tuple(recorded_input_shapes[i]) for i in range(len(input_specs))
-        ]
         device_resident = self.device is not None and self.device.kind != "cpu"
+        input_contracts = plan.input_contracts
         arrays: list[Any] = []
-        for i, (tensor, spec, expected) in enumerate(
-            zip(flat_input_tensors, input_specs, expected_shapes)
-        ):
+        for i, tensor in enumerate(flat_input_tensors):
+            dtype, expected = input_contracts[i]
             if not isinstance(tensor, core.Tensor):
                 raise core.BackendError(
                     f"input {i} must be a core.Tensor, got "
                     f"{type(tensor).__name__}"
                 )
-            if tensor.dtype != spec.dtype:
+            if tensor.dtype != dtype:
                 raise core.DTypeError(
-                    f"input {i}: expected dtype {spec.dtype}, got "
+                    f"input {i}: expected dtype {dtype}, got "
                     f"{tensor.dtype}"
                 )
             if tuple(tensor.shape) != expected:
@@ -729,58 +786,99 @@ class XlaExecutable(CompilerExecutable):
 
         if device_resident:
             buffers = arrays  # _Buffer handles owned by their payloads
-        else:
-            buffers = [self._client.buffer_from_host(array) for array in arrays]
-        output_buffers: list[Any] = []
-        try:
             output_buffers = self.native_module.execute(
-                buffers, execute_device=self._execute_device
+                buffers,
+                execute_device=self._execute_device,
+                output_meta=plan.output_meta,
             )
-            if device_resident:
-                # Outputs STAY on the device — wrap them as payloads; the
-                # payloads own the buffers (never closed here).
-                tensors = [
-                    core.Tensor(
-                        XlaDevicePayload(
-                            self._plugin, self._client, buffer, self.device
-                        )
-                    )
-                    for buffer in output_buffers
-                ]
-            else:
+            if not self._outputs_verified:
+                # ONE-TIME contract check (per executable): the recorded
+                # static output metadata prefilled onto the buffers must
+                # match the plugin's real buffer metadata.
+                try:
+                    for buffer in output_buffers:
+                        buffer._verify_metadata()
+                except BaseException:
+                    for buffer in output_buffers:
+                        buffer.close()
+                    raise
+                self._outputs_verified = True
+            # ONE shared-client reference + ONE finalizer for the whole
+            # output set (the payloads keep the group alive).
+            group = _XlaDeviceRunGroup(self._plugin, self._client, output_buffers)
+            # Outputs STAY on the device — wrap them as payloads; the
+            # payloads own the buffers via the run group (never closed here).
+            tensors = [
+                core.Tensor(
+                    XlaDevicePayload._from_run_group(group, buffer, self.device)
+                )
+                for buffer in output_buffers
+            ]
+        else:
+            buffers = [
+                self._client.buffer_from_host(array) for array in arrays
+            ]
+            output_buffers = []
+            try:
+                output_buffers = self.native_module.execute(
+                    buffers, execute_device=self._execute_device
+                )
                 tensors = [
                     core.Tensor(buffer.to_host()) for buffer in output_buffers
                 ]
-        finally:
-            if not device_resident:
+            finally:
                 # CPU path: staged inputs and copied outputs are owned here.
                 for buffer in buffers:
                     buffer.close()
                 for buffer in output_buffers:
                     buffer.close()
 
-        output_specs = tuple(self.signature.output_specs)
-        if len(tensors) != len(output_specs):
+        if len(tensors) != plan.num_outputs:
             raise core.BackendError(
                 f"program produced {len(tensors)} output tensor(s), "
-                f"expected {len(output_specs)}"
+                f"expected {plan.num_outputs}"
             )
-        recorded_output_shapes = self._recorded_shapes(
-            "static_output_shapes", len(output_specs)
-        )
-        for i, (tensor, spec) in enumerate(zip(tensors, output_specs)):
-            if tensor.dtype != spec.dtype:
+        for i, tensor in enumerate(tensors):
+            dtype, expected = plan.output_contracts[i]
+            if tensor.dtype != dtype:
                 raise core.BackendError(
-                    f"output {i}: expected dtype {spec.dtype}, got "
+                    f"output {i}: expected dtype {dtype}, got "
                     f"{tensor.dtype}"
                 )
-            expected = tuple(recorded_output_shapes[i])
             if tuple(tensor.shape) != expected:
                 raise core.BackendError(
                     f"output {i}: expected static shape {expected}, got "
                     f"{tuple(tensor.shape)}"
                 )
         return tensors
+
+    def _build_run_plan(self) -> _XlaRunPlan:
+        """Derive (and cache) the per-executable run plan.
+
+        Reads the static-shape gate results recorded in the artifact payload
+        ONCE (with ``_recorded_shapes``' signature fallback for artifacts
+        that predate the recording), so ``run`` never re-derives them.
+        """
+        input_specs = tuple(self.signature.input_specs)
+        output_specs = tuple(self.signature.output_specs)
+        recorded_input_shapes = self._recorded_shapes(
+            "static_input_shapes", len(input_specs)
+        )
+        recorded_output_shapes = self._recorded_shapes(
+            "static_output_shapes", len(output_specs)
+        )
+        plan = _XlaRunPlan(
+            tuple(
+                (spec.dtype, tuple(recorded_input_shapes[i]))
+                for i, spec in enumerate(input_specs)
+            ),
+            tuple(
+                (spec.dtype, tuple(recorded_output_shapes[i]))
+                for i, spec in enumerate(output_specs)
+            ),
+        )
+        self._run_plan = plan
+        return plan
 
     def _check_device_resident_input(self, i: int, tensor: core.Tensor) -> None:
         """Validate input ``i`` of a device-resident run (explicit placement).
@@ -852,6 +950,34 @@ class XlaExecutable(CompilerExecutable):
         return shapes
 
 
+class _XlaDeviceRunGroup:
+    """One shared-client reference + one finalizer for a device run's outputs.
+
+    A device-resident run produces several ``PJRT_Buffer`` objects that must
+    outlive the payloads wrapping them and be destroyed BEFORE the client
+    that owns them. Taking one shared-client reference and registering one
+    ``weakref.finalize`` PER OUTPUT cost ~1.4 us per output (a locked
+    ``acquire_client`` pair + the finalizer); instead the run creates ONE
+    group (one ``acquire_client``, one finalizer calling
+    ``xla_util.release_payloads`` for the whole buffer set) and every output
+    payload of that run holds a reference to it, so the group — hence the
+    buffers and the client reference — outlives all of them, and the release
+    happens exactly once when the last payload dies. Payloads created OUTSIDE
+    a run (``upload_tensor``, external users) keep the per-payload
+    reference/finalizer of the public constructor.
+    """
+
+    __slots__ = ("client", "buffers", "_finalizer", "__weakref__")
+
+    def __init__(self, plugin: Any, client: Any, buffers: Any) -> None:
+        self.client = client
+        self.buffers = tuple(buffers)
+        acquire_client(plugin)  # ONE reference for the whole output set
+        self._finalizer = weakref.finalize(
+            self, release_payloads, plugin, client, self.buffers
+        )
+
+
 class XlaDevicePayload:
     """PUBLIC device-resident payload wrapping a live PJRT buffer.
 
@@ -859,10 +985,15 @@ class XlaDevicePayload:
     device-resident ``XlaExecutable`` runs and of the explicit placement
     path ``t.to(Device('cuda'|'rocm', N))`` (``upload_tensor``). The wrapped
     ``PJRT_Buffer`` stays alive for the payload's lifetime; the payload
-    holds one reference on the process-global shared client
-    (``acquire_client``) and releases it — destroying the buffer BEFORE
-    the client, guarded against stale-cache ordering — when garbage
-    collected. It exposes the ``core.Tensor`` device-payload protocol:
+    keeps a reference on the process-global shared client (``acquire_client``)
+    and releases it — destroying the buffer BEFORE the client, guarded
+    against stale-cache ordering — when garbage collected. Payloads produced
+    by ONE device-resident run share a single client reference and a single
+    finalizer (the run's output group), so the release happens once for the
+    run's buffer set; a payload constructed directly (the 4-argument public
+    constructor used by ``upload_tensor`` and external users) takes its own
+    reference and registers its own finalizer. It exposes the
+    ``core.Tensor`` device-payload protocol:
 
     - ``.buffer``: the driver ``_Buffer`` (the live ``PJRT_Buffer``) —
       the unit handed to ``PJRT_LoadedExecutable_Execute`` for
@@ -882,12 +1013,20 @@ class XlaDevicePayload:
     wrappers; each run produces fresh payloads.
     """
 
-    __slots__ = ("_buffer", "_device", "_client", "_finalizer", "__weakref__")
+    __slots__ = (
+        "_buffer",
+        "_device",
+        "_client",
+        "_finalizer",
+        "_group",
+        "__weakref__",
+    )
 
     def __init__(self, plugin: Any, client: Any, buffer: Any, device: core.Device) -> None:
         self._buffer = buffer
         self._device = device
         self._client = client
+        self._group = None
         # Own one shared-client reference for the buffer's lifetime: PJRT
         # buffers must outlive... in fact be destroyed BEFORE the client
         # that owns them — the guarded release_payload enforces that order.
@@ -895,6 +1034,26 @@ class XlaDevicePayload:
         self._finalizer = weakref.finalize(
             self, release_payload, plugin, client, buffer
         )
+
+    @classmethod
+    def _from_run_group(
+        cls, group: "_XlaDeviceRunGroup", buffer: Any, device: core.Device
+    ) -> "XlaDevicePayload":
+        """Wrap a run output buffer, sharing the run group's client reference.
+
+        Internal alternate constructor for a device-resident run: the group
+        already holds the (single) shared-client reference and the (single)
+        finalizer for the run's whole output set, so the payload must NOT
+        acquire its own reference or register its own finalizer — it just
+        keeps the group alive.
+        """
+        payload = cls.__new__(cls)
+        payload._buffer = buffer
+        payload._device = device
+        payload._client = group.client
+        payload._group = group
+        payload._finalizer = None
+        return payload
 
     @property
     def buffer(self) -> Any:

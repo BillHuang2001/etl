@@ -35,7 +35,19 @@ Plugin flow (the header ``xla/pjrt/c/pjrt_c_api.h`` is the contract):
    event before returning (and keeps the array alive on the buffer object
    until the buffer is destroyed — the header's lifetime contract).
 5. **Execute.** ``PJRT_LoadedExecutable_Execute`` with one device, the
-   staged buffers, and a zeroed ``PJRT_ExecuteOptions``.
+   staged buffers, and a zeroed ``PJRT_ExecuteOptions``. Per-call cost
+   discipline (device-resident hot paths): the executable's output count is
+   queried ONCE per loaded executable and cached, and the ctypes argument
+   scaffolding (input/output pointer arrays, ``PJRT_ExecuteOptions``,
+   ``PJRT_LoadedExecutable_Execute_Args``) is built once per
+   ``(executable, num_args, num_outputs)`` PER THREAD (``threading.local`` —
+   concurrent runs of one executable from different threads never share
+   mutable scaffolding) and reused, so a call writes only the input buffer
+   pointers before invoking. ``execute(output_meta=...)`` may pass the
+   caller's static output ``(shape, dtype)`` pairs, which are prefilled on
+   the returned ``_Buffer`` objects so their metadata costs no plugin FFI
+   (see ``_Buffer``: prefilled values are verified against the real plugin
+   metadata on demand).
 6. **Outputs.** Per output buffer: ``PJRT_Buffer_ElementType`` +
    ``PJRT_Buffer_Dimensions`` -> allocate a writable numpy array ->
    ``PJRT_Buffer_ToHostBuffer`` -> await + destroy the completion event.
@@ -82,6 +94,7 @@ __all__ = [
     "acquire_client",
     "release_client",
     "release_payload",
+    "release_payloads",
     "set_opt_level",
 ]
 
@@ -490,20 +503,22 @@ def release_client(plugin: "PjrtPlugin") -> None:
     client.close()
 
 
-def release_payload(
-    plugin: "PjrtPlugin", client: "_Client", buffer: "_Buffer"
+def release_payloads(
+    plugin: "PjrtPlugin", client: "_Client", buffers: Any
 ) -> None:
-    """Guarded finalizer for device-resident payloads (see ``xla.py``).
+    """Guarded finalizer for a whole run's device-resident output buffers.
 
-    A device-resident payload owns (a) a ``PJRT_Buffer`` created by ``client``
-    and (b) one reference on the shared client (``acquire_client``). PJRT
-    buffers must be destroyed BEFORE the client that owns them, so the
-    buffer is destroyed first; the client is destroyed only when this was
-    the last reference. The cache-identity guard makes the finalizer safe
-    for any ordering: if the client already died (e.g. its executable was
-    closed and no other holder remained), the plugin freed its buffers with
-    it, so nothing is touched — and a LATER re-created client for the same
-    plugin path is never decremented by a stale payload.
+    A device-resident run produces several ``PJRT_Buffer`` objects that
+    share ONE reference on the shared client (see the payload class in
+    ``xla.py``: one reference per run's output set, not per output), so the
+    release must happen once for the set: PJRT buffers must be destroyed
+    BEFORE the client that owns them, so every buffer is closed first; the
+    client is destroyed only when this was the last reference. The
+    cache-identity guard makes the finalizer safe for any ordering: if the
+    client already died (e.g. its executable was closed and no other holder
+    remained), the plugin freed its buffers with it, so nothing is touched
+    — and a LATER re-created client for the same plugin path is never
+    decremented by a stale payload.
     """
     with _shared_clients_lock:
         entry = _shared_clients.get(plugin.path)
@@ -516,10 +531,38 @@ def release_payload(
             del _shared_clients[plugin.path]
             is_last = True
     try:
-        buffer.close()
+        for buffer in buffers:
+            buffer.close()
     finally:
         if is_last:
             client.close()
+
+
+def release_payload(
+    plugin: "PjrtPlugin", client: "_Client", buffer: "_Buffer"
+) -> None:
+    """Guarded finalizer for a single-buffer device-resident payload.
+
+    A thin wrapper over :func:`release_payloads` for the one-buffer case
+    (payloads created outside a run — the explicit placement path and
+    external users), so both paths share the exact same refcount /
+    destroy-ordering / stale-cache semantics.
+    """
+    release_payloads(plugin, client, (buffer,))
+
+
+# ---------------------------------------------------------------------------
+# Per-thread execute scaffolding (hot-path cost discipline — see the
+# ``_LoadedExecutable.execute`` / ``_execute_scaffolding`` docs)
+# ---------------------------------------------------------------------------
+
+#: Per-thread execute scaffolding cache (``threading.local``: concurrent runs
+#: of ONE executable from different threads must never share mutable ctypes
+#: argument structs).
+_execute_scaffolding = threading.local()
+
+#: Bound on the per-thread scaffolding cache (many executables per process).
+_EXECUTE_SCAFFOLDING_MAX = 64
 
 
 # ---------------------------------------------------------------------------
@@ -784,8 +827,16 @@ class _Client(_Handle):
             if event:
                 self.plugin.destroy_event(event)
         # Keep the host array alive with the buffer: some plugins alias host
-        # memory beyond the documented transfer-complete point.
-        return _Buffer(self.plugin, args.buffer, keepalive=(arr, dims))
+        # memory beyond the documented transfer-complete point. The metadata
+        # is prefilled HONESTLY (we just staged exactly this array), so the
+        # first shape/dtype read costs no plugin FFI.
+        return _Buffer(
+            self.plugin,
+            args.buffer,
+            keepalive=(arr, dims),
+            shape=arr.shape,
+            dtype=arr.dtype,
+        )
 
 
 class _Executable(_Handle):
@@ -808,9 +859,14 @@ class _LoadedExecutable(_Handle):
     ``PJRT_LoadedExecutable_GetExecutable`` hands out an unloaded
     ``PJRT_Executable`` the caller must destroy separately; the driver
     keeps both and destroys the inner one first.
+
+    Per-call cost discipline: the output count is immutable for a loaded
+    executable, so it is queried ONCE and cached, and ``execute`` reuses a
+    per-thread ctypes scaffolding instead of rebuilding it every call (see
+    the module docstring).
     """
 
-    __slots__ = ("_inner",)
+    __slots__ = ("_inner", "_num_outputs")
 
     def __init__(self, plugin: "PjrtPlugin", ptr: int) -> None:
         super().__init__(plugin, ptr)
@@ -824,6 +880,7 @@ class _LoadedExecutable(_Handle):
             "PJRT_LoadedExecutable_GetExecutable",
         )
         self._inner = _Executable(plugin, args.executable)
+        self._num_outputs: int | None = None
 
     def close(self) -> None:
         if self._closed:
@@ -839,17 +896,24 @@ class _LoadedExecutable(_Handle):
         )
 
     def num_outputs(self) -> int:
-        """Output count per device (``PJRT_Executable_NumOutputs``)."""
-        args = pjrt.PJRT_Executable_NumOutputs_Args(
-            struct_size=pjrt.sizeof(pjrt.PJRT_Executable_NumOutputs_Args),
-            executable=self._inner.ptr,
-            num_outputs=0,
-        )
-        self.plugin._check(
-            self.plugin.api.PJRT_Executable_NumOutputs(ctypes.byref(args)),
-            "PJRT_Executable_NumOutputs",
-        )
-        return args.num_outputs
+        """Output count per device (``PJRT_Executable_NumOutputs``).
+
+        Immutable for a loaded executable, so the plugin is queried once
+        and the value cached (one FFI instead of one per run).
+        """
+        num_outputs = self._num_outputs
+        if num_outputs is None:
+            args = pjrt.PJRT_Executable_NumOutputs_Args(
+                struct_size=pjrt.sizeof(pjrt.PJRT_Executable_NumOutputs_Args),
+                executable=self._inner.ptr,
+                num_outputs=0,
+            )
+            self.plugin._check(
+                self.plugin.api.PJRT_Executable_NumOutputs(ctypes.byref(args)),
+                "PJRT_Executable_NumOutputs",
+            )
+            num_outputs = self._num_outputs = args.num_outputs
+        return num_outputs
 
     def serialize(self) -> bytes:
         """Serialize to bytes (``PJRT_Executable_Serialize``)."""
@@ -874,7 +938,10 @@ class _LoadedExecutable(_Handle):
                 deleter(args.serialized_executable)
 
     def execute(
-        self, buffers: list["_Buffer"], execute_device: int | None = None
+        self,
+        buffers: list["_Buffer"],
+        execute_device: int | None = None,
+        output_meta: Any = None,
     ) -> list["_Buffer"]:
         """Execute; return output buffers.
 
@@ -885,18 +952,79 @@ class _LoadedExecutable(_Handle):
         returned ``_Buffer`` objects (destroy via ``close()``); input
         buffers stay owned by the caller and may be destroyed once execute
         returns.
+
+        ``output_meta`` is an optional sequence of ``(shape, dtype)`` pairs
+        whose length equals the output count: the caller's STATIC output
+        contract (XLA executable output types are static), prefilled on the
+        returned buffers so their metadata costs no plugin FFI. The values
+        are not trusted blindly — ``_Buffer.to_host`` (and the adapter's
+        one-time run-time check) verifies them against the real plugin
+        metadata. ``None`` (the default) keeps the lazy per-buffer queries
+        of the CPU/host-staging path.
         """
         num_args = len(buffers)
-        device_ptrs = (ctypes.c_void_p * max(1, num_args))(
-            *[b.ptr for b in buffers]
+        scaffolding = self._execute_scaffolding(num_args)
+        device_ptrs, out_ptrs, args, num_outputs = scaffolding
+        metas = None
+        if output_meta is not None:
+            # Validate the contract BEFORE invoking: a mismatched
+            # ``output_meta`` must never leave the plugin's output buffers
+            # unowned (the driver owns everything it creates).
+            metas = list(output_meta)
+            if len(metas) != num_outputs:
+                raise core.BackendError(
+                    f"output_meta describes {len(metas)} output(s) but the "
+                    f"loaded executable produces {num_outputs}"
+                )
+        for i, buffer in enumerate(buffers):
+            device_ptrs[i] = buffer.ptr
+        args.execute_device = execute_device
+        self.plugin._check(
+            self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
+            "PJRT_LoadedExecutable_Execute",
         )
+        if metas is None:
+            return [_Buffer(self.plugin, out_ptrs[i]) for i in range(num_outputs)]
+        return [
+            _Buffer(
+                self.plugin,
+                out_ptrs[i],
+                shape=metas[i][0],
+                dtype=metas[i][1],
+            )
+            for i in range(num_outputs)
+        ]
+
+    def _execute_scaffolding(self, num_args: int) -> tuple:
+        """Return the (cached) execute scaffolding for ``(self, num_args)``.
+
+        ONE set of ctypes argument structs per ``(executable ptr, input
+        arity, output count)`` PER THREAD: a call then only writes the input
+        buffer pointers (and the execute device) before invoking, instead of
+        rebuilding ``PJRT_ExecuteOptions`` + the args struct + four pointer
+        arrays (~10 us of the ~11 us of non-FFI execute overhead). The
+        thread-local storage is what makes concurrent runs of ONE executable
+        from different threads safe — no mutable scaffolding is shared
+        across threads. The output count is part of the key so a reused
+        pointer address (an executable closed and a new one allocated at the
+        same address) can never be served stale, under-sized arrays.
+        """
+        num_outputs = self.num_outputs()
+        key = (self.ptr, num_args, num_outputs)
+        cache = getattr(_execute_scaffolding, "cache", None)
+        if cache is None:
+            cache = {}
+            _execute_scaffolding.cache = cache
+        scaffolding = cache.get(key)
+        if scaffolding is not None:
+            return scaffolding
+        device_ptrs = (ctypes.c_void_p * max(1, num_args))()
         argument_lists = (ctypes.c_void_p * 1)(
             ctypes.cast(device_ptrs, ctypes.c_void_p)
         )
-        num_outputs = self.num_outputs()
-        out_inner = (ctypes.c_void_p * max(1, num_outputs))()
+        out_ptrs = (ctypes.c_void_p * max(1, num_outputs))()
         output_lists = (ctypes.c_void_p * 1)(
-            ctypes.cast(out_inner, ctypes.c_void_p)
+            ctypes.cast(out_ptrs, ctypes.c_void_p)
         )
         options = pjrt.PJRT_ExecuteOptions(
             struct_size=pjrt.sizeof(pjrt.PJRT_ExecuteOptions)
@@ -914,31 +1042,59 @@ class _LoadedExecutable(_Handle):
                 output_lists, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
             ),
             device_complete_events=None,
-            execute_device=execute_device,
+            execute_device=None,
         )
-        self.plugin._check(
-            self.plugin.api.PJRT_LoadedExecutable_Execute(ctypes.byref(args)),
-            "PJRT_LoadedExecutable_Execute",
-        )
-        return [_Buffer(self.plugin, out_inner[i]) for i in range(num_outputs)]
+        scaffolding = (device_ptrs, out_ptrs, args, num_outputs)
+        if len(cache) >= _EXECUTE_SCAFFOLDING_MAX:
+            # Bounded: a meta-level loop that builds many executables must
+            # not grow per-thread state without limit. Clearing is safe —
+            # an in-flight call holds its own references to the arrays.
+            cache.clear()
+        cache[key] = scaffolding
+        return scaffolding
 
 
 class _Buffer(_Handle):
     """A device buffer (destroyed via ``PJRT_Buffer_Destroy``).
 
-    ``shape``/``dtype`` are lazy metadata queries (``PJRT_Buffer_ElementType``
+    ``shape``/``dtype`` are metadata queries (``PJRT_Buffer_ElementType``
     + ``PJRT_Buffer_Dimensions``) cached on the instance — reading them does
     NOT touch host memory, so device-resident payloads can be validated and
     wrapped without a host round-trip.
+
+    They may also be PREFILLED (the keyword-only ``shape``/``dtype``
+    arguments) by callers that already know the metadata — the XLA adapter
+    records its static output contract at compile time, and
+    ``buffer_from_host`` just staged exactly that array — so a hot path pays
+    ZERO plugin FFI per buffer (~3.4 us per output). Prefilled values are
+    never trusted blindly: ``_verify_metadata()`` performs the real FFI
+    queries, compares them against the prefilled values and raises
+    ``core.BackendError`` naming declared-vs-actual on a mismatch (never
+    silent), then caches the real values. ``to_host()`` always verifies
+    first, so a host copy can never be produced from unverified metadata.
     """
 
-    __slots__ = ("_keepalive", "_shape", "_dtype")
+    __slots__ = ("_keepalive", "_shape", "_dtype", "_verified")
 
-    def __init__(self, plugin: "PjrtPlugin", ptr: int, keepalive: tuple = ()) -> None:
+    def __init__(
+        self,
+        plugin: "PjrtPlugin",
+        ptr: int,
+        keepalive: tuple = (),
+        *,
+        shape: Any = None,
+        dtype: Any = None,
+    ) -> None:
         super().__init__(plugin, ptr)
         self._keepalive = keepalive  # host memory that must outlive the buffer
-        self._shape: tuple[int, ...] | None = None
-        self._dtype: Any | None = None
+        self._shape: tuple[int, ...] | None = (
+            None if shape is None else tuple(shape)
+        )
+        self._dtype: Any | None = dtype
+        # Prefilled (or not-yet-queried) metadata has not been checked
+        # against the plugin's real buffer metadata yet; a lazily-queried
+        # buffer only ever caches real FFI values, so it starts verified.
+        self._verified = shape is None and dtype is None
 
     def close(self) -> None:
         if self._closed:
@@ -947,58 +1103,101 @@ class _Buffer(_Handle):
         self._keepalive = ()
         self.plugin._destroy("PJRT_Buffer_Destroy", pjrt.PJRT_Buffer_Destroy_Args, self.ptr)
 
+    def _query_shape(self) -> tuple[int, ...]:
+        """The buffer's REAL shape from ``PJRT_Buffer_Dimensions`` (FFI)."""
+        dim_args = pjrt.PJRT_Buffer_Dimensions_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_Dimensions_Args),
+            buffer=self.ptr,
+            dims=None,
+            num_dims=0,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Buffer_Dimensions(ctypes.byref(dim_args)),
+            "PJRT_Buffer_Dimensions",
+        )
+        return tuple(dim_args.dims[i] for i in range(dim_args.num_dims))
+
+    def _query_dtype(self) -> Any:
+        """The buffer's REAL numpy dtype from ``PJRT_Buffer_ElementType`` (FFI)."""
+        type_args = pjrt.PJRT_Buffer_ElementType_Args(
+            struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ElementType_Args),
+            buffer=self.ptr,
+            type=0,
+        )
+        self.plugin._check(
+            self.plugin.api.PJRT_Buffer_ElementType(ctypes.byref(type_args)),
+            "PJRT_Buffer_ElementType",
+        )
+        try:
+            dtype_name = _PJRT_TO_DTYPE_NAME[
+                pjrt.PJRT_Buffer_Type(type_args.type)
+            ]
+        except KeyError:
+            raise core.BackendError(
+                f"the PJRT plugin produced an output buffer of element "
+                f"type {type_args.type}, which has no numpy equivalent — "
+                "the xla adapter supports "
+                + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
+            ) from None
+        import numpy as np
+
+        return np.dtype(dtype_name)
+
+    def _verify_metadata(self) -> None:
+        """Check prefilled metadata against the plugin's real buffer metadata.
+
+        Performs the two real FFI queries, compares them with any prefilled
+        values (a mismatch is a loud ``core.BackendError`` naming the
+        declared vs actual shape/dtype — a compiler/contract violation is
+        never silently accepted), and caches the real values. Idempotent:
+        after a successful verification the cached metadata IS the real
+        metadata, so it returns immediately.
+        """
+        if self._verified:
+            return
+        real_shape = self._query_shape()
+        real_dtype = self._query_dtype()
+        if self._shape is not None and self._shape != real_shape:
+            raise core.BackendError(
+                f"the PJRT plugin reports shape {real_shape} for a buffer "
+                f"declared as {self._shape} — the compiled program's "
+                "recorded output contract does not match the buffer the "
+                "plugin produced (never silently accepted)"
+            )
+        if self._dtype is not None and self._dtype != real_dtype:
+            raise core.BackendError(
+                f"the PJRT plugin reports dtype {real_dtype} for a buffer "
+                f"declared as {self._dtype} — the compiled program's "
+                "recorded output contract does not match the buffer the "
+                "plugin produced (never silently accepted)"
+            )
+        self._shape = real_shape
+        self._dtype = real_dtype
+        self._verified = True
+
     @property
     def shape(self) -> tuple[int, ...]:
         """The buffer's concrete shape (cached metadata query, no host copy)."""
         if self._shape is None:
-            dim_args = pjrt.PJRT_Buffer_Dimensions_Args(
-                struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_Dimensions_Args),
-                buffer=self.ptr,
-                dims=None,
-                num_dims=0,
-            )
-            self.plugin._check(
-                self.plugin.api.PJRT_Buffer_Dimensions(ctypes.byref(dim_args)),
-                "PJRT_Buffer_Dimensions",
-            )
-            self._shape = tuple(
-                dim_args.dims[i] for i in range(dim_args.num_dims)
-            )
+            self._shape = self._query_shape()
         return self._shape
 
     @property
     def dtype(self) -> Any:
         """The buffer's numpy dtype (cached metadata query, no host copy)."""
         if self._dtype is None:
-            type_args = pjrt.PJRT_Buffer_ElementType_Args(
-                struct_size=pjrt.sizeof(pjrt.PJRT_Buffer_ElementType_Args),
-                buffer=self.ptr,
-                type=0,
-            )
-            self.plugin._check(
-                self.plugin.api.PJRT_Buffer_ElementType(ctypes.byref(type_args)),
-                "PJRT_Buffer_ElementType",
-            )
-            try:
-                dtype_name = _PJRT_TO_DTYPE_NAME[
-                    pjrt.PJRT_Buffer_Type(type_args.type)
-                ]
-            except KeyError:
-                raise core.BackendError(
-                    f"the PJRT plugin produced an output buffer of element "
-                    f"type {type_args.type}, which has no numpy equivalent — "
-                    "the xla adapter supports "
-                    + ", ".join(sorted(_DTYPE_NAME_TO_PJRT))
-                ) from None
-            import numpy as np
-
-            self._dtype = np.dtype(dtype_name)
+            self._dtype = self._query_dtype()
         return self._dtype
 
     def to_host(self) -> Any:
-        """Copy the buffer into a fresh row-major numpy array."""
+        """Copy the buffer into a fresh row-major numpy array.
+
+        Verifies any prefilled metadata against the plugin's real buffer
+        metadata first — a host copy is always sized from HONEST metadata.
+        """
         import numpy as np
 
+        self._verify_metadata()
         shape = self.shape
         array = np.empty(shape, dtype=self.dtype)
         dst = (
