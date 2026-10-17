@@ -550,7 +550,10 @@ def _eigh_cond_runtime_pred(x, pred):
 def test_eigh_inside_cond_runtime_predicate():
     n = 10
     A = _sym(n, scale=10.0, seed=73)
-    specs = (etl.TensorSpec((n, n), etl.float32), etl.TensorSpec((), etl.bool_))
+    specs = (
+        etl.TensorSpec((n, n), etl.float32),
+        etl.TensorSpec((), etl.bool_),
+    )
     exe = etl.build(_eigh_cond_runtime_pred, *specs, backend="iree")
     spectra = {}
     for pred, M in ((True, A), (False, -A)):
@@ -569,9 +572,9 @@ def test_eigh_inside_cond_runtime_predicate():
     assert not np.allclose(spectra[True], spectra[False]), (
         "the runtime predicate did not change the selected branch"
     )
-    assert np.allclose(spectra[True], -spectra[False][::-1], rtol=1e-4, atol=1e-4), (
-        f"spectra are not mirror images: {spectra[True]} vs {spectra[False]}"
-    )
+    assert np.allclose(
+        spectra[True], -spectra[False][::-1], rtol=1e-4, atol=1e-4,
+    ), f"spectra are not mirror images: {spectra[True]} vs {spectra[False]}"
 
 
 # --- 4b(iii) cond inside cond, eigh in the INNER branches -------------------
