@@ -227,3 +227,4 @@ The per-suite inventory (file list, test counts, known skips/gates) is owned by 
 - Shared capability goes to the lowest common ancestor module per the contracts above — do not duplicate (e.g. numpy kernels live ONLY in `backends/numpy`).
 - `etl/__init__.py` re-exports this exact surface; when adding a public name, update `__init__.py` and this contract together.
 - Keep this file to the API contract + routing table: new per-feature detail belongs in the owning child node's CONTEXT.md plus a routing-table row here.
+- **`run`'s per-call host cost is leaf-driven, not graph-driven** — measured on MI300X/rocm with a 12-leaf step (per-leaf ≈2–3.5 µs, per-op ≈0): `_prepare_flat_inputs` + `_unflatten_outputs` cost ≈16–31 µs of a 140–150 µs `etl.run` (~20 %), while the backend invoke dominates. The full stage ladder, bare-metal bounds and the adapter-side costs live in `./backends/adapters/CONTEXT.md` Known Issue 14; don't re-derive them.
