@@ -585,15 +585,20 @@ class _XlaRunPlan:
     """The per-executable run plan (built once, reused by every run).
 
     Pure derivation from ``signature`` + the artifact's recorded static
-    shapes — no observable behavior: it holds the input/output arity, the
-    per-leaf ``(dtype, shape)`` validation contracts, and the static output
-    metadata handed to the driver so output buffers are created WITHOUT a
-    plugin metadata query (``output_meta``; verified on the executable's
-    first device-resident run).
+    shapes + the load device — no observable behavior: it holds the
+    input/output arity, the per-leaf ``(dtype, shape)`` validation contracts,
+    the static output metadata handed to the driver so output buffers are
+    created WITHOUT a plugin metadata query (``output_meta``; verified on
+    the executable's first device-resident run), and the run MODE
+    (``device_resident``: the load device is an accelerator, so inputs must
+    be ``XlaDevicePayload`` tensors rather than host arrays). The mode is a
+    property of the loaded executable, so it is derived once here instead of
+    per call.
     """
 
     __slots__ = (
         "num_inputs",
+        "device_resident",
         "input_contracts",
         "num_outputs",
         "output_contracts",
@@ -604,11 +609,13 @@ class _XlaRunPlan:
         self,
         input_contracts: tuple[tuple[Any, tuple[int, ...]], ...],
         output_contracts: tuple[tuple[Any, tuple[int, ...]], ...],
+        device_resident: bool,
     ) -> None:
         self.num_inputs = len(input_contracts)
         self.input_contracts = input_contracts
         self.num_outputs = len(output_contracts)
         self.output_contracts = output_contracts
+        self.device_resident = device_resident
         # Driver-side prefilled output metadata (shape, dtype) — the same
         # static contract, in the order the plugin returns buffers.
         self.output_meta = tuple(
@@ -734,18 +741,27 @@ class XlaExecutable(CompilerExecutable):
         options dict raises ``core.BackendError`` (loud; never silently
         swallowed).
 
-        Per-call cost design (device-resident hot path): the validation
-        contracts come from a plan built ONCE per executable, the driver
-        reuses a per-thread execute scaffolding and its cached output count,
-        and output buffers are created with the recorded static output
-        metadata prefilled (zero plugin metadata FFI per output). The
-        prefilled metadata is NOT trusted blindly: the FIRST device-resident
-        run of this executable verifies every output buffer against the
-        plugin's real ``PJRT_Buffer_Dimensions``/``PJRT_Buffer_ElementType``
-        metadata (a mismatch raises a loud ``core.BackendError``), then the
-        recorded static contract is trusted because XLA executable output
-        types are static; every explicit host read-back re-verifies too.
-        One shared-client reference (and one finalizer) is taken per run's
+        Per-call cost design (device-resident hot path): a plan built ONCE
+        per executable carries everything static about a run — the arity,
+        the per-leaf ``(dtype, shape)`` contracts, the static output
+        metadata AND the run mode (device-resident vs host-staging) — so a
+        call re-derives nothing. Inputs are validated in ONE pass that also
+        performs the explicit-placement checks (payload type -> device ->
+        owning client, with identity fast paths) and extracts the PJRT
+        buffers, reading per-leaf metadata from a device payload's
+        already-cached buffer metadata instead of re-deriving it. The
+        driver reuses a per-thread execute scaffolding and its cached output
+        count, and output buffers are created with the recorded static
+        output metadata prefilled (zero plugin metadata FFI per output).
+        The prefilled metadata is NOT trusted blindly: the FIRST
+        device-resident run of this executable verifies every output buffer
+        against the plugin's real
+        ``PJRT_Buffer_Dimensions``/``PJRT_Buffer_ElementType`` metadata (a
+        mismatch raises a loud ``core.BackendError``), then the recorded
+        static contract is trusted because XLA executable output types are
+        static; every explicit host read-back re-verifies too. Output leaves
+        are built into a pre-sized list which the same pass validates. One
+        shared-client reference (and one finalizer) is taken per run's
         output set, not per output tensor.
         """
         from ..options import validate_options
@@ -764,12 +780,17 @@ class XlaExecutable(CompilerExecutable):
         plan = self._run_plan
         if plan is None:
             plan = self._build_run_plan()
-        if len(flat_input_tensors) != plan.num_inputs:
+        num_inputs = plan.num_inputs
+        if len(flat_input_tensors) != num_inputs:
             raise core.BackendError(
-                f"program expects {plan.num_inputs} input tensor(s), got "
+                f"program expects {num_inputs} input tensor(s), got "
                 f"{len(flat_input_tensors)}"
             )
-        device_resident = self.device is not None and self.device.kind != "cpu"
+        # Everything static about this run comes from the plan and locals —
+        # the loop below never re-derives the mode or the device.
+        device_resident = plan.device_resident
+        device = self.device
+        client = self._client
         input_contracts = plan.input_contracts
         arrays: list[Any] = []
         for i, tensor in enumerate(flat_input_tensors):
@@ -779,20 +800,69 @@ class XlaExecutable(CompilerExecutable):
                     f"input {i} must be a core.Tensor, got "
                     f"{type(tensor).__name__}"
                 )
-            if tensor.dtype != dtype:
+            data = tensor.data
+            if isinstance(data, XlaDevicePayload):
+                # Metadata fast path: a device payload's buffer already
+                # caches it (prefilled at placement/execute, or queried) —
+                # the same values the ``core.Tensor`` properties would
+                # recompute from it.
+                is_payload = True
+                buffer = data._buffer
+                actual_dtype = buffer._dtype
+                actual_shape = buffer._shape
+                if actual_dtype is None or actual_shape is None:
+                    actual_dtype = tensor.dtype
+                    actual_shape = tensor.shape
+            else:
+                is_payload = False
+                actual_dtype = tensor.dtype
+                actual_shape = tensor.shape
+            if actual_dtype != dtype:
                 raise core.DTypeError(
                     f"input {i}: expected dtype {dtype}, got "
                     f"{tensor.dtype}"
                 )
-            if tuple(tensor.shape) != expected:
+            if actual_shape != expected:
                 raise core.ShapeError(
                     f"input {i}: expected static shape {expected}, got "
                     f"{tuple(tensor.shape)} — the xla adapter requires "
                     "exact static shapes"
                 )
             if device_resident:
-                self._check_device_resident_input(i, tensor)
-                arrays.append(tensor.data.buffer)  # pass the PJRT buffer
+                # Explicit placement (the defensive check for direct
+                # backend-level ``exe.run([...])`` calls — ``etl.run``
+                # rejects mismatched devices first), folded into THIS pass:
+                # payload type -> device -> owning client, in that order,
+                # with identity fast paths. Host inputs are never staged.
+                if not is_payload:
+                    raise core.DeviceError(
+                        f"input {i} is not a device-resident tensor on this "
+                        f"executable's device ({device!r}): the xla adapter "
+                        "never stages host inputs for a device-resident run — "
+                        "there is no implicit host-to-device transfer at the run "
+                        "boundary. Place inputs on the device explicitly first "
+                        f"via t.to({device!r}) (the xla backend's placement "
+                        "provider), or load the executable on Device('cpu', 0) "
+                        f"for host staging. Got a tensor carrying "
+                        f"{type(data).__name__}."
+                    )
+                payload_device = data._device
+                if payload_device is not device and payload_device != device:
+                    raise core.DeviceError(
+                        f"input {i} is on {payload_device!r}, but the executable "
+                        f"runs on {device!r}: no implicit device-to-device or "
+                        "host-to-device transfer happens at the run boundary — "
+                        f"move the tensor to the executable's device explicitly "
+                        f"via t.to({device!r})."
+                    )
+                if data._client is not client:
+                    raise core.DeviceError(
+                        f"input {i} carries an xla device payload owned by a "
+                        "different PJRT client/plugin than this executable's — a "
+                        "buffer from another client cannot be executed (never "
+                        "silently mixed)."
+                    )
+                arrays.append(data._buffer)  # pass the PJRT buffer
             else:
                 arrays.append(tensor.numpy())
 
@@ -803,6 +873,12 @@ class XlaExecutable(CompilerExecutable):
                 execute_device=self._execute_device,
                 output_meta=plan.output_meta,
             )
+            num_outputs = plan.num_outputs
+            if len(output_buffers) != num_outputs:
+                raise core.BackendError(
+                    f"program produced {len(output_buffers)} output tensor(s), "
+                    f"expected {num_outputs}"
+                )
             if not self._outputs_verified:
                 # ONE-TIME contract check (per executable): the recorded
                 # static output metadata prefilled onto the buffers must
@@ -817,15 +893,16 @@ class XlaExecutable(CompilerExecutable):
                 self._outputs_verified = True
             # ONE shared-client reference + ONE finalizer for the whole
             # output set (the payloads keep the group alive).
-            group = _XlaDeviceRunGroup(self._plugin, self._client, output_buffers)
+            group = _XlaDeviceRunGroup(self._plugin, client, output_buffers)
             # Outputs STAY on the device — wrap them as payloads; the
             # payloads own the buffers via the run group (never closed here).
-            tensors = [
-                core.Tensor(
-                    XlaDevicePayload._from_run_group(group, buffer, self.device)
+            tensors: list[Any] = [None] * num_outputs
+            wrap = core.Tensor
+            from_group = XlaDevicePayload._from_run_group
+            for i in range(num_outputs):
+                tensors[i] = wrap(
+                    from_group(group, output_buffers[i], device)
                 )
-                for buffer in output_buffers
-            ]
         else:
             buffers = [
                 self._client.buffer_from_host(array) for array in arrays
@@ -845,22 +922,38 @@ class XlaExecutable(CompilerExecutable):
                 for buffer in output_buffers:
                     buffer.close()
 
-        if len(tensors) != plan.num_outputs:
+        num_outputs = plan.num_outputs
+        if len(tensors) != num_outputs:
             raise core.BackendError(
                 f"program produced {len(tensors)} output tensor(s), "
-                f"expected {plan.num_outputs}"
+                f"expected {num_outputs}"
             )
+        output_contracts = plan.output_contracts
         for i, tensor in enumerate(tensors):
-            dtype, expected = plan.output_contracts[i]
-            if tensor.dtype != dtype:
+            # Same metadata fast path as the input pass: a device payload's
+            # buffer caches the values the ``core.Tensor`` properties would
+            # recompute from it.
+            data = tensor.data
+            if isinstance(data, XlaDevicePayload):
+                buffer = data._buffer
+                actual_dtype = buffer._dtype
+                actual_shape = buffer._shape
+                if actual_dtype is None or actual_shape is None:
+                    actual_dtype = data.dtype
+                    actual_shape = data.shape
+            else:
+                actual_dtype = tensor.dtype
+                actual_shape = tensor.shape
+            dtype, expected = output_contracts[i]
+            if actual_dtype != dtype:
                 raise core.BackendError(
                     f"output {i}: expected dtype {dtype}, got "
-                    f"{tensor.dtype}"
+                    f"{actual_dtype}"
                 )
-            if tuple(tensor.shape) != expected:
+            if actual_shape != expected:
                 raise core.BackendError(
                     f"output {i}: expected static shape {expected}, got "
-                    f"{tuple(tensor.shape)}"
+                    f"{actual_shape}"
                 )
         return tensors
 
@@ -869,7 +962,9 @@ class XlaExecutable(CompilerExecutable):
 
         Reads the static-shape gate results recorded in the artifact payload
         ONCE (with ``_recorded_shapes``' signature fallback for artifacts
-        that predate the recording), so ``run`` never re-derives them.
+        that predate the recording), so ``run`` never re-derives them, and
+        records the run MODE (the load device decides device-resident vs
+        host-staging) once instead of per call.
         """
         input_specs = tuple(self.signature.input_specs)
         output_specs = tuple(self.signature.output_specs)
@@ -879,6 +974,7 @@ class XlaExecutable(CompilerExecutable):
         recorded_output_shapes = self._recorded_shapes(
             "static_output_shapes", len(output_specs)
         )
+        device = self.device
         plan = _XlaRunPlan(
             tuple(
                 (spec.dtype, tuple(recorded_input_shapes[i]))
@@ -888,50 +984,10 @@ class XlaExecutable(CompilerExecutable):
                 (spec.dtype, tuple(recorded_output_shapes[i]))
                 for i, spec in enumerate(output_specs)
             ),
+            device is not None and device.kind != "cpu",
         )
         self._run_plan = plan
         return plan
-
-    def _check_device_resident_input(self, i: int, tensor: core.Tensor) -> None:
-        """Validate input ``i`` of a device-resident run (explicit placement).
-
-        The input must be an ``XlaDevicePayload`` tensor on this
-        executable's device, created by the same shared client — its PJRT
-        buffer is executed directly (zero host staging). Host tensors and
-        foreign payloads raise ``core.DeviceError`` with the same message
-        family as the iree adapter: there is no implicit host->device
-        transfer at the run boundary (the pipeline rejects host inputs
-        first for ``etl.run``; this is the defensive check for direct
-        backend-level ``exe.run([...])`` calls).
-        """
-        payload = tensor.data
-        if not isinstance(payload, XlaDevicePayload):
-            raise core.DeviceError(
-                f"input {i} is not a device-resident tensor on this "
-                f"executable's device ({self.device!r}): the xla adapter "
-                "never stages host inputs for a device-resident run — "
-                "there is no implicit host-to-device transfer at the run "
-                "boundary. Place inputs on the device explicitly first "
-                f"via t.to({self.device!r}) (the xla backend's placement "
-                "provider), or load the executable on Device('cpu', 0) "
-                f"for host staging. Got a tensor carrying "
-                f"{type(payload).__name__}."
-            )
-        if payload.device != self.device:
-            raise core.DeviceError(
-                f"input {i} is on {payload.device!r}, but the executable "
-                f"runs on {self.device!r}: no implicit device-to-device or "
-                "host-to-device transfer happens at the run boundary — "
-                f"move the tensor to the executable's device explicitly "
-                f"via t.to({self.device!r})."
-            )
-        if payload.client is not self._client:
-            raise core.DeviceError(
-                f"input {i} carries an xla device payload owned by a "
-                "different PJRT client/plugin than this executable's — a "
-                "buffer from another client cannot be executed (never "
-                "silently mixed)."
-            )
 
     def _recorded_shapes(self, field: str, count: int) -> list[list[int]]:
         """Read the static-shape gate results recorded in the artifact payload.
