@@ -144,6 +144,23 @@ class CompilerBackend(Backend):
     #: composition when the extent >= 32, bit-exact vs numpy, else pair).
     default_sort_emission: ClassVar[str] = "pair"
 
+    #: Default for the reserved per-call ``eigh_algorithm`` lower option
+    #: ("jacobi" | "jacobi_batched") — forwarded to ``stablehlo.export``; see
+    #: the stablehlo Writer. "jacobi_batched" runs all mutually-disjoint
+    #: rotations of a round-robin round per ``stablehlo.while`` iteration
+    #: (measured 65-74x faster than the sequential composition at n = 100,
+    #: 4-5.7x at n = 10, and it avoids an iree llvm-cpu crash at
+    #: n in {4, 8, 12, 16}); "jacobi" is the previous one-rotation-per-
+    #: iteration composition (byte-identical to the pre-option export text).
+    default_eigh_algorithm: ClassVar[str] = "jacobi_batched"
+
+    #: Default for the reserved per-call ``split_reduction`` lower option
+    #: (bool) — forwarded to ``stablehlo.export``; see the stablehlo Writer.
+    #: ``True`` emits two-stage split reductions for rank-0-result reductions
+    #: (measured 7.1-8.1x on those ops); ``False`` emits the byte-identical
+    #: single-stage text.
+    default_split_reduction: ClassVar[bool] = True
+
     #: Known per-stage option names (the options-override contract — see
     #: ``../options.py``): each adapter OVERRIDES this class attribute with
     #: its compile/load/run sets (e.g. iree declares ``iree_compile_args`` at
@@ -378,7 +395,21 @@ class CompilerBackend(Backend):
         ``"HIGH"`` / ``"HIGHEST"``; only ``"HIGHEST"`` disables XLA/ROCm's
         TF32-class fp32 ``dot``); its literal default ``"DEFAULT"`` emits no
         ``precision_config`` attribute, leaving the export unchanged.
+        ``eigh_algorithm`` selects the ``eigh`` cyclic-Jacobi composition
+        (``"jacobi"`` | ``"jacobi_batched"``, this adapter's class default);
+        the value is passed through UNVALIDATED — per the framework's
+        validation philosophy the Writer validates VALUES (raising
+        ``core.BackendError`` listing the valid ones) while this framework
+        validates unknown KEYS (``options.validate_options``).
+        ``split_reduction`` (bool, this adapter's class default) enables the
+        two-stage split reductions for rank-0-result reductions; it is
+        coerced to a real ``bool`` by ``options.normalize_bool_option`` here
+        — as is ``while_init_rewrite`` — so an env-style string value like
+        ``"0"`` cannot fall into the ``bool("0") is True`` trap inside the
+        Writer.
         """
+        from .options import normalize_bool_option
+
         return {
             "rng_bit_generator": (options or {}).get(
                 "rng_bit_generator", self.capabilities.rng_bit_generator
@@ -386,8 +417,20 @@ class CompilerBackend(Backend):
             "sort_emission": (options or {}).get(
                 "sort_emission", self.default_sort_emission
             ),
-            "while_init_rewrite": (options or {}).get("while_init_rewrite", True),
+            "while_init_rewrite": normalize_bool_option(
+                "while_init_rewrite",
+                (options or {}).get("while_init_rewrite", True),
+            ),
             "dot_precision": (options or {}).get("dot_precision", "DEFAULT"),
+            "eigh_algorithm": (options or {}).get(
+                "eigh_algorithm", self.default_eigh_algorithm
+            ),
+            "split_reduction": normalize_bool_option(
+                "split_reduction",
+                (options or {}).get(
+                    "split_reduction", self.default_split_reduction
+                ),
+            ),
         }
 
     def _record_signature(self, graph: "Graph", main_fn: Any) -> Signature:
