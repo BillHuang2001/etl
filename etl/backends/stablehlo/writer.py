@@ -87,7 +87,7 @@ from etl.core import BackendError, Dim, DimExpr
 
 from . import ops as mapping
 from . import random_export
-
+from .eigh_batched import EighBatchedMixin
 if TYPE_CHECKING:
     from etl.ir import Block, Function, Module, Op, Value
 
@@ -203,7 +203,35 @@ def _normalize_dot_precision(value) -> str:
     return mode
 
 
-class Writer:
+#: ``eigh`` lowering selection (``eigh_algorithm`` exporter option, see
+#: ``Writer.__init__`` and ``./eigh_batched.py``).
+_EIGH_ALGORITHM_MODES = ("jacobi", "jacobi_batched")
+_EIGH_ALGORITHM_DEFAULT = "jacobi_batched"
+
+
+def _normalize_eigh_algorithm(value) -> str:
+    """Validate the ``eigh_algorithm`` exporter option (see
+    ``Writer.__init__``): ``"jacobi"`` (the sequential one-rotation-per-
+    iteration while composition) | ``"jacobi_batched"`` (the batched /
+    parallel-rotation while composition in ``./eigh_batched.py``) —
+    case-insensitive, whitespace-stripped; ``None`` -> the default."""
+    if value is None:
+        return _EIGH_ALGORITHM_DEFAULT
+    if not isinstance(value, str):
+        raise BackendError(
+            f"stablehlo export: invalid eigh_algorithm option {value!r} "
+            f"(expected one of {', '.join(_EIGH_ALGORITHM_MODES)})"
+        )
+    mode = value.strip().lower()
+    if mode not in _EIGH_ALGORITHM_MODES:
+        raise BackendError(
+            f"stablehlo export: invalid eigh_algorithm option {value!r} "
+            f"(expected one of {', '.join(_EIGH_ALGORITHM_MODES)})"
+        )
+    return mode
+
+
+class Writer(EighBatchedMixin):
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
     first), the Writer only type-checks it defensively."""
@@ -260,6 +288,22 @@ class Writer:
         #: ``IreeBackend._exporter_options``).
         self._sort_emission = _normalize_sort_emission(
             (options or {}).get("sort_emission", "pair")
+        )
+        #: eigh_algorithm exporter option (``"jacobi"`` |
+        #: ``"jacobi_batched"``, case-insensitive; default
+        #: ``"jacobi_batched"``): selects the ``eigh`` while composition.
+        #: ``"jacobi_batched"`` (``./eigh_batched.py``) runs ALL of a
+        #: sweep's ``L`` mutually-disjoint rotations in ONE loop iteration
+        #: (``sweeps × L`` iterations instead of ``sweeps × n(n-1)/2``),
+        #: with the partner/angle mapping derived arithmetically from
+        #: hoisted iotas — no per-iteration scatters or selects over the
+        #: matrix. ``"jacobi"`` is the sequential one-rotation-per-iteration
+        #: composition (``_emit_eigh_jacobi``) and emits the pre-option text
+        #: unchanged. Both paths share ALL validation, the while SHAPE (one
+        #: ``stablehlo.while``, cond region ``k < total``, hoisted
+        #: constants/iotas) and the post-loop tail (``_emit_eigh_finish``).
+        self._eigh_algorithm = _normalize_eigh_algorithm(
+            (options or {}).get("eigh_algorithm", _EIGH_ALGORITHM_DEFAULT)
         )
         #: dot_precision exporter option (``"DEFAULT"`` | ``"HIGH"`` |
         #: ``"HIGHEST"``, case-insensitive; default ``"DEFAULT"``): when
@@ -2286,7 +2330,22 @@ class Writer:
                 "inputs; int/bool upcast to float64)"
             )
         batch = x_shape[:-2]
+        if self._eigh_algorithm == "jacobi_batched" and n >= 2:
+            return self._emit_eigh_batched(
+                op, x, x_shape, n, batch, in_dtype, dtype
+            )
+        return self._emit_eigh_jacobi(op, x, x_shape, n, batch, in_dtype, dtype)
+
+    def _emit_eigh_jacobi(self, op: Op, x, x_shape, n, batch, in_dtype,
+                         dtype) -> str:
+        """The SEQUENTIAL cyclic-Jacobi composition (``eigh_algorithm =
+        "jacobi"``): one ``stablehlo.while`` iteration = ONE (p, q)
+        rotation, the pair carried as rank-0 i64 scalars. Shared
+        validation and the post-loop tail live in ``_emit_eigh`` /
+        ``_emit_eigh_finish``; the emission is the pre-option text
+        unchanged."""
         i64 = np.dtype("int64")
+        rank = len(x_shape)
         lines = []
         # int/bool → float64 (numpy linalg upcast rule).
         a = self._name(x)
@@ -2443,16 +2502,7 @@ class Writer:
         # (measured 0/10 SIGSEGV); the body instead clamps k to total when
         # done fires (see below), so this cond region is byte-identical to
         # the pre-option text. No closing brace — `_emit_while` style.
-        cond_args = [self._new_name() for _ in range(n_carries)]
-        cond_lines = []
-        cnd = self._cmp(cond_args[4], i_total, "LT", i64, (), cond_lines)
-        cond_region = (
-            "  ^bb0("
-            + ", ".join(f"{nm} : {tp}" for nm, tp in zip(cond_args, arg_types))
-            + "):\n"
-            + "\n".join("    " + line for line in cond_lines)
-            + f"\n    stablehlo.return {cnd} : tensor<i1>"
-        )
+        cond_region = self._emit_eigh_cond_region(arg_types, i_total, 4)
         # Body region: one rotation on (p, q), then the pair/counter step.
         body_args = [self._new_name() for _ in range(n_carries)]
         body_lines = []
@@ -2517,41 +2567,7 @@ class Writer:
             + f"\n  }}) : {carry_types} -> {carry_types}"
         )
         a, v = result_names[0], result_names[1]
-        # The carried matrices are in the transposed layout — transpose
-        # back to (batch..., n, n) for the diagonal extract and the column
-        # reorder. The inverse of the init perm [rank-1, rank-2]+[0..rank-3]
-        # is [2..rank-1] + [1, 0] (batch dims in order, MATRIX DIMS
-        # REVERSED — both are involutions on the matrix block). A's
-        # back-transpose is only needed for batch dims (rank 2: a stayed
-        # (n, n) throughout); V's is real at every rank (rank 2: [1, 0] —
-        # the same formula).
-        if batch:
-            perm = list(range(2, rank)) + [1, 0]
-            a2 = self._new_name()
-            lines.append(
-                f'{a2} = "stablehlo.transpose"({a}) '
-                f"{{permutation = {self._i64_array(perm)}}} : "
-                f"({self._type_str(dtype, t_shape)}) -> "
-                f"{self._type_str(dtype, x_shape)}"
-            )
-            a = a2
-        v_perm = list(range(2, rank)) + [1, 0]
-        v2 = self._new_name()
-        lines.append(
-            f'{v2} = "stablehlo.transpose"({v}) '
-            f"{{permutation = {self._i64_array(v_perm)}}} : "
-            f"({self._type_str(dtype, t_shape)}) -> "
-            f"{self._type_str(dtype, x_shape)}"
-        )
-        v = v2
-        # The diagonal now holds the (unsorted) eigenvalues.
-        w = self._emit_diagonal_extract(a, dtype, x_shape, n, lines)
-        # Ascending order + the permutation, then the V column reorder.
-        w_shape = batch + (n,)
-        sv, si = self._emit_stable_argsort(w, dtype, w_shape, len(w_shape) - 1, lines)
-        vs = self._emit_reorder_columns(v, si, dtype, x_shape, n, lines)
-        self._names[id(op.results[0])] = sv
-        self._names[id(op.results[1])] = vs
+        self._emit_eigh_finish(op, a, v, dtype, x_shape, n, lines)
         return "\n".join(lines)
 
     def _emit_jacobi_rotation_loop_body(self, a_name, v_name, p_name, q_name,
