@@ -88,6 +88,13 @@ from etl.core import BackendError, Dim, DimExpr
 from . import ops as mapping
 from . import random_export
 from .eigh_batched import EighBatchedMixin
+from .split_reduce import (
+    SplitReductionMixin,
+    normalize_split_reduction,
+    normalize_split_reduction_non_exact,
+    normalize_split_reduction_threshold,
+)
+
 if TYPE_CHECKING:
     from etl.ir import Block, Function, Module, Op, Value
 
@@ -231,7 +238,7 @@ def _normalize_eigh_algorithm(value) -> str:
     return mode
 
 
-class Writer(EighBatchedMixin):
+class Writer(EighBatchedMixin, SplitReductionMixin):
     """Emit StableHLO MLIR text for a verified `etl.ir.Module`; the
     module is assumed verified (``export()`` runs ``module.verify()``
     first), the Writer only type-checks it defensively."""
@@ -352,7 +359,35 @@ class Writer(EighBatchedMixin):
         self._eigh_early_exit = bool(
             (options or {}).get("eigh_early_exit", False)
         )
-
+        #: split_reduction exporter option (bool, default True): emit an
+        #: eligible reduction as a TWO-STAGE ("split") reduce — reshape the
+        #: reduced extent N into (R, C), reduce the inner axis (rank >= 1,
+        #: so IREE parallelizes it) and then reduce the R partials — instead
+        #: of ONE single-stage ``stablehlo.reduce``. IREE's GPU backend
+        #: lowers a rank-0 reduce as ONE workgroup of ONE thread (measured:
+        #: min/argmin over 10001 = 0.7-0.9 ms of a 1.9 ms evox DE step), so
+        #: the split is a 7-9x win there. ``False`` emits the single-stage
+        #: text BYTE-FOR-BYTE (the hard backward-compat requirement).
+        self._split_reduction = normalize_split_reduction(
+            (options or {}).get("split_reduction", True)
+        )
+        #: split_reduction_threshold exporter option (int >= 2, default
+        #: 1024): the minimum ``total_reduced`` extent (product of the
+        #: reduced dims) for which a reduce is split; also lets callers
+        #: force/suppress splitting on small shapes.
+        self._split_reduction_threshold = normalize_split_reduction_threshold(
+            (options or {}).get("split_reduction_threshold", 1024)
+        )
+        #: split_reduction_non_exact exporter option (bool, default False):
+        #: ALSO split float ``sum``/``prod`` (and therefore
+        #: ``reduce_mean``), which reassociates the floating-point
+        #: accumulation — the result is then not bit-exact vs the
+        #: single-stage text. Exact classes (min/max incl. the i1 guards,
+        #: argmin/argmax via the composite index, integer/bool sum/prod)
+        #: always split; see ``./split_reduce.py``.
+        self._split_reduction_non_exact = normalize_split_reduction_non_exact(
+            (options or {}).get("split_reduction_non_exact", False)
+        )
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -1058,7 +1093,9 @@ class Writer(EighBatchedMixin):
                 "complex dtype is not supported in v1 — complex-number "
                 "computation beyond cast is deferred"
             )
-        lines, red_name, reduced_shape = self._emit_reduce_core(x, dims, kind)
+        lines, red_name, reduced_shape = self._reduce_core_with_split(
+            x, dims, kind
+        )
         cur = red_name
         # numpy promotion guard: stablehlo.reduce keeps the operand dtype;
         # etl sum/prod promote (ints → int64, bool → int64).
@@ -1112,7 +1149,9 @@ class Writer(EighBatchedMixin):
         for i in dims:
             count *= x.type.shape[i]
         out_dtype = np.dtype(op.result.type.dtype)
-        lines, sum_name, reduced_shape = self._emit_reduce_core(x, dims, "sum")
+        lines, sum_name, reduced_shape = self._reduce_core_with_split(
+            x, dims, "sum"
+        )
         converted = self._new_name()
         lines.append(
             f"{converted} = stablehlo.convert {sum_name} : "
@@ -3131,6 +3170,9 @@ class Writer(EighBatchedMixin):
         Float NaN: numpy returns the FIRST NaN position; StableHLO
         comparisons with NaN are false, so NaN never beats a finite value
         — divergence documented (evox fitnesses are finite)."""
+        split_text = self._emit_split_arg_reduce(op)
+        if split_text is not None:
+            return split_text
         x = op.operands[0]
         kind = "max" if op.name == "argmax" else "min"
         axis_attr = op.attributes.get("axis")

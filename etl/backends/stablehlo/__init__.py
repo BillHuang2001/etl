@@ -92,7 +92,56 @@ def export(graph_or_module, options: dict | None = None) -> str:
             real ROCm PJRT plugin: max-abs error vs fp64 0.1228 ->
             0.000203 at n=1024); ``"HIGH"`` does NOT help there. Any other
             value raises `core.BackendError` naming the option, the
-            offending value, and the accepted forms.
+            offending value, and the accepted forms. ``split_reduction``
+            (bool, default True) selects the TWO-STAGE ("split") reduction
+            emission for reductions whose IREE lowering degrades to one
+            single-threaded workgroup: the reduced extent ``N`` is reshaped
+            into ``(R, C)``, the inner axis is reduced first (a rank >= 1
+            intermediate — ``R`` partials — which IREE parallelizes) and
+            the partials are reduced in a second, tiny stage. Reshaping to
+            keepdims ``(N, 1)`` does NOT help — the intermediate result has
+            to be genuinely small. Measured on an AMD MI300X (iree-base
+            3.11.0, real evox DE step): the rank-0 ``min``/``argmin``/i1
+            guard reduces over 10001 cost 1765 us of a 1858 us step while
+            all of the 10000x100 data-parallel work cost 61 us; the split
+            measures ``min`` 0.7608 -> 0.0957 ms (7.9x, exact 73x137
+            factorization) / 0.1067 ms (7.1x, generic padded path) and
+            ``argmin`` 0.9386 -> 0.1162 ms (8.1x), and ~9x on
+            iree/llvm-cpu too. A reduction is split when ALL of: the option
+            is True; the operand shape is fully STATIC (any
+            ``Dim``/``DimExpr``/``None`` keeps today's emission, no error);
+            the reduced dims are non-empty; the product of the reduced
+            extents is >= ``split_reduction_threshold``; the result has
+            <= 1024 elements (rank-0 or otherwise tiny); and the
+            reduction's exactness class allows it (below). Everything else
+            emits the single-stage ``stablehlo.reduce`` text. ONE MLIR
+            comment line (``// etl split reduction: pivot axis {pivot}, {N}
+            -> {R} x {C}``) precedes the stage-1 reduce so export goldens
+            can assert the split unambiguously. **Exactness classes:** the
+            i1 ``any``/``all`` guard shapes included, ``min``/``max`` split
+            BY DEFAULT; ``argmin``/``argmax`` split BY DEFAULT (both stages
+            carry the composite ``(value, index)`` reduce with the SAME
+            comparator region and an index operand ``iota(pivot)*C +
+            iota(pivot+1)`` — the ORIGINAL flat index for real elements,
+            and ``>= N`` for padded slots, so the first-occurrence
+            ``idx LT`` tie-break stays exact vs ``np.argmin``/``np.argmax``);
+            ``sum``/``prod`` over INTEGER/bool dtypes split BY DEFAULT
+            (wraparound integer arithmetic is associative — exact);
+            ``sum``/``prod`` over FLOAT dtypes — and therefore the
+            ``reduce_mean`` sum and ``var`` (a composition over the mean) —
+            do NOT split by default, because splitting reassociates the
+            floating-point accumulation and is therefore not bit-exact vs
+            the single-stage text; they split only when
+            ``split_reduction_non_exact`` is True. ``split_reduction=False``
+            emits the single-stage text BYTE-FOR-BYTE (hard
+            backward-compat requirement). ``split_reduction_threshold``
+            (int >= 2, default 1024) is the ``total_reduced`` gate — it also
+            lets callers force or suppress splitting on small shapes.
+            ``split_reduction_non_exact`` (bool, default False) opts INTO
+            splitting float ``sum``/``prod`` (and hence ``reduce_mean``).
+            A non-bool / non-int / out-of-range value for any of the three
+            raises `core.BackendError` naming the option, the offending
+            value and the accepted forms.
 
     Returns:
         The StableHLO MLIR text (a ``str``) — compiler input for external
