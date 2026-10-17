@@ -559,6 +559,7 @@ def test_split_reduction_malformed_env_raises_backend_error(monkeypatch):
 # Stub backends (no real adapter imports)
 # ---------------------------------------------------------------------------
 
+
 class _IreeStubExecutable:
     """Minimal backend executable wrapper reporting ``backend_name="iree"``
     while delegating everything to the numpy backend executable."""
