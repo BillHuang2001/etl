@@ -4061,40 +4061,23 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
 
     # --- Control flow ---
 
-    # REGION-SCOPED EMISSION (iree 3.11 region defects — see
-    # `_split_region_invariants`). A `stablehlo.while` nested inside a
-    # `stablehlo.if` region is FINE: a hand-written probe whose branch
-    # regions EACH contain their own `stablehlo.while` over ENCLOSING-scope
-    # constants compiles and runs correctly with the adapter's exact flags
-    # (`/tmp/t1a64/probe_while_in_if.mlir`, raw `iree-compile` +
-    # `iree-run-module`; run it to re-validate before changing this).
-    # The previously assumed "iree mis-lowers while-inside-if" claim (the
-    # c7c5022 whole-prefix hoist) was WRONG — that hoist emitted an if
-    # whose branches only returned already-computed values, which iree
-    # 3.11 executes incorrectly (identical results for both branches;
-    # orthogonality lost on an eigh under `etl.cond`).
+    # REGION-SCOPED EMISSION — the region contract (iree 3.11 regional
+    # defects; see `_split_region_invariants`). Three independent rules:
     #
-    # The REAL defect is REGION-LOCAL CONSTANTS: iree 3.11 hoists a
-    # `stablehlo.constant` (or an op consuming one) placed inside a region
-    # into a `util.global` nothing defines — `'util.global.load' op
-    # undefined global: @__hoisted_tensor_3x3xf32` at compile (reproduced
-    # by disabling the old hoist on `eigh` under `etl.cond`, whose
-    # cyclic-Jacobi composition emits a pre-loop prelude of constants and
-    # iotas — the eye, the sweep counters, the index lattices).
-    #
-    # FIX: every region-emitting emitter prints its setup lines at the TOP
-    # of its returned text (depth 0), and the region emitters split each
-    # region block into atomic units and lift the REGION-INVARIANT ones
-    # into a PRELUDE emitted BEFORE the enclosing `if`/`while` header
-    # (`_split_region_invariants`, driven by `_region_lines`). Constants
-    # therefore live in the enclosing scope and the regions capture them
-    # lexically — the shape iree handles correctly — while the `while`
-    # STAYS inside the region.
+    # (1) REGION-LOCAL CONSTANTS. iree 3.11 hoists a `stablehlo.constant`
+    # (or an op consuming one) placed inside a region into a `util.global`
+    # nothing defines — `'util.global.load' op undefined global:
+    # @__hoisted_tensor_3x3xf32` at compile (reproduced on `eigh` under
+    # `etl.cond`, whose cyclic-Jacobi composition emits a pre-loop prelude
+    # of constants and iotas — the eye, the sweep counters, the index
+    # lattices). FIX: every region-emitting emitter prints its setup lines
+    # at the TOP of its returned text, and the region emitters split each
+    # region block into atomic units and lift the REGION-INVARIANT ones into
+    # a PRELUDE emitted BEFORE the enclosing `if`/`while` header
+    # (`_split_region_invariants`, driven by `_region_lines`), so constants
+    # live in the enclosing scope and the regions capture them lexically.
     # Safe because every op reaching the exporter is pure (effectful ops —
-    # collectives, runtime_call/external_call — defer with BackendError),
-    # so a lifted prefix cannot duplicate a side effect; it may compute
-    # unconditionally what a branch computed conditionally, which pure
-    # semantics preserve.
+    # collectives, runtime_call/external_call — defer with BackendError).
     # DOMINANCE (binding): a lifted unit lands at the ENCLOSING scope, where
     # only enclosing-scope names are visible — NOT the region's block
     # arguments, not anything any unit of this block (or of the sibling
@@ -4103,11 +4086,29 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # FORBIDS all of those, and lifts only units that use none of them (a
     # unit derived from an already-lifted constant still lifts, so an
     # `eigh` prelude lifts as one chain). Lifting bubbles outward one
-    # region level at a time (a lifted unit joins its enclosing block's
-    # units and that block's own split may lift it further), so an `eigh`
-    # inside a cond inside a cond, and an `eigh` inside a `while` BODY,
-    # both end up with their constants at function scope — while a unit
-    # that depends on a region-local value correctly STAYS in the region.
+    # region level at a time, so an `eigh` inside a cond inside a cond, and
+    # an `eigh` inside a `while` BODY, both end up with their constants at
+    # function scope — while a unit that depends on a region-local value
+    # correctly STAYS in the region.
+    #
+    # (2) NO `stablehlo.sort` IN A REGION OR AN INLINE BRANCH SCOPE. A
+    # 2-operand `stablehlo.sort` there executes with the sort result and
+    # its consumers out of sync (index correct, gather of the same operand
+    # unsorted), so every sort/argsort emitted at `_region_depth > 0` OR
+    # `_select_inline_depth > 0` uses the count composition — see
+    # `_count_argsort_active`.
+    #
+    # (3) NO `stablehlo.while` INSIDE A `stablehlo.if`. iree 3.11's
+    # `local-task` driver mis-executes such a module (correct 6/6 under
+    # `local-sync`; the implicit-capture-mis-binding hypothesis is
+    # REFUTED), so a `cond` whose branch regions contain a while-emitting
+    # op is emitted INLINE + `select` instead (`_emit_if_select`, which
+    # runs both branches — see its docstring for the cost). Region-free and
+    # reduce-only branches keep the `stablehlo.if` emission byte for byte;
+    # the trigger is derived from the IR (`_region_contains_while`), no
+    # writer state flag, and `_region_depth` is not incremented on the
+    # inline path (the branch units become ordinary units of the enclosing
+    # block, so that block's split lifts their constants normally).
     # The eigh composition stays a single while (O(1) emitted text — no
     # compile blowup at dim 50).
 
