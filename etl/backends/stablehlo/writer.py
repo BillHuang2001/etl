@@ -273,6 +273,33 @@ def _is_hoistable_unit(unit: str) -> bool:
     return bool(match) and match.group(1) in _HOISTABLE_MNEMONICS
 
 
+#: IR op names whose EMITTED text contains a ``stablehlo.while``: the
+#: ``while`` op itself and ``eigh``, whose cyclic-Jacobi compositions are
+#: emitted as one (``_emit_eigh`` / ``./eigh_batched.py``). These are the
+#: ops that must not be wrapped in a ``stablehlo.if`` region (see
+#: ``Writer._emit_if_select``). A ``reduce``/``sort`` comparator region is
+#: NOT a while and does not trigger the fallback (probed: a reduce-bearing
+#: `if` executes correctly).
+_WHILE_EMITTING_OPS = frozenset({"while", "eigh"})
+
+
+def _region_contains_while(region) -> bool:
+    """True when a region's body contains an op that emits a
+    ``stablehlo.while`` (``_WHILE_EMITTING_OPS``), directly or in a nested
+    region (see ``Writer._emit_if_select``).
+
+    This is the trigger for the `cond` select-fallback: iree 3.11's
+    `local-task` driver mis-executes a ``stablehlo.if`` whose regions hold a
+    ``stablehlo.while``, so such an `if` must not be emitted."""
+    for block in region.blocks:
+        for op in block.ops:
+            if op.name in _WHILE_EMITTING_OPS:
+                return True
+            if any(_region_contains_while(inner) for inner in op.regions):
+                return True
+    return False
+
+
 def _is_static_dim(dim) -> bool:
     """True for concrete int dims (bool excluded — it is not a size)."""
     return isinstance(dim, int) and not isinstance(dim, bool)
@@ -4064,6 +4091,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # compile blowup at dim 50).
 
     def _emit_if(self, op: Op) -> str:
+        if any(_region_contains_while(region) for region in op.regions):
+            return self._emit_if_select(op)
         pred = op.operands[0]
         # Bind the branch block args to the if operands BEFORE emitting the
         # regions so branch-local references resolve to the enclosing
@@ -4119,6 +4148,83 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 self._region_depth -= 1
             blocks.append((f"  ^bb{i}:", units))
         return blocks, set()
+
+    def _emit_if_select(self, op: Op) -> str:
+        """A `cond` whose branches contain a ``while`` — emitted as INLINE
+        branches combined with ``stablehlo.select`` instead of
+        ``stablehlo.if`` (see ``_region_contains_while``).
+
+        Both branch bodies are emitted at the ENCLOSING scope, in order, and
+        each result i becomes ``select(broadcast(pred), true_i, false_i)``:
+        no ``if`` region, and both ``while`` ops sit at function (or
+        enclosing-block) level, where iree executes them correctly — the
+        same shape a bare ``eigh`` emits. Every op reaching the exporter is
+        pure (effectful ops — collectives, `runtime_call`/`external_call` —
+        defer with ``BackendError``), so running both branches is
+        semantics-preserving: only the selected value reaches the
+        consumers. The cost is that the UNSELECTED branch is computed too —
+        its ``while`` runs its full iteration count — so a while-bearing
+        `cond` costs the sum of both branches rather than one of them.
+
+        Reason: iree 3.11's ``local-task`` driver mis-executes a
+        ``stablehlo.if`` whose regions contain a ``stablehlo.while`` — the
+        SAME compiled module returns zeros for both results on some runs
+        (the identical module is always correct under ``local-sync``), which
+        is what made an ``eigh`` inside an ``etl.cond`` branch unusable on
+        the default CPU driver. The defect is not about capture binding
+        (minimal probes refuted that), and a ``reduce``-bearing branch is
+        NOT affected — hence the narrow ``while``-only trigger: region-free
+        and reduce-only branches keep the ``stablehlo.if`` emission, byte
+        for byte.
+        """
+        pred = op.operands[0]
+        result_names = self._bind_results(op)
+        lines, branches = [], []
+        for region in op.regions:
+            units, returned = self._emit_branch_inline(region, op)
+            lines.extend(units)
+            branches.append(returned)
+        true_values, false_values = branches
+        for result, name, true_value, false_value in zip(
+            op.results, result_names, true_values, false_values
+        ):
+            shape = tuple(result.type.shape)
+            pred_name, extra = self._equalize_operand(
+                pred, shape, self._shape_source([true_value, false_value], shape)
+            )
+            lines.extend(extra)
+            lines.append(
+                f"{name} = stablehlo.select {pred_name}, "
+                f"{self._name(true_value)}, {self._name(false_value)} : "
+                f"({self._type_str(pred.type.dtype, shape)}, "
+                f"{self._vt_value(true_value)}, {self._vt_value(false_value)})"
+                f" -> {self._vt_value(result)}"
+            )
+        return "\n".join(lines)
+
+    def _emit_branch_inline(self, region, op: Op):
+        """One `cond` branch emitted at the ENCLOSING scope (see
+        ``_emit_if_select``): the branch's block ops become ordinary units of
+        the enclosing block in program order, so they inherit its scope and
+        the enclosing region split lifts their constants exactly as it would
+        for a `while` emitted there (no region-local constant, hence no
+        ``@__hoisted_`` failure).
+
+        Returns ``(units, returned)``: the branch body WITHOUT its
+        terminator (``stablehlo.return`` is only valid inside a region) and
+        the SSA names the branch returns — the values the fallback
+        ``stablehlo.select`` combines."""
+        units, returned = [], []
+        for block in region.blocks:
+            for arg, operand in zip(block.arguments, op.operands):
+                self._names[id(arg)] = self._name(operand)
+            block_units = self._block_units(block)
+            terminator = block.ops[-1] if block.ops else None
+            if terminator is not None and terminator.name == "return":
+                returned = list(terminator.operands)
+                block_units = block_units[:-1]
+            units.extend(block_units)
+        return units, returned
 
     def _emit_while(self, op: Op) -> str:
         init_lines = []
