@@ -42,13 +42,30 @@ consumed by the pipeline env-var resolution for ``ETL_OPT_LEVEL``. The
 per-backend translation (mapping the normalized int to each compiler's own
 optimization setting) happens in the adapters.
 
+``normalize_bool_option`` is the shared parser/normalizer for BOOL-valued
+options — it coerces real bools, 0/1 ints and the usual true/false strings
+to a real ``bool`` so a string value can never fall into the
+``bool("0") is True`` trap. It is used by the bool exporter options the
+compiler framework forwards (``CompilerBackend._exporter_options``:
+``split_reduction``, ``while_init_rewrite``) and is the reuse point for
+bool ``ETL_*`` env-var parsing. It is a TYPE COERCION for options whose
+type is bool — not a per-backend semantic mapping — so the statement above
+stays accurate: ``opt_level`` remains the one etl-DEFINED/translated
+option.
+
 Import acyclicity: this module imports ``etl.core`` ONLY.
 """
 from __future__ import annotations
 
 from etl.core import BackendError
 
-__all__ = ["STAGES", "validate_options", "normalize_opt_level", "OPT_LEVEL"]
+__all__ = [
+    "STAGES",
+    "validate_options",
+    "normalize_opt_level",
+    "normalize_bool_option",
+    "OPT_LEVEL",
+]
 
 #: The canonical pipeline stage names (option scope keys).
 STAGES = ("lower", "compile", "load", "run")
@@ -120,4 +137,54 @@ def normalize_opt_level(value) -> int:
     raise BackendError(
         f"invalid {OPT_LEVEL!r} value {value!r} — accepted forms: "
         "'O0'..'O3' (case-insensitive), '0'..'3', or an int 0..3"
+    )
+
+
+#: The accepted string spellings of a bool-valued option (case-insensitive,
+#: whitespace-stripped) mapped to their bool.
+_BOOL_STRINGS = {
+    "1": True,
+    "0": False,
+    "true": True,
+    "false": False,
+    "yes": True,
+    "no": False,
+    "on": True,
+    "off": False,
+}
+
+
+def normalize_bool_option(option: str, value) -> bool:
+    """Normalize a bool-valued option to a real ``bool``.
+
+    A shared TYPE COERCION for options whose declared type is bool (the
+    compiler framework's bool exporter options — ``split_reduction``,
+    ``while_init_rewrite`` — and the reuse point for bool ``ETL_*`` env-var
+    parsing), so an env-style string value like ``"0"``/``"false"`` can
+    never fall into the ``bool("0") is True`` trap. Accepted forms:
+
+    - real ``True``/``False``;
+    - ints ``0``/``1`` (``type(value) is int``, so a bool is never
+      re-interpreted as an int — 0 and 1 only);
+    - strings ``"1"``/``"0"``/``"true"``/``"false"``/``"yes"``/``"no"``/
+      ``"on"``/``"off"``, case-insensitive, whitespace-stripped (so
+      ``" ON "`` works).
+
+    ANY other value (``None``, ``2``, ``-1``, ``1.0``, ``"maybe"``, lists,
+    ...) raises ``core.BackendError`` naming the option, the offending value
+    and the accepted forms — never a silent coercion.
+    """
+    if isinstance(value, bool):
+        return value
+    if type(value) is int:  # `type is int`: bool handled above
+        if value in (0, 1):
+            return bool(value)
+    elif isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped in _BOOL_STRINGS:
+            return _BOOL_STRINGS[stripped]
+    raise BackendError(
+        f"invalid {option!r} value {value!r} — accepted forms: True/False, "
+        "0/1, or one of 'true', 'false', 'yes', 'no', 'on', 'off' "
+        "(case-insensitive)"
     )
