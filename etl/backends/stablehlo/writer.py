@@ -1992,15 +1992,18 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         tie-break) — here it is irrelevant. Bool operands sort via an i8
         key (StableHLO compare on i1 only supports EQ/NE).
 
-        Emission mode: in STRICT ``sort_emission="count"`` mode the sorted
-        values come from ``_emit_stable_argsort``'s count composition (the
-        sorted-VALUES column — bit-exact vs numpy on llvm-cpu AND cuda, and
-        on iree-cuda it dodges the single-threaded O(n²) kernel the
-        1-operand pair form lowers to; see stablehlo/CONTEXT.md). ``"pair"``
-        and ``"auto"`` keep the 1-operand emission (unchanged llvm-cpu
-        behavior: the count values-composition is ~1.6× slower than its
-        1-operand sort at n ≥ 10000, so the count routing is gated to the
-        strict mode — the iree adapter passes it on cuda targets)."""
+        Emission mode (``_count_sort_active``): the sorted values come from
+        ``_emit_stable_argsort``'s count composition (the sorted-VALUES
+        column — bit-exact vs numpy on llvm-cpu AND cuda, and on iree-cuda it
+        dodges the single-threaded O(n²) kernel the 1-operand pair form lowers
+        to; see stablehlo/CONTEXT.md) in the STRICT ``sort_emission="count"``
+        mode AND for every sort emitted inside a region (the region-nested
+        2-operand mis-execution — see ``_count_argsort_active``). ``"pair"``
+        and ``"auto"`` keep the 1-operand emission at region depth 0
+        (unchanged llvm-cpu behavior: the count values-composition is ~1.6×
+        slower than its 1-operand sort at n ≥ 10000, so the extent-gated
+        routing is left to the strict mode — the iree adapter passes it on
+        cuda targets)."""
         x = op.operands[0]
         rank = x.type.rank
         axis = self._normalize_axis(op.attributes.get("axis", -1), rank, "sort.axis")
@@ -2018,8 +2021,8 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
                 f"{self._type_str(np.dtype('int8'), x_shape)}"
             )
             key_name, keys_dtype = t, np.dtype("int8")
-        if self._sort_emission == "count":
-            # Count mode: reuse the count-based STABLE argsort composition's
+        if self._count_sort_active():
+            # Count composition: reuse the count-based STABLE argsort's
             # sorted-VALUES column (the index column is discarded). The
             # values are the same regardless of the tie order.
             cur, _ = self._emit_stable_argsort(
@@ -2109,13 +2112,24 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         ``keys_shape``; the iota column is int64). Shared by the ``argsort``
         op, the permutation expansion, and the ``eigh`` eigenvalue sort.
 
-        Emission mode (writer option ``sort_emission``): ``"pair"`` (this
+        Emission mode (writer option ``sort_emission`` combined with the
+        emission SITE, see ``_count_argsort_active``): ``"pair"`` (this
         two-operand sort — iree-cuda cannot bufferize multi-operand sorts
         whenever the sorted-axis extent is >= 32, upstream iree 3.11.0
         bug), ``"count"`` (the count-based O(n^2) composition with NO sort
         op — bit-exact vs numpy on both llvm-cpu and cuda), or ``"auto"``
         (per call: ``"count"`` when the sorted-axis extent >= 32, else
-        ``"pair"``). The iree adapter defaults to ``"auto"``."""
+        ``"pair"``). The iree adapter defaults to ``"auto"``.
+        INDEPENDENT of the mode, a sort emitted INSIDE a region (region
+        depth > 0) always takes the count composition: iree 3.11.0
+        mis-executes a 2-operand ``stablehlo.sort`` that lives inside an
+        ``if``/``while`` region when its index operand is a
+        region-INVARIANT value hoisted to the enclosing scope — the
+        index column comes back as the unsorted iota, so a following
+        ``gather`` silently yields the unsorted data (the ``eigh``
+        post-loop tail's eigenvalue sort + column reorder is exactly that
+        shape). The count composition contains no ``sort`` op at all, so
+        the defect class cannot arise."""
         if self._count_argsort_active(keys_shape, axis):
             return self._emit_count_argsort(
                 keys_name, keys_dtype, keys_shape, axis, lines
@@ -2155,14 +2169,42 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
     # --- eigh (while-loop cyclic-Jacobi) ---
     def _count_argsort_active(self, keys_shape: tuple, axis: int) -> bool:
         """Whether the count-based argsort emission applies for this call
-        under the configured ``sort_emission`` mode."""
+        under the configured ``sort_emission`` mode AND the emission site.
+
+        The count composition is used whenever the sort sits INSIDE a
+        region (``_region_depth > 0``): iree 3.11.0 mis-executes a
+        2-operand ``stablehlo.sort`` nested in an ``if``/``while`` region
+        when its index operand is a region-invariant value hoisted to the
+        enclosing scope (a loop-carried value sorted in a body, then
+        gathered with the returned index, silently yields the UNSORTED
+        input — measured on a minimal ``argsort`` + ``gather`` loop body
+        and on the ``eigh`` post-loop eigenvalue sort). No ``sort`` op is
+        emitted by the count composition, so the whole defect class
+        disappears, and the region-nested extents involved (eigenvalue
+        counts) are small enough that its O(n^2) cost is negligible.
+        Everything at region depth 0 keeps the mode's own choice, so a
+        bare/top-level export is byte-identical."""
         mode = self._sort_emission
         if mode == "count":
+            return True
+        if self._region_depth > 0:
             return True
         if mode == "pair":
             return False
         extent = keys_shape[axis]
         return _is_static_dim(extent) and extent >= 32
+
+    def _count_sort_active(self) -> bool:
+        """Whether the VALUES-sort emission uses the count composition —
+        the strict ``sort_emission="count"`` mode, or any sort emitted
+        inside a region (see ``_count_argsort_active`` for the region
+        rule; a 1-operand ``stablehlo.sort`` never hits the 2-operand
+        mis-execution, but routing it through the same count composition
+        keeps one rule for every sort emission site). ``"auto"`` at
+        region depth 0 keeps the 1-operand pair form — byte-identical to
+        the pre-region-rule text and cheaper on llvm-cpu at large
+        extents."""
+        return self._sort_emission == "count" or self._region_depth > 0
 
     def _emit_count_argsort(self, keys_name: str, keys_dtype, keys_shape: tuple,
                             axis: int, lines: list) -> tuple[str, str]:
@@ -2171,7 +2213,11 @@ class Writer(EighBatchedMixin, SplitReductionMixin):
         iree 3.11.0 cannot bufferize multi-operand ``stablehlo.sort`` on
         cuda whenever the sorted-axis extent is >= 32 (upstream bug; every
         iota dtype / is_stable / operand-order variant fails — llvm-cpu is
-        unaffected, 1-operand sorts are unaffected). This composition
+        unaffected, 1-operand sorts are unaffected), and mis-executes a
+        2-operand ``stablehlo.sort`` nested in an ``if``/``while`` region
+        whose index operand is a region-invariant hoisted value (the index
+        column returns as the UNSORTED iota — this composition is what the
+        region-nested emission uses, see ``_count_argsort_active``). It
         computes the stable rank of every element by counting, then
         inverts the rank permutation:
 
