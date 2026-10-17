@@ -60,37 +60,32 @@ grows O(n⁴) in the rotation count). CPU only (llvm-cpu — well-shaped carries
 no iree-cuda while fragility); ONE extra ROCm-guarded case proves the batched
 composition also runs on the AMD GPU (the sequential one SIGSEGVs there).
 
-KNOWN ISSUE (**BUG(etl)**, pre-existing — it hits BOTH compositions):
-``eigh`` inside a nested ``stablehlo`` REGION is broken on the compiler path.
-The eigh emitters hoist their constants/iotas "outside the loop" by appending
-them to the FUNCTION-level body, so an eigh inside an ``etl.cond`` branch is
-emitted at the top level and both ``stablehlo.if`` regions are left holding
-only ``stablehlo.return`` of captured values — iree then mis-executes the
-graph: ``w`` is right but ``V`` comes back non-orthonormal (all columns equal
-in the true branch, a cyclic column rotation in the false branch). Inside a
-``while_loop`` body it does not even compile (``'util.global.load' op
-undefined global: @__hoisted_tensor_NxNxf32``). The numpy backend is
-unaffected (bit-identical to a plain eigh). Minimal repro (n=3, iree-llvm-cpu,
-~1 s)::
+eigh INSIDE A NESTED ``stablehlo`` REGION — an ``etl.cond`` branch, an
+``etl.while_loop`` body, cond-inside-cond — is supported and pinned on
+iree-llvm-cpu. Three emission rules make a nested composition behave exactly
+like a bare one:
 
-    import numpy as np, etl
-    def f(x):
-        return etl.cond(etl.sum(x) > 0.0,
-                        lambda t: etl.eigh(t),
-                        lambda t: etl.eigh(-t), x)
-    a = np.asarray([[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]])
-    exe = etl.build(f, etl.TensorSpec((3, 3), etl.float32), backend="iree")
-    w, v = etl.run(exe, a)
-    v = v.numpy()                      # columns 0/1/2 come back IDENTICAL
-    print(np.max(np.abs(v.T @ v - np.eye(3))))   # ~1.0, expected ~1e-7
+* the hoisted constant/iota prelude stays INSIDE the enclosing region, so
+  every hoisted value dominates its uses inside that region;
+* a ``stablehlo.while`` that would end up nested in a ``stablehlo.if`` is
+  emitted as inline branches + ``stablehlo.select`` instead
+  (``_emit_if_select`` — iree mis-executes while-inside-if on local-task), so a
+  while-bearing cond evaluates both branch bodies unconditionally and selects
+  the result; region-free / reduce-only conds keep the plain ``stablehlo.if``
+  text;
+* a 2-operand ``stablehlo.sort`` whose operand is defined OUTSIDE the region
+  (the ``gather(v, argsort(v))`` shape) uses the count composition inside
+  regions, sidestepping the region-crossing operand desync.
 
-(The numpy backend gives a correct eigh for the same graph, bit-identical to
-a plain ``etl.eigh``.)
-
-``test_eigh_inside_cond_*`` below pins the CONTRACT with the full assertions
-under ``xfail(strict=True)`` (the suite stays green, and an XPASS — i.e. the
-day the hoisting becomes region-aware — fails loudly instead of silently
-dropping the coverage).
+The region pins are ``test_eigh_inside_cond_contract[n3|n10|n25]`` (eigh in an
+``etl.cond`` branch, run in both branch directions),
+``test_eigh_inside_cond_runtime_predicate`` (the predicate is an i1 GRAPH
+INPUT, so the runtime polarity drives the emitted select/branch path),
+``test_eigh_inside_cond_nested`` (cond inside cond, eigh in the inner
+branches) and ``test_eigh_inside_while_body_contract`` (the composition inside
+a ``while_loop`` BODY whose loop re-forms ``A = V diag(w) Vᵀ`` from its own
+eigh outputs each iteration). All four assert the ordinary eigh contract, never
+elementwise v.
 """
 
 import numpy as np
@@ -100,6 +95,7 @@ pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
 import etl
+import etl.numpy as enp
 
 from tests.backends import _rocm_guard as guard
 
@@ -421,16 +417,18 @@ def test_eigh_dim45_early_exit_off_matches_on():
 
 
 # ---------------------------------------------------------------------------
-# 4. eigh INSIDE etl.cond — BUG(etl), see the module docstring
+# 4. eigh INSIDE etl.cond — the while-bearing-cond select fallback
 #
 # Each branch computes its own eigh and the predicate (sign of the matrix sum)
-# selects; the graph is built and run ONCE per size on the batched default and
-# fed the matrix AND its negation, so BOTH branches execute. The assertions are
-# the ordinary eigh contract — they are kept verbatim under a strict xfail
-# because the emitted regions currently lose the composition (w is right, V is
-# non-orthonormal: all columns equal / cyclic column rotation). Delete the
-# xfail marker — it turns into an XPASS failure — once the hoisting is
-# region-aware.
+# selects. Because a branch region of this cond contains a while-emitting op
+# (eigh), the cond is emitted as inline branches + ``stablehlo.select`` rather
+# than as ``stablehlo.if`` regions — so BOTH branch bodies execute on every run
+# and the predicate only picks the result. The graph is built and run ONCE per
+# size on the batched default and fed the matrix AND its negation, so both
+# branch directions are provably exercised (the selected branch is the one
+# whose eigh input is the positive matrix), and the ordinary eigh contract —
+# ascending w, A ≈ V diag(w) Vᵀ, VᵀV ≈ I — is asserted on each run, never
+# elementwise v.
 # ---------------------------------------------------------------------------
 
 EIGH_COND_CASES = [
@@ -450,12 +448,6 @@ def _eigh_cond(x):
     return etl.cond(etl.sum(x) > 0.0, _eigh, lambda t: _eigh(-t), x)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG(etl): eigh inside a cond branch is emitted outside the "
-    "stablehlo.if regions (constant/iota hoisting is not region-aware), so "
-    "iree returns a non-orthonormal V",
-)
 @pytest.mark.parametrize(
     "n,seed,rec_rel",
     [(n, seed, rec_rel) for _, n, seed, rec_rel in EIGH_COND_CASES],
@@ -471,6 +463,145 @@ def test_eigh_inside_cond_contract(n, seed, rec_rel):
         gw, gv = _np(got[0]), _np(got[1])
         _check_eigh_contract(A, gw, gv, rtol=1e-4, atol=1e-4)
         _check_eigh_scaled(A, gw, gv, w_ref, rec_rel, 1.0e-5, 2.0e-5)
+
+
+# ---------------------------------------------------------------------------
+# 4b. the other region shapes — eigh in a while_loop BODY, in a cond whose
+#     predicate is a runtime GRAPH INPUT, and in an inner cond of a cond.
+#
+# Same llvm-cpu-only, one-compile-per-pin discipline as above, with the
+# ordinary eigh contract asserted on every run (``rtol=atol=1e-4``; the
+# scale-normalized bounds are what actually constrain the accuracy). Every
+# bound below is the MEASURED value on the pinned fixed-seed matrix with a
+# 2-5x margin, and the measurement is recorded next to the bound — the inputs
+# are deterministic and the compiler is real, so the bounds cannot flake.
+# ---------------------------------------------------------------------------
+
+
+def _i64(v):
+    """A static int64 scalar constant (the verified ``while_loop`` counter
+    pattern — embedded explicitly through ``etl.constant``)."""
+    return etl.constant(etl.tensor(np.array(v, dtype=np.int64)))
+
+
+# --- 4b(i) eigh inside a while_loop BODY ------------------------------------
+#
+# The loop CARRIES the matrix and re-forms it inside the body from its own
+# eigh outputs (``A = V diag(w) Vᵀ``), so the eigenvectors feed back into the
+# next iteration's eigh: a body whose composition is dropped, or whose V loses
+# orthogonality, walks the carried matrix away from the input, and the
+# reconstruction check against the INPUT matrix below fails.
+WHILE_BODY_N = 10
+WHILE_BODY_ITERS = 3
+
+
+def _eigh_while(x):
+    n, iters = WHILE_BODY_N, WHILE_BODY_ITERS
+
+    def cond_fn(state):
+        _a, _w, _v, i = state
+        return i < _i64(iters)
+
+    def body_fn(state):
+        a, _w, _v, i = state
+        w, v = etl.eigh(a)
+        m = etl.dot(etl.dot(v, etl.diag(w)), etl.transpose(v))
+        return (m, w, v, i + 1)
+
+    init = (
+        x,
+        enp.zeros((n,), etl.float32),      # overwritten by iteration 1
+        enp.zeros((n, n), etl.float32),    # overwritten by iteration 1
+        _i64(0),
+    )
+    return etl.while_loop(cond_fn, body_fn, init)
+
+
+def test_eigh_inside_while_body_contract():
+    A = _sym(WHILE_BODY_N, scale=10.0, seed=67)
+    spec = etl.TensorSpec((WHILE_BODY_N, WHILE_BODY_N), etl.float32)
+    w_ref = _np(etl.evaluate(_eigh, A)[0])
+    got = etl.run(etl.build(_eigh_while, spec, backend="iree"), A)
+    a_out, gw, gv = _np(got[0]), _np(got[1]), _np(got[2])
+    # The loop is matrix-preserving: measured drift of the carried matrix
+    # 4.9e-6 of max|A| after 3 eigh/re-form round trips (bound 2.0e-5).
+    scale = float(np.max(np.abs(A)))
+    drift = float(np.max(np.abs(a_out - A))) / scale
+    assert drift <= 2.0e-5, f"while body lost the matrix: drift {drift:.3e}"
+    _check_eigh_contract(A, gw, gv, rtol=1e-4, atol=1e-4)
+    # Measured (n=10, seed 67, 3 iterations): rec 4.9e-6 / orth 1.1e-6 /
+    # eigenvalues 6.2e-6 (rec and eigenvalues normalized by max|A|) — bounds
+    # at 3-5x margin.
+    _check_eigh_scaled(A, gw, gv, w_ref, 1.5e-5, 5.0e-6, 1.5e-5)
+
+
+# --- 4b(ii) eigh inside a cond with a RUNTIME i1 predicate ------------------
+#
+# The predicate is a SEPARATE graph input of dtype bool, so the polarity is
+# decided at run time (never specialized at build time) and the emitted
+# inline-branch + ``stablehlo.select`` path is driven by an input tensor: the
+# true run selects ``eigh(A)``, the false run selects ``eigh(-A)``.
+
+
+def _eigh_cond_runtime_pred(x, pred):
+    return etl.cond(pred, _eigh, lambda t: _eigh(-t), x)
+
+
+def test_eigh_inside_cond_runtime_predicate():
+    n = 10
+    A = _sym(n, scale=10.0, seed=73)
+    specs = (etl.TensorSpec((n, n), etl.float32), etl.TensorSpec((), etl.bool_))
+    exe = etl.build(_eigh_cond_runtime_pred, *specs, backend="iree")
+    spectra = {}
+    for pred, M in ((True, A), (False, -A)):
+        got = etl.run(exe, A, np.array(pred))
+        gw, gv = _np(got[0]), _np(got[1])
+        spectra[pred] = gw
+        _check_eigh_contract(M, gw, gv, rtol=1e-4, atol=1e-4)
+        # Measured (n=10, seed 73; the same numbers for both polarities, since
+        # eigh(-A) is the mirrored spectrum at the same accuracy): rec 2.4e-6 /
+        # orth 1.1e-6 / eigenvalues 1.4e-6 — bounds at 3-5x margin.
+        _check_eigh_scaled(
+            M, gw, gv, _np(etl.evaluate(_eigh, M)[0]), 1.0e-5, 5.0e-6, 5.0e-6,
+        )
+    # The polarity really reaches the select: the two runs hold mirror-image
+    # spectra (ascending eigenvalues of A vs of -A), never the same branch.
+    assert not np.allclose(spectra[True], spectra[False]), (
+        "the runtime predicate did not change the selected branch"
+    )
+    assert np.allclose(spectra[True], -spectra[False][::-1], rtol=1e-4, atol=1e-4), (
+        f"spectra are not mirror images: {spectra[True]} vs {spectra[False]}"
+    )
+
+
+# --- 4b(iii) cond inside cond, eigh in the INNER branches -------------------
+
+
+def _eigh_cond_nested(x):
+    def inner(t):
+        return etl.cond(etl.sum(t) > 0.0, _eigh, lambda u: _eigh(-u), t)
+
+    return etl.cond(etl.sum(x) > 0.0, inner, inner, x)
+
+
+def test_eigh_inside_cond_nested():
+    n = 3
+    A = _sym(n, scale=10.0, seed=79)
+    spec = etl.TensorSpec((n, n), etl.float32)
+    w_ref = _np(etl.evaluate(_eigh, A)[0])
+    exe = etl.build(_eigh_cond_nested, spec, backend="iree")
+    # Both outer branches hold the same while-bearing inner cond, so either
+    # outer polarity runs an inner cond whose two branches each compute their
+    # own eigh — and ``sum`` of a symmetrized X Xᵀ + 10·I is positive, so the
+    # selected inner result is ``eigh(A)`` for the matrix AND for its negation.
+    for arg in (A, -A):
+        got = etl.run(exe, arg)
+        gw, gv = _np(got[0]), _np(got[1])
+        _check_eigh_contract(A, gw, gv, rtol=1e-4, atol=1e-4)
+        # Measured (n=3, seed 79): rec 3.4e-7 / orth 2.4e-7 / eigenvalues
+        # 2.7e-7 (rec and eigenvalues normalized by max|A|) — bounds at 3-5x
+        # margin.
+        _check_eigh_scaled(A, gw, gv, w_ref, 1.5e-6, 1.0e-6, 1.0e-6)
 
 
 # ---------------------------------------------------------------------------
