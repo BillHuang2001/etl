@@ -19,6 +19,15 @@ Contract:
 * **Explicit.** No silent fallbacks: :func:`download_model` walks the documented
   weight-candidate order and raises ONE error listing every candidate that
   failed, so a half-downloaded directory is never reported as usable.
+* **Aliased, never duplicated.** A checkpoint is reachable under more than one
+  slug name: :data:`ALIASES` maps an alias slug onto its canonical slug for the
+  SAME repo id (the golden-fixture harness spells two checkpoints after their HF
+  repo — ``tiny_random_llama`` / ``tiny_random_mistral`` — where the rest of the
+  suite says ``tiny_llama`` / ``tiny_mistral``).  The cache directory is derived
+  from the *slug*, so an alias resolves to its canonical slug's directory and
+  reuses that download instead of fetching a second copy.  Aliases are keys of
+  :data:`MODELS` but are deliberately absent from :data:`DEFAULT_SLUGS` (no
+  duplicate default downloads) and from :data:`BIG_MODELS` (they are tiny).
 
 CLI::
 
@@ -40,7 +49,7 @@ import urllib.request
 from pathlib import Path
 
 __all__ = [
-    "HF_BASE", "MODELS", "BIG_MODELS", "DownloadUnavailable",
+    "HF_BASE", "MODELS", "ALIASES", "BIG_MODELS", "DownloadUnavailable",
     "models_dir", "fetch", "download_model", "is_available",
     "require_model", "ensure_models", "main",
 ]  # fmt: skip
@@ -48,13 +57,30 @@ __all__ = [
 HF_BASE = "https://huggingface.co"
 
 #: Model slug -> HuggingFace repo id.  The tiny models are the default test set;
-#: the real checkpoints are opt-in and listed in :data:`BIG_MODELS`.
+#: the real checkpoints are opt-in and listed in :data:`BIG_MODELS`.  The last two
+#: entries are *aliases* (see :data:`ALIASES`): the golden-fixture harness names
+#: those checkpoints after the HF repo they came from, so the same repo id is
+#: reachable under both spellings — and both spellings share one cache directory.
 MODELS: dict[str, str] = {
     "tiny_llama": "hf-internal-testing/tiny-random-LlamaForCausalLM",
     "tiny_mistral": "hf-internal-testing/tiny-random-MistralForCausalLM",
     "tiny_gpt2": "sshleifer/tiny-gpt2",
     "distilgpt2": "distilgpt2",
     "gpt2": "openai-community/gpt2",
+    # alias slugs (see ALIASES) — the SAME checkpoints, golden-harness spelling
+    "tiny_random_llama": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+    "tiny_random_mistral": "hf-internal-testing/tiny-random-MistralForCausalLM",
+}
+
+#: Alias slug -> canonical slug for the SAME checkpoint.  An alias is a key of
+#: :data:`MODELS` with the canonical entry's repo id, and it resolves to the
+#: canonical slug's cache directory — so ``require_model("tiny_random_llama")``
+#: reuses the ``tiny_llama`` download instead of fetching a second copy.
+#: Aliases are deliberately NOT in :data:`DEFAULT_SLUGS` (no duplicate default
+#: downloads) and NOT in :data:`BIG_MODELS` (they are tiny checkpoints).
+ALIASES: dict[str, str] = {
+    "tiny_random_llama": "tiny_llama",
+    "tiny_random_mistral": "tiny_mistral",
 }
 
 #: Slugs large enough that tests gate them behind an environment variable.
@@ -62,6 +88,42 @@ BIG_MODELS: frozenset[str] = frozenset({"distilgpt2", "gpt2"})
 
 #: Slugs the CLI downloads when ``--slugs`` is not given.
 DEFAULT_SLUGS: tuple[str, ...] = ("tiny_llama", "tiny_mistral", "tiny_gpt2")
+
+
+def _check_aliases() -> None:
+    """Import-time invariants for :data:`ALIASES` (a broken alias is a bug here).
+
+    Every alias must be a :data:`MODELS` key whose repo id equals its canonical
+    slug's, and it must stay out of the default/big slug sets — an alias in
+    ``DEFAULT_SLUGS`` would download the same checkpoint twice, and an alias in
+    ``BIG_MODELS`` would gate a tiny checkpoint behind the opt-in variable.
+    """
+    for alias, canonical in ALIASES.items():
+        if alias not in MODELS or canonical not in MODELS:
+            raise RuntimeError(
+                f"hf_download.ALIASES[{alias!r}] = {canonical!r}: both must be keys of "
+                f"hf_download.MODELS (known: {', '.join(sorted(MODELS))})"
+            )
+        if MODELS[alias] != MODELS[canonical]:
+            raise RuntimeError(
+                f"hf_download alias disagrees: MODELS[{alias!r}] = {MODELS[alias]!r} but "
+                f"MODELS[{canonical!r}] = {MODELS[canonical]!r}; an alias must name the "
+                "SAME checkpoint as its canonical slug"
+            )
+        if alias in DEFAULT_SLUGS:
+            raise RuntimeError(
+                f"hf_download.ALIASES: {alias!r} is an alias of {canonical!r} and must "
+                f"stay out of DEFAULT_SLUGS ({', '.join(DEFAULT_SLUGS)}) so the CLI never "
+                "downloads one checkpoint twice"
+            )
+        if alias in BIG_MODELS:
+            raise RuntimeError(
+                f"hf_download.ALIASES: {alias!r} is a tiny alias of {canonical!r} and "
+                f"must stay out of BIG_MODELS ({', '.join(sorted(BIG_MODELS))})"
+            )
+
+
+_check_aliases()
 
 #: Weight files tried in order; ``*.index.json`` entries expand into their shards.
 _WEIGHT_CANDIDATES: tuple[str, ...] = (
@@ -190,8 +252,23 @@ def _download_once(url: str, tmp: Path, timeout: float) -> int:
     return written
 
 
+def _dir_name(slug: str) -> str:
+    """Cache-directory name for a slug or a raw ``org/name`` repo id.
+
+    One flat directory per checkpoint: ``/`` (and the path separator) become
+    ``__``, so a repo id can never escape the cache root.
+    """
+    return slug.replace("/", "__").replace(os.sep, "__").replace("..", "_")
+
+
 def _repo_and_dir(slug: str, root: str | os.PathLike[str] | None = None) -> tuple[str, Path]:
-    """Map a slug (or a raw ``org/name`` repo id) to ``(repo_id, target_dir)``."""
+    """Map a slug (or a raw ``org/name`` repo id) to ``(repo_id, target_dir)``.
+
+    An *alias* slug (:data:`ALIASES`, e.g. the golden-fixture spelling
+    ``tiny_random_llama``) keeps its own repo id but resolves to its canonical
+    slug's cache directory, so an alias and its canonical slug share ONE
+    download.  Nothing is created or fetched here.
+    """
     if not isinstance(slug, str) or not slug.strip():
         raise ValueError(f"model slug must be a non-empty string, got {slug!r}")
     key = slug.strip()
@@ -204,7 +281,7 @@ def _repo_and_dir(slug: str, root: str | os.PathLike[str] | None = None) -> tupl
                 f"({', '.join(sorted(MODELS))}) or a raw 'org/name' HuggingFace repo id"
             )
         repo = key
-    return repo, _root(root) / key.replace("/", "__").replace(os.sep, "__").replace("..", "_")
+    return repo, _root(root) / _dir_name(ALIASES.get(key, key))
 
 
 def _safetensors_ok(path: Path) -> bool:
@@ -280,9 +357,16 @@ def download_model(slug: str, *, root: str | os.PathLike[str] | None = None, rev
     ``pytorch_model.bin``, ``pytorch_model.bin.index.json`` (+ its shards) — and
     raises :class:`DownloadUnavailable` when ``config.json`` or every candidate
     fails; a half-downloaded directory is never returned as usable.
+
+    An alias slug (:data:`ALIASES`) downloads into its CANONICAL slug's
+    directory — the two spellings share one copy, and a cached canonical
+    checkpoint makes the alias an offline cache hit.
     """
     repo, target = _repo_and_dir(slug, root)
     label = repr(slug) if repo == slug else f"{slug!r} ({repo})"
+    alias = ALIASES.get(slug.strip())
+    if alias is not None:
+        label += f" — alias of {alias!r}, sharing its cache directory {target}"
     base = f"{HF_BASE}/{repo}/resolve/{revision}"
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -307,7 +391,8 @@ def is_available(slug: str, *, root: str | os.PathLike[str] | None = None) -> bo
     """Whether a complete-enough checkpoint is already cached (no network access).
 
     True when ``config.json`` is present and either a shard index with all of its
-    non-empty shards, or a non-empty single-file weight payload, is on disk.
+    non-empty shards, or a non-empty single-file weight payload, is on disk.  An
+    alias slug (:data:`ALIASES`) reports its canonical slug's cached copy.
     """
     try:
         _, target = _repo_and_dir(slug, root)
@@ -329,6 +414,10 @@ def is_available(slug: str, *, root: str | os.PathLike[str] | None = None) -> bo
 
 def require_model(slug: str, *, root: str | os.PathLike[str] | None = None) -> Path:
     """Return the model directory, or ``pytest.skip`` when it cannot be fetched.
+
+    An alias slug (:data:`ALIASES`) returns its canonical slug's directory, so
+    ``require_model("tiny_random_llama")`` is a usable checkpoint directory even
+    on an offline host that only ever downloaded ``tiny_llama``.
 
     ``pytest`` is imported here — never at module scope — so this module stays
     importable without the test framework (e.g. from the CLI).

@@ -15,10 +15,12 @@ caches it, while the ``skipif`` gates use :func:`_oracle_available`, which only
 probes ``importlib.util.find_spec``.  So in this repository's default
 environment (numpy only) the oracle-dependent cases skip cleanly **and** the
 torch-free ones still collect and run: :func:`test_etl_hf_never_imports_torch`,
-the golden-fixture contract check :func:`test_golden_fixture_format`, and the
+:func:`test_golden_fixture_format`, :func:`test_golden_slugs_resolve`, and the
 fixture parity :func:`test_torch_goldens_parity` (comparing against pre-computed
-HF logits needs no torch at all) — the latter two skipping only because
-``bench_logs/hf_goldens/`` is empty today, never because torch is missing.
+HF logits needs no torch at all — the goldens are committed under
+``bench_logs/hf_goldens/``, so it runs whenever that directory exists and
+skips only when a fixture or its checkpoint is genuinely unavailable, never
+because torch is missing).
 
 Golden fixture contract
 -----------------------
@@ -31,7 +33,8 @@ per model, ``<slug>`` naming the model::
         input_ids   int32    (batch, seq_len)              # ids fed to the HF model
         logits      float32  (batch, seq_len, vocab_size)   # that model's own output
     bench_logs/hf_goldens/<slug>.meta.json
-        {"model": "<hf repo id>", "revision": "<sha|branch>", "dtype": "<torch dtype>"}
+        {"model_id": "<hf repo id>", "revision": "<sha|branch>", "dtype": "<torch dtype>"}
+        # a "model": "<hf repo id>" key is accepted in place of "model_id"
 
 * ``input_ids`` and ``logits`` are the two **required** array names, written with
   ``numpy.savez`` and readable with ``allow_pickle=False`` (never pickled
@@ -40,25 +43,47 @@ per model, ``<slug>`` naming the model::
   either 3-D ``(batch, seq_len, vocab_size)`` or 2-D
   ``(batch * seq_len, vocab_size)``.  The leading axes must agree, and the
   dtype must be float32 so a downcast never dominates the comparison.
-* ``<slug>`` should be a key of :data:`hf_download.MODELS` (``tiny_llama``,
-  ``tiny_mistral``, ``tiny_gpt2``, ``distilgpt2``, ``gpt2``) so the checkpoint
-  can be located/downloaded; otherwise ``.meta.json``'s ``model`` is treated as
-  a raw ``org/name`` HuggingFace repo id.
-* ``.meta.json``'s ``model`` is the only required key and it wins over the slug
-  mapping; ``revision``/``dtype`` are informational only (extra keys are ignored)
-  — ``dtype`` records the torch dtype the goldens were produced with, and the
+* The meta's repo id lives under **either** ``model`` **or** ``model_id``
+  (:data:`_META_REPO_KEYS`; ``model`` wins when a fixture somehow carries both)
+  and must be a non-empty string naming a HuggingFace repo id.  The harness that
+  produced today's fixtures writes ``model_id``, so both keys are accepted —
+  a producer never has to rename its meta to satisfy this contract.
+* ``<slug>`` is resolved to a checkpoint in this order: the fixture's
+  ``meta["model"]``, then ``meta["model_id"]``, then
+  :data:`hf_download.MODELS`, then the slug itself (assumed to already be an
+  ``org/name`` repo id) — see :func:`_repo_for_slug`.  All five current slugs
+  are keys of ``hf_download.MODELS``; the harness spells two of them after
+  their HF repo (``tiny_random_llama``, ``tiny_random_mistral``), which
+  ``hf_download`` carries as :data:`hf_download.ALIASES` of
+  ``tiny_llama``/``tiny_mistral`` so both spellings share one cached download.
+* Resolution is **strict**: a discovered golden that cannot be mapped onto a
+  fetchable checkpoint is a FAILURE, never a silent skip.
+  :func:`test_golden_slugs_resolve` fails without any network access, and
+  :func:`test_torch_goldens_parity` fails with the offending
+  ``<slug>.meta.json`` path.  The only tolerated skip is a genuine download
+  failure (:class:`hf_download.DownloadUnavailable`: offline host, missing or
+  gated repo) — a missing *fixture directory* skips too, because it means the
+  golden harness has not run here yet.
+* ``revision``/``dtype`` are informational only (extra keys are ignored) —
+  ``dtype`` records the torch dtype the goldens were produced with, and the
   stored ``logits`` must still be float32.
 
-Missing or malformed fixtures are never an error: the golden-parity test skips
-with a message naming this contract, while
-:func:`test_golden_fixture_format` validates the contract strictly whenever the
-directory *does* exist (that is how the contract is enforced on the producer).
+Missing fixtures are never an error: the golden-parity test skips with a message
+naming this contract, while :func:`test_golden_fixture_format` validates the
+contract strictly whenever the directory *does* exist (that is how the contract
+is enforced on the producer).
 
 Tolerances (and why)
 --------------------
 * tiny random checkpoints ≤ **1e-4 abs** — the feasibility spike measured
   ~1e-7…1e-8 for etl-numpy vs a pure-numpy reference, so 1e-4 leaves room only
-  for HF's different accumulation order / kernel choices, not for a real bug;
+  for HF's different accumulation order / kernel choices, not for a real bug.
+  The two alias slugs are the same tiny random checkpoints under the harness'
+  spelling, whose own logit absmax is 0.35 (``tiny_random_llama``) / 0.56
+  (``tiny_random_mistral``), so they get the tiny budget as well —
+  :func:`_tolerances` treats ANY ``tiny*`` slug as tiny, and :data:`_TINY_SLUGS`
+  lists the tiny fixtures explicitly so the documented set matches the
+  fixtures on disk.
 * real-size checkpoints (``distilgpt2``/``gpt2``) ≤ **1e-3 abs** *and* ≤ **1e-5
   relative to the logit scale** — their fp32 logits are O(100), where ~1e-3 abs
   is ~1e-5 relative (measured 1.7e-4…9.1e-4 across iree/numpy runs in
@@ -157,13 +182,25 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 #: Where the parallel torch-golden harness drops its fixtures (read-only here).
 _GOLDENS_SUBPATH = Path("bench_logs") / "hf_goldens"
 
-#: Slugs whose logits are tiny enough for the tight absolute budget.
-_TINY_SLUGS = frozenset({"tiny_llama", "tiny_mistral", "tiny_gpt2"})
+#: Slugs whose logits are tiny enough for the tight absolute budget: the tiny
+#: random checkpoints this file names in both spellings (``tiny_llama`` /
+#: ``tiny_mistral`` and the golden harness' ``tiny_random_llama`` /
+#: ``tiny_random_mistral`` aliases — see :data:`hf_download.ALIASES`) plus
+#: ``tiny_gpt2``.  :func:`_tolerances` ALSO treats any ``tiny*`` slug as tiny, so
+#: a future tiny fixture inherits the budget without editing this set; the listed
+#: members keep the documented set equal to the fixtures actually on disk.
+_TINY_SLUGS = frozenset(
+    {"tiny_llama", "tiny_mistral", "tiny_random_llama", "tiny_random_mistral", "tiny_gpt2"}
+)
 
 #: Tolerances — see the module docstring for the measurements behind them.
 _TINY_ATOL = 1e-4
 _REAL_ATOL = 1e-3
 _REAL_RTOL = 1e-5
+
+#: Meta keys that may carry the fixture's HuggingFace repo id, in precedence
+#: order: ``model`` first, then ``model_id`` (the key the golden harness writes).
+_META_REPO_KEYS: tuple[str, ...] = ("model", "model_id")
 
 #: The sequence length used for the in-process (no-fixture) parity test.
 _SEQ_LEN = 8
@@ -178,7 +215,8 @@ _GOLDENS_CONTRACT = (
     "<repo>/" + str(_GOLDENS_SUBPATH) + ": one <slug>.npz per model holding "
     "`input_ids` (int32, (batch, seq_len)) and `logits` (float32, "
     "(batch, seq_len, vocab_size) or (batch*seq_len, vocab_size)), plus a sibling "
-    '<slug>.meta.json carrying at least {"model": "<hf repo id>"}'
+    '<slug>.meta.json carrying either {"model": "<hf repo id>"} or '
+    '{"model_id": "<hf repo id>"} (model wins when both exist)'
 )
 
 
@@ -227,24 +265,57 @@ def _load_goldens(directory: Path | None = None) -> dict[str, tuple[np.ndarray, 
     return goldens
 
 
+def _meta_repo_id(meta: dict) -> str | None:
+    """The fixture's HuggingFace repo id carried by its meta, else ``None``.
+
+    Reads :data:`_META_REPO_KEYS` in precedence order — ``model`` first, then
+    ``model_id`` (the key the golden harness writes) — and returns the first
+    non-empty string, stripped.  A missing, empty or non-string value yields
+    ``None``, leaving the decision to the caller: :func:`_repo_for_slug` falls
+    back to the slug mapping, while :func:`test_golden_fixture_format` fails.
+    """
+    for key in _META_REPO_KEYS:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _repo_for_slug(slug: str, meta: dict | None = None) -> str:
     """Resolve the HuggingFace repo id for a fixture slug.
 
-    Precedence: the fixture's ``meta["model"]``, then :data:`hf_download.MODELS`,
-    then the slug itself (already an ``org/name`` repo id).
+    Precedence (:data:`_META_REPO_KEYS`, then the slug mapping):
+
+    1. the fixture's ``meta["model"]``,
+    2. the fixture's ``meta["model_id"]`` — the key the golden harness writes,
+    3. :data:`hf_download.MODELS` (which carries the golden-harness aliases
+       ``tiny_random_llama``/``tiny_random_mistral``),
+    4. the slug itself, assumed to already be an ``org/name`` repo id.
+
+    The result is whatever the fixture/downloader says it is — validating that
+    it names a *fetchable* checkpoint is :func:`test_golden_slugs_resolve`'s and
+    :func:`_checkpoint_dir`'s job, so this helper never guesses a repo.
     """
-    model = (meta or {}).get("model")
-    if isinstance(model, str) and model.strip():
-        return model.strip()
-    return hf_download.MODELS.get(slug, slug)
+    repo_id = _meta_repo_id(meta or {})
+    return repo_id if repo_id is not None else hf_download.MODELS.get(slug, slug)
 
 
 def _checkpoint_dir(slug: str, repo_id: str) -> Path:
-    """Local checkpoint directory for ``slug`` (downloads it, skipping when offline).
+    """Local checkpoint directory for golden ``slug``.
 
-    Known slugs go through :func:`hf_download.require_model` (which turns an
-    offline/failed download into a clean ``pytest.skip``); an unknown slug naming
-    a raw ``org/name`` repo id is fetched directly for the same effect.
+    Resolution is STRICT: a golden that cannot be mapped onto a fetchable
+    checkpoint is an assertion failure naming its ``.meta.json`` path and
+    restating the contract — never a silent skip, which would let an unmappable
+    fixture pass unnoticed.
+
+    * A key of :data:`hf_download.MODELS` (including the harness' aliases) goes
+      through :func:`hf_download.require_model`, which skips ONLY on a genuine
+      :class:`hf_download.DownloadUnavailable` (offline host / missing repo).
+    * Any other slug is fetched through its :func:`_repo_for_slug` repo id, with
+      the same single tolerated skip.
+    * A ``ValueError`` from the downloader means ``repo_id`` is not a fetchable
+      repo id at all (not an ``org/name`` pair) — that is a broken fixture, so it
+      is raised as an :class:`AssertionError`.
     """
     if slug in hf_download.MODELS:
         return hf_download.require_model(slug)
@@ -253,7 +324,12 @@ def _checkpoint_dir(slug: str, repo_id: str) -> Path:
     except hf_download.DownloadUnavailable as exc:
         pytest.skip(f"checkpoint for golden {slug!r} ({repo_id}) unavailable: {exc}")
     except ValueError as exc:
-        pytest.skip(f"golden {slug!r} does not name a fetchable HuggingFace repo id: {exc}")
+        raise AssertionError(
+            f"golden {slug!r} cannot be mapped onto a fetchable checkpoint: {exc}. "
+            f"Either add {slug!r} to hf_download.MODELS, or give "
+            f"{_goldens_dir() / (slug + '.meta.json')} a 'model'/'model_id' "
+            f"'org/name' HuggingFace repo id — {_GOLDENS_CONTRACT}"
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +501,14 @@ def _compare(got: object, want: object, *, rtol: float, atol: float) -> _ParityR
 
 
 def _tolerances(slug: str) -> tuple[float, float, bool]:
-    """``(rtol, atol, require_relative)`` for a fixture/user model slug."""
+    """``(rtol, atol, require_relative)`` for a fixture/user model slug.
+
+    A slug is tiny when it is listed in :data:`_TINY_SLUGS` (the tiny fixtures,
+    in both spellings) or when it starts with ``tiny`` — the prefix rule keeps
+    every future ``tiny*`` fixture on the tight 1e-4 absolute budget without
+    editing this function, and the explicit set keeps the documented budget
+    readable next to the fixtures it applies to.
+    """
     if slug in _TINY_SLUGS or slug.startswith("tiny"):
         return _REAL_RTOL, _TINY_ATOL, False
     return _REAL_RTOL, _REAL_ATOL, True
@@ -592,9 +675,75 @@ _NO_GOLDENS_MESSAGE = (
 )
 
 
+def test_golden_slugs_resolve():
+    """Every discovered golden must map to a fetchable checkpoint (no network).
+
+    This is the download-free guarantee behind
+    :func:`test_torch_goldens_parity`: that test may only ever skip on a genuine
+    :class:`hf_download.DownloadUnavailable`, so an unmappable golden has to be
+    reported HERE as a failure instead of disappearing into a skip.
+
+    For each ``<slug>.npz`` on disk it asserts:
+
+    1. :func:`_repo_for_slug` returns a non-empty string — the meta's ``model``,
+       its ``model_id``, a :data:`hf_download.MODELS` entry or the slug itself;
+    2. the id is at most one ``org/name`` pair (never ``a/b/c``, never a
+       half-empty ``a/``), and exactly one when the slug is NOT a
+       :data:`hf_download.MODELS` key — HF serves single-namespace ids such as
+       ``distilgpt2``, but this downloader's raw-repo-id path needs ``org/name``;
+    3. the downloader can build a cache location for it
+       (:func:`hf_download._repo_and_dir` — the same pure, I/O-free resolution
+       ``download_model`` starts from), taking the MODELS path for a known slug
+       and the raw repo-id path otherwise.
+
+    Nothing is downloaded or written, so this runs everywhere — offline hosts
+    included — and a golden that cannot be resolved is a red test right now.
+    """
+    goldens = _load_goldens()
+    if not goldens:
+        pytest.skip(_NO_GOLDENS_MESSAGE)
+    for slug, (_input_ids, _logits, meta) in sorted(goldens.items()):
+        meta_path = _goldens_dir() / (slug + ".meta.json")
+        repo_id = _repo_for_slug(slug, meta)
+        assert isinstance(repo_id, str) and repo_id.strip(), (
+            f"golden {slug!r} does not resolve to any HuggingFace repo id (got "
+            f"{repo_id!r}); {meta_path.name} must carry one of {_META_REPO_KEYS} "
+            f"as a non-empty string — {_GOLDENS_CONTRACT}"
+        )
+        assert repo_id.count("/") <= 1 and all(repo_id.split("/")), (
+            f"golden {slug!r} resolves to {repo_id!r}, which is not a usable "
+            f"HuggingFace repo id (at most one 'org/name' pair, no empty part) — "
+            f"{_GOLDENS_CONTRACT}"
+        )
+        known = slug in hf_download.MODELS
+        assert known or repo_id.count("/") == 1, (
+            f"golden {slug!r} is not a key of hf_download.MODELS "
+            f"({', '.join(sorted(hf_download.MODELS))}) and its repo id {repo_id!r} "
+            f"is not an 'org/name' pair, so it cannot be downloaded — add the slug "
+            f"to hf_download.MODELS or fix 'model'/'model_id' in {meta_path.name} — "
+            f"{_GOLDENS_CONTRACT}"
+        )
+        # The downloader's own resolution, so a mapping this file accepts can
+        # never turn into a ValueError deep inside download_model at run time.
+        try:
+            hf_download._repo_and_dir(slug if known else repo_id)
+        except ValueError as exc:
+            raise AssertionError(
+                f"golden {slug!r} does not resolve to a fetchable checkpoint: {exc}. "
+                f"Path checked: {meta_path} — {_GOLDENS_CONTRACT}"
+            ) from None
+
+
 @pytest.mark.parametrize("slug", sorted(_GOLDENS) or ["<no goldens>"])
 def test_torch_goldens_parity(slug: str):
-    """Compare our logits against the pre-computed HF ones (no torch needed)."""
+    """Compare our logits against the pre-computed HF ones (no torch needed).
+
+    Skips ONLY when no fixture directory exists (the golden harness has not run
+    here) or when :func:`_checkpoint_dir` hits a genuine download failure
+    (:class:`hf_download.DownloadUnavailable`).  A golden that exists but cannot
+    be mapped onto a checkpoint is a FAILURE — that is what
+    :func:`_checkpoint_dir` and :func:`test_golden_slugs_resolve` enforce.
+    """
     if slug not in _GOLDENS:
         pytest.skip(_NO_GOLDENS_MESSAGE)
     input_ids, want, meta = _GOLDENS[slug]
@@ -750,10 +899,14 @@ def test_golden_fixture_format():
             f"{meta_path.name}: expected a JSON object, got {type(meta).__name__} — "
             f"{_GOLDENS_CONTRACT}"
         )
-        model = meta.get("model")
-        assert isinstance(model, str) and model.strip(), (
-            f"{meta_path.name}: required key 'model' must be a non-empty HuggingFace "
-            f"repo id, got {model!r} — {_GOLDENS_CONTRACT}"
+        # The repo id lives under `model` or `model_id` (see _META_REPO_KEYS):
+        # the harness that produced today's fixtures writes `model_id`, while
+        # `model` stays the preferred spelling when a fixture carries both.
+        repo_id = _meta_repo_id(meta)
+        assert repo_id is not None, (
+            f"{meta_path.name}: one of the keys {_META_REPO_KEYS} must carry a "
+            f"non-empty HuggingFace repo id, found none (keys present: "
+            f"{sorted(meta)}) — {_GOLDENS_CONTRACT}"
         )
 
 
