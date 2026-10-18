@@ -26,7 +26,11 @@ Pinned here (the "Known issues / v1 deferrals" list of
    ``test_pipeline.py``).
 4. Compiler-backend mechanism: ONE representative capability-drift error +
    ONE representative stablehlo export naming error (the full 16-op matrix
-   lives in ``test_backends.py``).
+   lives in ``test_backends.py``). The drift pin goes through the shared
+   ``assert_capability_drift`` helper — reaching the drift pre-check needs
+   the adapter to activate (which needs its compiler packages), so it skips
+   only on the genuine adapter-absence signature.
+
 5. The three VJP TransformError deferrals (``sparse_concatenate``,
    ``sparse_coo_to_csc``, ``sparse_csc_to_coo``).
 6. ``scan`` over sparse ``xs`` and sparse ``y``-stacking.
@@ -41,7 +45,13 @@ import etl
 from etl import core
 from etl import sparse
 
-from tests.sparse.conftest import coo_example, coo_spec, csc_spec
+from tests.sparse.conftest import (
+    assert_capability_drift,
+    coo_example,
+    coo_spec,
+    csc_spec,
+)
+
 
 # ---------------------------------------------------------------------------
 # 1. No sparse constant in v1
@@ -128,15 +138,15 @@ def test_whole_sparse_bind_fails():
 def test_compiler_backend_capability_drift_representative():
     """CompilerBackend.lower rejects sparse ops BEFORE any compiler runs:
     the capability-drift BackendError names the op and suggests
-    etl.sparse.to_dense (no iree installation needed — the check is a pure
-    capability pre-check)."""
+    etl.sparse.to_dense. The drift check itself needs no compiler (it is a
+    pure capability pre-check), but REACHING it requires the adapter to
+    activate: ``etl.lower(..., backend="iree")`` resolves the backend through
+    the registry, which imports the adapter and runs its ``check_available``
+    dependency probe. In a compiler-free env that probe raises the adapter-
+    absence BackendError first, so this pin skips on that signature only
+    (shared helper — never an ``importorskip``)."""
     graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
-    with pytest.raises(core.BackendError) as excinfo:
-        etl.lower(graph, backend="iree")
-    msg = str(excinfo.value)
-    assert re.search("capability drift", msg)
-    assert "sparse_negate" in msg
-    assert "etl.sparse.to_dense" in msg
+    assert_capability_drift(graph, "iree", "sparse_negate")
 
 
 def test_stablehlo_export_names_op_representative():

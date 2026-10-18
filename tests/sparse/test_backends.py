@@ -8,16 +8,26 @@ Contract under test: ``../etl/sparse/CONTEXT.md`` (Known issues) and
 ``../etl/backends/CONTEXT.md``. The capability drift check runs in
 ``CompilerBackend.lower`` (``../etl/backends/compiler.py``) BEFORE any
 compiler is invoked, so ``etl.lower(graph, backend="iree"|"tvm")`` rejects a
-sparse graph at lower time; ``lower`` never compiles, so a dense-only graph
-lowers to a ``LoweredProgram`` on ``"iree"`` without any compiler run.
+sparse graph at lower time.
 
-NOTE on the conftest helpers: ``tests.sparse.conftest.csr_spec`` /
-``csc_spec`` currently omit the ``format=`` keyword (so they raise
-``ShapeError`` — a test-helper bug, not an etl bug). This file therefore
-defines corrected ``csr_spec`` / ``csc_spec`` helpers at module level;
-``coo_spec`` and the concrete examples from conftest are used as-is.
+Env gating: ``etl.lower(..., backend=<adapter>)`` resolves the backend through
+``etl.backends.registry.get``, which AUTO-ACTIVATES the optional adapter on a
+registry miss — and the adapter's ``register()`` probes its compiler
+dependency (``check_available``), raising the ``pip install etl[...]``
+adapter-absence ``BackendError`` BEFORE ``CompilerBackend.lower`` runs. So in
+a compiler-free env the drift pre-check is unreachable; those tests therefore
+assert the strict drift contract and skip only on the genuine adapter-absence
+signature (shared helper ``assert_capability_drift`` in ``conftest.py`` — no
+``importorskip``, no dropped parametrizations).
+
+The ``CompilerBackend.lower`` path itself is exercised dependency-free by the
+``stub_iree_backend`` fixture, which registers a compiler-free
+``CompilerBackend`` named ``"iree"`` by direct registry assignment
+(save/restore of the previous entry, the pattern in
+``tests/pipeline_env_defaults_test.py``).
 """
 
+import dataclasses
 import re
 
 import numpy as np
@@ -28,6 +38,7 @@ from etl import core
 from etl import sparse
 
 from tests.sparse.conftest import (
+    assert_capability_drift,
     coo_example,
     coo_spec,
     csr_example,
@@ -38,9 +49,8 @@ from tests.sparse.conftest import (
 )
 
 # ---------------------------------------------------------------------------
-# Per-file helpers (see the module docstring re: conftest's csr/csc specs).
+# Per-file spec helpers (mirror `csr_example()` / `csc_example()`).
 # ---------------------------------------------------------------------------
-
 
 def csr_spec(dtype=etl.float32):
     """The SparseTensorSpec matching `csr_example()` (indptr static (4,))."""
@@ -219,15 +229,63 @@ def test_lower_defaults_to_numpy():
 _TVM_REPRESENTATIVES = ("sparse_add", "sparse_to_dense", "sparse_dot_dense")
 
 
+class _StubIreeCompilerBackend(etl.backends.CompilerBackend):
+    """A dependency-free ``CompilerBackend`` named ``"iree"``.
+
+    Inherits the SHARED ``CompilerBackend.lower`` path (capability
+    pre-check -> portable inlining -> StableHLO export -> ``Signature``
+    recording), so that path can be exercised with NO IREE packages
+    installed. ``compile`` / ``load`` are never reached (``lower`` never
+    compiles) and raise explicitly rather than silently pretending to work.
+
+    ``capabilities`` mirrors the real iree adapter in the one flag this suite
+    cares about (``sparse_ops=False``) while staying dependency-free (all
+    numpy dtypes, dynamic shapes).
+    """
+
+    name = "iree"
+    capabilities = dataclasses.replace(
+        etl.backends.numpy_backend.capabilities,
+        sparse_ops=False,  # mirrors the real iree adapter
+        runtime_calls=False,
+        collectives=False,
+        async_collectives=False,
+        custom_blocks=False,
+        external_calls=False,
+    )
+
+    def compile(self, lowered, options=None):  # pragma: no cover - never called
+        raise NotImplementedError("stub compiler backend: lower() never compiles")
+
+    def load(self, artifact, device=None):  # pragma: no cover - never called
+        raise NotImplementedError("stub compiler backend: lower() never loads")
+
+
+@pytest.fixture
+def stub_iree_backend():
+    """Register the dependency-free ``"iree"`` stub, restoring the registry
+    afterwards (save/restore of the previous entry, so this also works when
+    the real adapter is registered in this process — the pattern in
+    ``tests/pipeline_env_defaults_test.py``)."""
+    from etl.backends import registry as _registry
+
+    stub = _StubIreeCompilerBackend()
+    previous = _registry._registry.get("iree")
+    _registry._registry["iree"] = stub
+    try:
+        yield stub
+    finally:
+        if previous is None:
+            _registry._registry.pop("iree", None)
+        else:
+            _registry._registry["iree"] = previous
+
+
 @pytest.mark.parametrize("op_name", SPARSE_OPS)
 def test_sparse_op_defers_on_iree(sparse_graphs, op_name):
-    graph = sparse_graphs[op_name]
-    with pytest.raises(core.BackendError) as excinfo:
-        etl.lower(graph, backend="iree")
-    msg = str(excinfo.value)
-    assert re.search("capability drift", msg)
-    assert op_name in msg
-    assert "etl.sparse.to_dense" in msg
+    # Strict drift contract; env-gated on genuine adapter absence only (see
+    # the module docstring). All 16 parametrizations are kept in both envs.
+    assert_capability_drift(sparse_graphs[op_name], "iree", op_name)
 
 
 @pytest.mark.parametrize("op_name", _TVM_REPRESENTATIVES)
@@ -254,11 +312,14 @@ def test_sparse_op_defers_in_stablehlo_export(sparse_graphs, op_name):
     assert op_name in str(excinfo.value)
 
 
-def test_dense_graph_lowers_on_compiler_backend_without_compiler(sparse_graphs):
-    # Positive control: a dense-only graph passes the capability pre-check —
-    # lower never invokes a compiler, so it succeeds even though no compiler
-    # has run (and would also succeed if the compiler packages were absent).
-    del sparse_graphs
+def test_dense_graph_lowers_on_compiler_backend_without_compiler(stub_iree_backend):
+    # Positive control: a dense-only graph passes the capability pre-check and
+    # exports, so the SHARED `CompilerBackend.lower` path (capability
+    # pre-check -> portable inlining -> StableHLO export -> Signature
+    # recording) completes with NO compiler installed. Reaching a compiler
+    # ADAPTER at all requires its packages (activation runs `check_available`
+    # in `register()`), which is why the dependency-free stub backend is
+    # registered under the name "iree" for this test.
 
     def f(x):
         return etl.add(x, x)
@@ -267,3 +328,22 @@ def test_dense_graph_lowers_on_compiler_backend_without_compiler(sparse_graphs):
     lowered = etl.lower(graph, backend="iree")
     assert isinstance(lowered, etl.backends.LoweredProgram)
     assert lowered.backend == "iree"
+    assert lowered.payload["format"] == "stablehlo"
+    assert "func.func" in lowered.payload["mlir_text"]
+
+
+def test_sparse_graph_drifts_on_capability_precheck_without_compiler(
+    stub_iree_backend,
+):
+    # The drift contract compiler-free: `CompilerBackend.lower`'s capability
+    # pre-check rejects a sparse op BEFORE any export/compile, with the stub
+    # standing in for the real adapter (which cannot even activate without
+    # its packages). This keeps the contract covered in a compiler-free env
+    # even though the adapter-driven pins legitimately skip there.
+    graph = etl.trace(lambda x: sparse.negate(x), coo_spec())
+    with pytest.raises(core.BackendError) as excinfo:
+        etl.lower(graph, backend="iree")
+    msg = str(excinfo.value)
+    assert re.search("capability drift", msg)
+    assert "sparse_negate" in msg
+    assert "etl.sparse.to_dense" in msg

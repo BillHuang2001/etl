@@ -6,9 +6,13 @@ belong in the test modules themselves. Import package-qualified:
 `from tests.sparse.conftest import ...` (never `from conftest import ...`).
 """
 
+import re
+
 import numpy as np
+import pytest
 
 import etl
+from etl import core
 from etl import sparse
 
 # ---------------------------------------------------------------------------
@@ -136,3 +140,32 @@ def batched_coo_example():
         dense_shape=(3, 4),
         format="coo",
     )
+
+
+# ---------------------------------------------------------------------------
+# Compiler-backend capability-drift assertion (shared env-gating convention).
+# ---------------------------------------------------------------------------
+
+
+def assert_capability_drift(graph, backend, op_name):
+    """Assert the compiler-backend capability-drift contract for `graph`.
+
+    Env gating: activating the adapter itself requires its compiler
+    dependency (`registry.get` -> adapter `register()` -> `check_available`),
+    so in a compiler-free env `etl.lower` raises the adapter-absence
+    `BackendError` before the drift pre-check is reached — an environment
+    property, not a contract violation. Skip ONLY on that genuine
+    adapter-absence signature (the `pip install etl[...]` install hint, as in
+    `test_backends.py::test_sparse_op_defers_on_tvm`); anything else must
+    fail the strict assertions below.
+    """
+    with pytest.raises(core.BackendError) as excinfo:
+        etl.lower(graph, backend=backend)
+    msg = str(excinfo.value)
+    if "capability drift" not in msg and "pip install etl[" in msg:
+        # Genuine adapter absence in this env — the drift pre-check is
+        # unreachable. Any OTHER message falls through to the pins below.
+        pytest.skip(f"{backend} adapter not available in this env: {msg}")
+    assert re.search("capability drift", msg)
+    assert op_name in msg
+    assert "etl.sparse.to_dense" in msg
