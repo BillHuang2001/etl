@@ -9,13 +9,16 @@ implementation (``transformers`` + ``torch``), run on CPU.
 
 ``torch`` and ``transformers`` are optional, test-only dependencies — ``etl_hf``
 itself never imports them (pinned in ``tests/test_public_api.py`` and by
-:func:`test_etl_hf_never_imports_torch` below).  Both are pulled in with
-``pytest.importorskip`` at module scope, so in this repository's default
-environment (numpy only) the whole file reports as **skipped** instead of
-erroring, and every test here is an opt-in extra when they are installed.  (A
-module-level skip is one skip, not one per test — run this file with ``-rs`` to
-see the reason line, and expect pytest's "no tests collected" exit status when
-this file is the only thing selected.)
+:func:`test_etl_hf_never_imports_torch` below).  **Nothing optional is imported
+at module scope here either**: :func:`_oracle` imports the pair on first use and
+caches it, while the ``skipif`` gates use :func:`_oracle_available`, which only
+probes ``importlib.util.find_spec``.  So in this repository's default
+environment (numpy only) the oracle-dependent cases skip cleanly **and** the
+torch-free ones still collect and run: :func:`test_etl_hf_never_imports_torch`,
+the golden-fixture contract check :func:`test_golden_fixture_format`, and the
+fixture parity :func:`test_torch_goldens_parity` (comparing against pre-computed
+HF logits needs no torch at all) — the latter two skipping only because
+``bench_logs/hf_goldens/`` is empty today, never because torch is missing.
 
 Golden fixture contract
 -----------------------
@@ -61,23 +64,27 @@ Tolerances (and why)
   is ~1e-5 relative (measured 1.7e-4…9.1e-4 across iree/numpy runs in
   ``bench_logs/hf_feasibility_findings.md``).  Both are asserted, so a
   large-magnitude logit cannot buy tolerance for a wrong one.
-* ``sshleifer/tiny-gpt2``'s logits are degenerate (~1e-44) — but **not** because
-  the checkpoint is degenerate (see Known issue below); its numbers are reported
-  but vacuous (the measured ``scale`` is in the message).
+* ``sshleifer/tiny-gpt2``'s logits are ordinary (``max |logit| ≈ 0.13``), so it
+  is held to the same 1e-4 absolute budget as the other tiny checkpoints — the
+  legacy-format checkpoint is *not* a known failure (see below).
 
-Known issue this oracle exposes
--------------------------------
-``sshleifer/tiny-gpt2`` ships the **legacy** (pre-torch-1.6) ``pytorch_model.bin``
-layout, and ``etl_hf.weights``' legacy reader disagrees with ``torch.load`` on
-every one of its 33 tensors (measured; e.g. the checkpoint's all-zero
-``transformer.ln_f.weight`` is read back as arbitrary data), so the model built
-from it is not the checkpoint's model.  The in-process test therefore carries a
-strict ``xfail`` for that slug: the failure is a reader bug (outside this test
-file), never something to absorb with a looser tolerance.
+Legacy-format checkpoints (why ``tiny_gpt2`` matters)
+----------------------------------------------------
+``sshleifer/tiny-gpt2`` ships the **legacy** (pre-torch-1.6)
+``pytorch_model.bin`` layout, whose trailer prefixes every storage blob with an
+int64 element count.  ``etl_hf.weights`` consumes that prefix, so its 33 tensors
+agree with ``torch.load`` and the in-process parity case is an ordinary case
+(measured at ``seq_len=8``: max-abs 2.2e-8 against a logit scale of 0.128, argmax
+identical at every non-tie position).  Keeping it in the in-process set is the
+reader's end-to-end check against an **external** oracle: a shifted parse still
+yields correctly-shaped, plausible-looking tensors that agree with ``etl_hf``'s
+own numpy reference (both sides read the same loaded arrays), so only a
+comparison like this one can catch it.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import struct
 import subprocess
@@ -90,18 +97,56 @@ from typing import NamedTuple
 import numpy as np
 import pytest
 
-#: The oracle is optional: both packages are test-only extras, so the whole
-#: module skips (never errors) when they are absent — the default for this repo.
-torch = pytest.importorskip("torch", reason="torch is not installed (optional HF golden oracle)")
-transformers = pytest.importorskip(
-    "transformers", reason="transformers is not installed (optional HF golden oracle)"
-)
-
 _TESTS_DIR = Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:  # pragma: no cover - pytest already adds it
     sys.path.insert(0, str(_TESTS_DIR))
 
 import hf_download  # noqa: E402  (needs the sys.path entry above)
+
+# ---------------------------------------------------------------------------
+# the optional oracle (never imported at module scope — see the docstring)
+# ---------------------------------------------------------------------------
+#: Reason attached to every ``skipif`` that needs the real HF implementation.
+_ORACLE_SKIP_REASON = (
+    "torch + transformers are not installed (optional HuggingFace golden oracle)"
+)
+
+#: Lazily populated ``(torch, transformers)`` pair — see :func:`_oracle`.
+_ORACLE: tuple[object, object] | None = None
+
+
+def _import_oracle():
+    """Import ``(torch, transformers)``, turning a missing oracle into a skip."""
+    try:
+        import torch
+        import transformers
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        pytest.skip(f"{_ORACLE_SKIP_REASON}: {exc}")
+    return torch, transformers
+
+
+def _oracle():
+    """The cached ``(torch, transformers)`` pair, imported on first use.
+
+    Call this *inside* a test, never at module scope: the optional oracle must
+    not be imported just because this file was collected.
+    """
+    global _ORACLE
+    if _ORACLE is None:
+        _ORACLE = _import_oracle()
+    return _ORACLE
+
+
+def _oracle_available() -> bool:
+    """Whether both oracle packages are importable — probes, never imports them."""
+    for name in ("torch", "transformers"):
+        try:
+            if importlib.util.find_spec(name) is None:
+                return False
+        except (ImportError, ValueError):  # a broken/partial installation
+            return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # constants
@@ -216,6 +261,7 @@ def _checkpoint_dir(slug: str, repo_id: str) -> Path:
 # ---------------------------------------------------------------------------
 def _torch_dtype(name: object):
     """Map a fixture ``dtype`` name onto a ``torch.dtype`` (explicit, no guessing)."""
+    torch, _transformers = _oracle()
     if name is None:
         return torch.float32
     if isinstance(name, torch.dtype):
@@ -276,13 +322,13 @@ def _hf_logits(
             fails loudly instead of silently substituting a different model.
         ValueError: the requested dtype is not mappable.
     """
-    from transformers import AutoModelForCausalLM
+    torch, transformers = _oracle()
 
     torch_dtype = _torch_dtype(dtype)
     location = _hf_source(repo_id) if source is None else str(source)
     try:
         try:
-            model = AutoModelForCausalLM.from_pretrained(
+            model = transformers.AutoModelForCausalLM.from_pretrained(
                 location, torch_dtype=torch_dtype, trust_remote_code=False
             )
         except TypeError as exc:
@@ -290,7 +336,7 @@ def _hf_logits(
                 raise
             # transformers >= 4.56 renamed the kwarg to `dtype`; retry explicitly
             # (a silent fallback would hide a real argument error).
-            model = AutoModelForCausalLM.from_pretrained(
+            model = transformers.AutoModelForCausalLM.from_pretrained(
                 location, dtype=torch_dtype, trust_remote_code=False
             )
     except Exception as exc:
@@ -536,6 +582,7 @@ def _write_tiny_checkpoint(directory: Path) -> Path:
 
 # ---------------------------------------------------------------------------
 # 1. parity against the torch golden fixtures (when the harness produced them)
+#    — torch-free: the oracle's logits are already on disk in the fixture
 # ---------------------------------------------------------------------------
 _GOLDENS = _load_goldens()
 
@@ -547,7 +594,7 @@ _NO_GOLDENS_MESSAGE = (
 
 @pytest.mark.parametrize("slug", sorted(_GOLDENS) or ["<no goldens>"])
 def test_torch_goldens_parity(slug: str):
-    """Compare our logits against HF's own, for every golden fixture present."""
+    """Compare our logits against the pre-computed HF ones (no torch needed)."""
     if slug not in _GOLDENS:
         pytest.skip(_NO_GOLDENS_MESSAGE)
     input_ids, want, meta = _GOLDENS[slug]
@@ -574,27 +621,15 @@ def test_torch_goldens_parity(slug: str):
 # ---------------------------------------------------------------------------
 # 2. parity against a fresh in-process HF forward (no fixtures needed)
 # ---------------------------------------------------------------------------
-#: Slugs of the in-process parity test.  ``tiny_gpt2`` is ``xfail``-marked: its
-#: checkpoint ships the **legacy** (pre-1.6) ``pytorch_model.bin`` layout and
-#: ``etl_hf.weights``' legacy reader disagrees with ``torch.load`` on *every*
-#: tensor of it (33/33, measured), so the model it builds is not the checkpoint's
-#: model (its logits come out ~1e-44).  That is a reader bug, not a tolerance
-#: question, so the case is recorded as a strict xfail — the marker must be
-#: removed when the reader is fixed (a fix turns it into XPASS → failure).
+#: Slugs of the in-process parity test.  ``tiny_gpt2`` is an ordinary case: its
+#: checkpoint ships the **legacy** (pre-1.6) ``pytorch_model.bin`` layout, which
+#: ``etl_hf.weights`` reads correctly (the trailer's per-storage int64 element
+#: count is consumed), so it is compared against HuggingFace like the others —
+#: this is the legacy reader's end-to-end check against an external oracle.
 _IN_PROCESS_SLUGS = (
     "tiny_llama",
     "tiny_mistral",
-    pytest.param(
-        "tiny_gpt2",
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "etl_hf.weights' legacy pytorch_model.bin reader mis-reads "
-                "sshleifer/tiny-gpt2 (every tensor differs from torch.load), so "
-                "this checkpoint cannot be compared against HF yet"
-            ),
-        ),
-    ),
+    "tiny_gpt2",
 )
 
 #: config.json keys carrying the maximum number of positions, in probe order.
@@ -616,6 +651,7 @@ def _max_positions(directory: object) -> int | None:
     return None
 
 
+@pytest.mark.skipif(not _oracle_available(), reason=_ORACLE_SKIP_REASON)
 @pytest.mark.parametrize("slug", _IN_PROCESS_SLUGS)
 def test_hf_in_process_parity(slug: str):
     """Run HF and ``etl_hf`` on the same ids and compare logits + argmax."""
@@ -722,17 +758,37 @@ def test_golden_fixture_format():
 
 
 # ---------------------------------------------------------------------------
-# 4. etl_hf must never import the (installed) oracle itself
+# 4. neither etl_hf nor this module may import the optional oracle
 # ---------------------------------------------------------------------------
+def _run_probe(code: str) -> dict[str, str]:
+    """Run ``code`` in a fresh interpreter and parse its ``KEY=value`` lines.
+
+    A subprocess is essential here: anything this module (or the surrounding
+    pytest session) already imported would otherwise pollute the check.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"the probe subprocess failed:\nstdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    return dict(line.split("=", 1) for line in completed.stdout.strip().splitlines())
+
+
 def test_etl_hf_never_imports_torch(tmp_path):
     """``import etl_hf`` + a full tiny forward must not pull in torch/transformers.
 
-    Run in a subprocess so nothing this module imported at module scope can
-    pollute the check — the whole point is that the *library* stays numpy-only
-    even when the oracle happens to be installed.
+    Two probes, each in a fresh interpreter: the *library* stays numpy-only even
+    when the oracle happens to be installed, and this test module's own oracle
+    helper stays lazy (collecting the file — ``skipif`` gates included — must not
+    import the oracle either).
     """
     directory = _write_tiny_checkpoint(tmp_path)
-    code = textwrap.dedent(
+    library = _run_probe(
         f"""
         import sys
         import etl_hf
@@ -744,14 +800,31 @@ def test_etl_hf_never_imports_torch(tmp_path):
             name for name in ("torch", "transformers") if name in sys.modules))
         """
     )
-    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert completed.returncode == 0, (
-        f"the subprocess could not load + run a tiny synthetic checkpoint:\n"
-        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    assert library["LEAKED"] == "", (
+        f"etl_hf imported optional oracle dependencies: {library['LEAKED']}"
     )
-    reported = dict(line.split("=", 1) for line in completed.stdout.strip().splitlines())
-    assert reported["LEAKED"] == "", (
-        f"etl_hf imported optional oracle dependencies: {reported['LEAKED']}"
+    assert library["SHAPE"] == f"1,4,{_TINY_CONFIG['vocab_size']}", library["SHAPE"]
+    assert library["DTYPE"] == "float32", library["DTYPE"]
+
+    this_file = Path(__file__).resolve()
+    gate = _run_probe(
+        f"""
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location("etl_hf_oracle_gate", {str(this_file)!r})
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        print("ORACLE_CACHED=" + str(module._ORACLE is not None))
+        print("LEAKED=" + ",".join(
+            name for name in ("torch", "transformers") if name in sys.modules))
+        """
     )
-    assert reported["SHAPE"] == f"1,4,{_TINY_CONFIG['vocab_size']}", reported["SHAPE"]
-    assert reported["DTYPE"] == "float32", reported["DTYPE"]
+    assert gate["LEAKED"] == "", (
+        f"importing {this_file.name} pulled in optional oracle dependencies: "
+        f"{gate['LEAKED']} — the oracle must only be imported by _oracle()"
+    )
+    assert gate["ORACLE_CACHED"] == "False", (
+        "importing this test module already invoked the oracle helper; it must "
+        "stay lazy so the torch-free tests can run without torch"
+    )
