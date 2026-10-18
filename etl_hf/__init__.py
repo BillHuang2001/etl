@@ -38,7 +38,7 @@ torch / transformers / safetensors / iree are **never** imported at module scope
 
 from __future__ import annotations
 
-from etl_hf import build, config, families, ops, reference, weights
+from etl_hf import build, config, families, ops, pack, reference, weights
 from etl_hf.build import HFModel, build_model, load_hf, place_params, run_model
 from etl_hf.config import ModelConfig
 from etl_hf.errors import (
@@ -48,6 +48,7 @@ from etl_hf.errors import (
     HFWeightError,
 )
 from etl_hf.families import FAMILIES, FamilySpec, family_for_model_type, get_family
+from etl_hf.pack import PackPlan, pack_params, pack_plan
 
 __version__ = "0.1.0"
 
@@ -59,6 +60,10 @@ __all__ = [
     "load_hf",
     "place_params",
     "run_model",
+    # -- packed weights (opt-in) --------------------------------------------
+    "PackPlan",
+    "pack_params",
+    "pack_plan",
     # -- family registry ----------------------------------------------------
     "FAMILIES",
     "FamilySpec",
@@ -74,6 +79,7 @@ __all__ = [
     "config",
     "families",
     "ops",
+    "pack",
     "reference",
     "weights",
     # -- metadata -----------------------------------------------------------

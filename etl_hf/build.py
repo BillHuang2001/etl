@@ -43,6 +43,15 @@ boundary by design, so callers must place weights explicitly with
 :func:`place_params` first (one ``Tensor.to(device)`` per leaf — never a hidden
 move) and then drive the documented same-device loop.
 
+Packed weights (``pack_weights=True``, opt-in): the graph takes a handful of
+concatenated params inputs (:mod:`etl_hf.pack`) instead of one per canonical
+weight and unpacks them in-graph with static ``etl.slice`` ops. It exists for one
+measured reason — IREE's Python runtime SIGSEGVs above ~161 *consumed* inputs and
+the 124M ``gpt2`` declares 197 — and it changes nothing about the arithmetic:
+packing happens once on the host (:func:`etl_hf.pack.pack_params` /
+:meth:`HFModel.pack_params`), never per run. Unpacked stays the default, so no
+existing caller changes behaviour.
+
 Import-time constraint: only ``numpy``, ``etl`` and sibling ``etl_hf`` modules
 are imported here. Backend adapters (iree / xla / tvm) are resolved lazily by
 ``etl`` itself, so ``import etl_hf`` never imports them.
@@ -62,10 +71,12 @@ import etl
 from etl import core as _core
 from etl_hf import families as _families
 from etl_hf import ops as _ops
+from etl_hf import pack as _pack
 from etl_hf import weights as _weights
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
 from etl_hf.families import FamilySpec
+from etl_hf.pack import PackPlan
 
 __all__ = [
     "DEFAULT_LLVM_CPU_COMPILE_ARGS",
@@ -113,6 +124,13 @@ _GRAPH_CACHE_MAX = 64
 
 _GRAPH_CACHE: "OrderedDict[tuple, Callable]" = OrderedDict()
 _GRAPH_CACHE_LOCK = threading.Lock()
+
+#: Bound of the module-level packed-plan memo (same reasoning as
+#: :data:`_GRAPH_CACHE`: a plan is a pure function of a config's ``param_specs``).
+_PACK_CACHE_MAX = 64
+
+_PACK_CACHE: "OrderedDict[tuple, PackPlan]" = OrderedDict()
+_PACK_CACHE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -357,15 +375,49 @@ def resolve_build_options(
 # ---------------------------------------------------------------------------
 # the memoised @etl.defn forward
 # ---------------------------------------------------------------------------
+def _pack_plan_for(spec: FamilySpec, cfg: ModelConfig) -> PackPlan:
+    """Return the memoised :class:`~etl_hf.pack.PackPlan` for one config.
+
+    A plan is a pure function of the family's ``param_specs(cfg)`` (dtypes, ranks
+    and trailing dims only), so it is memoised exactly like the forward objects:
+    bounded LRU, built outside the lock, first-insert-wins.
+
+    Args:
+        spec: the resolved family.
+        cfg: the static config.
+
+    Returns:
+        etl_hf.pack.PackPlan: the packed-input plan (one input per
+        ``(dtype, rank, shape[1:])`` bucket — a handful, never one per weight).
+    """
+    key = (spec.name, cfg.digest)
+    with _PACK_CACHE_LOCK:
+        cached = _PACK_CACHE.get(key)
+        if cached is not None:
+            _PACK_CACHE.move_to_end(key)
+            return cached
+    plan = _pack.pack_plan(spec.param_specs(cfg))
+    with _PACK_CACHE_LOCK:
+        existing = _PACK_CACHE.setdefault(key, plan)
+        _PACK_CACHE.move_to_end(key)
+        while len(_PACK_CACHE) > _PACK_CACHE_MAX:
+            _PACK_CACHE.popitem(last=False)
+        return existing
+
+
 def _forward_fn(
-    spec: FamilySpec, cfg: ModelConfig, seq_len: int, batch_size: int
+    spec: FamilySpec,
+    cfg: ModelConfig,
+    seq_len: int,
+    batch_size: int,
+    pack_weights: bool = False,
 ) -> Callable:
     """Return the memoised ``@etl.defn`` forward for one static specialisation.
 
-    The graph depends only on ``(family, config, seq_len, batch_size)`` — never
-    on weights or on a backend — so a bounded LRU of forward objects is safe and
-    makes ``id(fn)`` (``etl.build_cached``'s identity component) stable across
-    ``build_model`` calls. Entries are built outside the lock (tracing is
+    The graph depends only on ``(family, config, seq_len, batch_size, packed)`` —
+    never on weights or on a backend — so a bounded LRU of forward objects is
+    safe and makes ``id(fn)`` (``etl.build_cached``'s identity component) stable
+    across ``build_model`` calls. Entries are built outside the lock (tracing is
     expensive) and first-insert-wins, so concurrent callers still observe a
     single object per key.
 
@@ -374,17 +426,21 @@ def _forward_fn(
         cfg: the static config.
         seq_len: static sequence length.
         batch_size: static batch size.
+        pack_weights: whether the forward takes the PACKED params inputs (it then
+            unpacks them in-graph as its first statement). Part of the cache key:
+            a packed and an unpacked graph are different functions.
 
     Returns:
         Callable: the ``@etl.defn`` forward ``(params, input_ids) -> logits``.
     """
-    key = (spec.name, cfg.digest, seq_len, batch_size)
+    key = (spec.name, cfg.digest, seq_len, batch_size, bool(pack_weights))
     with _GRAPH_CACHE_LOCK:
         cached = _GRAPH_CACHE.get(key)
         if cached is not None:
             _GRAPH_CACHE.move_to_end(key)
             return cached
-    forward = spec.graph(cfg, seq_len, batch_size)
+    plan = _pack_plan_for(spec, cfg) if pack_weights else None
+    forward = spec.graph(cfg, seq_len, batch_size, pack_plan=plan)
     with _GRAPH_CACHE_LOCK:
         existing = _GRAPH_CACHE.setdefault(key, forward)
         _GRAPH_CACHE.move_to_end(key)
@@ -431,6 +487,28 @@ def _check_activation(cfg: ModelConfig, backend_name: str) -> None:
     )
 
 
+def _require_bool(value: object, what: str) -> bool:
+    """Validate a boolean flag argument.
+
+    Args:
+        value: the candidate value.
+        what: argument name used in the error message.
+
+    Returns:
+        bool: ``value`` as a ``bool``.
+
+    Raises:
+        TypeError: ``value`` is not a ``bool`` (an int/str would silently flip
+            the graph's params tree shape, so it is rejected).
+    """
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"{what} must be a bool (True/False), got {value!r} of type "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
 def build_model(
     cfg: ModelConfig,
     seq_len: int,
@@ -440,6 +518,7 @@ def build_model(
     device: object = None,
     cache: object = None,
     family: str | None = None,
+    pack_weights: bool = False,
     **options: object,
 ) -> "etl.Executable":
     """Build (trace → lower → compile → load) one model forward executable.
@@ -470,6 +549,15 @@ def build_model(
             process-wide default cache.
         family: optional explicit family key; when given it must agree with
             ``cfg.family``.
+        pack_weights: opt-in **packed weights** (default ``False``). When
+            ``True`` the graph takes a handful of concatenated params inputs
+            (:attr:`etl_hf.pack.PackPlan.specs`, one per ``(dtype, rank,
+            shape[1:])`` bucket) instead of one input per canonical weight, and
+            unpacks them in-graph with static ``etl.slice`` ops. This is what
+            makes the 124M-model case runnable on IREE (its runtime SIGSEGVs
+            above ~161 consumed inputs; ``gpt2`` declares 197 unpacked). Run it
+            with the packed tree — ``etl_hf.pack_params(plan, params)`` or
+            :meth:`HFModel.pack_params` — never with the canonical tree.
         **options: compile options forwarded to ``etl.build_cached`` (and hence
             to both ``lower`` and ``compile`` — that is what makes
             ``iree_compile_args`` effective). Explicit values always beat the
@@ -477,7 +565,8 @@ def build_model(
 
     Returns:
         etl.Executable: the loaded executable; call it with a params mapping and
-        integer ``input_ids`` through :func:`run_model` / ``etl.run``.
+        integer ``input_ids`` through :func:`run_model` / ``etl.run``. For
+        ``pack_weights=True`` that mapping is the packed tree.
 
     Raises:
         HFConfigError: ``seq_len``/``batch_size`` is not a positive integer,
@@ -485,15 +574,17 @@ def build_model(
             disagrees with ``cfg.family``, or the backend/device argument is
             malformed.
         HFUnsupportedError: unknown ``family``, unsupported ``cfg.hidden_act``,
-            or an erf-based activation on a compiled backend (raised before any
-            tracing).
-        TypeError: ``cfg`` is not a :class:`ModelConfig`.
+            an erf-based activation on a compiled backend (raised before any
+            tracing), or a non-static config shape that cannot be packed.
+        TypeError: ``cfg`` is not a :class:`ModelConfig`, or ``pack_weights`` is
+            not a bool.
         etl.BackendError: the resolved backend is unavailable or rejects the
             graph (propagated verbatim — never a silent fallback).
     """
     cfg = _require_config(cfg)
     seq_len = _positive_int(seq_len, "build_model(seq_len)")
     batch_size = _positive_int(batch_size, "build_model(batch_size)")
+    pack_weights = _require_bool(pack_weights, "build_model(pack_weights)")
     limit = cfg.max_position_embeddings
     if seq_len > limit:
         raise HFConfigError(
@@ -507,10 +598,14 @@ def build_model(
         backend, device, options
     )
     _check_activation(cfg, resolved_backend)
-    forward = _forward_fn(spec, cfg, seq_len, batch_size)
+    forward = _forward_fn(spec, cfg, seq_len, batch_size, pack_weights)
+    if pack_weights:
+        params_specs: Mapping[str, "etl.TensorSpec"] = _pack_plan_for(spec, cfg).specs
+    else:
+        params_specs = spec.param_specs(cfg)
     return etl.build_cached(
         forward,
-        spec.param_specs(cfg),
+        params_specs,
         etl.TensorSpec((batch_size, seq_len), etl.int32),
         backend=resolved_backend,
         device=device,
@@ -543,6 +638,92 @@ def _ids_spec(executable: "etl.Executable") -> "etl.TensorSpec | None":
     return specs[-1]
 
 
+def _params_keys(executable: "etl.Executable") -> tuple | None:
+    """Return the params-dict keys recorded by the executable, if available.
+
+    The forward signature is ``(params, input_ids)`` and etl flattens the params
+    dict into leaves, recording the *structure* (``signature.input_tree``) beside
+    the flat ``input_specs``. The params dict is the tree's first child and its
+    ``node_data`` carries the sorted key list — canonical weight names, or the
+    packed ``packed.N`` names for a ``pack_weights=True`` executable. An
+    executable from some other graph returns ``None`` and the caller skips the
+    check rather than guessing.
+
+    Args:
+        executable: the executable to inspect.
+
+    Returns:
+        tuple | None: the recorded params keys, or ``None`` when unavailable.
+    """
+    tree = getattr(getattr(executable, "signature", None), "input_tree", None)
+    children = getattr(tree, "children", None)
+    if not children:
+        return None
+    keys = getattr(children[0], "node_data", None)
+    if not isinstance(keys, (list, tuple)) or not keys:
+        return None
+    return tuple(keys)
+
+
+def _check_params_mode(
+    executable: "etl.Executable", params: Mapping[str, np.ndarray]
+) -> None:
+    """Raise an actionable error when params and executable disagree on packing.
+
+    ``etl.run`` reports a pytree structure mismatch, which says nothing about
+    *why* the two trees differ. A packed executable takes a handful of
+    ``packed.N`` inputs while the canonical tree has one key per weight, and
+    mixing them is the one mistake this guard translates into a remedy that
+    names ``pack_weights``.
+
+    Only a genuine packed-vs-canonical mix is reported here; any other mismatch
+    (a typo'd key, a wrong shape) is left to etl's own structure/shape errors.
+
+    Args:
+        executable: the executable about to run.
+        params: the caller's params mapping.
+
+    Returns:
+        None
+
+    Raises:
+        HFWeightError: the executable takes packed params inputs and ``params``
+            is a canonical tree, or the executable takes canonical weight inputs
+            and ``params`` is a packed tree.
+    """
+    expected = _params_keys(executable)
+    if expected is None:
+        return
+    expected_keys = set(expected)
+    got = set(params)
+    if got == expected_keys:
+        return
+    expected_packed = _pack.is_packed_tree(expected_keys)
+    got_packed = _pack.is_packed_tree(got)
+    if expected_packed and not got_packed:
+        raise HFWeightError(
+            f"this executable was built with pack_weights=True, so it takes "
+            f"{len(expected)} PACKED params inputs "
+            f"({sorted(expected_keys)[:8]}) — one concatenated input per "
+            f"(dtype, rank, trailing-shape) bucket — but it was given "
+            f"{len(got)} canonical weight keys ({sorted(got)[:8]}). Pack the "
+            f"params first, e.g. "
+            f"plan = etl_hf.pack_plan(param_specs); "
+            f"packed = etl_hf.pack_params(plan, params) "
+            f"(or HFModel.pack_params()), and pass the packed tree; to run the "
+            f"canonical tree instead, build with pack_weights=False."
+        )
+    if got_packed and not expected_packed:
+        raise HFWeightError(
+            f"this executable was built with pack_weights=False, so it takes the "
+            f"{len(expected)} canonical weight inputs "
+            f"({sorted(expected_keys)[:8]}), but it was given packed keys "
+            f"({sorted(got)[:8]}). Pass the canonical params tree, or rebuild "
+            f"with pack_weights=True together with "
+            f"etl_hf.pack_params(etl_hf.pack_plan(param_specs), params)."
+        )
+
+
 def run_model(
     executable: "etl.Executable",
     params: Mapping[str, np.ndarray],
@@ -562,12 +743,18 @@ def run_model(
     * ``params`` is passed through **untouched** — etl validates keys, shapes and
       dtypes and reports the first mismatching pytree path. Nothing is filtered
       or renamed here.
+    * The one exception is the packed-vs-canonical mix: feeding a canonical tree
+      to a ``pack_weights=True`` executable (or the reverse) raises an
+      :class:`~etl_hf.errors.HFWeightError` naming ``pack_weights`` and the
+      remedy instead of a bare etl pytree error.
 
     Args:
         executable: an executable whose signature is ``(params, input_ids)``,
             e.g. the result of :func:`build_model`.
         params: canonical flat params mapping (:func:`FamilySpec.param_specs`
-            keys) of host arrays or placed :class:`etl.Tensor` leaves.
+            keys) of host arrays or placed :class:`etl.Tensor` leaves — or, for a
+            ``pack_weights=True`` executable, the packed tree it was built for
+            (:func:`etl_hf.pack.pack_params` / :meth:`HFModel.pack_params`).
         input_ids: ``(batch_size, seq_len)`` integer token ids.
 
     Returns:
@@ -578,6 +765,8 @@ def run_model(
     Raises:
         TypeError: ``executable`` is not an :class:`etl.Executable`, or ``params``
             is not a mapping.
+        etl_hf.HFWeightError: ``params`` is a canonical tree where the executable
+            takes packed inputs (or the reverse).
         etl.DTypeError: ``input_ids`` is not integral.
         etl.ShapeError: ``input_ids`` is not 2-D or does not match the
             executable's ids spec.
@@ -614,6 +803,7 @@ def run_model(
             f"input_ids must be an integer array (any integral dtype; token ids are "
             f"cast to int32), got dtype {ids.dtype}"
         )
+    _check_params_mode(executable, params)
     return etl.run(
         executable, params, np.ascontiguousarray(ids, dtype=np.int32)
     )
@@ -634,9 +824,15 @@ def place_params(
     :func:`run_model` and feed each run's outputs back as the next run's inputs
     (the documented same-device loop).
 
+    Packed weights fit here unchanged, and the supported order is **pack on the
+    host first, then place the packed tree**: ``place_params(packed, device)``
+    transfers the ~4–8 packed leaves instead of one leaf per weight (~200 for
+    the 124M models) — the same bytes, a fraction of the per-leaf staging calls.
+
     Args:
         params: canonical flat params mapping (host arrays, e.g. from
-            :meth:`HFModel.params`).
+            :meth:`HFModel.params`) — or, after :meth:`HFModel.pack_params`, the
+            packed tree.
         device: the target :class:`etl.core.Device` (e.g. ``Device("cuda", 0)``).
 
     Returns:
@@ -699,6 +895,12 @@ class HFModel:
         family: the resolved ``etl_hf`` family key (``"llama"`` / ``"gpt2"``).
         seq_len: the static sequence length this model forwards at.
         batch_size: the static batch size this model forwards at.
+
+    Packed weights are opt-in and orthogonal to the stored canonical tree: the
+    model always keeps the canonical arrays, and
+    :meth:`pack_params`/:meth:`build`/:meth:`forward` take
+    ``pack_weights=True`` when a compiled backend cannot cope with one graph
+    input per weight (see :mod:`etl_hf.pack`).
     """
 
     def __init__(
@@ -753,6 +955,8 @@ class HFModel:
             )
         self.model_dir: Path | None = None if model_dir is None else Path(model_dir)
         self._params: dict[str, np.ndarray] = self._check_params(params)
+        #: Lazily built :class:`etl_hf.pack.PackPlan` (see :meth:`pack_plan`).
+        self._pack_plan_cache: PackPlan | None = None
 
     # -- validation ---------------------------------------------------------
     def _check_params(
@@ -814,14 +1018,69 @@ class HFModel:
         """
         return dict(self._params)
 
-    def param_specs(self) -> dict[str, "etl.TensorSpec"]:
-        """Return the ``TensorSpec`` of every canonical parameter.
+    def param_specs(self, *, pack_weights: bool = False) -> dict[str, "etl.TensorSpec"]:
+        """Return the ``TensorSpec`` of every **graph input** parameter.
+
+        Args:
+            pack_weights: when ``True`` return the PACKED inputs
+                (:attr:`etl_hf.pack.PackPlan.specs` — a handful of concatenated
+                tensors, the tree a ``pack_weights=True`` executable takes);
+                ``False`` (default) returns the canonical per-weight tree.
 
         Returns:
-            dict[str, etl.TensorSpec]: canonical name → float32 static-shape spec
-            (the weights are graph *inputs*, so this is the build-time tree).
+            dict[str, etl.TensorSpec]: canonical name → float32 static-shape spec,
+            or packed input name (``"packed.N"``) → its concatenated spec.
         """
+        if _require_bool(pack_weights, "HFModel.param_specs(pack_weights)"):
+            return dict(self.pack_plan().specs)
         return self._family_spec.param_specs(self.config)
+
+    def pack_plan(self) -> PackPlan:
+        """Return (and memoise) the packed-input plan of this model's weights.
+
+        The plan is a pure function of :meth:`param_specs` (dtypes, ranks and
+        trailing dims only), so it is built once per model and reused by
+        :meth:`pack_params`, :meth:`param_specs` and :meth:`forward`.
+
+        Returns:
+            etl_hf.PackPlan: the plan mapping the canonical keys onto
+            ``"packed.N"`` graph inputs with static slice offsets.
+        """
+        if self._pack_plan_cache is None:
+            self._pack_plan_cache = _pack.pack_plan(
+                self._family_spec.param_specs(self.config)
+            )
+        return self._pack_plan_cache
+
+    def pack_params(
+        self, params: Mapping[str, np.ndarray] | None = None
+    ) -> dict[str, np.ndarray]:
+        """Concatenate canonical host params into the packed tree.
+
+        This is the params argument a ``pack_weights=True`` executable takes: it
+        is exactly ``etl_hf.pack_params(self.pack_plan(), params)``. Pack **once**
+        on the host (at params/build time, never per run), then either pass the
+        result to :meth:`forward` / :func:`run_model` directly or hand it to
+        :func:`place_params` for a device-resident run (the supported order is
+        pack → place).
+
+        Args:
+            params: canonical params mapping (default: :meth:`params`, the
+                checkpoint's own weights); host arrays whose dtype/shape must
+                match :meth:`param_specs`.
+
+        Returns:
+            dict[str, np.ndarray]: packed host arrays keyed by
+            ``self.pack_plan().specs`` keys (``"packed.N"``), C-contiguous.
+
+        Raises:
+            TypeError: ``params`` is not a mapping.
+            etl_hf.HFWeightError: a key is missing/extra, a value is not a host
+                numeric array (e.g. an already-placed device ``Tensor``), or its
+                dtype/shape disagrees — the message names the key.
+        """
+        weights = self.params() if params is None else params
+        return self.pack_plan().pack(weights)
 
     @property
     def family_spec(self) -> FamilySpec:
@@ -851,13 +1110,15 @@ class HFModel:
 
         Args:
             **kwargs: forwarded to :func:`build_model` (``backend``, ``device``,
-                ``cache``, compile options). ``seq_len``/``batch_size``/
-                ``family`` are fixed by this object.
+                ``cache``, ``pack_weights``, compile options).
+                ``seq_len``/``batch_size``/``family`` are fixed by this object.
 
         Returns:
             etl.Executable: the loaded executable for
             ``(self.config, self.seq_len, self.batch_size)``; repeated calls with
-            the same arguments return the identical object.
+            the same arguments return the identical object. With
+            ``pack_weights=True`` the executable takes :meth:`pack_params`
+            output, not the canonical tree.
         """
         return build_model(
             self.config,
@@ -902,6 +1163,8 @@ class HFModel:
         self,
         params: Mapping[str, np.ndarray] | None = None,
         input_ids: object = None,
+        *,
+        pack_weights: bool = False,
         **kwargs: object,
     ) -> np.ndarray:
         """Run the compiled forward pass and return host logits.
@@ -909,10 +1172,17 @@ class HFModel:
         Args:
             params: canonical params mapping (default: :meth:`params`, the
                 checkpoint's own weights). Pass host arrays for a cpu executable
-                or :func:`place_params` output for a device-resident one.
+                or :func:`place_params` output for a device-resident one. With
+                ``pack_weights=True`` an already-packed tree
+                (:meth:`pack_params` output) is used as-is; a canonical tree is
+                packed once here, on the host, before the run.
             input_ids: ``(batch_size, seq_len)`` integer ids (default: all zeros
                 — a shape-only smoke forward). Integral dtypes are cast to
                 ``int32``; anything else raises ``etl.DTypeError``.
+            pack_weights: opt-in packed weights (default ``False``). Packing
+                happens once per call, on the host — nothing is re-concatenated
+                per run inside etl. For repeated runs pass the packed tree
+                explicitly (``params=self.pack_params()``) so it is packed once.
             **kwargs: forwarded to :meth:`build` (``backend``, ``device``,
                 ``cache``, compile options).
 
@@ -929,12 +1199,20 @@ class HFModel:
             etl.DeviceError: a host params tree was given to a non-cpu executable
                 (place it with :func:`place_params`), or the output could not be
                 transferred.
+            etl_hf.HFWeightError: ``params`` is a canonical tree where the
+                executable takes packed inputs (or the reverse), or the tree does
+                not match this model's specs.
             etl.BackendError: the resolved backend is unavailable or rejects the
                 graph.
         """
         weights = self.params() if params is None else params
+        pack_weights = _require_bool(pack_weights, "HFModel.forward(pack_weights)")
+        if pack_weights and not _pack.is_packed_tree(weights):
+            # Pack ONCE, on the host, before the run: the packed tree is what a
+            # pack_weights=True executable takes.
+            weights = self.pack_params(weights)
         ids = self._default_ids() if input_ids is None else self._validate_ids(input_ids)
-        executable = self.build(**kwargs)
+        executable = self.build(pack_weights=pack_weights, **kwargs)
         logits = run_model(executable, weights, ids)
         if logits.device.kind != "cpu":
             logits = logits.to(_core.Device("cpu", 0))

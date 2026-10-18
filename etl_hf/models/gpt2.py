@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -64,6 +64,9 @@ from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFWeightError
 from etl_hf.models._common import attention, linear, two_layer_mlp
 from etl_hf.ops import resolve_activation
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (no runtime import)
+    from etl_hf.pack import PackPlan
 
 __all__ = ["canonicalize_weights", "graph", "param_specs", "reference"]
 
@@ -601,7 +604,13 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
 # ---------------------------------------------------------------------------
 # graph
 # ---------------------------------------------------------------------------
-def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., Any]:
+def graph(
+    cfg: ModelConfig,
+    seq_len: int,
+    batch_size: int = 1,
+    *,
+    pack_plan: "PackPlan | None" = None,
+) -> Callable[..., Any]:
     """Build the GPT-2 forward as one ``@etl.defn`` graph.
 
     The graph is ``forward(params, input_ids) -> logits`` with ``params`` a dict
@@ -620,12 +629,25 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     ``(in_features, out_features)`` orientation ``etl.dot`` needs — to the output
     projection; there is no extra ``lm_head`` graph input.
 
+    Packed weights (opt-in): when ``pack_plan`` is an
+    :class:`etl_hf.pack.PackPlan` the forward's FIRST statement maps the packed
+    params tree back to this canonical dict with
+    ``pack_plan.unpack(params)`` (static ``etl.slice`` per canonical key — no
+    dynamic slice, no new IR op, and the fused-QKV split still happened at load
+    time), then the rest of the body is unchanged. The positional signature stays
+    ``(params, input_ids)``; only ``params`` becomes the plan's few packed inputs
+    (:attr:`etl_hf.pack.PackPlan.specs`) instead of one input per canonical
+    weight. ``pack_plan=None`` (the default) is today's behaviour, unchanged.
+
     Args:
         cfg: the GPT-2 config (a static specialisation value: one config = one
             graph).
         seq_len: static sequence length; must satisfy
             ``1 <= seq_len <= cfg.max_position_embeddings``.
         batch_size: static batch size (default 1).
+        pack_plan: optional :class:`etl_hf.pack.PackPlan` built from
+            :func:`param_specs` (``etl_hf.pack.pack_plan(param_specs(cfg))``);
+            ``None`` keeps one graph input per canonical weight.
 
     Returns:
         The ``@etl.defn``-marked function; pass it to ``etl.trace`` /
@@ -650,6 +672,10 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
 
     @etl.defn
     def gpt2_forward(params, input_ids):
+        if pack_plan is not None:
+            # Packed weights: static slicing of the few packed graph inputs back
+            # into the canonical dict — the rest of the body is unchanged.
+            params = pack_plan.unpack(params)
         embed = params["embed.weight"]
         pos_embed = params["pos_embed.weight"]
         tokens = etl.gather(embed, input_ids, axis=0)  # (batch, seq, hidden)

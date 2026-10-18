@@ -12,7 +12,7 @@ The package-level contract is what users see first, so it is pinned here:
 * the re-exports are the *same objects* as their defining modules' attributes
   (no shadowing wrapper that could drift);
 * the submodules (``ops``, ``reference``, ``weights``, ``config``, ``families``,
-  ``build``) are reachable as attributes;
+  ``build``, ``pack``) are reachable as attributes;
 * the error hierarchy derives from :class:`etl.core.ETLError` as documented.
 """
 
@@ -38,6 +38,9 @@ _EXPECTED_EXPORTS = {
     "load_hf": ("etl_hf.build", "load_hf"),
     "place_params": ("etl_hf.build", "place_params"),
     "run_model": ("etl_hf.build", "run_model"),
+    "PackPlan": ("etl_hf.pack", "PackPlan"),
+    "pack_plan": ("etl_hf.pack", "pack_plan"),
+    "pack_params": ("etl_hf.pack", "pack_params"),
     "FAMILIES": ("etl_hf.families", "FAMILIES"),
     "FamilySpec": ("etl_hf.families", "FamilySpec"),
     "family_for_model_type": ("etl_hf.families", "family_for_model_type"),
@@ -49,7 +52,7 @@ _EXPECTED_EXPORTS = {
 }
 
 #: Submodules the package exposes as attributes (``etl_hf.<name>``).
-_SUBMODULES = ("config", "families", "build", "ops", "reference", "weights")
+_SUBMODULES = ("config", "families", "build", "ops", "pack", "reference", "weights")
 
 
 # ---------------------------------------------------------------------------

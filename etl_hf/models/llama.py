@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import difflib
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -44,6 +45,9 @@ from etl_hf import ops
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
 from etl_hf.models import _common
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (no runtime import)
+    from etl_hf.pack import PackPlan
 
 __all__ = [
     "FAMILY",
@@ -436,7 +440,13 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
 # ---------------------------------------------------------------------------
 # the graph
 # ---------------------------------------------------------------------------
-def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., object]:
+def graph(
+    cfg: ModelConfig,
+    seq_len: int,
+    batch_size: int = 1,
+    *,
+    pack_plan: "PackPlan | None" = None,
+) -> Callable[..., object]:
     """Build the ``@etl.defn`` Llama/Mistral forward pass for one static shape.
 
     The forward pass is HF's ``LlamaModel``: token-embedding gather →
@@ -464,11 +474,24 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     ``(in_features, out_features)`` orientation ``etl.dot`` needs — to the output
     projection; there is no extra ``lm_head`` graph input.
 
+    Packed weights (opt-in): when ``pack_plan`` is an
+    :class:`etl_hf.pack.PackPlan` the forward's FIRST statement maps the packed
+    params tree back to this canonical dict with
+    ``pack_plan.unpack(params)`` (static ``etl.slice`` per canonical key — no
+    dynamic slice, no new IR op), and the rest of the body is unchanged. The
+    positional signature stays ``(params, input_ids)``; only ``params`` becomes
+    the plan's few packed inputs (:attr:`etl_hf.pack.PackPlan.specs`) instead of
+    one input per canonical weight. ``pack_plan=None`` (the default) is today's
+    behaviour, unchanged.
+
     Args:
         cfg: the ``family == "llama"`` config (one config = one graph).
         seq_len: static sequence length; ``1 <= seq_len <=
             cfg.max_position_embeddings``.
         batch_size: static batch size (default 1).
+        pack_plan: optional :class:`etl_hf.pack.PackPlan` built from
+            :func:`param_specs` (``etl_hf.pack.pack_plan(param_specs(cfg))``);
+            ``None`` keeps one graph input per canonical weight.
 
     Returns:
         A fresh ``@etl.defn`` callable with positional signature
@@ -512,6 +535,10 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     @etl.defn
     def forward(params, input_ids):
         """Llama forward: ``(params, input_ids) -> logits`` (see :func:`graph`)."""
+        if pack_plan is not None:
+            # Packed weights: static slicing of the few packed graph inputs back
+            # into the canonical dict — the rest of the body is unchanged.
+            params = pack_plan.unpack(params)
         # (b, s) ids -> (b, s, hidden); the reshape pins the static extents.
         embed = params["embed.weight"]
         x = etl.reshape(etl.gather(embed, input_ids, axis=0), (b, s, hidden))
