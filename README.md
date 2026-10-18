@@ -161,13 +161,21 @@ out = etl.run(model.build(backend="iree", device=etl.core.Device("cuda", 0)), te
   logits on five checkpoints (`tiny-random-llama`, `tiny-random-mistral`,
   `tiny-gpt2`, `distilgpt2`, `gpt2`): ≤1.5e-4 max-abs on the 124M models
   (≈1e-6 relative), fp32 accumulation-order only.
-- **Compiled:** a 12-layer/124M graph (870 IR ops, 175 KB StableHLO) compiles
-  on iree/llvm-cpu in ~2.5 s; whole-graph iree runs match the numpy backend.
-  One upstream limitation is explicit rather than silent: IREE's Python runtime
-  SIGSEGVs on graphs that **consume** more than ~160 distinct inputs, so
-  124M GPT-2 (196 weights) runs on the numpy interpreter, while ≤9-layer models
-  (`distilgpt2`, 101 inputs) run compiled — fuse weights to go bigger.
-- **Deferred by design (explicit errors):** exact-`erf` GELU configs
+- **Compiled, including on GPU:** a 12-layer/124M graph (870 IR ops, 171 KB
+  StableHLO) compiles on iree in a few seconds and runs **device-resident** on
+  an AMD MI300X (iree/rocm): outputs stay on the device, weights are placed
+  once with `place_params` and fed back input-to-output in a same-device loop
+  (re-placing per call measured 10–56× slower). Whole-forward latency:
+  `tiny_llama` 0.20 ms, `distilgpt2` 1.24 ms, `gpt2` (124M, packed) 7.07 ms —
+  4–14× faster than the numpy interpreter and up to ~200× faster than
+  iree/llvm-cpu. On CPU the numpy/OpenBLAS path is still the fast one (the
+  compiler's value here is the GPU).
+- **Opt-in weight packing (`pack_weights=True`)** collapses the whole weight
+  tree into ~4 graph inputs by host-side concatenation plus static in-graph
+  slices (bit-identical to unpacked). It also works around a real upstream
+  limit: IREE's Python runtime SIGSEGVs on llvm-cpu graphs that **consume**
+  more than ~161 distinct inputs, which an unpacked 124M model exceeds (196
+  weights) — packed, it runs compiled and stable (13/13 identical runs).- **Deferred by design (explicit errors):** exact-`erf` GELU configs
   (`hidden_act: "gelu"`) are numpy-backend-only (`erf` is a StableHLO v1
   deferral); dynamic shapes, kv-cache/incremental decode, and generation loops
   are out of scope — this is the forward graph, not a serving stack.
