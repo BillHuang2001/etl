@@ -146,12 +146,18 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         from ``hidden_size // num_attention_heads`` when HF sets it explicitly),
         never from an assumed ``hidden_size // num_attention_heads``.
 
+    Note:
+        A ``tie_word_embeddings=True`` config has **no** ``lm_head.weight`` key:
+        the output head IS ``embed.weight`` (one graph input, gathered for tokens
+        and transposed for the projection), so the tied tree is exactly one key
+        smaller than the untied one.
+
     Args:
         cfg: a ``family == "llama"`` config.
 
     Returns:
         dict: canonical key → shape tuple, in canonical (embed → layers →
-        final_norm → lm_head) order.
+        final_norm → untied lm_head) order.
     """
     hidden = cfg.hidden_size
     q_dim = cfg.num_attention_heads * cfg.head_dim
@@ -174,7 +180,8 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         shapes[f"{prefix}mlp.up.weight"] = (hidden, inter)
         shapes[f"{prefix}mlp.down.weight"] = (inter, hidden)
     shapes["final_norm.weight"] = (hidden,)
-    shapes["lm_head.weight"] = (hidden, vocab)
+    if not cfg.tie_word_embeddings:
+        shapes["lm_head.weight"] = (hidden, vocab)
     return shapes
 
 
@@ -256,7 +263,13 @@ def canonicalize_weights(
         layers.{i}.mlp.up.weight           (hidden_size, intermediate)    <- ...mlp.up_proj.weight       .T
         layers.{i}.mlp.down.weight         (intermediate, hidden_size)    <- ...mlp.down_proj.weight     .T
         final_norm.weight                  (hidden_size,)                 <- model.norm.weight
-        lm_head.weight                     (hidden_size, vocab_size)      <- lm_head.weight .T, or (tied) embed.weight.T
+        lm_head.weight                     (hidden_size, vocab_size)      <- lm_head.weight .T (UNTIED only)
+
+    Weight tying: with ``tie_word_embeddings`` the output head IS
+    ``embed.weight``, so a tied tree has **no** ``lm_head.weight`` entry (one key
+    fewer, and the head is never a second transposed copy); a checkpoint that
+    also ships ``lm_head.weight`` must agree with the embedding, is verified,
+    consumed and dropped.
 
     Nothing is guessed: every problem is an explicit error (see Raises).
 
@@ -267,7 +280,8 @@ def canonicalize_weights(
 
     Returns:
         dict: canonical key → ``float32`` contiguous writable array, in the order
-        of :func:`param_specs`.
+        of :func:`param_specs` (a tied config therefore has no
+        ``lm_head.weight`` entry).
 
     Raises:
         HFConfigError: ``cfg`` is not a llama-family :class:`ModelConfig`.
@@ -338,13 +352,15 @@ def canonicalize_weights(
             params[canonical] = take(f"model.layers.{index}.{hf_suffix}", canonical, transpose)
     params["final_norm.weight"] = take("model.norm.weight", "final_norm.weight", False)
 
-    # lm_head: required when untied, derived from the embedding when tied. A tied
-    # checkpoint that ALSO ships an lm_head must agree with the embedding —
-    # never silently pick one of the two.
+    # lm_head: a required, separate canonical entry when untied; the embedding
+    # itself when tied (`embed.weight` is one graph input and the head is its
+    # transpose, so no duplicate array is built). A tied checkpoint that ALSO
+    # ships an lm_head must agree with the embedding — never silently pick one of
+    # the two — and is then consumed-and-dropped so the leftover check passes.
     embed_raw = params["embed.weight"]
-    if "lm_head.weight" in raw:
-        head_raw = _as_f32("lm_head.weight", raw["lm_head.weight"])
-        if cfg.tie_word_embeddings:
+    if cfg.tie_word_embeddings:
+        if "lm_head.weight" in raw:
+            head_raw = _as_f32("lm_head.weight", raw["lm_head.weight"])
             if head_raw.shape != embed_raw.shape:
                 raise HFWeightError(
                     f"tie_word_embeddings is set, but 'lm_head.weight' "
@@ -360,13 +376,9 @@ def canonicalize_weights(
                     "refusing to pick one silently — either re-export the checkpoint "
                     "or set tie_word_embeddings=False in the config"
                 )
-            params["lm_head.weight"] = take("lm_head.weight", "lm_head.weight", True)
-        else:
-            params["lm_head.weight"] = take("lm_head.weight", "lm_head.weight", True)
-    elif cfg.tie_word_embeddings:
-        # The embedding is already canonical `(vocab, hidden)`, so the tied head is
-        # simply its transpose.
-        params["lm_head.weight"] = np.ascontiguousarray(np.transpose(embed_raw))
+            consumed.add("lm_head.weight")
+    elif "lm_head.weight" in raw:
+        params["lm_head.weight"] = take("lm_head.weight", "lm_head.weight", True)
     else:
         raise HFWeightError(
             "missing required checkpoint key 'lm_head.weight' (needed for canonical "
@@ -398,6 +410,12 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
     ``input_ids`` spec. Keys and shapes match :func:`canonicalize_weights`
     exactly (linears ``(in_features, out_features)``); every spec is
     ``etl.float32``.
+
+    Weight tying: a ``tie_word_embeddings=True`` config has **no**
+    ``lm_head.weight`` spec — the output head reuses ``embed.weight`` (one graph
+    input, gathered for tokens and transposed for the projection), so the tied
+    set is exactly one key smaller. An untied config keeps the separate
+    ``(hidden_size, vocab_size)`` head.
 
     Args:
         cfg: the ``family == "llama"`` config.
@@ -441,6 +459,11 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     its canonical **flat** key (``params[f"layers.{i}.attn.q.weight"]``, linears
     ``(in_features, out_features)`` — see :func:`canonicalize_weights`).
 
+    Weight tying: a tied config feeds the SAME ``params["embed.weight"]``
+    ``SymbolicTensor`` to the token gather and — transposed to the
+    ``(in_features, out_features)`` orientation ``etl.dot`` needs — to the output
+    projection; there is no extra ``lm_head`` graph input.
+
     Args:
         cfg: the ``family == "llama"`` config (one config = one graph).
         seq_len: static sequence length; ``1 <= seq_len <=
@@ -483,13 +506,15 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     n_rep = n_heads // n_kv_heads
     scale = head_dim**-0.5
     act = ops.resolve_activation(cfg.hidden_act)
+    tied = cfg.tie_word_embeddings
     b, s = batch_size, seq_len
 
     @etl.defn
     def forward(params, input_ids):
         """Llama forward: ``(params, input_ids) -> logits`` (see :func:`graph`)."""
         # (b, s) ids -> (b, s, hidden); the reshape pins the static extents.
-        x = etl.reshape(etl.gather(params["embed.weight"], input_ids, axis=0), (b, s, hidden))
+        embed = params["embed.weight"]
+        x = etl.reshape(etl.gather(embed, input_ids, axis=0), (b, s, hidden))
         mask = ops.causal_mask(s)
         cos, sin = ops.rope_cos_sin(s, head_dim, theta)
         for index in range(n_layers):
@@ -516,6 +541,11 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
                 ),
             )
         x = ops.rms_norm(x, params["final_norm.weight"], eps)
+        if tied:
+            # The tied head IS the embedding `(vocab, hidden)`: transposed to
+            # `(in_features, out_features)` it is the output projection, so the
+            # one embedding graph input is reused instead of adding a duplicate.
+            return _common.linear(x, etl.transpose(embed))
         return _common.linear(x, params["lm_head.weight"])
 
     return forward
@@ -571,7 +601,10 @@ def reference(
     Args:
         cfg: the ``family == "llama"`` config.
         params: flat canonical parameter dict (``canonicalize_weights`` output);
-            every required key is validated for presence and shape.
+            every required key is validated for presence and shape, and the key
+            set must match :func:`param_specs` exactly. A tied config's tree has
+            no ``lm_head.weight`` — the head is
+            ``np.transpose(params["embed.weight"])``, exactly as in the graph.
         input_ids: ``(batch_size, seq_len)`` integer token ids, each in
             ``[0, cfg.vocab_size)``.
 
@@ -582,7 +615,7 @@ def reference(
     Raises:
         HFConfigError: ``cfg`` is not llama-family, or ``input_ids`` is not a
             2-D positive-shape array within ``cfg.max_position_embeddings``.
-        HFWeightError: a parameter is missing or mis-shaped.
+        HFWeightError: a parameter is missing, unexpected, or mis-shaped.
         ValueError: ``input_ids`` is not integer-valued or is out of vocabulary.
     """
     _require_llama(cfg, "reference")
@@ -614,6 +647,13 @@ def reference(
     ids = ids.astype(np.int32, copy=False)
 
     shapes = _expected_shapes(cfg)
+    missing = sorted(set(shapes) - set(params))
+    extra = sorted(set(params) - set(shapes))
+    if missing or extra:
+        raise HFWeightError(
+            f"reference: params must be exactly the canonical llama parameter set "
+            f"(missing={missing}, unexpected={extra})"
+        )
     weights = {key: _reference_param(params, key, shape) for key, shape in shapes.items()}
 
     hidden = cfg.hidden_size
@@ -646,5 +686,10 @@ def reference(
         gated = act(h @ weights[prefix + "mlp.gate.weight"]) * (h @ weights[prefix + "mlp.up.weight"])
         x = x + gated @ weights[prefix + "mlp.down.weight"]
     x = _numpy_ref.rms_norm(x, weights["final_norm.weight"], eps)
-    logits = np.asarray(x @ weights["lm_head.weight"], dtype=np.float32)
+    head = (
+        np.transpose(weights["embed.weight"])
+        if cfg.tie_word_embeddings
+        else weights["lm_head.weight"]
+    )
+    logits = np.asarray(x @ head, dtype=np.float32)
     return logits.reshape(batch, seq, cfg.vocab_size)

@@ -17,7 +17,12 @@ could hide, so none of them is inferred from shapes at run time):
   of shape ``(in_features, out_features)`` — unlike the ``nn.Linear`` layers of
   the Llama family (``(out, in)``). GPT-2 weights are therefore **never
   transposed**; only ``lm_head.weight`` (an ``nn.Linear``, ``(vocab, hidden)``)
-  is transposed to the canonical ``(hidden, vocab)``.
+  is transposed, and only when the config is UNTIED — a tied head is not a
+  canonical key at all (see :func:`canonicalize_weights`).
+* **Weight tying is one input, not two.** When ``tie_word_embeddings`` is true
+  the output head *is* ``embed.weight``: the canonical tree has no
+  ``lm_head.weight`` entry and the graph feeds the one embedding
+  ``SymbolicTensor`` to both the token gather and the output projection.
 * **Fused QKV split order.** ``attn.c_attn`` packs ``(hidden, 3 * hidden)`` and
   HF splits it ``query, key, value = c_attn(x).split(hidden, dim=2)``, i.e. the
   column blocks ``[0:H]``, ``[H:2H]``, ``[2H:3H]`` in that order. The split
@@ -86,7 +91,13 @@ def _canonical_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
 
     Canonical orientation: every linear weight is ``(in_features,
     out_features)`` — GPT-2 ``Conv1D`` weights already are, so nothing is
-    transposed here except ``lm_head`` (whose HF source is ``(vocab, hidden)``).
+    transposed here except the untied ``lm_head`` (whose HF source is
+    ``(vocab, hidden)``).
+
+    Weight tying: a ``tie_word_embeddings=True`` config has **no**
+    ``lm_head.weight`` entry — the head is ``embed.weight`` itself (one graph
+    input, gathered for tokens and transposed for the output projection), so the
+    tied tree is exactly one key smaller.
 
     Args:
         cfg: a GPT-2 :class:`~etl_hf.config.ModelConfig` (validated by callers).
@@ -96,7 +107,8 @@ def _canonical_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         order: ``embed.weight``, ``pos_embed.weight``, then per layer the
         attention projections (``q``/``k``/``v``/``o``, each weight then bias),
         the attention LayerNorm, the MLP projections (``fc1``, ``fc2``) and the
-        MLP LayerNorm, then ``final_norm.{weight,bias}`` and ``lm_head.weight``.
+        MLP LayerNorm, then ``final_norm.{weight,bias}`` and — untied only —
+        ``lm_head.weight``.
         Dict order carries no graph meaning (``core.flatten`` sorts dict keys);
         it only keeps specs and loaded arrays reported identically.
     """
@@ -122,7 +134,8 @@ def _canonical_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         shapes[prefix + "mlp_norm.bias"] = (hidden,)
     shapes["final_norm.weight"] = (hidden,)
     shapes["final_norm.bias"] = (hidden,)
-    shapes["lm_head.weight"] = (hidden, vocab)
+    if not cfg.tie_word_embeddings:
+        shapes["lm_head.weight"] = (hidden, vocab)
     return shapes
 
 
@@ -326,9 +339,11 @@ def canonicalize_weights(cfg: ModelConfig, raw: Mapping[str, Any]) -> dict[str, 
       three ``(hidden, hidden)`` blocks in HF's ``query, key, value`` column
       order (biases split the same way along their single axis);
     * ``Conv1D`` weights kept in their ``(in, out)`` orientation (no transpose);
-    * the tied output head (``lm_head.weight`` aliases ``wte.T`` when the config
-      ties embeddings and the checkpoint has no separate head; an inconsistent
-      tied pair is an error);
+    * the output head: ``lm_head.weight`` (transposed) when the config is
+      untied; when the config ties embeddings the head IS ``embed.weight``, so
+      no ``lm_head.weight`` entry is emitted — a checkpoint that ships a copy
+      must agree with ``wte.weight`` (it is verified, consumed and dropped; an
+      inconsistent tied pair is an error, never a silent pick);
     * the derived causal-buffer keys (``attn.bias`` / ``attn.masked_bias``),
       which are ignored;
     * shape validation of every tensor against ``cfg``, and rejection of any
@@ -343,7 +358,8 @@ def canonicalize_weights(cfg: ModelConfig, raw: Mapping[str, Any]) -> dict[str, 
     Returns:
         ``dict`` mapping every canonical name (the exact keys of
         :func:`param_specs`) to a C-contiguous ``float32`` array of the
-        corresponding spec shape.
+        corresponding spec shape; a tied head contributes no entry (the head is
+        ``embed.weight``), so a tied tree has exactly that one key fewer.
 
     Raises:
         HFConfigError: ``cfg`` is not a GPT-2 config.
@@ -430,7 +446,7 @@ def canonicalize_weights(cfg: ModelConfig, raw: Mapping[str, Any]) -> dict[str, 
         normalized, consumed, "ln_f.weight", (hidden,)
     )
     out["final_norm.bias"] = _take(normalized, consumed, "ln_f.bias", (hidden,))
-    out["lm_head.weight"] = _resolve_lm_head(cfg, normalized, consumed, out["embed.weight"])
+    _resolve_lm_head(cfg, normalized, consumed, out)
 
     _reject_unexpected(normalized, consumed)
     _assert_complete(cfg, out)
@@ -441,21 +457,24 @@ def _resolve_lm_head(
     cfg: ModelConfig,
     normalized: Mapping[str, tuple[str, Any]],
     consumed: set[str],
-    embed_weight: np.ndarray,
-) -> np.ndarray:
-    """Resolve the output head, honouring (and validating) weight tying.
+    canonical: dict[str, np.ndarray],
+) -> None:
+    """Resolve the output head into ``canonical``, honouring weight tying.
+
+    A tied head IS ``embed.weight`` — one canonical array, one graph input — so
+    nothing is added to ``canonical`` in that case. A checkpoint that also ships
+    ``lm_head.weight`` is checked against ``wte.weight`` (never a silent pick)
+    and then consumed-and-dropped, so the leftover-key check does not fire and
+    no second transposed copy is materialised.
 
     Args:
-        cfg: the GPT-2 config (``tie_word_embeddings`` decides the fallback).
+        cfg: the GPT-2 config (``tie_word_embeddings`` decides the contract).
         normalized: output of :func:`_normalize_keys`.
         consumed: set of mapped base keys (``lm_head.weight`` is added when the
             checkpoint carries one).
-        embed_weight: the canonical ``embed.weight`` (``(vocab, hidden)`` f32),
-            used for the tied-head fallback and the consistency check.
-
-    Returns:
-        ``np.ndarray``: the canonical ``lm_head.weight`` of shape
-        ``(hidden, vocab)``.
+        canonical: the canonical dict being built; ``embed.weight`` (already
+            present, ``(vocab, hidden)`` f32) is the tied head, and an untied
+            ``lm_head.weight`` ``(hidden, vocab)`` is added here.
 
     Raises:
         HFWeightError: the config is untied but the checkpoint has no
@@ -463,27 +482,33 @@ def _resolve_lm_head(
             ``lm_head.weight`` disagrees with ``wte.weight``.
     """
     entry = normalized.get("lm_head.weight")
-    if entry is None:
-        if not cfg.tie_word_embeddings:
+    if not cfg.tie_word_embeddings:
+        if entry is None:
             raise HFWeightError(
                 "missing required GPT-2 checkpoint key 'lm_head.weight': the config "
                 "sets tie_word_embeddings=False, so the output head cannot be aliased "
                 "to 'transformer.wte.weight'"
             )
-        return np.ascontiguousarray(embed_weight.T)
+        array = _take(
+            normalized,
+            consumed,
+            "lm_head.weight",
+            (cfg.vocab_size, cfg.hidden_size),
+        )
+        canonical["lm_head.weight"] = np.ascontiguousarray(array.T)
+        return
+    if entry is None:
+        return
     original, value = entry
     consumed.add("lm_head.weight")
     array = _as_f32(value, original)
     _check_shape(array, (cfg.vocab_size, cfg.hidden_size), original)
-    if cfg.tie_word_embeddings and not np.allclose(
-        array, embed_weight, rtol=0.0, atol=1e-6
-    ):
+    if not np.allclose(array, canonical["embed.weight"], rtol=0.0, atol=1e-6):
         raise HFWeightError(
             f"{original}: the config sets tie_word_embeddings=True but this tensor "
             "differs from 'transformer.wte.weight' (they must be identical when "
             "tied); fix the checkpoint or set tie_word_embeddings=False"
         )
-    return np.ascontiguousarray(array.T)
 
 
 def _reject_unexpected(
@@ -548,13 +573,20 @@ def param_specs(cfg: ModelConfig) -> dict[str, etl.TensorSpec]:
     so these specs are what the caller traces/builds with; the keys and shapes
     are exactly what :func:`canonicalize_weights` emits.
 
+    Weight tying: when ``cfg.tie_word_embeddings`` is true there is **no**
+    ``lm_head.weight`` spec — the output head reuses ``embed.weight`` (one graph
+    input, gathered for tokens and transposed for the projection), so the tied
+    set is exactly one key smaller. An untied config carries the separate
+    ``(hidden, vocab)`` head exactly as before.
+
     Args:
         cfg: the GPT-2 config.
 
     Returns:
         ``dict`` from canonical parameter name to ``TensorSpec`` of
         ``float32`` dtype, in canonical order (``embed``, ``pos_embed``,
-        ``layers.0.…``, …, ``final_norm.{weight,bias}``, ``lm_head``).
+        ``layers.0.…``, …, ``final_norm.{weight,bias}``, then ``lm_head``
+        only when untied).
 
     Raises:
         HFConfigError: ``cfg`` is not a GPT-2 config.
@@ -583,6 +615,11 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     ``etl_hf`` compositions (:mod:`etl_hf.ops` / :mod:`etl_hf.models._common`);
     the fused QKV was split at load time, so no in-graph slicing is needed.
 
+    Weight tying: a tied config feeds the SAME ``params["embed.weight"]``
+    ``SymbolicTensor`` to the token gather and — transposed to the
+    ``(in_features, out_features)`` orientation ``etl.dot`` needs — to the output
+    projection; there is no extra ``lm_head`` graph input.
+
     Args:
         cfg: the GPT-2 config (a static specialisation value: one config = one
             graph).
@@ -609,6 +646,7 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
     eps = cfg.layer_norm_eps
     scale = cfg.head_dim**-0.5
     n_layers = cfg.num_hidden_layers
+    tied = cfg.tie_word_embeddings
 
     @etl.defn
     def gpt2_forward(params, input_ids):
@@ -682,6 +720,12 @@ def graph(cfg: ModelConfig, seq_len: int, batch_size: int = 1) -> Callable[..., 
         normed = ops.layer_norm(
             x, params["final_norm.weight"], params["final_norm.bias"], eps
         )
+        if tied:
+            # The tied head IS the embedding `(vocab, hidden)`, so it is
+            # transposed to `(hidden, vocab)` — the `(in_features,
+            # out_features)` shape `linear`/`etl.dot` needs — and reused here
+            # instead of adding a second, duplicate graph input.
+            return linear(normed, etl.transpose(embed))
         return linear(normed, params["lm_head.weight"])
 
     return gpt2_forward
@@ -705,7 +749,9 @@ def reference(
     Args:
         cfg: the GPT-2 config.
         params: the canonical parameter dict (``str -> ndarray``, the exact keys
-            of :func:`param_specs`); extra or missing keys are an error.
+            of :func:`param_specs`); extra or missing keys are an error. A tied
+            config's tree has no ``lm_head.weight`` — the head is
+            ``np.transpose(params["embed.weight"])``, exactly as in the graph.
         input_ids: ``(batch, seq)`` integer array of token ids.
 
     Returns:
@@ -795,6 +841,9 @@ def reference(
     normed = numpy_reference.layer_norm(
         x, weights["final_norm.weight"], weights["final_norm.bias"], eps
     )
-    return np.asarray(
-        np.dot(normed, weights["lm_head.weight"]), dtype=np.float32
+    head = (
+        np.transpose(weights["embed.weight"])
+        if cfg.tie_word_embeddings
+        else weights["lm_head.weight"]
     )
+    return np.asarray(np.dot(normed, head), dtype=np.float32)
