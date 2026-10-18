@@ -221,6 +221,18 @@ host = etl.run(exe, x_cuda, w_cuda)[0].to(etl.Device("cpu", 0)).numpy()  # expli
 pytest, CPU only; unit tests per module in `../tests/<module>/`, integration tests for the full pipeline and design-principle compliance in `../tests/test_spec_compliance.py` (staging explicitness, closure-capture errors, `SymbolicTensor` purity, bind-as-sugar, vmap≡vectorize sugar, collectives local-shape semantics, serialization round-trips, explicit placement, DLPack interop via `importorskip`).
 The per-suite inventory (file list, test counts, known skips/gates) is owned by `../tests/CONTEXT.md`.
 
+## Full-model forward (Llama / GPT-2 transformers) — readiness map
+
+One-graph full transformer forward is feasible on **iree** (llvm-cpu/cuda/rocm); `xla` needs fully static shapes + `dot_precision="HIGHEST"` (TF32); **tvm cannot run it** (single-function/single-output, no `gather`/control flow).
+
+- **Absent — must be composed:** `rsqrt` (use `divide(1.0, sqrt(x))` or `power(x, -0.5)`), `softmax`, `layer_norm`, `rms_norm`, `log_softmax`, `iota`, `einsum`, `silu`, `logistic`. Mask primitive is `etl.select(pred, a, b)` (`where` exists only as `etl.numpy.where`); index generation is `etl.arange` (Constant op, static bounds only). Canonical compositions: `ops/CONTEXT.md`.
+- **`etl.gelu` is the exact erf form** (not HF's tanh approximation) — and `erf`/`gelu` are both exporter `DEFERRED_OPS`, so a GPT-2-style GELU FFN cannot be lowered on any compiler adapter; use the tanh-approx formula (`tanh`/`power` export) or stay on numpy. Llama SiLU is fine (`sigmoid` → `stablehlo.logistic`).
+- **Also deferred** (`backends/stablehlo/ops.py`): `cumsum`, `cumprod`, `tril`, `triu`, `flip`, `roll`, `nan_to_num`, `diagonal`, `solve`, linalg factorizations, `runtime_call`/`external_call`/`block_call`, all `sparse_*`. Build causal masks from `arange` compares broadcast together — never an `(S,S)` `etl.constant` (`_constant_text` inlines the payload).
+- **`gather` IS exportable** (single-axis; static operand + index SHAPES, runtime index VALUES) ⇒ `etl.gather(embed_table, ids, axis=0)` works on iree. `etl.slice` requires static lengths — there is no dynamic slice.
+- **Batched `dot` works**: `(B,H,S,D) × (B,H,D,S)` with matched static batch dims emits one `dot_general`; contracting dims are fixed to lhs-last × rhs-second-last. Symbolic reshape / symbolic batch *broadcast* defer, so attention head reshapes need static shapes.
+- **Weights**: pass `{"w1": TensorSpec((in, out), float32), ...}` as ONE positional defn arg (dict pytree; keys sorted, order-insensitive, no input-count limit). Cost ≈2–3.5 µs/leaf per `run` (400 leaves ≈ 1 ms), and non-cpu executables require pre-placed device tensors. Never `etl.constant` a weight (export inlines the payload).
+- **Unmeasured**: compile-time / vmfb scaling for thousands of ops + 100+ inputs (largest validated graph ≈11 inputs). Capture weights inside `while` bodies rather than carrying them (iree `AffinityAnalysis` SEGV at ≥3–4 carries with `select`).
+
 ## Notes for agents
 
 - Keep modules thin and single-purpose; files under ~1000 lines (split along declared boundaries instead).
