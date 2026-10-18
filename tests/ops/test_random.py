@@ -22,6 +22,9 @@ The contract under test (binding — see ``etl/ops/random.py`` and
   BackendError naming ``random_multinomial``); transforms have no rules for
   random ops → TransformError.
 """
+import importlib
+from contextlib import contextmanager
+
 import numpy as np
 import pytest
 
@@ -45,6 +48,52 @@ def _exec(fn, *specs):
     static specs from concrete args)."""
     graph = etl.trace(fn, *specs)
     return etl.load(etl.compile(etl.lower(graph)))
+
+
+@contextmanager
+def _compiler_adapter_registered_without_compiler(name):
+    """Expose the REAL optional compiler adapter ``name`` through the registry
+    without probing (or importing) its compiler dependency.
+
+    ``registry.get(name)`` auto-activates an optional adapter by importing its
+    module and calling ``register()``, which probes the compiler packages
+    (``check_available``) and raises ``core.BackendError`` with a pip-install
+    hint when they are absent. The adapter MODULE itself imports no compiler
+    at module scope (the binding heavy-import rule: ``iree`` /
+    ``iree.compiler`` / ``iree.runtime`` are imported lazily inside function
+    bodies), so its singleton and ``Capabilities`` exist in a compiler-free
+    environment; only that probe is environment-dependent.
+
+    Installing the real singleton by direct registry assignment (save/restore
+    of the previous entry) therefore bypasses ONLY the probe: the adapter's
+    OWN shared ``CompilerBackend.lower`` path — verify → capability pre-check
+    → portable inlining → StableHLO export — runs identically with or without
+    the compiler packages installed, and ``lower`` never compiles. The
+    previous entry is restored in ``finally``, so the helper is
+    order-independent: it works whether or not a real ``"iree"`` backend is
+    already registered in this process, and never leaks the assignment to
+    another test. Tests run sequentially, so no cross-test interference.
+
+    Mirrors the ``iree_stub_registered`` helpers in
+    ``tests/pipeline_env_defaults_test.py`` / ``tests/test_pipeline_options.py``
+    (same direct-registry-assignment save/restore style) — here with the real
+    adapter singleton instead of a stub.
+    """
+    from etl.backends import registry as _registry
+
+    module = importlib.import_module(_registry.OPTIONAL_ADAPTERS[name])
+    backend = getattr(module, f"{name}_backend")
+    table = _registry._registry
+    previous = table.get(name)
+    table[name] = backend
+    try:
+        yield backend
+    finally:
+        if previous is None:
+            table.pop(name, None)
+        else:
+            table[name] = previous
+
 
 
 # --- 1. determinism: same key ⇒ bit-identical draws -------------------------
@@ -805,7 +854,14 @@ def test_stablehlo_export_rejects_random_op():
 def test_compiler_backend_lower_rejects_random_op():
     """Adapter lowering rejects the one still-deferred random op
     (``random_multinomial``) via the shared stablehlo export path before
-    any compiler runs (pure capability pre-check)."""
+    any compiler runs (pure capability pre-check).
+
+    Environment-INDEPENDENT: the real iree adapter singleton is installed
+    into ``etl.backends.registry`` for the duration of the test, bypassing
+    only the env-dependent ``register()``/``check_available()`` probe — no
+    compiler is imported, invoked or required, and nothing is skipped, so the
+    assertion is strict with OR without the IREE packages installed.
+    """
 
     @etl.defn
     def f(key):
@@ -815,5 +871,9 @@ def test_compiler_backend_lower_rejects_random_op():
         return etl.random.multinomial(key, probs, 5)
 
     graph = etl.trace(f, etl.TensorSpec((), etl.int64))
-    with pytest.raises(core.BackendError, match="random_multinomial"):
-        etl.lower(graph, backend="iree")
+    with _compiler_adapter_registered_without_compiler("iree"):
+        with pytest.raises(core.BackendError) as excinfo:
+            etl.lower(graph, backend="iree")
+    message = str(excinfo.value)
+    assert "op 'random_multinomial'" in message
+    assert "not supported in v1" in message
