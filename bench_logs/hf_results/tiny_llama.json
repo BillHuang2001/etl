@@ -1,0 +1,107 @@
+[
+  {
+    "model": "tiny_llama",
+    "status": "ok",
+    "family": "llama",
+    "arch": "LlamaForCausalLM",
+    "model_type": "llama",
+    "weights_format": "safetensors",
+    "seq_len": 8,
+    "params": 1032272,
+    "vocab": 32000,
+    "hidden_act": "silu",
+    "config": {
+      "hidden_size": 16,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 4,
+      "intermediate_size": 64,
+      "hidden_act": "silu",
+      "tie_word_embeddings": false
+    },
+    "trace_s": 0.04225705692078918,
+    "export": {
+      "ok": true
+    },
+    "build_numpy_s": 0.05313737702090293,
+    "graph": {
+      "graph_inputs": 22,
+      "ops_total": 170,
+      "distinct_ops": 24,
+      "op_histogram": {
+        "multiply": 32,
+        "reshape": 21,
+        "constant": 19,
+        "dot": 19,
+        "add": 15,
+        "transpose": 10,
+        "slice": 8,
+        "divide": 7,
+        "concatenate": 5,
+        "reduce_mean": 5,
+        "sqrt": 5,
+        "negate": 4,
+        "cast": 3,
+        "subtract": 3,
+        "reduce_max": 2,
+        "exp": 2,
+        "reduce_sum": 2,
+        "sigmoid": 2,
+        "gather": 1,
+        "less_equal": 1,
+        "power": 1,
+        "cos": 1,
+        "sin": 1,
+        "return": 1
+      },
+      "stablehlo_lines": 301,
+      "stablehlo_bytes": 28896
+    },
+    "numpy_backend": {
+      "logits_shape": [
+        1,
+        8,
+        32000
+      ],
+      "logits_abs_max": 0.3430013954639435,
+      "vs_reference": {
+        "ref_abs_max": 0.3430013954639435,
+        "max_abs": 7.450580596923828e-08,
+        "mean_abs": 3.332417854551295e-09,
+        "max_rel_vs_max_abs": 2.1721720947654388e-07,
+        "argmax_rel": 0.005130716909245146
+      },
+      "run_ms_best": 1.0965140536427498
+    },
+    "finite": true,
+    "iree_compile_args": [
+      "--iree-llvmcpu-target-cpu=host",
+      "--iree-opt-data-tiling"
+    ],
+    "lower_s": 0.016775047057308257,
+    "compile_s": 1.1580018759705126,
+    "load_s": 0.01905259699560702,
+    "iree": {
+      "target": "llvm-cpu",
+      "whole_graph_compiled": true,
+      "vs_reference": {
+        "ref_abs_max": 0.3430013954639435,
+        "max_abs": 8.940696716308594e-08,
+        "mean_abs": 5.39047871761511e-09,
+        "max_rel_vs_max_abs": 2.606606513718527e-07,
+        "argmax_rel": 0.007035264115441107
+      },
+      "vs_numpy_backend": {
+        "ref_abs_max": 0.3430013954639435,
+        "max_abs": 8.940696716308594e-08,
+        "mean_abs": 5.747426390811939e-09,
+        "max_rel_vs_max_abs": 2.606606513718527e-07,
+        "argmax_rel": 0.007040399960243959
+      },
+      "run_ms_best": 1.3774019898846745,
+      "peak_rss_mb": 75.328125,
+      "speedup_vs_numpy_backend": 0.7960741030543722
+    },
+    "wall_s": 1.3298791430424899
+  }
+]

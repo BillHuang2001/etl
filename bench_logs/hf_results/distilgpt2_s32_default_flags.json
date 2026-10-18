@@ -1,0 +1,95 @@
+[
+  {
+    "model": "distilgpt2",
+    "status": "ok",
+    "family": "gpt2",
+    "arch": "GPT2LMHeadModel",
+    "model_type": "gpt2",
+    "weights_format": "safetensors",
+    "seq_len": 32,
+    "params": 120509952,
+    "vocab": 50257,
+    "hidden_act": "gelu_new",
+    "config": {
+      "n_embd": 768,
+      "n_layer": 6,
+      "n_head": 12,
+      "activation_function": "gelu_new"
+    },
+    "trace_s": 0.09377364790998399,
+    "export": {
+      "ok": true
+    },
+    "build_numpy_s": 0.13649647601414472,
+    "graph": {
+      "graph_inputs": 78,
+      "ops_total": 444,
+      "distinct_ops": 19,
+      "op_histogram": {
+        "multiply": 82,
+        "add": 81,
+        "constant": 60,
+        "dot": 37,
+        "transpose": 30,
+        "reshape": 29,
+        "reduce_mean": 26,
+        "subtract": 20,
+        "divide": 19,
+        "slice": 18,
+        "sqrt": 13,
+        "reduce_max": 6,
+        "exp": 6,
+        "reduce_sum": 6,
+        "tanh": 6,
+        "gather": 2,
+        "less_equal": 1,
+        "cast": 1,
+        "return": 1
+      },
+      "stablehlo_lines": 952,
+      "stablehlo_bytes": 87302
+    },
+    "numpy_backend": {
+      "logits_shape": [
+        1,
+        32,
+        50257
+      ],
+      "logits_abs_max": 119.94673156738281,
+      "vs_reference": {
+        "ref_abs_max": 119.94673156738281,
+        "max_abs": 0.0001678466796875,
+        "mean_abs": 3.452167019604104e-05,
+        "max_rel_vs_max_abs": 1.399343504355584e-06,
+        "argmax_rel": 4.685247312703641e-06
+      },
+      "run_ms_best": 15.887695946730673
+    },
+    "finite": true,
+    "lower_s": 0.029353683930821717,
+    "compile_s": 0.9964507670374587,
+    "load_s": 0.013300452032126486,
+    "iree": {
+      "target": "llvm-cpu",
+      "whole_graph_compiled": true,
+      "vs_reference": {
+        "ref_abs_max": 119.94673156738281,
+        "max_abs": 0.0003509521484375,
+        "mean_abs": 5.826158752409527e-05,
+        "max_rel_vs_max_abs": 2.9259000545616754e-06,
+        "argmax_rel": 4.779019521634835e-06
+      },
+      "vs_numpy_backend": {
+        "ref_abs_max": 119.94673156738281,
+        "max_abs": 0.0003662109375,
+        "mean_abs": 6.956627309769479e-05,
+        "max_rel_vs_max_abs": 3.053113100412183e-06,
+        "argmax_rel": 5.547552946349847e-06
+      },
+      "run_ms_best": 4414.465998997912,
+      "peak_rss_mb": 1021.04296875,
+      "speedup_vs_numpy_backend": 0.0035990074338180873
+    },
+    "wall_s": 19.986948666977696
+  }
+]

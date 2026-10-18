@@ -1,0 +1,99 @@
+[
+  {
+    "model": "tiny_gpt2",
+    "status": "ok",
+    "family": "gpt2",
+    "arch": "GPT2LMHeadModel",
+    "model_type": "gpt2",
+    "weights_format": "torch-bin",
+    "seq_len": 8,
+    "params": 203228,
+    "vocab": 50257,
+    "hidden_act": "gelu_new",
+    "config": {
+      "n_embd": 2,
+      "n_layer": 2,
+      "n_head": 2,
+      "activation_function": "gelu_new"
+    },
+    "trace_s": 0.042880187975242734,
+    "export": {
+      "ok": true
+    },
+    "build_numpy_s": 0.057396383956074715,
+    "graph": {
+      "graph_inputs": 30,
+      "ops_total": 168,
+      "distinct_ops": 19,
+      "op_histogram": {
+        "multiply": 30,
+        "add": 29,
+        "constant": 24,
+        "reshape": 13,
+        "dot": 13,
+        "reduce_mean": 10,
+        "transpose": 10,
+        "subtract": 8,
+        "divide": 7,
+        "slice": 6,
+        "sqrt": 5,
+        "gather": 2,
+        "reduce_max": 2,
+        "exp": 2,
+        "reduce_sum": 2,
+        "tanh": 2,
+        "less_equal": 1,
+        "cast": 1,
+        "return": 1
+      },
+      "stablehlo_lines": 372,
+      "stablehlo_bytes": 32584
+    },
+    "numpy_backend": {
+      "logits_shape": [
+        1,
+        8,
+        50257
+      ],
+      "logits_abs_max": 2.2420775429197073e-44,
+      "vs_reference": {
+        "ref_abs_max": 2.2420775429197073e-44,
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "max_rel_vs_max_abs": 0.0,
+        "argmax_rel": 0.0
+      },
+      "run_ms_best": 2.856019069440663
+    },
+    "finite": true,
+    "iree_compile_args": [
+      "--iree-llvmcpu-target-cpu=host",
+      "--iree-opt-data-tiling"
+    ],
+    "lower_s": 0.016172742936760187,
+    "compile_s": 0.9618902569636703,
+    "load_s": 0.016169814975000918,
+    "iree": {
+      "target": "llvm-cpu",
+      "whole_graph_compiled": true,
+      "vs_reference": {
+        "ref_abs_max": 2.2420775429197073e-44,
+        "max_abs": 2.2420775429197073e-44,
+        "mean_abs": 1.6350387398373814e-46,
+        "max_rel_vs_max_abs": 2.242077542919707e-14,
+        "argmax_rel": 2.2420775429197073e-36
+      },
+      "vs_numpy_backend": {
+        "ref_abs_max": 2.2420775429197073e-44,
+        "max_abs": 2.2420775429197073e-44,
+        "mean_abs": 1.6350387398373814e-46,
+        "max_rel_vs_max_abs": 2.242077542919707e-14,
+        "argmax_rel": 2.2420775429197073e-36
+      },
+      "run_ms_best": 0.5268119275569916,
+      "peak_rss_mb": 76.36328125,
+      "speedup_vs_numpy_backend": 5.421325752218647
+    },
+    "wall_s": 1.14672353095375
+  }
+]
