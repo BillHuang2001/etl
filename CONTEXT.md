@@ -56,6 +56,7 @@ etl learns from Nx (explicit numerical language, `block`, `vectorize`, `runtime_
 |---|---|
 | `./etl/` | The package. Public API contract lives in `./etl/CONTEXT.md` — read it before touching anything. |
 | `./etl/sparse/` | Sparse tensor subsystem (value model, ops, transforms rules — see `./etl/sparse/CONTEXT.md`); numpy-backend-only in v1. |
+| `./etl_hf/` | HuggingFace integration: load a real checkpoint (`config.json` + safetensors/`pytorch_model.bin`) and run the whole model forward as ONE compiled etl graph; numpy-only, separate top-level package above `etl` (see `./etl_hf/CONTEXT.md` for the binding API contract). |
 | `./tests/` | pytest suite mirroring `./etl/` module structure + spec-compliance tests (design principles); sparse suite in `./tests/sparse/`. |
 | `./bench_logs/` | Probe scratch area: one-off compiler/hardware probe scripts, notes, result JSONs (xla-vs-iree GPU probes; see its own CONTEXT.md). Not part of the library. |
 | `./probe_new_emitters.py` | Repo-root probe script: exercises the new StableHLO emissions (gather/sort/argsort/argmax/argmin/tile/scatter/shifts/random) through iree llvm-cpu/cuda vs numpy with bit-exact checks; superseded by the pinned parity suite `tests/backends/test_iree_emitters_parity.py`. |

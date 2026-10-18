@@ -67,9 +67,14 @@ bench = ["torch>=2.0"]
 
 [tool.setuptools.packages.find]
 include = ["etl*"]
+# etl_hf is a separate top-level package (HuggingFace model loading / compiled
+# execution built on etl). Its tests are colocated, not shipped.
+exclude = ["etl_hf.tests", "etl_hf.tests.*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# `tests/` mirrors the `etl` package; `etl_hf/tests/` is colocated with the
+# separate `etl_hf` package.
+testpaths = ["tests", "etl_hf/tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 # NOTE: do NOT include "dist" in norecursedirs — `tests/dist/` is a test
