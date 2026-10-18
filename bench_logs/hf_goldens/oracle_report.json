@@ -1,0 +1,172 @@
+{
+  "produced": [
+    {
+      "model_id": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+      "slug": "tiny_random_llama",
+      "logits_shape": [
+        1,
+        8,
+        32000
+      ],
+      "weights_format": "safetensors",
+      "weight_files": [
+        "model.safetensors"
+      ],
+      "num_keys": 21,
+      "absmax": 0.3487534821033478,
+      "flags": []
+    },
+    {
+      "model_id": "hf-internal-testing/tiny-random-MistralForCausalLM",
+      "slug": "tiny_random_mistral",
+      "logits_shape": [
+        1,
+        8,
+        32000
+      ],
+      "weights_format": "pytorch_model.bin",
+      "weight_files": [
+        "pytorch_model.bin"
+      ],
+      "num_keys": 21,
+      "absmax": 0.5608811378479004,
+      "flags": [
+        "hidden_act='gelu' is EXACT erf-GELU \u2014 NOT exportable by etl v1"
+      ]
+    },
+    {
+      "model_id": "sshleifer/tiny-gpt2",
+      "slug": "tiny_gpt2",
+      "logits_shape": [
+        1,
+        8,
+        50257
+      ],
+      "weights_format": "pytorch_model.bin",
+      "weight_files": [
+        "pytorch_model.bin"
+      ],
+      "num_keys": 33,
+      "absmax": 0.12893779575824738,
+      "flags": []
+    },
+    {
+      "model_id": "distilgpt2",
+      "slug": "distilgpt2",
+      "logits_shape": [
+        1,
+        32,
+        50257
+      ],
+      "weights_format": "safetensors",
+      "weight_files": [
+        "model.safetensors",
+        "pytorch_model.bin"
+      ],
+      "num_keys": 82,
+      "absmax": 82.1148681640625,
+      "flags": []
+    },
+    {
+      "model_id": "gpt2",
+      "slug": "gpt2",
+      "logits_shape": [
+        1,
+        32,
+        50257
+      ],
+      "weights_format": "safetensors",
+      "weight_files": [
+        "model.safetensors",
+        "pytorch_model.bin"
+      ],
+      "num_keys": 160,
+      "absmax": 138.72409057617188,
+      "flags": []
+    }
+  ],
+  "failed": [],
+  "verify": [
+    {
+      "slug": "tiny_random_llama",
+      "status": "PASS",
+      "shape": [
+        1,
+        8,
+        32000
+      ],
+      "dtype": "float32",
+      "absmax": 0.3487534821033478,
+      "mean": 0.00015656856703571975,
+      "std": 0.07987374812364578,
+      "degenerate_flag": false,
+      "npz_bytes": 950273
+    },
+    {
+      "slug": "tiny_random_mistral",
+      "status": "PASS",
+      "shape": [
+        1,
+        8,
+        32000
+      ],
+      "dtype": "float32",
+      "absmax": 0.5608811378479004,
+      "mean": 0.00017684506019577384,
+      "std": 0.11282818764448166,
+      "degenerate_flag": false,
+      "npz_bytes": 951908
+    },
+    {
+      "slug": "tiny_gpt2",
+      "status": "PASS",
+      "shape": [
+        1,
+        8,
+        50257
+      ],
+      "dtype": "float32",
+      "absmax": 0.12893779575824738,
+      "mean": -1.2993103155167773e-05,
+      "std": 0.027387727051973343,
+      "degenerate_flag": false,
+      "npz_bytes": 1494569
+    },
+    {
+      "slug": "distilgpt2",
+      "status": "PASS",
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "dtype": "float32",
+      "absmax": 82.1148681640625,
+      "mean": -58.53804016113281,
+      "std": 8.646546363830566,
+      "degenerate_flag": false,
+      "npz_bytes": 5211770
+    },
+    {
+      "slug": "gpt2",
+      "status": "PASS",
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "dtype": "float32",
+      "absmax": 138.72409057617188,
+      "mean": -102.00896453857422,
+      "std": 18.61493682861328,
+      "degenerate_flag": false,
+      "npz_bytes": 5087414
+    }
+  ],
+  "versions": {
+    "transformers": "5.20.1",
+    "torch": "2.14.1+cpu",
+    "numpy": "2.5.4",
+    "python": "3.12.3"
+  }
+}

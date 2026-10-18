@@ -1,0 +1,88 @@
+# distilgpt2
+# format: safetensors
+# on-disk files: .gitattributes, 64.tflite, README.md, config.json, coreml_model.mlmodel, flax_model.msgpack, generation_config.json, generation_config_for_text_generation.json, merges.txt, model.safetensors, pytorch_model.bin, rust_model.ot, tf_model.h5, tokenizer.json, tokenizer_config.json, vocab.json
+# weight files: model.safetensors, pytorch_model.bin
+# 82 tensors
+# name	shape	dtype
+transformer.h.0.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.0.attn.c_attn.bias	(2304,)	F32
+transformer.h.0.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.0.attn.c_proj.bias	(768,)	F32
+transformer.h.0.attn.c_proj.weight	(768, 768)	F32
+transformer.h.0.ln_1.bias	(768,)	F32
+transformer.h.0.ln_1.weight	(768,)	F32
+transformer.h.0.ln_2.bias	(768,)	F32
+transformer.h.0.ln_2.weight	(768,)	F32
+transformer.h.0.mlp.c_fc.bias	(3072,)	F32
+transformer.h.0.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.0.mlp.c_proj.bias	(768,)	F32
+transformer.h.0.mlp.c_proj.weight	(3072, 768)	F32
+transformer.h.1.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.1.attn.c_attn.bias	(2304,)	F32
+transformer.h.1.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.1.attn.c_proj.bias	(768,)	F32
+transformer.h.1.attn.c_proj.weight	(768, 768)	F32
+transformer.h.1.ln_1.bias	(768,)	F32
+transformer.h.1.ln_1.weight	(768,)	F32
+transformer.h.1.ln_2.bias	(768,)	F32
+transformer.h.1.ln_2.weight	(768,)	F32
+transformer.h.1.mlp.c_fc.bias	(3072,)	F32
+transformer.h.1.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.1.mlp.c_proj.bias	(768,)	F32
+transformer.h.1.mlp.c_proj.weight	(3072, 768)	F32
+transformer.h.2.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.2.attn.c_attn.bias	(2304,)	F32
+transformer.h.2.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.2.attn.c_proj.bias	(768,)	F32
+transformer.h.2.attn.c_proj.weight	(768, 768)	F32
+transformer.h.2.ln_1.bias	(768,)	F32
+transformer.h.2.ln_1.weight	(768,)	F32
+transformer.h.2.ln_2.bias	(768,)	F32
+transformer.h.2.ln_2.weight	(768,)	F32
+transformer.h.2.mlp.c_fc.bias	(3072,)	F32
+transformer.h.2.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.2.mlp.c_proj.bias	(768,)	F32
+transformer.h.2.mlp.c_proj.weight	(3072, 768)	F32
+transformer.h.3.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.3.attn.c_attn.bias	(2304,)	F32
+transformer.h.3.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.3.attn.c_proj.bias	(768,)	F32
+transformer.h.3.attn.c_proj.weight	(768, 768)	F32
+transformer.h.3.ln_1.bias	(768,)	F32
+transformer.h.3.ln_1.weight	(768,)	F32
+transformer.h.3.ln_2.bias	(768,)	F32
+transformer.h.3.ln_2.weight	(768,)	F32
+transformer.h.3.mlp.c_fc.bias	(3072,)	F32
+transformer.h.3.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.3.mlp.c_proj.bias	(768,)	F32
+transformer.h.3.mlp.c_proj.weight	(3072, 768)	F32
+transformer.h.4.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.4.attn.c_attn.bias	(2304,)	F32
+transformer.h.4.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.4.attn.c_proj.bias	(768,)	F32
+transformer.h.4.attn.c_proj.weight	(768, 768)	F32
+transformer.h.4.ln_1.bias	(768,)	F32
+transformer.h.4.ln_1.weight	(768,)	F32
+transformer.h.4.ln_2.bias	(768,)	F32
+transformer.h.4.ln_2.weight	(768,)	F32
+transformer.h.4.mlp.c_fc.bias	(3072,)	F32
+transformer.h.4.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.4.mlp.c_proj.bias	(768,)	F32
+transformer.h.4.mlp.c_proj.weight	(3072, 768)	F32
+transformer.h.5.attn.bias	(1, 1, 1024, 1024)	F32
+transformer.h.5.attn.c_attn.bias	(2304,)	F32
+transformer.h.5.attn.c_attn.weight	(768, 2304)	F32
+transformer.h.5.attn.c_proj.bias	(768,)	F32
+transformer.h.5.attn.c_proj.weight	(768, 768)	F32
+transformer.h.5.ln_1.bias	(768,)	F32
+transformer.h.5.ln_1.weight	(768,)	F32
+transformer.h.5.ln_2.bias	(768,)	F32
+transformer.h.5.ln_2.weight	(768,)	F32
+transformer.h.5.mlp.c_fc.bias	(3072,)	F32
+transformer.h.5.mlp.c_fc.weight	(768, 3072)	F32
+transformer.h.5.mlp.c_proj.bias	(768,)	F32
+transformer.h.5.mlp.c_proj.weight	(3072, 768)	F32
+transformer.ln_f.bias	(768,)	F32
+transformer.ln_f.weight	(768,)	F32
+transformer.wpe.weight	(1024, 768)	F32
+transformer.wte.weight	(50257, 768)	F32

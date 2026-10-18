@@ -1,0 +1,337 @@
+{
+  "model_id": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+  "slug": "tiny_random_llama",
+  "resolved_model_type": "llama",
+  "model_class": "LlamaForCausalLM",
+  "seq_len": 8,
+  "vocab_size": 32000,
+  "config_summary": {
+    "vocab_size": 32000,
+    "hidden_size": 16,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "intermediate_size": 64,
+    "intermediate_size_source": "config",
+    "hidden_act": "silu",
+    "layer_norm_eps": null,
+    "rms_norm_eps": 1e-06,
+    "layer_norm_epsilon": null,
+    "max_position_embeddings": 2048,
+    "tie_word_embeddings": false,
+    "rope_theta": 10000.0,
+    "rope_scaling": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "n_embd": null,
+    "n_head": null,
+    "n_layer": null,
+    "n_positions": null,
+    "activation_function": null,
+    "attention_bias": false,
+    "mlp_bias": false,
+    "kv_lora_rank": null,
+    "head_dim": 4
+  },
+  "raw_config": {
+    "transformers_version": "5.20.1",
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": "float32",
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "problem_type": null,
+    "vocab_size": 32000,
+    "hidden_size": 16,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "hidden_act": "silu",
+    "max_position_embeddings": 2048,
+    "initializer_range": 0.02,
+    "rms_norm_eps": 1e-06,
+    "use_cache": true,
+    "pad_token_id": -1,
+    "bos_token_id": 0,
+    "eos_token_id": 1,
+    "pretraining_tp": 1,
+    "tie_word_embeddings": false,
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "mlp_bias": false,
+    "head_dim": 4,
+    "_name_or_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+    "model_type": "llama",
+    "output_attentions": false
+  },
+  "versions": {
+    "transformers": "5.20.1",
+    "torch": "2.14.1+cpu",
+    "numpy": "2.5.4",
+    "python": "3.12.3"
+  },
+  "dtype": "float32",
+  "device": "cpu",
+  "grad_enabled": false,
+  "eval_mode": true,
+  "attn_implementation_effective": "eager",
+  "from_pretrained_kwargs": {
+    "dtype": "torch.float32",
+    "attn_implementation": "eager"
+  },
+  "input_ids_recipe": "input_ids[0, i] = (i * 7 + 3) % vocab_size for i in range(S); int64 for torch, saved int32",
+  "forward_call": "out = model(input_ids=input_ids); logits = out.logits",
+  "generation_used": false,
+  "logits_shape": [
+    1,
+    8,
+    32000
+  ],
+  "logits_dtype": "float32",
+  "logits_absmax": 0.3487534821033478,
+  "logits_mean": 0.00015656856703571975,
+  "logits_std": 0.07987374812364578,
+  "logits_finite": true,
+  "logits_argmax_last_pos": 31734,
+  "second_forward_maxdiff": 0.0,
+  "num_parameters": 1032272,
+  "num_buffer_elements": 4,
+  "flags": [],
+  "tie_observation": {
+    "lm_head_weight_on_disk": [
+      "lm_head.weight"
+    ],
+    "embed_weight_on_disk": [
+      "model.embed_tokens.weight"
+    ],
+    "tie_word_embeddings_config": false,
+    "lm_head_present": true,
+    "runtime_pair": [
+      "model.embed_tokens.weight",
+      "lm_head.weight"
+    ],
+    "runtime_lm_head_equals_embed": false,
+    "runtime_model.embed_tokens.weight_shape": [
+      32000,
+      16
+    ],
+    "runtime_lm_head.weight_shape": [
+      32000,
+      16
+    ]
+  },
+  "skip_keys_non_parameter": [],
+  "weights": {
+    "format": "safetensors",
+    "weight_files": [
+      "model.safetensors"
+    ],
+    "index_files": [],
+    "model_dir_files": [
+      ".gitattributes",
+      "README.md",
+      "config.json",
+      "generation_config.json",
+      "model.safetensors",
+      "special_tokens_map.json",
+      "tokenizer.json",
+      "tokenizer.model",
+      "tokenizer_config.json"
+    ],
+    "num_keys": 21,
+    "keys_head": [
+      [
+        "lm_head.weight",
+        [
+          32000,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.embed_tokens.weight",
+        [
+          32000,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.input_layernorm.weight",
+        [
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.mlp.down_proj.weight",
+        [
+          16,
+          64
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.mlp.gate_proj.weight",
+        [
+          64,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.mlp.up_proj.weight",
+        [
+          64,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.post_attention_layernorm.weight",
+        [
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.self_attn.k_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.self_attn.o_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.self_attn.q_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.self_attn.v_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.input_layernorm.weight",
+        [
+          16
+        ],
+        "F32"
+      ]
+    ],
+    "keys_tail": [
+      [
+        "model.layers.0.self_attn.q_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.0.self_attn.v_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.input_layernorm.weight",
+        [
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.mlp.down_proj.weight",
+        [
+          16,
+          64
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.mlp.gate_proj.weight",
+        [
+          64,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.mlp.up_proj.weight",
+        [
+          64,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.post_attention_layernorm.weight",
+        [
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.self_attn.k_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.self_attn.o_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.self_attn.q_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.layers.1.self_attn.v_proj.weight",
+        [
+          16,
+          16
+        ],
+        "F32"
+      ],
+      [
+        "model.norm.weight",
+        [
+          16
+        ],
+        "F32"
+      ]
+    ],
+    "full_key_listing": "tiny_random_llama.keys.txt"
+  },
+  "npz": "tiny_random_llama.npz"
+}

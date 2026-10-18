@@ -1,0 +1,166 @@
+# gpt2
+# format: safetensors
+# on-disk files: .gitattributes, 64-8bits.tflite, 64-fp16.tflite, 64.tflite, README.md, config.json, flax_model.msgpack, generation_config.json, merges.txt, model.safetensors, pytorch_model.bin, rust_model.ot, tf_model.h5, tokenizer.json, tokenizer_config.json, vocab.json
+# weight files: model.safetensors, pytorch_model.bin
+# 160 tensors
+# name	shape	dtype
+h.0.attn.bias	(1, 1, 1024, 1024)	F32
+h.0.attn.c_attn.bias	(2304,)	F32
+h.0.attn.c_attn.weight	(768, 2304)	F32
+h.0.attn.c_proj.bias	(768,)	F32
+h.0.attn.c_proj.weight	(768, 768)	F32
+h.0.ln_1.bias	(768,)	F32
+h.0.ln_1.weight	(768,)	F32
+h.0.ln_2.bias	(768,)	F32
+h.0.ln_2.weight	(768,)	F32
+h.0.mlp.c_fc.bias	(3072,)	F32
+h.0.mlp.c_fc.weight	(768, 3072)	F32
+h.0.mlp.c_proj.bias	(768,)	F32
+h.0.mlp.c_proj.weight	(3072, 768)	F32
+h.1.attn.bias	(1, 1, 1024, 1024)	F32
+h.1.attn.c_attn.bias	(2304,)	F32
+h.1.attn.c_attn.weight	(768, 2304)	F32
+h.1.attn.c_proj.bias	(768,)	F32
+h.1.attn.c_proj.weight	(768, 768)	F32
+h.1.ln_1.bias	(768,)	F32
+h.1.ln_1.weight	(768,)	F32
+h.1.ln_2.bias	(768,)	F32
+h.1.ln_2.weight	(768,)	F32
+h.1.mlp.c_fc.bias	(3072,)	F32
+h.1.mlp.c_fc.weight	(768, 3072)	F32
+h.1.mlp.c_proj.bias	(768,)	F32
+h.1.mlp.c_proj.weight	(3072, 768)	F32
+h.10.attn.bias	(1, 1, 1024, 1024)	F32
+h.10.attn.c_attn.bias	(2304,)	F32
+h.10.attn.c_attn.weight	(768, 2304)	F32
+h.10.attn.c_proj.bias	(768,)	F32
+h.10.attn.c_proj.weight	(768, 768)	F32
+h.10.ln_1.bias	(768,)	F32
+h.10.ln_1.weight	(768,)	F32
+h.10.ln_2.bias	(768,)	F32
+h.10.ln_2.weight	(768,)	F32
+h.10.mlp.c_fc.bias	(3072,)	F32
+h.10.mlp.c_fc.weight	(768, 3072)	F32
+h.10.mlp.c_proj.bias	(768,)	F32
+h.10.mlp.c_proj.weight	(3072, 768)	F32
+h.11.attn.bias	(1, 1, 1024, 1024)	F32
+h.11.attn.c_attn.bias	(2304,)	F32
+h.11.attn.c_attn.weight	(768, 2304)	F32
+h.11.attn.c_proj.bias	(768,)	F32
+h.11.attn.c_proj.weight	(768, 768)	F32
+h.11.ln_1.bias	(768,)	F32
+h.11.ln_1.weight	(768,)	F32
+h.11.ln_2.bias	(768,)	F32
+h.11.ln_2.weight	(768,)	F32
+h.11.mlp.c_fc.bias	(3072,)	F32
+h.11.mlp.c_fc.weight	(768, 3072)	F32
+h.11.mlp.c_proj.bias	(768,)	F32
+h.11.mlp.c_proj.weight	(3072, 768)	F32
+h.2.attn.bias	(1, 1, 1024, 1024)	F32
+h.2.attn.c_attn.bias	(2304,)	F32
+h.2.attn.c_attn.weight	(768, 2304)	F32
+h.2.attn.c_proj.bias	(768,)	F32
+h.2.attn.c_proj.weight	(768, 768)	F32
+h.2.ln_1.bias	(768,)	F32
+h.2.ln_1.weight	(768,)	F32
+h.2.ln_2.bias	(768,)	F32
+h.2.ln_2.weight	(768,)	F32
+h.2.mlp.c_fc.bias	(3072,)	F32
+h.2.mlp.c_fc.weight	(768, 3072)	F32
+h.2.mlp.c_proj.bias	(768,)	F32
+h.2.mlp.c_proj.weight	(3072, 768)	F32
+h.3.attn.bias	(1, 1, 1024, 1024)	F32
+h.3.attn.c_attn.bias	(2304,)	F32
+h.3.attn.c_attn.weight	(768, 2304)	F32
+h.3.attn.c_proj.bias	(768,)	F32
+h.3.attn.c_proj.weight	(768, 768)	F32
+h.3.ln_1.bias	(768,)	F32
+h.3.ln_1.weight	(768,)	F32
+h.3.ln_2.bias	(768,)	F32
+h.3.ln_2.weight	(768,)	F32
+h.3.mlp.c_fc.bias	(3072,)	F32
+h.3.mlp.c_fc.weight	(768, 3072)	F32
+h.3.mlp.c_proj.bias	(768,)	F32
+h.3.mlp.c_proj.weight	(3072, 768)	F32
+h.4.attn.bias	(1, 1, 1024, 1024)	F32
+h.4.attn.c_attn.bias	(2304,)	F32
+h.4.attn.c_attn.weight	(768, 2304)	F32
+h.4.attn.c_proj.bias	(768,)	F32
+h.4.attn.c_proj.weight	(768, 768)	F32
+h.4.ln_1.bias	(768,)	F32
+h.4.ln_1.weight	(768,)	F32
+h.4.ln_2.bias	(768,)	F32
+h.4.ln_2.weight	(768,)	F32
+h.4.mlp.c_fc.bias	(3072,)	F32
+h.4.mlp.c_fc.weight	(768, 3072)	F32
+h.4.mlp.c_proj.bias	(768,)	F32
+h.4.mlp.c_proj.weight	(3072, 768)	F32
+h.5.attn.bias	(1, 1, 1024, 1024)	F32
+h.5.attn.c_attn.bias	(2304,)	F32
+h.5.attn.c_attn.weight	(768, 2304)	F32
+h.5.attn.c_proj.bias	(768,)	F32
+h.5.attn.c_proj.weight	(768, 768)	F32
+h.5.ln_1.bias	(768,)	F32
+h.5.ln_1.weight	(768,)	F32
+h.5.ln_2.bias	(768,)	F32
+h.5.ln_2.weight	(768,)	F32
+h.5.mlp.c_fc.bias	(3072,)	F32
+h.5.mlp.c_fc.weight	(768, 3072)	F32
+h.5.mlp.c_proj.bias	(768,)	F32
+h.5.mlp.c_proj.weight	(3072, 768)	F32
+h.6.attn.bias	(1, 1, 1024, 1024)	F32
+h.6.attn.c_attn.bias	(2304,)	F32
+h.6.attn.c_attn.weight	(768, 2304)	F32
+h.6.attn.c_proj.bias	(768,)	F32
+h.6.attn.c_proj.weight	(768, 768)	F32
+h.6.ln_1.bias	(768,)	F32
+h.6.ln_1.weight	(768,)	F32
+h.6.ln_2.bias	(768,)	F32
+h.6.ln_2.weight	(768,)	F32
+h.6.mlp.c_fc.bias	(3072,)	F32
+h.6.mlp.c_fc.weight	(768, 3072)	F32
+h.6.mlp.c_proj.bias	(768,)	F32
+h.6.mlp.c_proj.weight	(3072, 768)	F32
+h.7.attn.bias	(1, 1, 1024, 1024)	F32
+h.7.attn.c_attn.bias	(2304,)	F32
+h.7.attn.c_attn.weight	(768, 2304)	F32
+h.7.attn.c_proj.bias	(768,)	F32
+h.7.attn.c_proj.weight	(768, 768)	F32
+h.7.ln_1.bias	(768,)	F32
+h.7.ln_1.weight	(768,)	F32
+h.7.ln_2.bias	(768,)	F32
+h.7.ln_2.weight	(768,)	F32
+h.7.mlp.c_fc.bias	(3072,)	F32
+h.7.mlp.c_fc.weight	(768, 3072)	F32
+h.7.mlp.c_proj.bias	(768,)	F32
+h.7.mlp.c_proj.weight	(3072, 768)	F32
+h.8.attn.bias	(1, 1, 1024, 1024)	F32
+h.8.attn.c_attn.bias	(2304,)	F32
+h.8.attn.c_attn.weight	(768, 2304)	F32
+h.8.attn.c_proj.bias	(768,)	F32
+h.8.attn.c_proj.weight	(768, 768)	F32
+h.8.ln_1.bias	(768,)	F32
+h.8.ln_1.weight	(768,)	F32
+h.8.ln_2.bias	(768,)	F32
+h.8.ln_2.weight	(768,)	F32
+h.8.mlp.c_fc.bias	(3072,)	F32
+h.8.mlp.c_fc.weight	(768, 3072)	F32
+h.8.mlp.c_proj.bias	(768,)	F32
+h.8.mlp.c_proj.weight	(3072, 768)	F32
+h.9.attn.bias	(1, 1, 1024, 1024)	F32
+h.9.attn.c_attn.bias	(2304,)	F32
+h.9.attn.c_attn.weight	(768, 2304)	F32
+h.9.attn.c_proj.bias	(768,)	F32
+h.9.attn.c_proj.weight	(768, 768)	F32
+h.9.ln_1.bias	(768,)	F32
+h.9.ln_1.weight	(768,)	F32
+h.9.ln_2.bias	(768,)	F32
+h.9.ln_2.weight	(768,)	F32
+h.9.mlp.c_fc.bias	(3072,)	F32
+h.9.mlp.c_fc.weight	(768, 3072)	F32
+h.9.mlp.c_proj.bias	(768,)	F32
+h.9.mlp.c_proj.weight	(3072, 768)	F32
+ln_f.bias	(768,)	F32
+ln_f.weight	(768,)	F32
+wpe.weight	(1024, 768)	F32
+wte.weight	(50257, 768)	F32

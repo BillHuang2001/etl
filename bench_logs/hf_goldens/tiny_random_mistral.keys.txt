@@ -1,0 +1,27 @@
+# hf-internal-testing/tiny-random-MistralForCausalLM
+# format: pytorch_model.bin
+# on-disk files: .gitattributes, README.md, added_tokens.json, config.json, generation_config.json, pytorch_model.bin, special_tokens_map.json, tokenizer.json, tokenizer.model, tokenizer_config.json
+# weight files: pytorch_model.bin
+# 21 tensors
+# name	shape	dtype
+lm_head.weight	(32000, 32)	torch.float32
+model.embed_tokens.weight	(32000, 32)	torch.float32
+model.layers.0.input_layernorm.weight	(32,)	torch.float32
+model.layers.0.mlp.down_proj.weight	(32, 37)	torch.float32
+model.layers.0.mlp.gate_proj.weight	(37, 32)	torch.float32
+model.layers.0.mlp.up_proj.weight	(37, 32)	torch.float32
+model.layers.0.post_attention_layernorm.weight	(32,)	torch.float32
+model.layers.0.self_attn.k_proj.weight	(16, 32)	torch.float32
+model.layers.0.self_attn.o_proj.weight	(32, 32)	torch.float32
+model.layers.0.self_attn.q_proj.weight	(32, 32)	torch.float32
+model.layers.0.self_attn.v_proj.weight	(16, 32)	torch.float32
+model.layers.1.input_layernorm.weight	(32,)	torch.float32
+model.layers.1.mlp.down_proj.weight	(32, 37)	torch.float32
+model.layers.1.mlp.gate_proj.weight	(37, 32)	torch.float32
+model.layers.1.mlp.up_proj.weight	(37, 32)	torch.float32
+model.layers.1.post_attention_layernorm.weight	(32,)	torch.float32
+model.layers.1.self_attn.k_proj.weight	(16, 32)	torch.float32
+model.layers.1.self_attn.o_proj.weight	(32, 32)	torch.float32
+model.layers.1.self_attn.q_proj.weight	(32, 32)	torch.float32
+model.layers.1.self_attn.v_proj.weight	(16, 32)	torch.float32
+model.norm.weight	(32,)	torch.float32

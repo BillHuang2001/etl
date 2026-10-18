@@ -9,6 +9,32 @@ conclusions (host-staging era, adapter 763a415 without cached staging) are
 superseded by the device-resident finding below and by
 `./etl/backends/adapters/CONTEXT.md`.
 
+## `hf_goldens/` — torch/transformers logits oracle for `etl_hf` (durable reference fixtures)
+
+`./hf_goldens/` holds **ground-truth HuggingFace logits** for the five checkpoints `etl_hf` is
+validated against, produced by a real `transformers`/PyTorch forward pass. Each fixture is
+`<slug>.npz` (`logits` f32 `(1,S,V)` + `input_ids` i32 `(1,S)`), `<slug>.meta.json` (model id,
+resolved `model_type`, config summary, versions, exact id/forward recipes, `logits_absmax`/`mean`/
+`std`, tie/untie observations, non-parameter buffers to skip, flags), `<slug>.keys.txt` (full
+on-disk weight key listing) and `oracle_report.json` (run summary + verification rows). Full
+contract, regeneration recipe and key-mapping gotchas: `./hf_goldens/README.md`.
+
+Generator: `./probe_hf_goldens.py`. It imports torch+transformers, so it **must** run in a
+throwaway `$TMPDIR` venv — never the repo `.venv`, whose `pytest.importorskip("torch")` guards
+would flip to real runs. Reading the fixtures needs numpy only (no torch in tests).
+
+Pinned checkpoints: `hf-internal-testing/tiny-random-LlamaForCausalLM` (`tiny_random_llama`, S=8,
+safetensors, silu, untied), `hf-internal-testing/tiny-random-MistralForCausalLM`
+(`tiny_random_mistral`, S=8, legacy torch `.bin`, **GQA 2:1**, `hidden_act: "gelu"` = exact
+erf-GELU ⇒ not etl-exportable), `sshleifer/tiny-gpt2` (`tiny_gpt2`, S=8, legacy `.bin`, n_embd=2),
+`distilgpt2` (S=32, safetensors, `transformer.`-prefixed keys), `gpt2` (S=32, safetensors,
+**prefix-free** keys) — so the GPT-2 family's inconsistent `transformer.` prefix, the
+`attn.bias`/`attn.masked_bias` mask buffers (skip them; 4 MB f32 per layer in the real models,
+`uint8` in tiny-gpt2) and tied-vs-untied `lm_head` behaviour (tiny-gpt2 ships an *equal copy*;
+distilgpt2/gpt2 omit it; the Llama/Mistral tinies ship a *different* matrix) are all pinned.
+All five are finite, non-constant, non-degenerate (absmax 0.13–139); a ~1e-44 `tiny_gpt2` result
+is therefore a real etl/iree bug, not checkpoint degeneracy.
+
 ## Finding (f2f50a7): evox_etl DE/Rastrigin 10000×100 on xla-cuda is at torch parity — the 10–25× "gap" was per-step host staging, not the graph
 
 Real evox_etl StdWorkflow steps (DE/PSO × Rastrigin/Sphere, pop 10000, dim 100,

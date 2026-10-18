@@ -1,0 +1,39 @@
+# sshleifer/tiny-gpt2
+# format: pytorch_model.bin
+# on-disk files: .gitattributes, config.json, flax_model.msgpack, merges.txt, pytorch_model.bin, special_tokens_map.json, tf_model.h5, tokenizer_config.json, vocab.json
+# weight files: pytorch_model.bin
+# 33 tensors
+# name	shape	dtype
+lm_head.weight	(50257, 2)	torch.float32
+transformer.h.0.attn.bias	(1, 1, 1024, 1024)	torch.uint8
+transformer.h.0.attn.c_attn.bias	(6,)	torch.float32
+transformer.h.0.attn.c_attn.weight	(2, 6)	torch.float32
+transformer.h.0.attn.c_proj.bias	(2,)	torch.float32
+transformer.h.0.attn.c_proj.weight	(2, 2)	torch.float32
+transformer.h.0.attn.masked_bias	()	torch.float32
+transformer.h.0.ln_1.bias	(2,)	torch.float32
+transformer.h.0.ln_1.weight	(2,)	torch.float32
+transformer.h.0.ln_2.bias	(2,)	torch.float32
+transformer.h.0.ln_2.weight	(2,)	torch.float32
+transformer.h.0.mlp.c_fc.bias	(8,)	torch.float32
+transformer.h.0.mlp.c_fc.weight	(2, 8)	torch.float32
+transformer.h.0.mlp.c_proj.bias	(2,)	torch.float32
+transformer.h.0.mlp.c_proj.weight	(8, 2)	torch.float32
+transformer.h.1.attn.bias	(1, 1, 1024, 1024)	torch.uint8
+transformer.h.1.attn.c_attn.bias	(6,)	torch.float32
+transformer.h.1.attn.c_attn.weight	(2, 6)	torch.float32
+transformer.h.1.attn.c_proj.bias	(2,)	torch.float32
+transformer.h.1.attn.c_proj.weight	(2, 2)	torch.float32
+transformer.h.1.attn.masked_bias	()	torch.float32
+transformer.h.1.ln_1.bias	(2,)	torch.float32
+transformer.h.1.ln_1.weight	(2,)	torch.float32
+transformer.h.1.ln_2.bias	(2,)	torch.float32
+transformer.h.1.ln_2.weight	(2,)	torch.float32
+transformer.h.1.mlp.c_fc.bias	(8,)	torch.float32
+transformer.h.1.mlp.c_fc.weight	(2, 8)	torch.float32
+transformer.h.1.mlp.c_proj.bias	(2,)	torch.float32
+transformer.h.1.mlp.c_proj.weight	(8, 2)	torch.float32
+transformer.ln_f.bias	(2,)	torch.float32
+transformer.ln_f.weight	(2,)	torch.float32
+transformer.wpe.weight	(1024, 2)	torch.float32
+transformer.wte.weight	(50257, 2)	torch.float32

@@ -1,0 +1,342 @@
+{
+  "model_id": "hf-internal-testing/tiny-random-MistralForCausalLM",
+  "slug": "tiny_random_mistral",
+  "resolved_model_type": "mistral",
+  "model_class": "MistralForCausalLM",
+  "seq_len": 8,
+  "vocab_size": 32000,
+  "config_summary": {
+    "vocab_size": 32000,
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "intermediate_size": 37,
+    "intermediate_size_source": "config",
+    "hidden_act": "gelu",
+    "layer_norm_eps": null,
+    "rms_norm_eps": 1e-06,
+    "layer_norm_epsilon": null,
+    "max_position_embeddings": 512,
+    "tie_word_embeddings": false,
+    "rope_theta": 10000.0,
+    "rope_scaling": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "n_embd": null,
+    "n_head": null,
+    "n_layer": null,
+    "n_positions": null,
+    "activation_function": null,
+    "attention_bias": null,
+    "mlp_bias": null,
+    "kv_lora_rank": null,
+    "head_dim": 8
+  },
+  "raw_config": {
+    "transformers_version": "5.20.1",
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": "float32",
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "problem_type": null,
+    "vocab_size": 32000,
+    "hidden_size": 32,
+    "intermediate_size": 37,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "hidden_act": "gelu",
+    "max_position_embeddings": 512,
+    "initializer_range": 0.02,
+    "rms_norm_eps": 1e-06,
+    "use_cache": true,
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "tie_word_embeddings": false,
+    "sliding_window": 4096,
+    "attention_dropout": 0.0,
+    "_name_or_path": "hf-internal-testing/tiny-random-MistralForCausalLM",
+    "attention_probs_dropout_prob": 0.1,
+    "hidden_dropout_prob": 0.1,
+    "is_decoder": true,
+    "model_type": "mistral",
+    "type_vocab_size": 16,
+    "output_attentions": false
+  },
+  "versions": {
+    "transformers": "5.20.1",
+    "torch": "2.14.1+cpu",
+    "numpy": "2.5.4",
+    "python": "3.12.3"
+  },
+  "dtype": "float32",
+  "device": "cpu",
+  "grad_enabled": false,
+  "eval_mode": true,
+  "attn_implementation_effective": "eager",
+  "from_pretrained_kwargs": {
+    "dtype": "torch.float32",
+    "attn_implementation": "eager"
+  },
+  "input_ids_recipe": "input_ids[0, i] = (i * 7 + 3) % vocab_size for i in range(S); int64 for torch, saved int32",
+  "forward_call": "out = model(input_ids=input_ids); logits = out.logits",
+  "generation_used": false,
+  "logits_shape": [
+    1,
+    8,
+    32000
+  ],
+  "logits_dtype": "float32",
+  "logits_absmax": 0.5608811378479004,
+  "logits_mean": 0.00017684506019577384,
+  "logits_std": 0.11282818764448166,
+  "logits_finite": true,
+  "logits_argmax_last_pos": 14148,
+  "second_forward_maxdiff": 0.0,
+  "num_parameters": 2061408,
+  "num_buffer_elements": 8,
+  "flags": [
+    "hidden_act='gelu' is EXACT erf-GELU \u2014 NOT exportable by etl v1"
+  ],
+  "tie_observation": {
+    "lm_head_weight_on_disk": [
+      "lm_head.weight"
+    ],
+    "embed_weight_on_disk": [
+      "model.embed_tokens.weight"
+    ],
+    "tie_word_embeddings_config": false,
+    "lm_head_present": true,
+    "runtime_pair": [
+      "model.embed_tokens.weight",
+      "lm_head.weight"
+    ],
+    "runtime_lm_head_equals_embed": false,
+    "runtime_model.embed_tokens.weight_shape": [
+      32000,
+      32
+    ],
+    "runtime_lm_head.weight_shape": [
+      32000,
+      32
+    ]
+  },
+  "skip_keys_non_parameter": [],
+  "weights": {
+    "format": "pytorch_model.bin",
+    "weight_files": [
+      "pytorch_model.bin"
+    ],
+    "index_files": [],
+    "model_dir_files": [
+      ".gitattributes",
+      "README.md",
+      "added_tokens.json",
+      "config.json",
+      "generation_config.json",
+      "pytorch_model.bin",
+      "special_tokens_map.json",
+      "tokenizer.json",
+      "tokenizer.model",
+      "tokenizer_config.json"
+    ],
+    "num_keys": 21,
+    "keys_head": [
+      [
+        "lm_head.weight",
+        [
+          32000,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.embed_tokens.weight",
+        [
+          32000,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.input_layernorm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.mlp.down_proj.weight",
+        [
+          32,
+          37
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.mlp.gate_proj.weight",
+        [
+          37,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.mlp.up_proj.weight",
+        [
+          37,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.post_attention_layernorm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.self_attn.k_proj.weight",
+        [
+          16,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.self_attn.o_proj.weight",
+        [
+          32,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.self_attn.q_proj.weight",
+        [
+          32,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.self_attn.v_proj.weight",
+        [
+          16,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.input_layernorm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ]
+    ],
+    "keys_tail": [
+      [
+        "model.layers.0.self_attn.q_proj.weight",
+        [
+          32,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.0.self_attn.v_proj.weight",
+        [
+          16,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.input_layernorm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.mlp.down_proj.weight",
+        [
+          32,
+          37
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.mlp.gate_proj.weight",
+        [
+          37,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.mlp.up_proj.weight",
+        [
+          37,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.post_attention_layernorm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.self_attn.k_proj.weight",
+        [
+          16,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.self_attn.o_proj.weight",
+        [
+          32,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.self_attn.q_proj.weight",
+        [
+          32,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.layers.1.self_attn.v_proj.weight",
+        [
+          16,
+          32
+        ],
+        "torch.float32"
+      ],
+      [
+        "model.norm.weight",
+        [
+          32
+        ],
+        "torch.float32"
+      ]
+    ],
+    "full_key_listing": "tiny_random_mistral.keys.txt"
+  },
+  "npz": "tiny_random_mistral.npz"
+}
