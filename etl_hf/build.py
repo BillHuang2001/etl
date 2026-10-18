@@ -12,13 +12,26 @@ situation                        resolution
 ``backend=None``, device cpu/None      ``"numpy"`` (the numpy interpreter)
 ``backend=None``, device cuda/rocm…    ``"iree"`` (the compiled path)
 any compiled backend             ``opt_level="O3"`` injected unless passed
+``"iree"`` + all-ROCm targets   ``opt_level="O1"`` injected instead
 ``"iree"`` + ``["llvm-cpu"]``    ``iree_compile_args`` injected unless passed
 ===============================  =============================================
 
-Both injected defaults are *measured* pitfalls rather than taste:
+Every injected default is a *measured* pitfall rather than taste:
 
 * IREE's default ``--iree-llvmcpu-target-cpu=generic`` target is 12–19× slower
   than ``host`` for these graphs, hence :data:`DEFAULT_LLVM_CPU_COMPILE_ARGS`.
+* IREE's ROCm codegen fails at ``opt_level`` O2/O3 on these shapes: a
+  transformer graph's LayerNorm mean is a ``stablehlo.reduce`` over the hidden
+  axis, and the rocm target's translation aborts with ``'func.func' op failed
+  to distribute`` (measured for gpt2-shaped graphs at hidden 128/640/768 — i.e.
+  ``distilgpt2`` and the real ``gpt2``), so the documented
+  ``build(backend="iree", device=Device("rocm", 0))`` recipe used to fail on
+  exactly the checkpoints it is for. O0/O1 compile every probed
+  hidden ∈ 64…768 × heads ∈ {2,4,8,12} combination, and O1's vmfb is
+  byte-identical to O0's and to the no-flag default, so
+  :data:`DEFAULT_ROCM_OPT_LEVEL` is ``"O1"`` — shape-robust, no optimisation
+  left on the table. An explicit ``opt_level`` (or ``ETL_OPT_LEVEL``) still
+  wins.
 * ``iree_compile_args`` is a **compile-stage** option: it has to reach
   ``etl.compile`` (``etl.build``/``etl.build_cached`` forward their options to
   both ``lower`` and ``compile``). Passing it to ``etl.lower`` alone is silently
@@ -39,10 +52,15 @@ pointless recompile per weights object (and per checkpoint load) with zero
 change in the compiled program.
 
 Device-resident runs: a non-cpu executable rejects host inputs at the run
-boundary by design, so callers must place weights explicitly with
-:func:`place_params` first (one ``Tensor.to(device)`` per leaf — never a hidden
-move) and then drive the documented same-device loop.
-
+boundary by design, so callers must place **both** sides explicitly —
+:func:`place_params` for the weights (one ``Tensor.to(device)`` per leaf) and
+:func:`place_ids` for the token ids — and then drive the documented same-device
+loop. :func:`run_model` accepts ids either as a host integer array or as an
+:class:`etl.Tensor`, and forwards a ``Tensor`` **verbatim** (no host copy, no
+dtype cast, no device move), so a device-resident ids tensor keeps host
+round-trips at zero. :meth:`HFModel.forward` is the *host-facing* helper and
+refuses device params with an error naming that recipe rather than pulling data
+back to the host behind the caller's back.
 Packed weights (``pack_weights=True``, opt-in): the graph takes a handful of
 concatenated params inputs (:mod:`etl_hf.pack`) instead of one per canonical
 weight and unpacks them in-graph with static ``etl.slice`` ops. It exists for one
@@ -80,10 +98,12 @@ from etl_hf.pack import PackPlan
 
 __all__ = [
     "DEFAULT_LLVM_CPU_COMPILE_ARGS",
+    "DEFAULT_ROCM_OPT_LEVEL",
     "DEFAULT_SEQ_LEN",
     "HFModel",
     "build_model",
     "load_hf",
+    "place_ids",
     "place_params",
     "resolve_build_options",
     "run_model",
@@ -112,6 +132,21 @@ DEFAULT_SEQ_LEN: int = 32
 #: (``"O0"``–``"O3"`` / int form all accepted by etl; ``"O3"`` is what the
 #: package's measurements used).
 DEFAULT_OPT_LEVEL: str = "O3"
+
+#: The default ``opt_level`` injected for an **all-ROCm** IREE target set.
+#:
+#: ``"O1"`` rather than ``"O3"`` because of a measured upstream failure:
+#: ``iree-compile`` cannot translate these graphs for the ``rocm`` HAL at O2/O3
+#: — the LayerNorm mean (a ``stablehlo.reduce`` over the hidden axis) makes
+#: ``--iree-opt-level=O2``/``O3`` abort with ``error: 'func.func' op failed to
+#: distribute`` inside ``#hal.executable.target<"rocm", …>`` (reproduced with
+#: random weights for gpt2-shaped graphs at hidden 128 / 640 / 768, i.e. the
+#: ``distilgpt2`` and real ``gpt2`` shapes). O0, O1 and no flag at all compile,
+#: O1's vmfb is **byte-identical** to O0's and to the no-flag default, and O1
+#: compiles every probed hidden ∈ 64…768 × heads ∈ {2,4,8,12} combination. So
+#: O1 is the shape-robust default for ROCm, with nothing lost to the disabled
+#: higher levels. An explicit ``opt_level`` (or ``ETL_OPT_LEVEL``) still wins.
+DEFAULT_ROCM_OPT_LEVEL: str = "O1"
 
 #: The backend name whose options are returned untouched (the numpy interpreter
 #: documents ignoring compile options, so etl_hf injects nothing for it).
@@ -296,6 +331,62 @@ def _targets_from_device(device: _core.Device | None) -> list[str]:
     return [device.kind]
 
 
+def _iree_targets(
+    options: Mapping[str, object], device: _core.Device | None
+) -> list[str]:
+    """Return the *effective* IREE compile targets (option → env → device).
+
+    Args:
+        options: the caller's options (only ``target_backends`` is read).
+        device: the requested device, or ``None``.
+
+    Returns:
+        list[str]: ``options["target_backends"]`` when given (a bare string is
+        accepted as a one-element set), else the ``ETL_TARGET_BACKENDS``
+        environment list, else the device-derived
+        :func:`_targets_from_device` default.
+    """
+    targets = options.get("target_backends")
+    if targets is None:
+        targets = _env_list("ETL_TARGET_BACKENDS")
+    if targets is None:
+        return _targets_from_device(device)
+    if isinstance(targets, str):
+        return [targets]
+    return list(targets)
+
+
+def _env_opt_level() -> bool:
+    """Whether ``ETL_OPT_LEVEL`` is set to a non-blank value.
+
+    etl resolves that variable itself at compile time (it is a documented
+    process-env knob), so when it is set etl_hf injects **nothing** and lets the
+    environment win over its own default.
+
+    Returns:
+        bool: ``True`` when ``ETL_OPT_LEVEL`` is set and non-blank.
+    """
+    return bool((os.environ.get("ETL_OPT_LEVEL") or "").strip())
+
+
+def _default_opt_level(targets: list[str] | None) -> str:
+    """etl_hf's ``opt_level`` default for a compiled backend.
+
+    Args:
+        targets: the effective IREE target list, or ``None`` for a non-IREE
+            backend (which has no ``target_backends`` concept).
+
+    Returns:
+        str: :data:`DEFAULT_ROCM_OPT_LEVEL` (``"O1"``) when ``targets`` is
+        non-empty and **every** target is rocm/hip (the codegen-safe level for
+        that HAL), else :data:`DEFAULT_OPT_LEVEL` (``"O3"``) — so llvm-cpu,
+        cuda, xla, tvm and any mixed/unknown target set are unchanged.
+    """
+    if targets and all(kind in ("rocm", "hip") for kind in targets):
+        return DEFAULT_ROCM_OPT_LEVEL
+    return DEFAULT_OPT_LEVEL
+
+
 # ---------------------------------------------------------------------------
 # the default-option matrix
 # ---------------------------------------------------------------------------
@@ -319,8 +410,14 @@ def resolve_build_options(
     * the ``numpy`` backend → ``options`` returned as an unchanged **copy** (the
       numpy interpreter documents ignoring compile options; nothing is
       injected).
-    * any other backend → ``opt_level="O3"`` injected unless the caller passed
-      ``opt_level``.
+    * any other backend → ``opt_level`` injected unless the caller passed it
+      **and** unless ``ETL_OPT_LEVEL`` is set/non-blank (etl resolves that
+      variable itself at compile time, so the environment wins over this
+      default). The injected value depends on the effective IREE targets:
+      ``"O1"`` (:data:`DEFAULT_ROCM_OPT_LEVEL`) when they are **all** rocm/hip —
+      IREE's ROCm translation fails at O2/O3 on transformer-shaped graphs — and
+      ``"O3"`` (:data:`DEFAULT_OPT_LEVEL`) for every other target (llvm-cpu,
+      cuda, a mixed set, or a backend without targets such as xla/tvm).
     * backend ``"iree"`` whose *effective* target set is exactly
       ``["llvm-cpu"]`` → ``iree_compile_args=list(DEFAULT_LLVM_CPU_COMPILE_ARGS)``
       injected unless the caller passed ``iree_compile_args``. The effective
@@ -356,19 +453,13 @@ def resolve_build_options(
     if name == _HOST_BACKEND:
         return name, resolved
 
-    resolved.setdefault("opt_level", DEFAULT_OPT_LEVEL)
-    if name == "iree":
-        targets = resolved.get("target_backends")
-        if targets is None:
-            targets = _env_list("ETL_TARGET_BACKENDS")
-        if targets is None:
-            targets = _targets_from_device(device)
-        elif isinstance(targets, str):
-            targets = [targets]
-        if list(targets) == ["llvm-cpu"]:
-            resolved.setdefault(
-                "iree_compile_args", list(DEFAULT_LLVM_CPU_COMPILE_ARGS)
-            )
+    targets = _iree_targets(resolved, device) if name == "iree" else None
+    if "opt_level" not in resolved and not _env_opt_level():
+        resolved["opt_level"] = _default_opt_level(targets)
+    if targets == ["llvm-cpu"]:
+        resolved.setdefault(
+            "iree_compile_args", list(DEFAULT_LLVM_CPU_COMPILE_ARGS)
+        )
     return name, resolved
 
 
@@ -638,6 +729,55 @@ def _ids_spec(executable: "etl.Executable") -> "etl.TensorSpec | None":
     return specs[-1]
 
 
+def _check_ids_tensor(
+    ids: "etl.Tensor", expected: "etl.TensorSpec | None" = None
+) -> "etl.Tensor":
+    """Validate an :class:`etl.Tensor` of token ids from its **metadata** only.
+
+    A tensor of ids may already live on the executable's device (the
+    device-resident path), so validation never touches its data: rank, dtype and
+    the static shape against the executable's ids spec are all read from
+    ``Tensor.dtype``/``Tensor.shape``. The tensor is returned unchanged — no
+    host copy, no dtype cast, no device movement.
+
+    Args:
+        ids: the caller's id tensor.
+        expected: the executable's ``input_ids`` spec, or ``None`` when the
+            executable does not record one (the shape check is then skipped
+            rather than guessed).
+
+    Returns:
+        etl.Tensor: ``ids`` unchanged.
+
+    Raises:
+        etl.ShapeError: ``ids`` is not 2-D, or its shape does not match the
+            executable's static ``(batch, seq_len)`` spec.
+        etl.DTypeError: ``ids.dtype`` is not integral.
+    """
+    shape = tuple(ids.shape)
+    want = None if expected is None else tuple(expected.shape)
+    if len(shape) != 2:
+        raise etl.ShapeError(
+            f"input_ids must be a 2-D etl.Tensor (batch, seq_len), got shape "
+            f"{shape} (rank {len(shape)})"
+            + (f"; this executable expects {want}" if want is not None else "")
+        )
+    if want is not None and all(isinstance(dim, int) for dim in want) and want != shape:
+        raise etl.ShapeError(
+            f"input_ids Tensor shape {shape} does not match this executable's "
+            f"(batch, seq_len) input spec {want} (expected {want[1]} tokens per "
+            f"row for a static graph; build for another length instead of "
+            f"reshaping)"
+        )
+    if ids.dtype.kind not in "iu":
+        raise etl.DTypeError(
+            f"input_ids must be an etl.Tensor of an integral dtype (token ids are "
+            f"integers; a host array would be cast to int32 — a tensor's data is "
+            f"never re-typed), got dtype {ids.dtype}"
+        )
+    return ids
+
+
 def _params_keys(executable: "etl.Executable") -> tuple | None:
     """Return the params-dict keys recorded by the executable, if available.
 
@@ -724,29 +864,75 @@ def _check_params_mode(
         )
 
 
+def _reject_device_params(params: Mapping[str, object], what: str) -> None:
+    """Reject device-resident params handed to a **host-facing** helper.
+
+    :meth:`HFModel.forward`/``reference`` answer in host ``numpy``, so they would
+    have to pull a device tree back to the host — an implicit transfer this
+    package never performs. Passing placed (non-cpu) ``Tensor`` leaves is
+    therefore an error naming the device-resident recipe instead of a failure
+    deep inside ``np.asarray``. A cpu ``Tensor`` (including an ``iree``
+    llvm-cpu payload) is fine: it is host-addressable by etl's own rules.
+
+    Args:
+        params: the params mapping about to be used.
+        what: helper name used in the error message.
+
+    Returns:
+        None
+
+    Raises:
+        etl.DeviceError: a leaf is an :class:`etl.Tensor` on a non-cpu device.
+    """
+    for name, value in params.items():
+        if not isinstance(value, etl.Tensor) or value.device.kind == "cpu":
+            continue
+        raise etl.DeviceError(
+            f"{what} answers in HOST logits, so it does not accept "
+            f"device-resident params: parameter {name!r} lives on "
+            f"{value.device!r}, and nothing is copied back to the host "
+            f"implicitly. Use the explicit device-resident recipe instead: "
+            f"device = etl.core.Device(...); "
+            f"exe = model.build(backend='iree', device=device); "
+            f"out = etl_hf.run_model(exe, "
+            f"etl_hf.place_params(model.params(), device), "
+            f"etl_hf.place_ids(input_ids, device)); "
+            f"logits = out.to(etl.core.Device('cpu', 0)) "
+            f"(or drive etl.run directly with the same placed inputs, feeding "
+            f"each run's outputs back as the next run's inputs). To keep using "
+            f"{what}, pass the host params tree (or cpu Tensors)."
+        )
+
+
 def run_model(
     executable: "etl.Executable",
     params: Mapping[str, np.ndarray],
-    input_ids: np.ndarray,
+    input_ids: object,
 ) -> "etl.Tensor":
     """Run a built model executable on one params tree and one id batch.
 
-    Thin, explicit validation followed by ``etl.run``:
+    Thin, explicit validation followed by ``etl.run``. ``input_ids`` may be
+    either of two things:
 
-    * ``input_ids`` must be an integer array (any integral dtype) — the **one**
-      documented host-side coercion is casting token ids to ``int32`` (ids are
-      integral by definition; etl's run boundary is dtype-strict). Non-integral
-      dtypes raise :class:`etl.DTypeError`.
-    * ``input_ids`` must be 2-D and match the executable's ``input_ids`` spec
-      exactly (:class:`etl.ShapeError` naming expected vs got) whenever that
-      spec is available.
-    * ``params`` is passed through **untouched** — etl validates keys, shapes and
-      dtypes and reports the first mismatching pytree path. Nothing is filtered
-      or renamed here.
-    * The one exception is the packed-vs-canonical mix: feeding a canonical tree
-      to a ``pack_weights=True`` executable (or the reverse) raises an
-      :class:`~etl_hf.errors.HFWeightError` naming ``pack_weights`` and the
-      remedy instead of a bare etl pytree error.
+    * a **host integer array** (any integral dtype) — the **one** documented
+      host-side coercion is casting token ids to ``int32`` (ids are integral by
+      definition; etl's run boundary is dtype-strict). It must be 2-D and match
+      the executable's ``input_ids`` spec exactly.
+    * an :class:`etl.Tensor` — validated from its **metadata** (rank 2, integral
+      dtype, static shape vs the ids spec) and then forwarded to ``etl.run``
+      **verbatim**: no ``np.asarray``, no host copy, no dtype cast, no device
+      move. This is what makes the device-resident recipe reachable —
+      ``model.build(device=Device('rocm', 0))`` plus
+      ``place_params(params, device)`` and ``place_ids(ids, device)`` runs with
+      zero host round-trips, and a host tensor of ids still reaches a cpu
+      executable as the same object.
+
+    ``params`` is passed through **untouched** — etl validates keys, shapes and
+    dtypes and reports the first mismatching pytree path. Nothing is filtered or
+    renamed here. The one exception is the packed-vs-canonical mix: feeding a
+    canonical tree to a ``pack_weights=True`` executable (or the reverse) raises
+    an :class:`~etl_hf.errors.HFWeightError` naming ``pack_weights`` and the
+    remedy instead of a bare etl pytree error.
 
     Args:
         executable: an executable whose signature is ``(params, input_ids)``,
@@ -755,7 +941,9 @@ def run_model(
             keys) of host arrays or placed :class:`etl.Tensor` leaves — or, for a
             ``pack_weights=True`` executable, the packed tree it was built for
             (:func:`etl_hf.pack.pack_params` / :meth:`HFModel.pack_params`).
-        input_ids: ``(batch_size, seq_len)`` integer token ids.
+        input_ids: ``(batch_size, seq_len)`` integer token ids, as a host array
+            or an :class:`etl.Tensor` (already on the executable's device for a
+            device-resident run — see :func:`place_ids`).
 
     Returns:
         etl.Tensor: the logits, ``(batch_size, seq_len, vocab_size)`` float32,
@@ -767,7 +955,7 @@ def run_model(
             is not a mapping.
         etl_hf.HFWeightError: ``params`` is a canonical tree where the executable
             takes packed inputs (or the reverse).
-        etl.DTypeError: ``input_ids`` is not integral.
+        etl.DTypeError: ``input_ids`` (array or Tensor) is not integral.
         etl.ShapeError: ``input_ids`` is not 2-D or does not match the
             executable's ids spec.
     """
@@ -781,32 +969,40 @@ def run_model(
             f"params must be a mapping of canonical name -> array/Tensor, got "
             f"{type(params).__name__}"
         )
-    ids = np.asarray(input_ids)
     expected = _ids_spec(executable)
-    if ids.ndim != 2:
-        raise etl.ShapeError(
-            f"input_ids must be 2-D (batch, seq_len), got shape {ids.shape} "
-            f"(rank {ids.ndim})"
-            + (f"; this executable expects {tuple(expected.shape)}" if expected else "")
-        )
-    if expected is not None:
-        want = tuple(expected.shape)
-        if all(isinstance(dim, int) for dim in want) and want != ids.shape:
+    if isinstance(input_ids, etl.Tensor):
+        # Device-resident path: validate metadata ONLY (never touch the data)
+        # and hand the very same tensor to etl.run.
+        ids: object = _check_ids_tensor(input_ids, expected)
+    else:
+        host = np.asarray(input_ids)
+        if host.ndim != 2:
             raise etl.ShapeError(
-                f"input_ids shape {ids.shape} does not match this executable's "
-                f"(batch, seq_len) input spec {want} (expected {want[1]} tokens per "
-                f"row for a static graph; build for another length instead of "
-                f"reshaping)"
+                f"input_ids must be 2-D (batch, seq_len), got shape {host.shape} "
+                f"(rank {host.ndim})"
+                + (
+                    f"; this executable expects {tuple(expected.shape)}"
+                    if expected is not None
+                    else ""
+                )
             )
-    if ids.dtype.kind not in "iu":
-        raise etl.DTypeError(
-            f"input_ids must be an integer array (any integral dtype; token ids are "
-            f"cast to int32), got dtype {ids.dtype}"
-        )
+        if expected is not None:
+            want = tuple(expected.shape)
+            if all(isinstance(dim, int) for dim in want) and want != host.shape:
+                raise etl.ShapeError(
+                    f"input_ids shape {host.shape} does not match this executable's "
+                    f"(batch, seq_len) input spec {want} (expected {want[1]} tokens per "
+                    f"row for a static graph; build for another length instead of "
+                    f"reshaping)"
+                )
+        if host.dtype.kind not in "iu":
+            raise etl.DTypeError(
+                f"input_ids must be an integer array (any integral dtype; token ids are "
+                f"cast to int32), got dtype {host.dtype}"
+            )
+        ids = np.ascontiguousarray(host, dtype=np.int32)
     _check_params_mode(executable, params)
-    return etl.run(
-        executable, params, np.ascontiguousarray(ids, dtype=np.int32)
-    )
+    return etl.run(executable, params, ids)
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1067,66 @@ def place_params(
             )
         placed[name] = _core.from_numpy(array).to(device)
     return placed
+
+
+def place_ids(input_ids: object, device: _core.Device) -> "etl.Tensor":
+    """Copy token ids onto ``device`` — explicit, one-step placement.
+
+    The ids half of the device-resident recipe (its counterpart is
+    :func:`place_params`): a non-cpu executable rejects *every* host input at
+    the run boundary by design, ids included, so both sides must be placed
+    explicitly::
+
+        device = etl.core.Device("rocm", 0)
+        exe = model.build(backend="iree", device=device)
+        out = etl_hf.run_model(
+            exe,
+            etl_hf.place_params(model.params(), device),
+            etl_hf.place_ids(ids, device),
+        )
+        logits = out.to(etl.core.Device("cpu", 0))   # one explicit D2H
+
+    Host ids are cast to ``int32`` — the same single documented id coercion
+    :func:`run_model` performs on a host array, so the placed tensor matches the
+    graph's ``etl.int32`` ids input instead of failing dtype-strictly at the run
+    boundary. An :class:`etl.Tensor` is **not** re-typed (a tensor's data is
+    never silently rewritten): it is validated and moved with the explicit
+    ``Tensor.to(device)``, which is a no-op when it already lives there.
+
+    Args:
+        input_ids: ``(batch_size, seq_len)`` integer token ids — a host array
+            (any integral dtype) or an :class:`etl.Tensor`.
+        device: the target :class:`etl.core.Device` (e.g. ``Device("cuda", 0)``).
+
+    Returns:
+        etl.Tensor: an ``int32`` ids tensor on ``device``.
+
+    Raises:
+        TypeError: ``device`` is not an :class:`etl.core.Device`.
+        etl.ShapeError: ``input_ids`` is not 2-D.
+        etl.DTypeError: ``input_ids`` (array or Tensor) is not integral.
+    """
+    device = _require_device(device, "place_ids(device)")
+    if isinstance(input_ids, etl.Tensor):
+        return _check_ids_tensor(input_ids).to(device)
+    try:
+        ids = np.ascontiguousarray(np.asarray(input_ids))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "place_ids: input_ids is not convertible to a numpy array (got "
+            f"{type(input_ids).__name__}: {exc})"
+        ) from exc
+    if ids.ndim != 2:
+        raise etl.ShapeError(
+            f"place_ids: input_ids must be 2-D (batch, seq_len), got shape "
+            f"{ids.shape} (rank {ids.ndim})"
+        )
+    if ids.dtype.kind not in "iu":
+        raise etl.DTypeError(
+            f"place_ids: input_ids must have an integral dtype (token ids are "
+            f"integers; they are cast to int32), got dtype {ids.dtype}"
+        )
+    return _core.from_numpy(np.ascontiguousarray(ids, dtype=np.int32)).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -1133,28 +1389,34 @@ class HFModel:
         return np.zeros((self.batch_size, self.seq_len), dtype=np.int32)
 
     def _validate_ids(self, input_ids: object) -> np.ndarray:
-        """Check an explicit ``input_ids`` array against this model's static shape.
+        """Check an explicit ``input_ids`` against this model's static shape.
+
+        Accepts a host array or an :class:`etl.Tensor`; a Tensor is checked from
+        its metadata and returned unchanged (so :meth:`forward` can hand it to
+        ``etl.run`` verbatim, device-resident path included — dtype checks happen
+        in :func:`run_model`).
 
         Args:
             input_ids: the caller's ids.
 
         Returns:
-            np.ndarray: ``input_ids`` as an array (dtype checks happen in
-            :func:`run_model`).
+            np.ndarray | etl.Tensor: ``input_ids`` as given, shape-validated
+            (dtype checks happen in :func:`run_model`).
 
         Raises:
             etl.ShapeError: the shape is not exactly
                 ``(self.batch_size, self.seq_len)``; the message says how to get a
                 model for another length.
         """
-        ids = np.asarray(input_ids)
+        ids = input_ids if isinstance(input_ids, etl.Tensor) else np.asarray(input_ids)
+        shape = tuple(ids.shape)
         expected = (self.batch_size, self.seq_len)
-        if ids.shape != expected:
+        if shape != expected:
             raise etl.ShapeError(
                 f"this HFModel was built for seq_len={self.seq_len} and "
                 f"batch_size={self.batch_size} (expected input_ids shape "
-                f"{expected}), got shape {ids.shape}; shapes are static — load "
-                f"another length with load_hf(model_dir, seq_len={ids.shape[-1] if ids.ndim else '?'}) "
+                f"{expected}), got shape {shape}; shapes are static — load "
+                f"another length with load_hf(model_dir, seq_len={shape[-1] if len(shape) else '?'}) "
                 f"instead of reshaping"
             )
         return ids
@@ -1169,16 +1431,27 @@ class HFModel:
     ) -> np.ndarray:
         """Run the compiled forward pass and return host logits.
 
+        This is the **host-facing** helper: it answers in ``numpy``, so its
+        params must be host-addressable (host arrays or cpu ``Tensor``s) — a
+        non-cpu params tree raises :class:`etl.DeviceError` naming the explicit
+        device-resident recipe (:meth:`build` with ``device=``,
+        :func:`place_params`, :func:`place_ids`, :func:`run_model`/``etl.run``),
+        never a silent copy back to the host. The only move it performs is the
+        one documented ``Tensor.to(Device('cpu', 0))`` on the *output* of a
+        device-resident executable.
+
         Args:
             params: canonical params mapping (default: :meth:`params`, the
-                checkpoint's own weights). Pass host arrays for a cpu executable
-                or :func:`place_params` output for a device-resident one. With
-                ``pack_weights=True`` an already-packed tree
-                (:meth:`pack_params` output) is used as-is; a canonical tree is
-                packed once here, on the host, before the run.
+                checkpoint's own weights). Host arrays (or cpu ``Tensor``s) only
+                — for a device-resident run use :meth:`build` + :func:`place_params`
+                + :func:`run_model` instead. With ``pack_weights=True`` an
+                already-packed tree (:meth:`pack_params` output) is used as-is; a
+                canonical tree is packed once here, on the host, before the run.
             input_ids: ``(batch_size, seq_len)`` integer ids (default: all zeros
                 — a shape-only smoke forward). Integral dtypes are cast to
-                ``int32``; anything else raises ``etl.DTypeError``.
+                ``int32``; anything else raises ``etl.DTypeError``. An
+                :class:`etl.Tensor` of ids is forwarded to ``etl.run`` as-is (use
+                :func:`place_ids` for the device-resident path).
             pack_weights: opt-in packed weights (default ``False``). Packing
                 happens once per call, on the host — nothing is re-concatenated
                 per run inside etl. For repeated runs pass the packed tree
@@ -1196,9 +1469,11 @@ class HFModel:
             etl.ShapeError: ``input_ids`` does not match this model's static
                 ``(batch_size, seq_len)``.
             etl.DTypeError: ``input_ids`` is not integral.
-            etl.DeviceError: a host params tree was given to a non-cpu executable
-                (place it with :func:`place_params`), or the output could not be
-                transferred.
+            etl.DeviceError: ``params`` carries a leaf on a non-cpu device (this
+                helper answers in host logits; see the device-resident recipe in
+                the message), a host params tree was given to a non-cpu
+                executable (place it with :func:`place_params`), or the output
+                could not be transferred.
             etl_hf.HFWeightError: ``params`` is a canonical tree where the
                 executable takes packed inputs (or the reverse), or the tree does
                 not match this model's specs.
@@ -1206,6 +1481,8 @@ class HFModel:
                 graph.
         """
         weights = self.params() if params is None else params
+        if isinstance(weights, Mapping):
+            _reject_device_params(weights, "HFModel.forward")
         pack_weights = _require_bool(pack_weights, "HFModel.forward(pack_weights)")
         if pack_weights and not _pack.is_packed_tree(weights):
             # Pack ONCE, on the host, before the run: the packed tree is what a
@@ -1246,6 +1523,11 @@ class HFModel:
         """
         weights = self.params() if params is None else params
         ids = self._default_ids() if input_ids is None else self._validate_ids(input_ids)
+        if isinstance(ids, etl.Tensor):
+            # The oracle is pure numpy: expose a cpu Tensor's host data
+            # explicitly (a non-cpu one raises etl.DeviceError — never a hidden
+            # device-to-host transfer).
+            ids = ids.numpy()
         return np.asarray(
             self._family_spec.reference(self.config, weights, ids), dtype=np.float32
         )

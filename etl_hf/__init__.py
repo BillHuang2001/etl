@@ -16,8 +16,9 @@ explicit**:
   run`` — reached through :func:`build_model` (``etl.build_cached``) and
   :func:`run_model` (``etl.run``), with no hidden tracing, compiling, weight
   embedding or device movement;
-* moving weights to a device is an explicit, per-leaf ``Tensor.to(device)``
-  (:func:`place_params`) — a non-cpu executable rejects host inputs by design;
+* moving weights *and* token ids to a device is an explicit, per-leaf
+  ``Tensor.to(device)`` (:func:`place_params` / :func:`place_ids`) — a non-cpu
+  executable rejects host inputs by design;
 * every failure is an explicit, actionable error deriving from
   :class:`etl.core.ETLError` — never a silent fallback, dtype swap or positional
   guess.
@@ -31,6 +32,7 @@ Typical use::
     logits = model.forward(backend="iree")       # compiled path (explicit)
     exe = model.build(backend="iree")            # the Executable itself
     device_params = etl_hf.place_params(model.params(), etl.core.Device("cuda", 0))
+    device_ids = etl_hf.place_ids(ids, etl.core.Device("cuda", 0))
 
 Import-time constraint: ``import etl_hf`` requires only ``numpy`` (plus ``etl``).
 torch / transformers / safetensors / iree are **never** imported at module scope.
@@ -39,7 +41,14 @@ torch / transformers / safetensors / iree are **never** imported at module scope
 from __future__ import annotations
 
 from etl_hf import build, config, families, ops, pack, reference, weights
-from etl_hf.build import HFModel, build_model, load_hf, place_params, run_model
+from etl_hf.build import (
+    HFModel,
+    build_model,
+    load_hf,
+    place_ids,
+    place_params,
+    run_model,
+)
 from etl_hf.config import ModelConfig
 from etl_hf.errors import (
     HFConfigError,
@@ -58,6 +67,7 @@ __all__ = [
     "ModelConfig",
     "build_model",
     "load_hf",
+    "place_ids",
     "place_params",
     "run_model",
     # -- packed weights (opt-in) --------------------------------------------
