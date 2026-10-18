@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "tiny_llama",
     "golden": "tiny_random_llama",
@@ -26,36 +26,20 @@
     "vocab_size": 32000,
     "tie_word_embeddings": false,
     "config_digest": "2d3a50f18a1a185a",
+    "packed": true,
     "param_count": 1032272,
-    "weight_inputs": 21,
-    "graph_inputs": 22
+    "weight_inputs": 4,
+    "graph_inputs": 5
   },
   "backend": {
-    "key": "iree-llvm-cpu",
-    "backend": "iree",
+    "key": "numpy-packed",
+    "backend": "numpy",
     "device": "cpu:0",
-    "options": {
-      "target_backends": [
-        "llvm-cpu"
-      ],
-      "opt_level": "O3",
-      "iree_compile_args": [
-        "--iree-llvmcpu-target-cpu=host",
-        "--iree-opt-data-tiling"
-      ]
-    },
+    "options": {},
     "device_resident": false,
-    "resolved_backend": "iree",
-    "resolved_options": {
-      "target_backends": [
-        "llvm-cpu"
-      ],
-      "opt_level": "O3",
-      "iree_compile_args": [
-        "--iree-llvmcpu-target-cpu=host",
-        "--iree-opt-data-tiling"
-      ]
-    }
+    "packed": true,
+    "resolved_backend": "numpy",
+    "resolved_options": {}
   },
   "measurement": {
     "iters": 7,
@@ -64,10 +48,12 @@
   },
   "status": "ok",
   "errors": [],
-  "notes": [],
+  "notes": [
+    "packed weights: host params concatenated ONCE with HFModel.pack_params (4 inputs); the graph unpacks them with static etl.slice"
+  ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmpW4QLgx/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -81,19 +67,19 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 8.0585,
+    "load_hf_ms": 8.9085,
     "weight_bytes_f32": 4129088,
-    "trace_ms": 50.5374,
-    "ir_ops": 170,
+    "trace_ms": 70.0643,
+    "ir_ops": 191,
     "ir_distinct_ops": 24,
     "ir_histogram": {
       "multiply": 32,
+      "slice": 29,
       "reshape": 21,
       "constant": 19,
       "dot": 19,
       "add": 15,
       "transpose": 10,
-      "slice": 8,
       "divide": 7,
       "concatenate": 5,
       "reduce_mean": 5,
@@ -112,37 +98,41 @@
       "return": 1,
       "sin": 1
     },
-    "export_ms": 4.6719,
-    "stablehlo_bytes": 28895,
-    "stablehlo_lines": 301,
-    "stablehlo_constants": 35
+    "export_ms": 5.5058,
+    "stablehlo_bytes": 32205,
+    "stablehlo_lines": 322,
+    "stablehlo_constants": 35,
+    "pack_params_ms": 2.2509,
+    "packed_inputs": 4
   },
   "build": {
-    "lower_ms": 13.7215,
-    "compile_ms": 1105.368,
-    "load_ms": 9.9793,
-    "stage_sum_ms": 1129.0687,
-    "artifact_bytes": 66026,
-    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_default": null,
     "opt_level_sweep": {
-      "O3": "compiled"
+      "default": "compiled"
     },
-    "opt_level_used": "O3",
-    "public_build_ms": 1171.2019,
+    "lower_ms": 8.6836,
+    "compile_ms": 4.6565,
+    "load_ms": 6.9981,
+    "stage_sum_ms": 20.3382,
+    "artifact_bytes": null,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_used": null,
+    "public_build_ms": 103.5506,
     "public_build_same_device": "Device(kind='cpu', index=0)"
   },
   "run": {
     "batch": 1,
     "seq_len": 8,
-    "first_call_ms": 3.9189,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 2.12,
     "n": 7,
-    "best_ms": 1.8204,
-    "median_ms": 2.1526,
-    "mean_ms": 2.0837,
-    "stdev_ms": 0.1332,
+    "best_ms": 1.1533,
+    "median_ms": 1.1786,
+    "mean_ms": 1.1797,
+    "stdev_ms": 0.0193,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 4394.64
+    "tokens_per_s": 6936.62
   },
   "parity": {
     "logits_shape": [
@@ -150,25 +140,26 @@
       8,
       32000
     ],
-    "logits_absmax": 0.3487534523010254,
-    "logits_mean": 0.00015656855248380452,
+    "logits_absmax": 0.348753422498703,
+    "logits_mean": 0.00015656856703571975,
     "golden_absmax": 0.3487534821033478,
-    "max_abs_vs_golden": 7.450580596923828e-08,
-    "mean_abs_vs_golden": 4.583393220514154e-09,
-    "max_rel_vs_golden": 2.1363459268286533e-07,
+    "max_abs_vs_golden": 8.940696716308594e-08,
+    "mean_abs_vs_golden": 6.270644004047199e-09,
+    "max_rel_vs_golden": 2.563615169037803e-07,
     "logits_source": "this leg",
-    "max_abs_vs_numpy_backend": 8.940696716308594e-08
+    "reference": "numpy backend (unpacked leg)",
+    "max_abs_vs_numpy_backend": 0.0
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 2.62,
+    "duration_s": 0.42,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/tiny_llama__iree-llvm-cpu.sanity.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/tiny_llama__numpy-packed.json (status=ok)"
     ],
-    "stderr_tail": [
-      " - leaked function \"get_buffer\"",
-      "nanobind: this is likely caused by a reference counting issue in the binding code.",
-      "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
-    ]
+    "stderr_tail": []
   }
 }

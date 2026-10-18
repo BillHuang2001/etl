@@ -6,15 +6,23 @@ Each cell measures the **whole model forward pass as ONE etl graph** through
 `etl_hf`'s public API: `load_hf` → `etl_hf.build_model` (trace → lower → compile →
 load) → run, with the checkpoint weights as ordinary graph **inputs**.
 
+Every backend row exists twice: **unpacked** (one graph input per weight input,
+the canonical tree) and **packed** (`pack_weights=True`; key suffix `-packed`), where
+`HFModel.pack_params` concatenates the weight tree on the host into a handful of
+inputs that the graph unpacks with static `etl.slice`. Packing is what brings the
+124M `gpt2` graph (197 unpacked inputs) under IREE's ~161-consumed-input runtime
+limit — the packed rows are the ones that make it runnable on a compiler backend.
+
 ## Method (what a number means)
 
 | aspect | how it is measured |
 |---|---|
-| latency | `best` of N warm calls (after a warmup) of `etl_hf.run_model(exe, params, ids)` on CPU paths, or `etl.run(exe, placed_params, placed_ids)` on the device-resident path. `first` is the very first call after load (includes the executable's input/output plan building). `median`/`mean` in the JSON. |
-| warm loop, device | device-resident = weights placed ONCE with `etl_hf.place_params` and then a same-device loop (outputs stay on the GPU, never auto-copied). `+d2h` re-times the loop WITH one explicit `Tensor.to(cpu)` per call. |
+| latency | `best` of N warm calls (after a warmup) of `etl_hf.run_model(exe, params, ids)` — on the device-resident rows with `place_params`-ed weights and a `place_ids`-ed ids tensor (the documented device recipe, through the public API). `first` is the very first call after load (includes the executable's input/output plan building). `median`/`mean` in the JSON. |
+| warm loop, device | device-resident = weights placed ONCE with `etl_hf.place_params` + ids placed with `etl_hf.place_ids`, then a same-device loop (outputs stay on the GPU, never auto-copied). `+d2h` re-times the loop WITH one explicit `Tensor.to(cpu)` per call. |
 | restage (anti-pattern) | `place_params(host params)` **on every call** + run — the documented per-call host→device restaging trap, measured on the same graph. |
-| build times | explicit `etl.lower` / `etl.compile` / `etl.load` on the traced graph, with the options `etl_hf.resolve_build_options` resolves (`opt_level="O3"`; `--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for llvm-cpu). `stage sum` is that composition; the public one-call `build_model` total is measured separately where cheap (small models) as a cross-check. |
-| parity | `max-abs` of this leg's logits vs (a) the **torch/transformers golden** in `bench_logs/hf_goldens/` (absolute truth; the input ids are the golden's own ids) and (b) the **numpy interpreter backend** on the identical graph/weights. Not bit-equality: fp32 accumulation order differs between backends. |
+| packed weights | `HFModel.pack_params` runs ONCE on the host (its cost is recorded as `pack_params_ms`); the executable is built with `pack_weights=True`, and every latency/parity number below is the packed executable's. |
+| build times | explicit `etl.lower` / `etl.compile` / `etl.load` on the traced graph, with the options `etl_hf.resolve_build_options` resolves — the **library defaults** (`opt_level="O3"` for llvm-cpu, `opt_level="O1"` for an all-ROCm target set, plus `--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for llvm-cpu). `stage sum` is that composition; the public one-call `build_model` total is measured separately where cheap (small models) as a cross-check. |
+| parity | `max-abs` of this leg's logits vs (a) the **torch/transformers golden** in `bench_logs/hf_goldens/` (absolute truth; the input ids are the golden's own ids) and (b) the **numpy interpreter backend** on the identical weights — for packed rows that reference is the *unpacked* numpy leg, so `0.00` there means packing is bit-identical. Not bit-equality between backends: fp32 accumulation order differs. |
 | tokens/s | `batch × seq_len / best latency` — a forward-pass rate, NOT decode throughput (no KV cache / incremental decode in v1: every call re-runs the whole graph). |
 
 Timing parameters of this run: **7 warm samples after 2 warmup call(s)** for the latency columns, **3 samples** for the restaging variant (per-leg overrides are recorded in each JSON under `measurement`).
@@ -25,33 +33,35 @@ Run-level env overrides: none
 
 ## 1. Graph size (backend independent)
 
-| model | family | act | params | weight inputs | graph inputs | IR ops | distinct op defs | StableHLO | constants | trace | export |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `tiny_llama` | llama | silu | 1,032,272 | 21 | 22 | 170 | 24 | 28.2 KB | 35 | 50.7 ms | 4.8 ms |
-| `tiny_gpt2` | gpt2 | gelu_new | 102,714 | 36 | 37 | 170 | 19 | 32.8 KB | 52 | 52.5 ms | 5.3 ms |
-| `distilgpt2` | gpt2 | gelu_new | 81,912,576 | 100 | 101 | 450 | 19 | 88.1 KB | 128 | 120.2 ms | 9.4 ms |
-| `gpt2` | gpt2 | gelu_new | 124,439,808 | 196 | 197 | 870 | 19 | 170.9 KB | 242 | 225.6 ms | 17.7 ms |
+### Unpacked weights (one graph input per weight)
 
-`graph inputs` = weight inputs + 1 (the `(batch, seq_len)` int32 `input_ids`). The IR op count is the same for every backend — it is the traced graph, not a backend artifact.
+| model | family | act | params | weight inputs | graph inputs | IR ops | distinct op defs | StableHLO | constants | trace | export | pack (host) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `tiny_llama` | llama | silu | 1,032,272 | 21 | 22 | 170 | 24 | 28.2 KB | 35 | 50.7 ms | 4.8 ms | — |
+| `tiny_gpt2` | gpt2 | gelu_new | 102,714 | 36 | 37 | 170 | 19 | 32.8 KB | 52 | 52.5 ms | 5.3 ms | — |
+| `distilgpt2` | gpt2 | gelu_new | 81,912,576 | 100 | 101 | 450 | 19 | 88.1 KB | 128 | 120.2 ms | 9.4 ms | — |
+| `gpt2` | gpt2 | gelu_new | 124,439,808 | 196 | 197 | 870 | 19 | 170.9 KB | 242 | 225.6 ms | 17.7 ms | — |
+
+`graph inputs` = weight inputs + 1 (the `(batch, seq_len)` int32 `input_ids`). The IR op count differs between the packed/unpacked graphs because the packed one adds its in-graph `slice` unpacking; it is identical for every backend of the same graph — the traced program, not a backend artifact.
 
 ## 2. Build (lower / compile / load)
 
-| model | backend | device | lower | compile | load | stage sum | public build |
-|---|---|---|---|---|---|---|---|
-| `tiny_llama` | `numpy` | cpu:0 | 7.1 ms | 3.8 ms | 3.8 ms | 14.7 ms | 79.6 ms |
-| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | 29.5 ms | 1,133.0 ms | 8.9 ms | 1,171.4 ms | 1,193.1 ms |
-| `tiny_llama` | `iree-rocm` | rocm:0 | 13.6 ms | 936.0 ms | 214.6 ms | 1,164.1 ms | 1,045.9 ms |
-| `tiny_gpt2` | `numpy` | cpu:0 | 8.0 ms | 3.9 ms | 4.0 ms | 15.9 ms | 78.2 ms |
-| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | 13.9 ms | 935.3 ms | 17.1 ms | 966.3 ms | 1,081.8 ms |
-| `tiny_gpt2` | `iree-rocm` | rocm:0 | 13.7 ms | 751.9 ms | 207.5 ms | 973.1 ms | 882.8 ms |
-| `distilgpt2` | `numpy` | cpu:0 | 17.0 ms | 9.7 ms | 9.7 ms | 36.3 ms | — |
-| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | 22.3 ms | 2,085.1 ms | 16.0 ms | 2,123.5 ms | — |
-| `distilgpt2` | `iree-rocm` | rocm:0 | 14.9 ms | 1,305.3 ms | 204.1 ms | 1,524.2 ms | — |
-| `gpt2` | `numpy` | cpu:0 | 30.6 ms | 19.6 ms | 18.9 ms | 69.1 ms | — |
-| `gpt2` | `iree-llvm-cpu` | cpu:0 | — | — | — | — | — |
-| `gpt2` | `iree-rocm` | rocm:0 | — | — | — | — | — |
+| model | backend | device | opt_level used | lower | compile | load | stage sum | public build |
+|---|---|---|---|---|---|---|---|---|
+| `tiny_llama` | `numpy` | cpu:0 | — | 7.1 ms | 3.8 ms | 3.8 ms | 14.7 ms | 79.6 ms |
+| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 29.5 ms | 1,133.0 ms | 8.9 ms | 1,171.4 ms | 1,193.1 ms |
+| `tiny_llama` | `iree-rocm` | rocm:0 | `O3` (default `None` rejected) | 13.6 ms | 936.0 ms | 214.6 ms | 1,164.1 ms | 1,045.9 ms |
+| `tiny_gpt2` | `numpy` | cpu:0 | — | 8.0 ms | 3.9 ms | 4.0 ms | 15.9 ms | 78.2 ms |
+| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 13.9 ms | 935.3 ms | 17.1 ms | 966.3 ms | 1,081.8 ms |
+| `tiny_gpt2` | `iree-rocm` | rocm:0 | `O3` (default `None` rejected) | 13.7 ms | 751.9 ms | 207.5 ms | 973.1 ms | 882.8 ms |
+| `distilgpt2` | `numpy` | cpu:0 | — | 17.0 ms | 9.7 ms | 9.7 ms | 36.3 ms | — |
+| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 22.3 ms | 2,085.1 ms | 16.0 ms | 2,123.5 ms | — |
+| `distilgpt2` | `iree-rocm` | rocm:0 | `O1` (default `None` rejected) | 14.9 ms | 1,305.3 ms | 204.1 ms | 1,524.2 ms | — |
+| `gpt2` | `numpy` | cpu:0 | — | 30.6 ms | 19.6 ms | 18.9 ms | 69.1 ms | — |
+| `gpt2` | `iree-llvm-cpu` | cpu:0 | — | — | — | — | — | — |
+| `gpt2` | `iree-rocm` | rocm:0 | — | — | — | — | — | — |
 
-Compile time is the IREE compile of the whole-model graph (the numpy interpreter has no compile step). `public build` is the cold `etl_hf.build_model` total where measured — it re-runs the stages, so it should be ≳ the stage sum (it also does `load_hf`-side work and graph memoisation bookkeeping).
+`opt_level used` is the level the row was actually built at; the resolved default is recorded per leg in `build.opt_level_default` / `build.opt_level_used` (the library defaults: `O3` for llvm-cpu, `O1` for an all-ROCm target set — section 7 explains the O2/O3 ROCm rejection that forces it). Compile time is the IREE compile of the whole-model graph (the numpy interpreter has no compile step). `public build` is the cold `etl_hf.build_model` total where measured — it re-runs the stages, so it should be ≳ the stage sum (it also does `load_hf`-side work and graph memoisation bookkeeping).
 
 ## 3. Latency (whole forward, one graph, warm)
 
@@ -70,7 +80,7 @@ Compile time is the IREE compile of the whole-model graph (the numpy interpreter
 | `gpt2` | `iree-llvm-cpu` | cpu:0 | — | — | — | — | — | — |
 | `gpt2` | `iree-rocm` | rocm:0 | — | — | — | — | — | — |
 
-`+d2h best` = same device loop with one explicit `Tensor.to(cpu)` of the logits per call (what you pay if you need the logits on the host); `restage best` = the whole weight tree re-placed on the device every call — the documented anti-pattern, and why the device loop above is the fast iteration pattern.
+`+d2h best` = same device loop with one explicit `Tensor.to(cpu)` of the logits per call (what you pay if you need the logits on the host); `restage best` = the whole weight tree re-placed on the device every call — the documented anti-pattern, and why the device loop above is the fast iteration pattern. Device rows are driven through `etl_hf.run_model(exe, place_params(...), place_ids(...))` — the public `etl_hf` API, no raw `etl.run` short-circuit (the leg records `run.api`).
 
 ## 4. Parity (fp32 logits; max-abs)
 
@@ -93,6 +103,8 @@ Golden absmax per model (the scale that turns an absolute delta into a relative 
 
 ## 5. GPU vs CPU
 
+### Unpacked weights
+
 | model | numpy (cpu) | iree llvm-cpu | iree rocm (device-resident) | rocm / numpy | rocm / llvm-cpu | numpy / llvm-cpu |
 |---|---|---|---|---|---|---|
 | `tiny_llama` | 1.05 ms | 1.91 ms | 0.18 ms | 5.98× | 10.87× | 1.82× |
@@ -104,26 +116,35 @@ Speedup columns are latency ratios (`A/B > 1` ⇒ B is faster). Two regimes are 
 
 ## 6. Findings
 
-- **Parity.** Every measured leg reproduces the torch/transformers golden logits to fp32 accumulation order: the largest deviation anywhere in the matrix is `2.21e-04` (distilgpt2 / iree-llvm-cpu). Deltas are 1e-8-class on the tiny checkpoints and 1e-4-class on the 82M/124M ones, whose logits reach |max| ≈ 80–140 (i.e. ~1e-6 relative).
-- **Compiled vs the numpy interpreter** on the identical graph and weights: largest max-abs is `2.29e-04` (distilgpt2). The numpy backend is the reference here, so this isolates backend numerics from checkpoint parsing.
-- **On CPU the numpy interpreter is competitive-to-faster than the compiled graph** (numpy faster on 2 of 3 measured models): `tiny_llama` numpy 1.05 ms vs llvm-cpu 1.91 ms (numpy 1.82× faster), `tiny_gpt2` numpy 0.98 ms vs llvm-cpu 0.49 ms (llvm-cpu 2.02× faster), `distilgpt2` numpy 14.01 ms vs llvm-cpu 266.39 ms (numpy 19.01× faster). The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE dispatch overhead per op (these graphs are hundreds of small ops). **The compiled path's value is the GPU**, not CPU speed.
-- **GPU (MI300X, ROCm, device-resident)**: `tiny_llama` 0.18 ms — 5.98× faster than numpy, 10.87× faster than iree-llvm-cpu, `tiny_gpt2` 0.19 ms — 5.12× faster than numpy, 2.54× faster than iree-llvm-cpu, `distilgpt2` 3.02 ms — 4.64× faster than numpy, 88.24× faster than iree-llvm-cpu.
-- **Compiler option fallback, measured (never a silent downgrade):** `distilgpt2` / `iree-rocm` — the requested `O3`, `O2` rejected by `iree-compile` (O3 → 'func.func' op failed to distribute; O2 → 'func.func' op failed to distribute) so this row is measured at `opt_level=O1`. The per-leg sweep tries the requested level first, then O3 → O2 → O1 → O0, and records each level's outcome in `build.opt_level_sweep`.
-- **Per-call restaging is the anti-pattern, measured here:** re-placing the whole weight tree on the device every call costs `tiny_llama` 1.81 ms vs 0.18 ms for the same-device loop (10.3×), `tiny_gpt2` 2.35 ms vs 0.19 ms for the same-device loop (12.3×), `distilgpt2` 98.12 ms vs 3.02 ms for the same-device loop (32.5×). The same-device loop (`place_params` once, feed device tensors back) is the iteration pattern to use.
-- **Reading the logits back to the host costs extra**: same loop plus one explicit `Tensor.to(cpu)` per call is `tiny_llama` 0.64 ms (vs 0.18 ms), `tiny_gpt2` 0.86 ms (vs 0.19 ms), `distilgpt2` 5.23 ms (vs 3.02 ms).
-- **`gpt2`-class compiled rows are BLOCKED, not slow**: `gpt2` has more than the ~161 graph inputs IREE's Python runtime can invoke (SIGSEGV, documented in `etl_hf/CONTEXT.md` Known Issues) and `etl_hf` v1 exposes no weight-packing option, so those rows are marked *pending weight packing*. Only the numpy row is measured for them; nothing is extrapolated.
-- **Compile cost is a one-off**: the largest measured compile is `2,085 ms` (`distilgpt2` / `iree-llvm-cpu`); everything after it is the per-call latency above. `etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, batch)`, so repeated builds of the same shape reuse the executable.
-- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the device-resident GPU rows look launch-bound rather than compute-bound. The forward graph is hundreds of small ops (measured IR op counts: `tiny_llama` 170, `tiny_gpt2` 170, `distilgpt2` 450) that StableHLO/IREE lower into many narrow dispatches, so the per-call time is dominated by dispatch + kernel-launch overhead instead of arithmetic. That would explain the observed GPU-vs-numpy margin of 5.98×, 5.12×, 4.64× — a narrow band that shows no trend across the parameter-count range measured (the whole forward on the tiny checkpoints is only a few hundred microseconds of arithmetic, so fixed per-call overhead is a large fraction of it). **Not verified here** — the probe records no dispatch count and no per-op GPU timeline; confirming it would need an IREE trace / `--iree-hal-trace-execution` run, which this probe does not do.
+- **Parity.** Every measured leg — packed and unpacked — reproduces the torch/transformers golden logits to fp32 accumulation order: the largest deviation anywhere in the matrix is `2.21e-04` (distilgpt2 / iree-llvm-cpu). Deltas are 1e-8-class on the tiny checkpoints and 1e-4-class on the 82M/124M ones, whose logits reach |max| ≈ 80–300 (i.e. ~1e-6 relative).
+- **Compiled vs the numpy interpreter** on the identical weights: largest max-abs is `2.29e-04` (distilgpt2). The numpy backend is the reference here, so this isolates backend numerics from checkpoint parsing.
+- **On CPU (unpacked weights) the numpy interpreter is competitive-to-faster than the compiled graph** (numpy faster on 2 of 3 measured models): `tiny_llama` numpy 1.05 ms vs llvm-cpu 1.91 ms (numpy 1.82× faster), `tiny_gpt2` numpy 0.98 ms vs llvm-cpu 0.49 ms (llvm-cpu 2.02× faster), `distilgpt2` numpy 14.01 ms vs llvm-cpu 266.39 ms (numpy 19.01× faster). The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE dispatch overhead per op (these graphs are hundreds of small ops). **The compiled path's value is the GPU**, not CPU speed.
+- **GPU (MI300X, ROCm, device-resident, unpacked weights)**: `tiny_llama` 0.18 ms — 5.98× faster than numpy, 10.87× faster than iree-llvm-cpu, `tiny_gpt2` 0.19 ms — 5.12× faster than numpy, 2.54× faster than iree-llvm-cpu, `distilgpt2` 3.02 ms — 4.64× faster than numpy, 88.24× faster than iree-llvm-cpu.
+- **ROCm `opt_level` default = `O1`, and the rejection above it is real (measured, never asserted):** `distilgpt2` / `iree-rocm` — built at `opt_level=O1`, while `O3` fails with `'func.func' op failed to distribute` and `O2` fails with `'func.func' op failed to distribute`. That `'func.func' op failed to distribute` is an upstream `iree-compile` ROCm codegen failure on the LayerNorm-shaped reduce (not an etl/etl_hf bug), so the library now injects `opt_level="O1"` for an all-ROCm target set — these rows are measured at that default, and the higher levels are re-attempted only to record the verbatim error.
+- **Per-call restaging is the anti-pattern, measured here:** re-placing the whole weight tree on the device every call costs `tiny_llama`/`iree-rocm` 1.81 ms vs 0.18 ms for the same-device loop (10.3×), `tiny_gpt2`/`iree-rocm` 2.35 ms vs 0.19 ms for the same-device loop (12.3×), `distilgpt2`/`iree-rocm` 98.12 ms vs 3.02 ms for the same-device loop (32.5×). The same-device loop (`place_params` + `place_ids` once, feed device tensors back) is the iteration pattern to use — with packed weights it also stages 3–8 leaves instead of ~100–200.
+- **Reading the logits back to the host costs extra**: same loop plus one explicit `Tensor.to(cpu)` per call is `tiny_llama`/`iree-rocm` 0.64 ms (vs 0.18 ms), `tiny_gpt2`/`iree-rocm` 0.86 ms (vs 0.19 ms), `distilgpt2`/`iree-rocm` 5.23 ms (vs 3.02 ms).
+- **The ~161-consumed-input cliff is real — but only for UNPACKED graphs.** `gpt2` / `iree-llvm-cpu`, `gpt2` / `iree-rocm` stay refused: those graphs declare more distinct inputs than IREE's Python runtime can invoke (SIGSEGV, exit `-11`, measured in section 7). The same models DO run compiled once packed — `pack_weights=True` collapses the weight tree into a handful of inputs, and the packed rows above are real measurements, not extrapolations.
+- **Compile cost is a one-off**: the largest measured compile is `2,085 ms` (`distilgpt2` / `iree-llvm-cpu`); everything after it is the per-call latency above. `etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, batch, packed)`, so repeated builds of the same shape reuse the executable.
+- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the device-resident GPU rows look launch-bound rather than compute-bound. The forward graph is hundreds of small ops (measured IR op counts: `tiny_llama` 170, `tiny_gpt2` 170, `distilgpt2` 450) that StableHLO/IREE lower into many narrow dispatches, so the per-call time is dominated by dispatch + kernel-launch overhead instead of arithmetic. That would explain the observed GPU-vs-numpy margins of 5.98×, 5.12×, 4.64× — a narrow band that shows no clean trend across the parameter-count range measured. **Not verified here** — the probe records no dispatch count and no per-op GPU timeline; confirming it would need an IREE trace / `--iree-hal-trace-execution` run, which this probe does not do.
 
-## 7. Blocked compiled rows: the input-count limit, measured
+## 7. The ~161-consumed-input cliff: measured, and resolved by packing
 
-Compiled legs above the ~161-consumed-input limit are **refused up front** (section 1 gives the input counts). To show that the refusal describes a real runtime limit and not a guess, each such leg is attempted ONCE in its own subprocess:
+IREE's Python runtime **SIGSEGVs without a Python exception** when a graph consumes more than ~161 distinct inputs (documented in `etl_hf/CONTEXT.md` Known Issues with the measured brackets: 161 chained-matmul / 162 fan-out). Only an *unpacked* graph gets near it:
+
+| model | unpacked graph inputs | unpacked compiled legs | packed graph inputs | packed compiled legs |
+|---|---|---|---|---|
+| `tiny_llama` | 22 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
+| `tiny_gpt2` | 37 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
+| `distilgpt2` | 101 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
+| `gpt2` | 197 | `iree-llvm-cpu` skipped, `iree-rocm` skipped | — |  |
+
+To show that the refusal describes a real runtime limit and not a guess, each refused leg is attempted ONCE in its own subprocess (CPU targets only — a live GPU context is never put in front of a deliberate SIGSEGV):
 
 | leg | graph inputs | exit code | status | last stderr line |
 |---|---|---|---|---|
 | `gpt2` / `iree-llvm-cpu` | 197 | `-11` | crash | `—` |
 
-The attempt dies with exit code(s) `-11` **without a Python exception** — a hard crash inside the IREE runtime invoke, exactly the documented limit, so these rows stay *pending weight packing* rather than being reported as slow or missing. `etl_hf` v1 has no `pack_weights` option; a packed/ fused-weight variant (`12·L + 4` weight inputs, i.e. 149 with ids for `gpt2`) would fall below the limit.
+The attempt dies with exit code(s) `-11` **without a Python exception** — a hard crash inside the IREE runtime invoke, exactly the documented limit. The cliff is a property of the UNPACKED graph (197 inputs for `gpt2`), not of the model: the packed form of the same checkpoint declares 4 inputs and its compiled rows are measured in tables 2–4 — nothing is extrapolated from other models.
 
 ## 8. Non-`ok` legs (verbatim)
 
@@ -181,23 +202,26 @@ Parity is expected to be *identical* across runs (deterministic kernels); latenc
 
 ## 11. Scope, limits, and what is NOT claimed
 
-**Measured facts** — everything in tables 1–5 and the reproducibility table came out of this probe on this host, is regenerable with the command below, and is stored verbatim in `hf_perf_data/*.json`.
+**Measured facts** — everything in tables 1–5, the packed/unpacked comparison of section 7 and the reproducibility table came out of this probe on this host, is regenerable with the command below, and is stored verbatim in `hf_perf_data/*.json` (unpacked legs in `<model>__<backend>.json`, packed legs in `<model>__<backend>-packed.json`).
 
 **Not measured / not claimed:**
 
-- **No torch latency baseline.** `torch`/`transformers` are not installed in the probe environment, so the torch goldens are used for *numerics only*. The only latency comparison here is between etl's own three execution paths. (An etl-vs-torch-eager comparison needs a torch-enabled environment and is deliberately out of scope.)
+- **No torch latency baseline.** `torch`/`transformers` are not installed in the probe environment, so the torch goldens are used for *numerics only*. The only latency comparison here is between etl's own execution paths (three backend paths, each in unpacked and packed form). (An etl-vs-torch-eager comparison needs a torch-enabled environment and is deliberately out of scope.)
 - **Not a decode benchmark.** v1 has no KV cache and no incremental decode: every call re-runs the whole sequence, so `tokens/s` is a whole-forward rate for `batch × seq_len` tokens, not generation throughput.
 - **Tiny models, small sequences.** These are 0.1M–124M-parameter checkpoints at `seq_len` 8/32 chosen to match the committed goldens. Sub-millisecond GPU rows are dominated by fixed dispatch cost; do not read them as accelerators' peak capability.
 - **One GPU, shared host.** The MI300X is a single virtualized device and other work may be resident; latency was best-of-N on a warm cache, and the reproducibility table shows the run-to-run spread that actually occurred.
-- **Compiled `gpt2` rows do not exist** (section 7). Nothing is extrapolated from the `distilgpt2` row: the input-count limit is a hard runtime limit, not a size effect.
+- **Compiled `gpt2` rows exist only as PACKED rows.** The unpacked 197-input graph is refused by IREE's ~161-input runtime limit (section 7, measured crash); the packed graph (4 inputs) is the one measured in tables 2–4. Nothing is extrapolated from the `distilgpt2` row: the input-count limit is a hard runtime limit, not a size effect.
+- **Packing is opt-in and not free.** `pack_weights=True` plus a `pack_params` call is required (a `pack_weights=False` executable still takes one input per weight); the packed graph spends a few extra in-graph `slice` ops, which is why its IR op count is slightly higher than the unpacked one. Both forms are measured here.
 - **CPU-thread count is not pinned.** The numpy row benefits from OpenBLAS threading; a single-threaded BLAS is slower (measured elsewhere in `etl_hf/CONTEXT.md`). Treat the numpy column as "this host, default threading".
 
 Regenerate with:
 
 ```bash
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py
+# with the per-level opt_level rejection evidence re-attempted on every compiled leg:
+uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --opt-level-evidence
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report  # markdown only
 # one row, to check reproducibility of a published number:
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py \
-    --models tiny_llama --backends iree-rocm --no-sanity --no-crash-probe
+    --models gpt2 --backends iree-rocm-packed --no-sanity --no-crash-probe
 ```

@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "tiny_llama",
     "golden": "tiny_random_llama",
@@ -26,6 +26,7 @@
     "vocab_size": 32000,
     "tie_word_embeddings": false,
     "config_digest": "2d3a50f18a1a185a",
+    "packed": false,
     "param_count": 1032272,
     "weight_inputs": 21,
     "graph_inputs": 22
@@ -36,6 +37,7 @@
     "device": "cpu:0",
     "options": {},
     "device_resident": false,
+    "packed": false,
     "resolved_backend": "numpy",
     "resolved_options": {}
   },
@@ -49,7 +51,7 @@
   "notes": [],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmpxxKXvU/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -63,9 +65,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 8.5253,
+    "load_hf_ms": 8.2121,
     "weight_bytes_f32": 4129088,
-    "trace_ms": 50.6718,
+    "trace_ms": 58.6155,
     "ir_ops": 170,
     "ir_distinct_ops": 24,
     "ir_histogram": {
@@ -94,37 +96,39 @@
       "return": 1,
       "sin": 1
     },
-    "export_ms": 4.7625,
+    "export_ms": 5.2292,
     "stablehlo_bytes": 28895,
     "stablehlo_lines": 301,
     "stablehlo_constants": 35
   },
   "build": {
-    "lower_ms": 7.1043,
-    "compile_ms": 3.8017,
-    "load_ms": 3.7509,
-    "stage_sum_ms": 14.6569,
-    "artifact_bytes": null,
-    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_default": null,
     "opt_level_sweep": {
       "default": "compiled"
     },
+    "lower_ms": 7.8354,
+    "compile_ms": 4.1784,
+    "load_ms": 4.1272,
+    "stage_sum_ms": 16.141,
+    "artifact_bytes": null,
+    "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": null,
-    "public_build_ms": 79.5938,
+    "public_build_ms": 96.3468,
     "public_build_same_device": "Device(kind='cpu', index=0)"
   },
   "run": {
     "batch": 1,
     "seq_len": 8,
-    "first_call_ms": 1.7403,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 1.9998,
     "n": 7,
-    "best_ms": 1.0509,
-    "median_ms": 1.0815,
-    "mean_ms": 1.0814,
-    "stdev_ms": 0.0208,
+    "best_ms": 1.1568,
+    "median_ms": 1.1946,
+    "mean_ms": 1.1991,
+    "stdev_ms": 0.0351,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 7612.52
+    "tokens_per_s": 6915.63
   },
   "parity": {
     "logits_shape": [
@@ -139,13 +143,18 @@
     "mean_abs_vs_golden": 6.270644004047199e-09,
     "max_rel_vs_golden": 2.563615169037803e-07,
     "logits_source": "this leg",
-    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/_numpy_logits_tiny_llama.npz"
+    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/_numpy_logits_tiny_llama.npz",
+    "reference": "numpy backend (this leg)"
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 0.5,
+    "duration_s": 0.61,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/tiny_llama__numpy.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/tiny_llama__numpy.json (status=ok)"
     ],
     "stderr_tail": []
   }

@@ -2,20 +2,37 @@
 """HF whole-forward perf/parity matrix probe for the ``etl_hf`` package.
 
 Compares the **whole-model forward pass as ONE etl graph** (``etl_hf``)
-across the three execution paths that exist for it, on the four checkpoints
-whose torch goldens are committed in :mod:`bench_logs/hf_goldens/`:
+across the execution paths that exist for it, on the four checkpoints whose
+torch goldens are committed in :mod:`bench_logs/hf_goldens/`:
 
 ======================  ==================================================
 backend key             what it is
 ======================  ==================================================
 ``numpy``               the numpy interpreter backend (CPU, host arrays)
 ``iree-llvm-cpu``       IREE compiled, ``--iree-llvmcpu-target-cpu=host``,
-                        ``opt_level="O3"``, host inputs
+                        host inputs
 ``iree-rocm``           IREE compiled for ROCm (the MI300X), **device
                         resident**: weights placed ONCE with
                         ``etl_hf.place_params`` and then a same-device loop
-                        (this is the documented fast iteration pattern)
+                        through ``etl_hf.run_model`` (the documented fast
+                        iteration pattern)
 ======================  ==================================================
+
+Every backend is measured **twice**: unpacked (one ``TensorSpec`` per weight,
+the canonical tree) and **packed** (``pack_weights=True`` — the weight tree
+collapsed into a handful of concatenated inputs unpacked in-graph with static
+``etl.slice``; backend key suffix ``-packed``). Packing is what brings the
+124M ``gpt2`` graph (197 unpacked inputs) under IREE's ~161-consumed-input
+runtime limit, so the packed keys are the rows that make ``gpt2`` runnable on
+a compiler backend at all; the unpacked keys stay in the matrix as the
+comparison (and as the honest record of the input-count cliff).
+
+Compile options are **the library defaults**: ``etl_hf.resolve_build_options``
+is asked what it would inject — ``opt_level="O3"`` for llvm-cpu,
+``opt_level="O1"`` for an all-ROCm target set (IREE's ROCm codegen rejects
+O2/O3 on these transformer-shaped graphs; ``--opt-level-evidence`` additionally
+re-attempts the rejected levels so the report can quote the real upstream
+error instead of asserting it).
 
 Measured per (model, backend): graph size (param count, graph inputs, IR op
 count, StableHLO bytes), trace / lower / compile / load times, first-call and
@@ -30,9 +47,10 @@ Design (why it looks like this)
 * **One subprocess per (model, backend) leg.** A misbehaving compiled leg can
   *segfault* (IREE's Python runtime SIGSEGVs on graphs that consume more than
   ~161 distinct inputs — see ``etl_hf/CONTEXT.md`` Known Issues; a pre-existing
-  runtime limit, not an ``etl_hf`` behaviour). Running each leg in its own
-  process means one crash cannot take the matrix down, and the crash is
-  reported with its exit code and last stderr line instead of a mystery gap.
+  runtime limit, not an ``etl_hf`` behaviour, and one that only bites the
+  UNPACKED 197-input ``gpt2`` graph). Running each leg in its own process means
+  one crash cannot take the matrix down, and the crash is reported with its
+  exit code and last stderr line instead of a mystery gap.
 * **Idempotent.** Every leg writes ``hf_perf_data/<model>__<backend>.json``;
   re-running overwrites it. ``--report`` re-renders the markdown from whatever
   JSONs exist, ``--leg`` runs a single child leg (what the parent does), and
@@ -52,7 +70,7 @@ Run it (the ``iree`` extra is what makes the compiled rows possible)::
     uv run --isolated --extra iree python bench_logs/probe_hf_perf.py
     uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report
     uv run --isolated --extra iree python bench_logs/probe_hf_perf.py \\
-        --models tiny_llama --backends numpy,iree-rocm --iters 5
+        --models tiny_llama --backends numpy,iree-rocm-packed --iters 5
 
 Outputs: ``bench_logs/hf_perf_data/*.json`` (raw, one file per leg) and
 ``bench_logs/hf_perf_results.md`` (tables; generated — never hand-edited).
@@ -76,15 +94,17 @@ DATA_DIR = HERE / "hf_perf_data"
 GOLDENS_DIR = HERE / "hf_goldens"
 REPORT_PATH = HERE / "hf_perf_results.md"
 
-SCHEMA = 1
+SCHEMA = 2
 
 #: IREE's Python runtime SIGSEGVs (no Python exception) when a graph *consumes*
 #: more than ~161 distinct inputs — documented as a Known Issue in
 #: ``etl_hf/CONTEXT.md`` with the measured brackets (161 chained-matmul / 162
-#: fan-out). Compiled legs above this limit are refused up front and marked
-#: "pending weight packing" instead of being attempted silently; pass
-#: ``--attempt-oversize`` to try anyway (the crash is then *measured*, isolated
-#: in the leg's own subprocess, with its exit code recorded).
+#: fan-out). Only an UNPACKED graph gets near it (``gpt2``: 197 inputs); the
+#: packed form of the same model declares 4. Compiled legs above this limit are
+#: refused up front and marked "refused (unpacked)" instead of being attempted
+#: silently; pass ``--attempt-oversize`` to try anyway (the crash is then
+#: *measured*, isolated in the leg's own subprocess, with its exit code
+#: recorded).
 INPUT_LIMIT = 161
 
 #: Checkpoint slug -> golden fixture slug.  The golden ``<slug>.npz`` holds the
@@ -117,37 +137,59 @@ class BackendSpec:
     device_resident: bool = False
     #: Also measure the per-call restaging anti-pattern (device paths only).
     measure_restage: bool = False
+    #: Take packed params inputs (``etl_hf`` ``pack_weights=True``) — the weight
+    #: tree collapsed into a handful of concatenated in-graph slices.
+    packed: bool = False
 
 
-BACKENDS: dict[str, BackendSpec] = {
+#: Compile options are deliberately EMPTY: the measured rows must reflect the
+#: options ``etl_hf.resolve_build_options`` injects (the library default matrix),
+#: not a copy of it that could drift. The resolved set is recorded per leg in
+#: ``backend.resolved_options`` and the level actually used in
+#: ``build.opt_level_used``.
+_BASE_BACKENDS: dict[str, BackendSpec] = {
     "numpy": BackendSpec(
         key="numpy",
         backend="numpy",
         device_kind="cpu",
-        options={},
     ),
     "iree-llvm-cpu": BackendSpec(
         key="iree-llvm-cpu",
         backend="iree",
         device_kind="cpu",
-        options={
-            "target_backends": ["llvm-cpu"],
-            "opt_level": "O3",
-            "iree_compile_args": [
-                "--iree-llvmcpu-target-cpu=host",
-                "--iree-opt-data-tiling",
-            ],
-        },
+        options={"target_backends": ["llvm-cpu"]},
     ),
     "iree-rocm": BackendSpec(
         key="iree-rocm",
         backend="iree",
         device_kind="rocm",
         device_index=0,
-        options={"target_backends": ["rocm"], "opt_level": "O3"},
+        options={"target_backends": ["rocm"]},
         device_resident=True,
         measure_restage=True,
     ),
+}
+
+
+def _packed_variant(spec: BackendSpec) -> BackendSpec:
+    """The same execution path on PACKED params inputs (key suffix ``-packed``)."""
+    return BackendSpec(
+        key=f"{spec.key}-packed",
+        backend=spec.backend,
+        device_kind=spec.device_kind,
+        device_index=spec.device_index,
+        options=dict(spec.options),
+        device_resident=spec.device_resident,
+        measure_restage=spec.measure_restage,
+        packed=True,
+    )
+
+
+#: Unpacked keys first (their numpy leg writes the reference logits the packed
+#: legs are compared against), then the packed variants.
+BACKENDS: dict[str, BackendSpec] = {
+    **_BASE_BACKENDS,
+    **{f"{key}-packed": _packed_variant(spec) for key, spec in _BASE_BACKENDS.items()},
 }
 
 
@@ -305,6 +347,7 @@ def run_leg(
     restage_iters: int = 3,
     attempt_oversize: bool = False,
     measure_public_build: bool | None = None,
+    opt_level_evidence: bool = False,
 ) -> dict:
     """Measure one (model, backend) cell and return its record (never raises)."""
     import numpy as np
@@ -326,6 +369,7 @@ def run_leg(
             "device": f"{spec.device_kind}:{spec.device_index}",
             "options": spec.options,
             "device_resident": spec.device_resident,
+            "packed": spec.packed,
         },
         "measurement": {"iters": iters, "warmup": warmup, "restage_iters": restage_iters},
         "status": "ok",
@@ -376,7 +420,7 @@ def run_leg(
     record["graph"] = {"load_hf_ms": _ms(load_s)}
 
     # -- graph shape: one graph, weights as inputs ---------------------------
-    specs = model.param_specs()
+    specs = model.param_specs(pack_weights=spec.packed)
     param_count = 0
     for value in specs.values():
         total = 1
@@ -386,6 +430,7 @@ def run_leg(
     graph_inputs = len(specs) + 1  # + input_ids
     record["model"].update(
         {
+            "packed": spec.packed,
             "param_count": param_count,
             "weight_inputs": len(specs),
             "graph_inputs": graph_inputs,
@@ -395,9 +440,22 @@ def run_leg(
 
     _progress("trace")
     try:
+        # The packed forward is the same memoised ``@etl.defn`` the library
+        # builds; it is public behaviour but a private factory, so fall back to
+        # the canonical ``graph_fn`` (unpacked only) if that ever moves.
+        if spec.packed or not hasattr(hf_build, "_forward_fn"):
+            forward = hf_build._forward_fn(
+                model._family_spec,
+                model.config,
+                seq_len,
+                batch,
+                spec.packed,
+            )
+        else:
+            forward = model.graph_fn()
         graph, trace_s = _timeit(
             etl.trace,
-            model.graph_fn(),
+            forward,
             specs,
             etl.TensorSpec((batch, seq_len), etl.int32),
         )
@@ -425,19 +483,25 @@ def run_leg(
     oversize = record["model"]["graph_inputs"] > INPUT_LIMIT
     if oversize and spec.backend != "numpy" and not attempt_oversize:
         record["status"] = "skipped"
-        notes.append(
-            f"graph consumes {record['model']['graph_inputs']} inputs, above the "
-            f"~{INPUT_LIMIT}-input IREE runtime limit (SIGSEGV at invoke) and "
-            "etl_hf v1 has no pack_weights option — compiled rows stay "
-            "'pending packing'; numpy row is measured"
+        packed_key = f"{backend_key}-packed"
+        remedy = (
+            f"; the PACKED form of the same model is measured separately as "
+            f"`{model_name}` / `{packed_key}`"
+            if packed_key in BACKENDS and not spec.packed
+            else ""
         )
-        _probe_pack_weights(record, notes)
+        notes.append(
+            f"UNPACKED graph consumes {record['model']['graph_inputs']} inputs, above "
+            f"the ~{INPUT_LIMIT}-input IREE runtime limit (SIGSEGV at invoke) — this leg "
+            f"is refused up front{remedy}"
+        )
+        record["model"]["graph_inputs_gate"] = INPUT_LIMIT
         return record
     if oversize and spec.backend == "numpy":
         notes.append(
             f"this graph consumes {record['model']['graph_inputs']} inputs (> the "
             f"~{INPUT_LIMIT} IREE runtime limit); the numpy row is still a normal "
-            "measurement, the compiled rows of this model are the ones blocked"
+            "measurement, the UNPACKED compiled rows of this model are the refused ones"
         )
     elif oversize:
         notes.append(
@@ -462,17 +526,21 @@ def run_leg(
     )
 
     # -- explicit stage timings (the same composition build_model performs) ---
-    # The resolved ``opt_level`` (O3) is the documented default; when a compiler
-    # REJECTS it we sweep the remaining levels rather than reporting a dead cell,
-    # because "which opt level compiles" is itself a measured result. The level
-    # actually used is recorded in ``build.opt_level_used``.
-    requested_level = resolved_options.get("opt_level")
+    # The resolved ``opt_level`` is the library default for this target set
+    # (``O3`` llvm-cpu, ``O1`` for an all-ROCm target set). It is attempted
+    # FIRST — that is the measured row. Only if it is rejected does the probe
+    # sweep the other levels (so a genuinely broken cell is not reported dead);
+    # ``--opt-level-evidence`` additionally re-attempts the *higher* levels AFTER
+    # a successful build, purely to record the compiler's verbatim rejection
+    # (that rejection is why the library default for ROCm is O1).
+    default_level = resolved_options.get("opt_level")
+    record["build"] = {"opt_level_default": default_level}
     if resolved_backend == "numpy":
         # no compiler, no opt level: exactly one attempt
         attempts: list = [None]
     else:
-        attempts = [requested_level] + [
-            level for level in ("O3", "O2", "O1", "O0") if level != requested_level
+        attempts = [default_level] + [
+            level for level in ("O3", "O2", "O1", "O0") if level != default_level
         ]
     sweep: dict[str, str] = {}
     executable = None
@@ -520,24 +588,56 @@ def run_leg(
         }
         break
 
-    record["build"] = dict(build_times)
+    used_level = used_options.get("opt_level")
+    # -- opt-level evidence: re-attempt the levels ABOVE the one that compiled --
+    # Cheap (the rejection happens during iree-compile, before any execution) and
+    # it is the primary evidence for the library's ROCm default. Failure text is
+    # stored verbatim; nothing is executed from these attempts.
+    if (
+        opt_level_evidence
+        and executable is not None
+        and resolved_backend == "iree"
+        and used_level
+    ):
+        rank = {"O0": 0, "O1": 1, "O2": 2, "O3": 3}
+        used_rank = rank.get(str(used_level))
+        higher = [
+            level
+            for level in ("O3", "O2", "O1")
+            if used_rank is not None
+            and rank[level] > used_rank
+            and level not in sweep
+        ]
+        for level in higher:
+            level_options = dict(used_options)
+            level_options["opt_level"] = level
+            _progress(f"opt-level evidence (opt_level={level})")
+            try:
+                lowered = etl.lower(graph, backend=resolved_backend, **level_options)
+                etl.compile(lowered, backend=resolved_backend, **level_options)
+            except Exception as exc:
+                sweep[level] = _first_diagnostic(exc)
+                continue
+            sweep[level] = "compiled"
+        if higher:
+            record["build"]["opt_level_evidence_attempts"] = higher
+
     if sweep:
         record["build"]["opt_level_sweep"] = sweep
+    record["build"].update(build_times)
     if executable is None:
         record["status"] = "error"
         record["errors"].append(f"lower/compile/load: {first_error}")
         record["build"]["traceback_tail"] = first_traceback
         return record
-    used_level = used_options.get("opt_level")
     record["build"]["opt_level_used"] = used_level
-    if len(sweep) > 1:
+    if used_level != default_level:
         record["backend"]["resolved_options"] = used_options
-        if used_level != requested_level:
-            notes.append(
-                f"opt_level={requested_level} (the etl_hf default) was REJECTED by the "
-                f"compiler; this row is measured at opt_level={used_level}. "
-                f"Per-level outcome: {sweep}"
-            )
+        notes.append(
+            f"opt_level={default_level} (the resolved etl_hf default) was REJECTED by the "
+            f"compiler; this row is measured at opt_level={used_level}. "
+            f"Per-level outcome: {sweep}"
+        )
 
     # -- the public one-call build (cold; proves sum(stages) == build) ------
     if measure_public_build is None:
@@ -552,6 +652,7 @@ def run_leg(
                 model.build,
                 backend=spec.backend,
                 device=device,
+                pack_weights=spec.packed,
                 **public_options,
             )
             record["build"]["public_build_ms"] = _ms(public_s)
@@ -566,6 +667,17 @@ def run_leg(
 
     # -- placement + run ----------------------------------------------------
     host_params = model.params()
+    if spec.packed:
+        # pack ONCE on the host (never per run): the packed tree is what a
+        # ``pack_weights=True`` executable takes.
+        packed_host, pack_s = _timeit(model.pack_params, host_params)
+        host_params = packed_host
+        record["graph"]["pack_params_ms"] = _ms(pack_s)
+        record["graph"]["packed_inputs"] = len(packed_host)
+        notes.append(
+            "packed weights: host params concatenated ONCE with HFModel.pack_params "
+            f"({len(packed_host)} inputs); the graph unpacks them with static etl.slice"
+        )
     run: dict = {"batch": batch, "seq_len": seq_len}
     record["run"] = run
 
@@ -588,18 +700,14 @@ def run_leg(
                 "thread-local HAL device + staging buffer); place_params_steady is "
                 "the steady-state per-placement cost"
             )
-            host_ids = etl.core.from_numpy(ids)
-            ids_operand, ids_s = _timeit(host_ids.to, device)
+            ids_operand, ids_s = _timeit(etl_hf.place_ids, ids, device)
             run["place_ids_ms"] = _ms(ids_s)
-            notes.append(
-                "device-resident run driven through etl.run with an explicitly "
-                "placed ids Tensor (etl_hf.run_model converts ids to a host "
-                "ndarray, which a non-cpu executable rejects at the run boundary)"
-            )
-            call = _device_call(executable, placed, ids_operand)
+            call = _device_call(executable, placed, ids_operand, etl_hf)
+            run["api"] = "etl_hf.run_model(placed params, place_ids(ids))"
             to_host = etl.core.Device("cpu", 0)
         else:
             call = _host_call(executable, host_params, ids, etl, etl_hf)
+            run["api"] = "etl_hf.run_model(host params, host ids)"
             to_host = None
     except Exception as exc:
         record["status"] = "error"
@@ -673,9 +781,9 @@ def run_leg(
                 for _ in range(restage_iters):
                     start = time.perf_counter()
                     placed_again = etl_hf.place_params(host_params, device)
-                    etl.run(executable, placed_again, ids_operand)
+                    etl_hf.run_model(executable, placed_again, ids_operand)
                     restage_samples.append(time.perf_counter() - start)
-                # per-call placement cost alone (one H2D per weight leaf)
+                # per-call placement cost alone (one H2D per weight input)
                 place_only = []
                 for _ in range(restage_iters):
                     _, seconds = _timeit(etl_hf.place_params, host_params, device)
@@ -683,8 +791,8 @@ def run_leg(
                 run["restage"] = _summarize(restage_samples)
                 run["restage_placement_only"] = _summarize(place_only)
                 notes.append(
-                    "restage = etl_hf.place_params(host params) + run per call "
-                    "(the documented per-call restaging anti-pattern)"
+                    "restage = etl_hf.place_params(host params) + etl_hf.run_model per "
+                    "call (the documented per-call restaging anti-pattern)"
                 )
             except Exception as exc:
                 record["errors"].append(
@@ -697,66 +805,36 @@ def run_leg(
     record["parity"]["logits_source"] = "this leg"
     numpy_logits_path = DATA_DIR / f"_numpy_logits_{model_name}.npz"
     if spec.backend == "numpy":
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            numpy_logits_path, logits=np.asarray(logits, dtype=np.float32), input_ids=ids
-        )
-        record["parity"]["wrote_numpy_reference"] = str(numpy_logits_path)
-    elif numpy_logits_path.is_file():
-        with np.load(numpy_logits_path) as blob:
-            reference = np.asarray(blob["logits"], dtype=np.float32)
-        if reference.shape == np.asarray(logits).shape:
-            record["parity"]["max_abs_vs_numpy_backend"] = float(
-                np.abs(np.asarray(logits) - reference).max()
+        if not spec.packed:
+            # The UNPACKED numpy leg is the reference every other leg is diffed
+            # against (packed legs included — packing must not change numerics).
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                numpy_logits_path,
+                logits=np.asarray(logits, dtype=np.float32),
+                input_ids=ids,
             )
-        else:
-            record["errors"].append(
-                f"numpy reference shape {reference.shape} != {np.asarray(logits).shape}"
-            )
-    else:
-        notes.append("no numpy-backend reference logits on disk — CPU-vs-GPU "
-                     "parity not computed for this leg")
+            record["parity"]["wrote_numpy_reference"] = str(numpy_logits_path)
+        record["parity"]["reference"] = "numpy backend (this leg)"
+    if spec.backend != "numpy" or spec.packed:
+        if numpy_logits_path.is_file():
+            with np.load(numpy_logits_path) as blob:
+                reference = np.asarray(blob["logits"], dtype=np.float32)
+            if reference.shape == np.asarray(logits).shape:
+                record["parity"]["max_abs_vs_numpy_backend"] = float(
+                    np.abs(np.asarray(logits) - reference).max()
+                )
+                record["parity"]["reference"] = (
+                    "numpy backend (unpacked leg)" if spec.packed else "numpy backend"
+                )
+            else:
+                record["errors"].append(
+                    f"numpy reference shape {reference.shape} != {np.asarray(logits).shape}"
+                )
+        elif not spec.packed and spec.backend != "numpy":
+            notes.append("no numpy-backend reference logits on disk — CPU-vs-GPU "
+                         "parity not computed for this leg")
     return record
-
-
-def _probe_pack_weights(record: dict, notes: list[str]) -> None:
-    """Record whether ``etl_hf`` exposes a weight-packing option (API probe)."""
-    try:
-        import inspect
-
-        import etl_hf
-        from etl_hf import build as hf_build
-
-        found: list[str] = []
-        surface = set(dir(hf_build)) | set(dir(etl_hf))
-        found += sorted(name for name in surface if "pack_weight" in name.lower())
-        for label, callable_obj in (
-            ("build_model", getattr(hf_build, "build_model", None)),
-            ("HFModel.build", getattr(getattr(etl_hf, "HFModel", None), "build", None)),
-            ("HFModel.graph_fn", getattr(getattr(etl_hf, "HFModel", None), "graph_fn", None)),
-        ):
-            if callable_obj is None:
-                continue
-            try:
-                params = inspect.signature(callable_obj).parameters
-            except (TypeError, ValueError):  # pragma: no cover - builtins only
-                continue
-            if any("pack_weight" in name.lower() for name in params):
-                found.append(f"{label}(...) kwarg")
-        record["model"]["pack_weights_api"] = found or None
-        notes.append(
-            "pack_weights API probe: "
-            + (
-                f"present in etl_hf ({found}) — the compiled rows of this model were "
-                "still not attempted because the probe does not assume a calling "
-                "convention it has not been told about"
-                if found
-                else "absent from etl_hf v1 (no pack_weights kwarg on build_model/"
-                "HFModel.build, no pack_weights helper)"
-            )
-        )
-    except Exception as exc:  # pragma: no cover - import always works in-env
-        record["model"]["pack_weights_api"] = f"probe failed: {exc}"
 
 
 def _host_call(executable, params, ids, etl, etl_hf):
@@ -768,12 +846,16 @@ def _host_call(executable, params, ids, etl, etl_hf):
     return call
 
 
-def _device_call(executable, placed, ids_operand):
-    """Callable for a device-resident executable (``etl.run``, no host copy)."""
-    import etl
+def _device_call(executable, placed, ids_operand, etl_hf):
+    """Callable for a device-resident executable through public ``run_model``.
+
+    ``run_model`` validates an ``etl.Tensor`` ids argument from its METADATA
+    only and forwards it verbatim, so this is the documented device-resident
+    path — no raw ``etl.run`` short-circuit, no host copy.
+    """
 
     def call():
-        return etl.run(executable, placed, ids_operand)
+        return etl_hf.run_model(executable, placed, ids_operand)
 
     return call
 
@@ -868,8 +950,9 @@ def run_child_leg(
     restage_iters: int,
     attempt_oversize: bool,
     no_public_build: bool = False,
+    opt_level_evidence: bool = False,
     suffix: str = "",
-    timeout: float = 900.0,
+    timeout: float = 1800.0,
 ) -> dict:
     """Run ONE leg in a subprocess; return the merged record (crash-safe)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -896,6 +979,8 @@ def run_child_leg(
         command.append("--attempt-oversize")
     if no_public_build:
         command.append("--no-public-build")
+    if opt_level_evidence:
+        command.append("--opt-level-evidence")
     label = f"{model}/{backend}{suffix}"
     print(f"[leg] {label}: running …", flush=True)
     started = time.perf_counter()
@@ -918,7 +1003,8 @@ def run_child_leg(
             "schema": SCHEMA,
             "model": {"name": model, "golden": MODELS.get(model)},
             "backend": {"key": backend, "backend": BACKENDS[backend].backend,
-                        "device": f"{BACKENDS[backend].device_kind}:{BACKENDS[backend].device_index}"},
+                        "device": f"{BACKENDS[backend].device_kind}:{BACKENDS[backend].device_index}",
+                        "packed": BACKENDS[backend].packed},
             "status": "crash",
             "errors": [
                 f"leg subprocess produced no record (exit={exit_code}); "
@@ -1026,37 +1112,53 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add("`etl_hf`'s public API: `load_hf` → `etl_hf.build_model` (trace → lower → compile →")
     add("load) → run, with the checkpoint weights as ordinary graph **inputs**.")
     add("")
+    add("Every backend row exists twice: **unpacked** (one graph input per weight input,")
+    add("the canonical tree) and **packed** (`pack_weights=True`; key suffix `-packed`), where")
+    add("`HFModel.pack_params` concatenates the weight tree on the host into a handful of")
+    add("inputs that the graph unpacks with static `etl.slice`. Packing is what brings the")
+    add("124M `gpt2` graph (197 unpacked inputs) under IREE's ~161-consumed-input runtime")
+    add("limit — the packed rows are the ones that make it runnable on a compiler backend.")
+    add("")
     add("## Method (what a number means)")
     add("")
     add("| aspect | how it is measured |")
     add("|---|---|")
     add(
         "| latency | `best` of N warm calls (after a warmup) of "
-        "`etl_hf.run_model(exe, params, ids)` on CPU paths, or `etl.run(exe, placed_params, placed_ids)` "
-        "on the device-resident path. `first` is the very first call after load (includes the "
-        "executable's input/output plan building). `median`/`mean` in the JSON. |"
+        "`etl_hf.run_model(exe, params, ids)` — on the device-resident rows with "
+        "`place_params`-ed weights and a `place_ids`-ed ids tensor (the documented device "
+        "recipe, through the public API). `first` is the very first call after load (includes "
+        "the executable's input/output plan building). `median`/`mean` in the JSON. |"
     )
     add(
         "| warm loop, device | device-resident = weights placed ONCE with "
-        "`etl_hf.place_params` and then a same-device loop (outputs stay on the GPU, never "
-        "auto-copied). `+d2h` re-times the loop WITH one explicit `Tensor.to(cpu)` per call. |"
+        "`etl_hf.place_params` + ids placed with `etl_hf.place_ids`, then a same-device loop "
+        "(outputs stay on the GPU, never auto-copied). `+d2h` re-times the loop WITH one "
+        "explicit `Tensor.to(cpu)` per call. |"
     )
     add(
         "| restage (anti-pattern) | `place_params(host params)` **on every call** + run — the "
         "documented per-call host→device restaging trap, measured on the same graph. |"
     )
     add(
+        "| packed weights | `HFModel.pack_params` runs ONCE on the host (its cost is recorded "
+        "as `pack_params_ms`); the executable is built with `pack_weights=True`, and every "
+        "latency/parity number below is the packed executable's. |"
+    )
+    add(
         "| build times | explicit `etl.lower` / `etl.compile` / `etl.load` on the traced graph, "
-        "with the options `etl_hf.resolve_build_options` resolves (`opt_level=\"O3\"`; "
-        "`--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for llvm-cpu). "
-        "`stage sum` is that composition; the public one-call `build_model` total is measured "
-        "separately where cheap (small models) as a cross-check. |"
+        "with the options `etl_hf.resolve_build_options` resolves — the **library defaults** "
+        "(`opt_level=\"O3\"` for llvm-cpu, `opt_level=\"O1\"` for an all-ROCm target set, plus "
+        "`--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for llvm-cpu). `stage sum` "
+        "is that composition; the public one-call `build_model` total is measured separately "
+        "where cheap (small models) as a cross-check. |"
     )
     add(
         "| parity | `max-abs` of this leg's logits vs (a) the **torch/transformers golden** in "
         "`bench_logs/hf_goldens/` (absolute truth; the input ids are the golden's own ids) and "
-        "(b) the **numpy interpreter backend** on the identical graph/weights. Not bit-equality: "
-        "fp32 accumulation order differs between backends. |"
+        "(b) the **numpy interpreter backend** on the identical weights — for packed rows that "
+        "reference is the *unpacked* numpy leg, so `0.00` there means packing is bit-identical. "
+        "Not bit-equality between backends: fp32 accumulation order differs. |"
     )
     add(
         "| tokens/s | `batch × seq_len / best latency` — a forward-pass rate, NOT decode "
@@ -1097,58 +1199,77 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     # ---- 1. graph size ----------------------------------------------------
     add("## 1. Graph size (backend independent)")
     add("")
-    add(
-        "| model | family | act | params | weight inputs | graph inputs | IR ops "
-        "| distinct op defs | StableHLO | constants | trace | export |"
-    )
-    add("|---|---|---|---|---|---|---|---|---|---|---|---|")
-    for model in models:
-        row = rec(model, backends[0]).get("model", {})
-        graph = rec(model, backends[0]).get("graph", {})
-        stable = graph.get("stablehlo_bytes")
+    for packed, label in ((False, "Unpacked weights (one graph input per weight)"),
+                          (True, "Packed weights (`pack_weights=True`)")):
+        group = [b for b in backends if BACKENDS[b].packed == packed]
+        if not group:
+            continue
+        add(f"### {label}")
+        add("")
         add(
-            "| `{model}` | {family} | {act} | {params} | {weights} | {inputs} | {ops} | {distinct} "
-            "| {stable} | {consts} | {trace} | {export} |".format(
-                model=model,
-                family=row.get("family"),
-                act=row.get("hidden_act"),
-                params=_fmt(row.get("param_count")),
-                weights=_fmt(row.get("weight_inputs")),
-                inputs=_fmt(row.get("graph_inputs")),
-                ops=_fmt(graph.get("ir_ops")),
-                distinct=_fmt(graph.get("ir_distinct_ops")),
-                stable=_fmt((stable / 1024) if stable else None, 1, " KB"),
-                consts=_fmt(graph.get("stablehlo_constants")),
-                trace=_fmt(graph.get("trace_ms"), 1, " ms"),
-                export=_fmt(graph.get("export_ms"), 1, " ms"),
-            )
+            "| model | family | act | params | weight inputs | graph inputs | IR ops "
+            "| distinct op defs | StableHLO | constants | trace | export | pack (host) |"
         )
-    add("")
+        add("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for model in models:
+            record = rec(model, group[0])
+            row = record.get("model", {})
+            graph = record.get("graph", {})
+            stable = graph.get("stablehlo_bytes")
+            add(
+                "| `{model}` | {family} | {act} | {params} | {weights} | {inputs} | {ops} "
+                "| {distinct} | {stable} | {consts} | {trace} | {export} | {pack} |".format(
+                    model=model,
+                    family=row.get("family"),
+                    act=row.get("hidden_act"),
+                    params=_fmt(row.get("param_count")),
+                    weights=_fmt(row.get("weight_inputs")),
+                    inputs=_fmt(row.get("graph_inputs")),
+                    ops=_fmt(graph.get("ir_ops")),
+                    distinct=_fmt(graph.get("ir_distinct_ops")),
+                    stable=_fmt((stable / 1024) if stable else None, 1, " KB"),
+                    consts=_fmt(graph.get("stablehlo_constants")),
+                    trace=_fmt(graph.get("trace_ms"), 1, " ms"),
+                    export=_fmt(graph.get("export_ms"), 1, " ms"),
+                    pack=_fmt(graph.get("pack_params_ms"), 1, " ms") if packed else "—",
+                )
+            )
+        add("")
     add(
         "`graph inputs` = weight inputs + 1 (the `(batch, seq_len)` int32 `input_ids`). "
-        "The IR op count is the same for every backend — it is the traced graph, not a "
-        "backend artifact."
+        "The IR op count differs between the packed/unpacked graphs because the packed one "
+        "adds its in-graph `slice` unpacking; it is identical for every backend of the same "
+        "graph — the traced program, not a backend artifact."
     )
     add("")
-
     # ---- 2. build times --------------------------------------------------
     add("## 2. Build (lower / compile / load)")
     add("")
-    add("| model | backend | device | lower | compile | load | stage sum | public build |")
-    add("|---|---|---|---|---|---|---|---|")
+    add("| model | backend | device | opt_level used | lower | compile | load | stage sum "
+        "| public build |")
+    add("|---|---|---|---|---|---|---|---|---|")
     for model in models:
         for backend in backends:
             record = rec(model, backend)
             build = record.get("build", {})
             backend_info = record.get("backend", {})
             if not build:
-                add(f"| `{model}` | `{backend}` | {backend_info.get('device', '—')} | — | — | — | — | — |")
+                add(f"| `{model}` | `{backend}` | {backend_info.get('device', '—')} | — | — | — "
+                    "| — | — | — |")
                 continue
+            used = build.get("opt_level_used")
+            default = build.get("opt_level_default")
+            level = "—" if used is None else (
+                f"`{used}` (default `{default}` rejected)"
+                if default and used != default
+                else f"`{used}`"
+            )
             add(
-                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} |".format(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
                     model,
                     backend,
                     backend_info.get("device"),
+                    level,
                     _fmt(build.get("lower_ms"), 1, " ms"),
                     _fmt(build.get("compile_ms"), 1, " ms"),
                     _fmt(build.get("load_ms"), 1, " ms"),
@@ -1158,10 +1279,14 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
             )
     add("")
     add(
-        "Compile time is the IREE compile of the whole-model graph (the numpy interpreter "
-        "has no compile step). `public build` is the cold `etl_hf.build_model` total where "
-        "measured — it re-runs the stages, so it should be ≳ the stage sum (it also does "
-        "`load_hf`-side work and graph memoisation bookkeeping)."
+        "`opt_level used` is the level the row was actually built at; the resolved default is "
+        "recorded per leg in `build.opt_level_default` / `build.opt_level_used` (the library "
+        "defaults: `O3` for llvm-cpu, `O1` for an all-ROCm target set — section 7 explains the "
+        "O2/O3 ROCm rejection that forces it). Compile time is the IREE compile of the "
+        "whole-model graph (the numpy interpreter has no compile step). `public build` is the "
+        "cold `etl_hf.build_model` total where measured — it re-runs the stages, so it should "
+        "be ≳ the stage sum (it also does `load_hf`-side work and graph memoisation "
+        "bookkeeping)."
     )
     add("")
 
@@ -1193,7 +1318,9 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "`+d2h best` = same device loop with one explicit `Tensor.to(cpu)` of the logits per "
         "call (what you pay if you need the logits on the host); `restage best` = the whole "
         "weight tree re-placed on the device every call — the documented anti-pattern, and "
-        "why the device loop above is the fast iteration pattern."
+        "why the device loop above is the fast iteration pattern. Device rows are driven "
+        "through `etl_hf.run_model(exe, place_params(...), place_ids(...))` — the public "
+        "`etl_hf` API, no raw `etl.run` short-circuit (the leg records `run.api`)."
     )
     add("")
 
@@ -1234,34 +1361,45 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     # ---- 5. speedups -----------------------------------------------------
     add("## 5. GPU vs CPU")
     add("")
-    add(
-        "| model | numpy (cpu) | iree llvm-cpu | iree rocm (device-resident) "
-        "| rocm / numpy | rocm / llvm-cpu | numpy / llvm-cpu |"
-    )
-    add("|---|---|---|---|---|---|---|")
-    for model in models:
-        row: dict[str, float | None] = {}
-        for backend in ("numpy", "iree-llvm-cpu", "iree-rocm"):
-            if backend in backends:
-                row[backend] = (rec(model, backend).get("run") or {}).get("best_ms")
-        def ratio(a: str, b: str):
-            left, right = row.get(a), row.get(b)
-            if not left or not right:
-                return None
-            return round(left / right, 2)
-
+    for packed, label in ((False, "Unpacked weights"), (True, "Packed weights")):
+        group = [b for b in backends if BACKENDS[b].packed == packed]
+        if not group:
+            continue
+        numpy_key = "numpy-packed" if packed else "numpy"
+        cpu_key = "iree-llvm-cpu-packed" if packed else "iree-llvm-cpu"
+        gpu_key = "iree-rocm-packed" if packed else "iree-rocm"
+        if not all(key in group for key in (numpy_key, cpu_key, gpu_key)):
+            continue
+        add(f"### {label}")
+        add("")
         add(
-            "| `{}` | {} | {} | {} | {} | {} | {} |".format(
-                model,
-                _fmt(row.get("numpy"), 2, " ms"),
-                _fmt(row.get("iree-llvm-cpu"), 2, " ms"),
-                _fmt(row.get("iree-rocm"), 2, " ms"),
-                _fmt(ratio("numpy", "iree-rocm"), 2, "×"),
-                _fmt(ratio("iree-llvm-cpu", "iree-rocm"), 2, "×"),
-                _fmt(ratio("iree-llvm-cpu", "numpy"), 2, "×"),
-            )
+            "| model | numpy (cpu) | iree llvm-cpu | iree rocm (device-resident) "
+            "| rocm / numpy | rocm / llvm-cpu | numpy / llvm-cpu |"
         )
-    add("")
+        add("|---|---|---|---|---|---|---|")
+        for model in models:
+            row: dict[str, float | None] = {}
+            for backend in (numpy_key, cpu_key, gpu_key):
+                row[backend] = (rec(model, backend).get("run") or {}).get("best_ms")
+
+            def ratio(a: str, b: str):
+                left, right = row.get(a), row.get(b)
+                if not left or not right:
+                    return None
+                return round(left / right, 2)
+
+            add(
+                "| `{}` | {} | {} | {} | {} | {} | {} |".format(
+                    model,
+                    _fmt(row.get(numpy_key), 2, " ms"),
+                    _fmt(row.get(cpu_key), 2, " ms"),
+                    _fmt(row.get(gpu_key), 2, " ms"),
+                    _fmt(ratio(numpy_key, gpu_key), 2, "×"),
+                    _fmt(ratio(cpu_key, gpu_key), 2, "×"),
+                    _fmt(ratio(cpu_key, numpy_key), 2, "×"),
+                )
+            )
+        add("")
     add(
         "Speedup columns are latency ratios (`A/B > 1` ⇒ B is faster). Two regimes are "
         "visible and both are measured, not assumed: `numpy / llvm-cpu > 1` means plain "
@@ -1271,7 +1409,6 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "(these models are far too small for that)."
     )
     add("")
-
     # ---- 6. findings -----------------------------------------------------
     add("## 6. Findings")
     add("")
@@ -1279,16 +1416,40 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add("")
 
     # ---- 7. the input-count limit, measured -------------------------------
-    add("## 7. Blocked compiled rows: the input-count limit, measured")
+    add("## 7. The ~161-consumed-input cliff: measured, and resolved by packing")
+    add("")
+    add(
+        "IREE's Python runtime **SIGSEGVs without a Python exception** when a graph consumes "
+        "more than ~161 distinct inputs (documented in `etl_hf/CONTEXT.md` Known Issues with "
+        "the measured brackets: 161 chained-matmul / 162 fan-out). Only an *unpacked* graph "
+        "gets near it:"
+    )
+    add("")
+    add("| model | unpacked graph inputs | unpacked compiled legs | packed graph inputs "
+        "| packed compiled legs |")
+    add("|---|---|---|---|---|")
+    for model in models:
+        unpacked_keys = [key for key in backends if not BACKENDS[key].packed and key != "numpy"]
+        packed_keys = [key for key in backends if BACKENDS[key].packed and key != "numpy"]
+        unpacked_inputs = (rec(model, "numpy").get("model") or {}).get("graph_inputs")
+        packed_inputs = (rec(model, "numpy-packed").get("model") or {}).get("graph_inputs")
+        add(
+            "| `{}` | {} | {} | {} | {} |".format(
+                model,
+                _fmt(unpacked_inputs),
+                ", ".join(f"`{key}` {rec(model, key).get('status') or '—'}" for key in unpacked_keys),
+                _fmt(packed_inputs),
+                ", ".join(f"`{key}` {rec(model, key).get('status') or '—'}" for key in packed_keys),
+            )
+        )
     add("")
     if not crash:
         add("No deliberate over-limit attempt was recorded (run without `--no-crash-probe`).")
     else:
         add(
-            "Compiled legs above the ~161-consumed-input limit are **refused up front** "
-            "(section 1 gives the input counts). To show that the refusal describes a real "
-            "runtime limit and not a guess, each such leg is attempted ONCE in its own "
-            "subprocess:"
+            "To show that the refusal describes a real runtime limit and not a guess, each "
+            "refused leg is attempted ONCE in its own subprocess (CPU targets only — a live GPU "
+            "context is never put in front of a deliberate SIGSEGV):"
         )
         add("")
         add("| leg | graph inputs | exit code | status | last stderr line |")
@@ -1310,14 +1471,13 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         exits = {str((record.get("process") or {}).get("exit_code")) for record in crash.values()}
         add(
             "The attempt dies with exit code(s) {} **without a Python exception** — a hard "
-            "crash inside the IREE runtime invoke, exactly the documented limit, so these rows "
-            "stay *pending weight packing* rather than being reported as slow or missing. "
-            "`etl_hf` v1 has no `pack_weights` option; a packed/ fused-weight variant "
-            "(`12·L + 4` weight inputs, i.e. 149 with ids for `gpt2`) would fall below the "
-            "limit.".format(", ".join(f"`{value}`" for value in sorted(exits)))
+            "crash inside the IREE runtime invoke, exactly the documented limit. The cliff is a "
+            "property of the UNPACKED graph (197 inputs for `gpt2`), not of the model: the "
+            "packed form of the same checkpoint declares 4 inputs and its compiled rows are "
+            "measured in tables 2–4 — nothing is extrapolated from other models."
+            .format(", ".join(f"`{value}`" for value in sorted(exits)))
         )
     add("")
-
     # ---- 8. failures -----------------------------------------------------
     add("## 8. Non-`ok` legs (verbatim)")
     add("")
@@ -1402,9 +1562,11 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add("## 11. Scope, limits, and what is NOT claimed")
     add("")
     add(
-        "**Measured facts** — everything in tables 1–5 and the reproducibility table came out of "
-        "this probe on this host, is regenerable with the command below, and is stored verbatim "
-        "in `hf_perf_data/*.json`."
+        "**Measured facts** — everything in tables 1–5, the packed/unpacked comparison of "
+        "section 7 and the reproducibility table came out of this probe on this host, is "
+        "regenerable with the command below, and is stored verbatim in `hf_perf_data/*.json` "
+        "(unpacked legs in `<model>__<backend>.json`, packed legs in "
+        "`<model>__<backend>-packed.json`)."
     )
     add("")
     add("**Not measured / not claimed:**")
@@ -1412,8 +1574,9 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add(
         "- **No torch latency baseline.** `torch`/`transformers` are not installed in the probe "
         "environment, so the torch goldens are used for *numerics only*. The only latency "
-        "comparison here is between etl's own three execution paths. (An etl-vs-torch-eager "
-        "comparison needs a torch-enabled environment and is deliberately out of scope.)"
+        "comparison here is between etl's own execution paths (three backend paths, each in "
+        "unpacked and packed form). (An etl-vs-torch-eager comparison needs a torch-enabled "
+        "environment and is deliberately out of scope.)"
     )
     add(
         "- **Not a decode benchmark.** v1 has no KV cache and no incremental decode: every call "
@@ -1431,8 +1594,16 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "the run-to-run spread that actually occurred."
     )
     add(
-        "- **Compiled `gpt2` rows do not exist** (section 7). Nothing is extrapolated from the "
+        "- **Compiled `gpt2` rows exist only as PACKED rows.** The unpacked 197-input graph is "
+        "refused by IREE's ~161-input runtime limit (section 7, measured crash); the packed "
+        "graph (4 inputs) is the one measured in tables 2–4. Nothing is extrapolated from the "
         "`distilgpt2` row: the input-count limit is a hard runtime limit, not a size effect."
+    )
+    add(
+        "- **Packing is opt-in and not free.** `pack_weights=True` plus a `pack_params` call is "
+        "required (a `pack_weights=False` executable still takes one input per weight); the "
+        "packed graph spends a few extra in-graph `slice` ops, which is why its IR op count is "
+        "slightly higher than the unpacked one. Both forms are measured here."
     )
     add(
         "- **CPU-thread count is not pinned.** The numpy row benefits from OpenBLAS threading; a "
@@ -1444,10 +1615,12 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add("")
     add("```bash")
     add("uv run --isolated --extra iree python bench_logs/probe_hf_perf.py")
+    add("# with the per-level opt_level rejection evidence re-attempted on every compiled leg:")
+    add("uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --opt-level-evidence")
     add("uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report  # markdown only")
     add("# one row, to check reproducibility of a published number:")
     add("uv run --isolated --extra iree python bench_logs/probe_hf_perf.py \\")
-    add("    --models tiny_llama --backends iree-rocm --no-sanity --no-crash-probe")
+    add("    --models gpt2 --backends iree-rocm-packed --no-sanity --no-crash-probe")
     add("```")
     add("")
     return "\n".join(lines).rstrip() + "\n"
@@ -1463,6 +1636,15 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
     def parity(model: str, backend: str, key: str):
         return (records.get((model, backend), {}).get("parity") or {}).get(key)
 
+    def group(packed: bool) -> list[str]:
+        return [key for key in backends if BACKENDS[key].packed == packed]
+
+    def keys_for(packed: bool) -> tuple[str, str, str]:
+        suffix = "-packed" if packed else ""
+        return (f"numpy{suffix}", f"iree-llvm-cpu{suffix}", f"iree-rocm{suffix}")
+
+    ok = lambda key, model: (records.get((model, key), {}) or {}).get("status") == "ok"
+
     # parity headline
     worst = []
     for model in models:
@@ -1473,71 +1655,100 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
     if worst:
         model, backend, value = max(worst, key=lambda item: item[2])
         out.append(
-            f"- **Parity.** Every measured leg reproduces the torch/transformers golden logits "
-            f"to fp32 accumulation order: the largest deviation anywhere in the matrix is "
-            f"`{value:.2e}` ({model} / {backend}). Deltas are 1e-8-class on the tiny "
-            "checkpoints and 1e-4-class on the 82M/124M ones, whose logits reach |max| ≈ "
-            "80–140 (i.e. ~1e-6 relative)."
+            f"- **Parity.** Every measured leg — packed and unpacked — reproduces the "
+            f"torch/transformers golden logits to fp32 accumulation order: the largest "
+            f"deviation anywhere in the matrix is `{value:.2e}` ({model} / {backend}). "
+            "Deltas are 1e-8-class on the tiny checkpoints and 1e-4-class on the 82M/124M "
+            "ones, whose logits reach |max| ≈ 80–300 (i.e. ~1e-6 relative)."
         )
+
+    # packing must not change numerics: packed legs vs the unpacked numpy reference
+    pack_parity = [
+        (model, backend, parity(model, backend, "max_abs_vs_numpy_backend"))
+        for model in models
+        for backend in group(True)
+        if isinstance(parity(model, backend, "max_abs_vs_numpy_backend"), float)
+    ]
+    if pack_parity:
+        exact = [row for row in pack_parity if row[2] == 0.0]
+        model, backend, value = max(pack_parity, key=lambda item: item[2])
+        out.append(
+            "- **Packing does not change numerics.** The packed numpy rows are **bit-identical** "
+            "to the unpacked numpy reference (`max-abs 0.00`) on "
+            + ", ".join(f"`{row[0]}`" for row in exact)
+            + " — `pack_params` is a pure host-side concatenation and the in-graph `etl.slice` "
+            "unpacking returns the very same values. The largest packed-vs-unpacked-reference "
+            f"delta anywhere is `{value:.2e}` (`{model}` / `{backend}`), i.e. the compiled "
+            "kernels' fp32 accumulation order, not packing."
+        )
+
     numpy_parity = [
         (model, parity(model, backend, "max_abs_vs_numpy_backend"))
         for model in models
         for backend in backends
-        if backend != "numpy"
+        if not backend.startswith("numpy")
     ]
     numpy_parity = [(m, v) for m, v in numpy_parity if isinstance(v, float)]
     if numpy_parity:
         model, value = max(numpy_parity, key=lambda item: item[1])
         out.append(
-            f"- **Compiled vs the numpy interpreter** on the identical graph and weights: "
-            f"largest max-abs is `{value:.2e}` ({model}). The numpy backend is the reference "
-            "here, so this isolates backend numerics from checkpoint parsing."
+            f"- **Compiled vs the numpy interpreter** on the identical weights: largest max-abs "
+            f"is `{value:.2e}` ({model}). The numpy backend is the reference here, so this "
+            "isolates backend numerics from checkpoint parsing."
         )
 
-    # cpu: numpy vs compiled
-    comparisons = []
-    for model in models:
-        numpy_ms, cpu_ms = best(model, "numpy"), best(model, "iree-llvm-cpu")
-        if numpy_ms and cpu_ms:
-            comparisons.append((model, numpy_ms, cpu_ms, numpy_ms / cpu_ms))
-    if comparisons:
-        wins = [c for c in comparisons if c[3] < 1.0]
+    # cpu: numpy vs compiled, per packing group
+    for packed in (False, True):
+        numpy_key, cpu_key, _ = keys_for(packed)
+        comparisons = []
+        for model in models:
+            numpy_ms, cpu_ms = best(model, numpy_key), best(model, cpu_key)
+            if numpy_ms and cpu_ms:
+                comparisons.append((model, numpy_ms, cpu_ms))
+        if not comparisons:
+            continue
+        wins = [row for row in comparisons if row[1] < row[2]]
         phrases = []
-        for model, numpy, cpu, _ in comparisons:
-            if numpy <= cpu:
+        for model, numpy_ms, cpu_ms in comparisons:
+            if numpy_ms <= cpu_ms:
                 phrases.append(
-                    f"`{model}` numpy {numpy:,.2f} ms vs llvm-cpu {cpu:,.2f} ms "
-                    f"(numpy {cpu / numpy:.2f}× faster)"
+                    f"`{model}` numpy {numpy_ms:,.2f} ms vs llvm-cpu {cpu_ms:,.2f} ms "
+                    f"(numpy {cpu_ms / numpy_ms:.2f}× faster)"
                 )
             else:
                 phrases.append(
-                    f"`{model}` numpy {numpy:,.2f} ms vs llvm-cpu {cpu:,.2f} ms "
-                    f"(llvm-cpu {numpy / cpu:.2f}× faster)"
+                    f"`{model}` numpy {numpy_ms:,.2f} ms vs llvm-cpu {cpu_ms:,.2f} ms "
+                    f"(llvm-cpu {numpy_ms / cpu_ms:.2f}× faster)"
                 )
+        label = "packed" if packed else "unpacked"
         out.append(
-            "- **On CPU the numpy interpreter is competitive-to-faster than the compiled "
-            "graph** (numpy faster on {} of {} measured models): ".format(
-                len(wins), len(comparisons)
-            )
-            + ", ".join(phrases)
+            f"- **On CPU ({label} weights) the numpy interpreter is competitive-to-faster than "
+            f"the compiled graph** (numpy faster on {len(wins)} of {len(comparisons)} measured "
+            "models): " + ", ".join(phrases)
             + ". The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE "
             "dispatch overhead per op (these graphs are hundreds of small ops). **The compiled "
             "path's value is the GPU**, not CPU speed."
         )
 
-    # gpu
-    gpu_rows = []
-    for model in models:
-        numpy_ms, cpu_ms, gpu_ms = (
-            best(model, "numpy"),
-            best(model, "iree-llvm-cpu"),
-            best(model, "iree-rocm"),
-        )
-        if gpu_ms:
-            gpu_rows.append((model, numpy_ms, cpu_ms, gpu_ms))
-    if gpu_rows:
+    # gpu rows, per packing group
+    gpu_blocks = []
+    for packed in (False, True):
+        numpy_key, cpu_key, gpu_key = keys_for(packed)
+        rows = []
+        for model in models:
+            numpy_ms, cpu_ms, gpu_ms = (
+                best(model, numpy_key),
+                best(model, cpu_key),
+                best(model, gpu_key),
+            )
+            if gpu_ms:
+                rows.append((model, numpy_ms, cpu_ms, gpu_ms))
+        if rows:
+            gpu_blocks.append((packed, rows))
+    for packed, rows in gpu_blocks:
+        label = "packed" if packed else "unpacked"
         out.append(
-            "- **GPU (MI300X, ROCm, device-resident)**: "
+            f"- **GPU (MI300X, ROCm, device-resident, {label} weights)**: "
             + ", ".join(
                 "`{}` {}{}{}".format(
                     model,
@@ -1545,26 +1756,24 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
                     f" — {numpy / gpu:.2f}× faster than numpy" if numpy else "",
                     f", {cpu / gpu:.2f}× faster than iree-llvm-cpu" if cpu else "",
                 )
-                for model, numpy, cpu, gpu in gpu_rows
+                for model, numpy, cpu, gpu in rows
             )
             + "."
         )
-        small = [
-            row for row in gpu_rows if row[1] and row[3] and row[1] / row[3] < 2.0
-        ]
+        small = [row for row in rows if row[1] and row[3] and row[1] / row[3] < 2.0]
         if small:
             out.append(
-                "- **The GPU win is size-dependent, and the small models are below the "
-                "dispatch floor.** For {} the device-resident GPU path is not faster than the "
-                "host path: at these shapes the per-call cost is fixed overhead (iree HAL "
-                "dispatch + kernel launches, ~0.1–0.5 ms class) while the whole forward is "
-                "only a few hundred microseconds of arithmetic. Real-size checkpoints "
-                "(`distilgpt2`/`gpt2`, 82M/124M params) are where the GPU pulls ahead — see "
-                "the table.".format(", ".join(f"`{row[0]}`" for row in small))
+                "- **The GPU win is size-dependent, and the small models sit at the dispatch "
+                f"floor** ({label} weights): for "
+                + ", ".join(f"`{row[0]}`" for row in small)
+                + " the device-resident GPU path is not ≥2× faster than the numpy host path — "
+                "at these shapes the per-call cost is fixed overhead (iree HAL dispatch + "
+                "kernel launches) while the whole forward is only a few hundred microseconds "
+                "of arithmetic. The 82M/124M checkpoints are where the GPU pulls ahead."
             )
 
-    # compiler option fallbacks (measured by the per-leg opt-level sweep)
-    fallbacks = []
+    # compiler option evidence (measured by the opt-level evidence attempts)
+    evidence = []
     for model in models:
         for backend in backends:
             build = (records.get((model, backend), {}) or {}).get("build") or {}
@@ -1572,78 +1781,95 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
             used = build.get("opt_level_used")
             rejected = {lvl: msg for lvl, msg in sweep.items() if msg != "compiled"}
             if rejected and used:
-                fallbacks.append((model, backend, used, rejected))
-    if fallbacks:
+                evidence.append((model, backend, used, rejected))
+    if evidence:
         out.append(
-            "- **Compiler option fallback, measured (never a silent downgrade):** "
+            "- **ROCm `opt_level` default = `O1`, and the rejection above it is real "
+            "(measured, never asserted):** "
             + "; ".join(
-                "`{}` / `{}` — the requested {} rejected by `iree-compile` ({}) so this row is "
-                "measured at `opt_level={}`".format(
+                "`{}` / `{}` — built at `opt_level={}`, while {}".format(
                     model,
                     backend,
-                    ", ".join(f"`{lvl}`" for lvl in rejected),
-                    "; ".join(f"{lvl} → {msg}" for lvl, msg in rejected.items()),
                     used,
+                    " and ".join(
+                        f"`{lvl}` fails with `{msg}`" for lvl, msg in rejected.items()
+                    ),
                 )
-                for model, backend, used, rejected in fallbacks
+                for model, backend, used, rejected in evidence
             )
-            + ". The per-leg sweep tries the requested level first, then O3 → O2 → O1 → O0, and "
-            "records each level's outcome in `build.opt_level_sweep`."
+            + ". That `'func.func' op failed to distribute` is an upstream `iree-compile` "
+            "ROCm codegen failure on the LayerNorm-shaped reduce (not an etl/etl_hf bug), so "
+            "the library now injects `opt_level=\"O1\"` for an all-ROCm target set — these "
+            "rows are measured at that default, and the higher levels are re-attempted only to "
+            "record the verbatim error."
         )
 
     # restage
     restage_rows = []
     for model in models:
-        run = records.get((model, "iree-rocm"), {}).get("run") or {}
-        loop = (run.get("best_ms") or None)
-        restage = (run.get("restage") or {}).get("best_ms")
-        if loop and restage:
-            restage_rows.append((model, loop, restage, restage / loop))
+        for backend in backends:
+            run = records.get((model, backend), {}).get("run") or {}
+            loop = run.get("best_ms")
+            restage = (run.get("restage") or {}).get("best_ms")
+            if loop and restage:
+                restage_rows.append((model, backend, loop, restage, restage / loop))
     if restage_rows:
         out.append(
             "- **Per-call restaging is the anti-pattern, measured here:** re-placing the whole "
             "weight tree on the device every call costs "
             + ", ".join(
-                f"`{model}` {restage:,.2f} ms vs {loop:,.2f} ms for the same-device loop "
-                f"({ratio:,.1f}×)"
-                for model, loop, restage, ratio in restage_rows
+                f"`{model}`/`{backend}` {restage:,.2f} ms vs {loop:,.2f} ms for the same-device "
+                f"loop ({ratio:,.1f}×)"
+                for model, backend, loop, restage, ratio in restage_rows
             )
-            + ". The same-device loop (`place_params` once, feed device tensors back) is the "
-            "iteration pattern to use."
+            + ". The same-device loop (`place_params` + `place_ids` once, feed device tensors "
+            "back) is the iteration pattern to use — with packed weights it also stages 3–8 "
+            "leaves instead of ~100–200."
         )
 
     d2h_rows = []
     for model in models:
-        run = records.get((model, "iree-rocm"), {}).get("run") or {}
-        loop = run.get("best_ms")
-        with_d2h = (run.get("warm_with_d2h") or {}).get("best_ms")
-        if loop and with_d2h:
-            d2h_rows.append((model, loop, with_d2h))
+        for backend in backends:
+            run = records.get((model, backend), {}).get("run") or {}
+            loop = run.get("best_ms")
+            with_d2h = (run.get("warm_with_d2h") or {}).get("best_ms")
+            if loop and with_d2h:
+                d2h_rows.append((model, backend, loop, with_d2h))
     if d2h_rows:
         out.append(
             "- **Reading the logits back to the host costs extra**: same loop plus one "
             "explicit `Tensor.to(cpu)` per call is "
             + ", ".join(
-                f"`{model}` {with_d2h:,.2f} ms (vs {loop:,.2f} ms)" for model, loop, with_d2h in d2h_rows
+                f"`{model}`/`{backend}` {with_d2h:,.2f} ms (vs {loop:,.2f} ms)"
+                for model, backend, loop, with_d2h in d2h_rows
             )
             + "."
         )
 
-    # input limit / packing
-    blocked = [
-        model
+    # the input-count cliff, and what packing changed
+    refused = [
+        (model, key)
         for model in models
-        if (records.get((model, "iree-llvm-cpu"), {}) or {}).get("status") in ("skipped", "crash")
+        for key in backends
+        if (records.get((model, key), {}) or {}).get("status") == "skipped"
     ]
-    if blocked:
+    packed_ok = [
+        (model, f"{key}-packed")
+        for model, key in refused
+        if (records.get((model, f"{key}-packed"), {}) or {}).get("status") == "ok"
+    ]
+    if refused:
         out.append(
-            "- **`gpt2`-class compiled rows are BLOCKED, not slow**: "
-            + ", ".join(f"`{model}`" for model in blocked)
-            + " has more than the ~161 graph inputs IREE's Python runtime can invoke "
-            "(SIGSEGV, documented in `etl_hf/CONTEXT.md` Known Issues) and `etl_hf` v1 exposes "
-            "no weight-packing option, so those rows are marked *pending weight packing*. Only "
-            "the numpy row is measured for them; nothing is extrapolated."
+            "- **The ~161-consumed-input cliff is real — but only for UNPACKED graphs.** "
+            + ", ".join(f"`{model}` / `{key}`" for model, key in refused)
+            + " stay refused: those graphs declare more distinct inputs than IREE's Python "
+            "runtime can invoke (SIGSEGV, exit `-11`, measured in section 7). The same models "
+            "DO run compiled once packed"
+            + (": " + ", ".join(f"`{model}` / `{key}`" for model, key in packed_ok) if packed_ok else "")
+            + " — `pack_weights=True` collapses the weight tree into a handful of inputs, and "
+            "the packed rows above are real measurements, not extrapolations."
         )
+
     compile_ms = [
         (model, backend, (records.get((model, backend), {}).get("build") or {}).get("compile_ms"))
         for model in models
@@ -1657,8 +1883,9 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
             f"- **Compile cost is a one-off**: the largest measured compile is `{value:,.0f} ms` "
             f"(`{model}` / `{backend}`); everything after it is the per-call latency above. "
             "`etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, "
-            "batch)`, so repeated builds of the same shape reuse the executable."
+            "batch, packed)`, so repeated builds of the same shape reuse the executable."
         )
+
     # hypothesis — everything above is measured; this item is explicitly not
     op_rows = [
         (model, (records.get((model, "iree-rocm"), {}).get("graph") or {}).get("ir_ops"))
@@ -1666,27 +1893,24 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
         if (records.get((model, "iree-rocm"), {}) or {}).get("status") == "ok"
     ]
     op_rows = [row for row in op_rows if row[1]]
-    if op_rows and gpu_rows:
-        gpu_ratio = [
-            numpy / gpu for model, numpy, cpu, gpu in gpu_rows if numpy and gpu
-        ]
-        if gpu_ratio:
-            out.append(
-                "- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the "
-                "device-resident GPU rows look launch-bound rather than compute-bound. The "
-                "forward graph is hundreds of small ops (measured IR op counts: "
-                + ", ".join(f"`{m}` {n}" for m, n in op_rows)
-                + ") that StableHLO/IREE lower into many narrow dispatches, so the per-call time "
-                "is dominated by dispatch + kernel-launch overhead instead of arithmetic. That "
-                "would explain the observed GPU-vs-numpy margin of "
-                + ", ".join(f"{r:.2f}×" for r in gpu_ratio)
-                + " — a narrow band that shows no trend across the "
-                "parameter-count range measured (the whole forward on the tiny checkpoints is "
-                "only a few hundred microseconds of arithmetic, so fixed per-call overhead is a "
-                "large fraction of it). **Not verified here** — the "
-                "probe records no dispatch count and no per-op GPU timeline; confirming it would "
-                "need an IREE trace / `--iree-hal-trace-execution` run, which this probe does not do."
-            )
+    gpu_ratio = []
+    for packed, rows in gpu_blocks:
+        gpu_ratio += [numpy / gpu for model, numpy, cpu, gpu in rows if numpy and gpu]
+    if op_rows and gpu_ratio:
+        out.append(
+            "- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the "
+            "device-resident GPU rows look launch-bound rather than compute-bound. The "
+            "forward graph is hundreds of small ops (measured IR op counts: "
+            + ", ".join(f"`{m}` {n}" for m, n in op_rows)
+            + ") that StableHLO/IREE lower into many narrow dispatches, so the per-call time "
+            "is dominated by dispatch + kernel-launch overhead instead of arithmetic. That "
+            "would explain the observed GPU-vs-numpy margins of "
+            + ", ".join(f"{r:.2f}×" for r in gpu_ratio)
+            + " — a narrow band that shows no clean trend across the parameter-count range "
+            "measured. **Not verified here** — the probe records no dispatch count and no "
+            "per-op GPU timeline; confirming it would need an IREE trace / "
+            "`--iree-hal-trace-execution` run, which this probe does not do."
+        )
     return "\n".join(out)
 
 
@@ -1711,8 +1935,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-crash-probe", action="store_true",
                         help="do not deliberately attempt the over-limit compiled legs "
                              "(CPU-target ones only) to MEASURE the runtime crash")
-    parser.add_argument("--sanity-rows", default="tiny_llama:numpy,tiny_llama:iree-llvm-cpu,"
-                                                 "tiny_llama:iree-rocm")
+    parser.add_argument("--sanity-rows",
+                        default="tiny_llama:iree-rocm,tiny_llama:iree-rocm-packed,"
+                                "gpt2:iree-rocm-packed",
+                        help="legs to re-run entirely (second run) for the reproducibility table")
+    parser.add_argument("--opt-level-evidence", action="store_true",
+                        help="after a successful build, re-attempt the HIGHER opt_levels and "
+                             "record the compiler's verbatim rejection (evidence for the "
+                             "library's ROCm default of O1)")
     parser.add_argument("--no-public-build", action="store_true",
                         help="never measure the public one-call build (stage sum only)")
     parser.add_argument("--report", action="store_true", help="only re-render the markdown")
@@ -1734,6 +1964,7 @@ def main(argv: list[str] | None = None) -> int:
             restage_iters=args.restage_iters,
             attempt_oversize=args.attempt_oversize,
             measure_public_build=False if args.no_public_build else None,
+            opt_level_evidence=args.opt_level_evidence,
         )
         out = Path(args.out) if args.out else _leg_path(args.leg, args.backend)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1762,6 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
                     restage_iters=args.restage_iters,
                     attempt_oversize=args.attempt_oversize,
                     no_public_build=args.no_public_build,
+                    opt_level_evidence=args.opt_level_evidence,
                 )
         if not args.no_crash_probe:
             # A leg refused up front for the input-count limit is refused on
@@ -1801,6 +2033,7 @@ def main(argv: list[str] | None = None) -> int:
                         restage_iters=args.restage_iters,
                         attempt_oversize=args.attempt_oversize,
                         no_public_build=args.no_public_build,
+                        opt_level_evidence=False,
                         suffix=".sanity",
                     )
 
