@@ -5,23 +5,23 @@
 Colocated test suite for `etl_hf`: the package is a separate top-level distribution, so its tests live here rather than under `./tests/`, which mirrors the `etl` package only (`pyproject.toml` `testpaths = ["tests", "etl_hf/tests"]`).
 The suite's job is to pin the **external** contracts: config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, and parity against an independent oracle.
 Everything is numpy-based by default — no torch, no compiler — so the contract can be verified on a bare `uv run --with pytest` install; the only network-touching tests are the guarded checkpoint readers, which skip when a fetch fails.
-Counts below are what `python -m pytest etl_hf/tests -q --collect-only` reports in the default environment (torch/transformers absent, network and the checkpoint cache available): **533 collected in 14 modules** — `526 passed, 7 skipped` with the `iree` extra (`uv run --extra iree --with pytest`), `519 passed, 14 skipped` without it.
+Counts below are what `python -m pytest etl_hf/tests -q` reports in the default environment (torch/transformers absent, network and the checkpoint/golden caches available): **553 collected in 13 modules — 541 passed, 12 skipped**; with the `iree` extra (`uv run --extra iree --with pytest`) **548 passed, 5 skipped**.
 
 | Module | Collected | Area |
 |---|---|---|
 | `test_build.py` | 73 | `etl_hf.build` — build/run/placement/load, default-option matrix, memoisation |
 | `test_config.py` | 70 | `etl_hf.config` — HF `config.json` normalisation and explicit errors |
 | `test_export.py` | 11 | whole-graph StableHLO export for both families (numpy only) |
-| `test_families.py` | 32 | `etl_hf.families` — registry consistency, routing |
-| `test_gpt2.py` | 59 | GPT-2 parity + canonicalisation |
+| `test_families.py` | 33 | `etl_hf.families` — registry consistency, routing |
+| `test_gpt2.py` | 67 | GPT-2 parity + canonicalisation |
 | `test_iree_llvm_cpu.py` | 7 | compiled whole-graph parity on `iree`/llvm-cpu (1 ungated, 6 need iree) |
-| `test_llama.py` | 37 | Llama/Mistral parity + canonicalisation |
+| `test_llama.py` | 43 | Llama/Mistral parity + canonicalisation |
 | `test_ops.py` | 83 | `etl_hf.ops` / `models._common` graph idioms vs numpy |
 | `test_public_api.py` | 37 | `etl_hf/__init__.py` public surface, import hygiene |
 | `test_real_checkpoints.py` | 9 | real downloaded checkpoints end-to-end (7 run, 2 `ETL_HF_BIG`-gated) |
 | `test_reference.py` | 59 | the pure-numpy oracle primitives |
-| `test_weights.py` | 42 | checkpoint readers + `load_checkpoint` |
-| `test_torch_oracle.py` | 6 | optional torch/transformers golden oracle (3 need torch, 3 are torch-free) |
+| `test_weights.py` | 50 | checkpoint readers + `load_checkpoint` |
+| `test_torch_oracle.py` | 11 | optional torch/transformers golden oracle (8 need torch, 3 are torch-free) |
 
 ## Test Strategy
 
@@ -36,7 +36,7 @@ The whole torch-format surface is exercised **without torch**: a `pickle` `Pickl
 `test_public_api.py` pins `import etl_hf` in a fresh **subprocess** (no torch/transformers/safetensors/iree pulled in, numpy + `etl` only), `__all__` completeness/duplicate-freedom/reachability, docstrings and documented arguments, star-import equality, submodule attributes, the error hierarchy under `etl.core.ETLError`, and registry reachability.
 `test_export.py` proves the "one graph" property at the IR level with numpy only: each family's graph is traced against its own `param_specs` + an int32 ids spec, verified, and exported through `etl.backends.stablehlo.export`, then the text is checked for the whole forward's constructs (attention dots, reductions, softmax exp, in-graph RoPE `cos`/`sin`, RMSNorm `sqrt`/`divide`, SiLU logistic, causal compare, embedding gather) with deliberately **loose lower-bound** op/line counts recorded in a module-level `MEASURED` table; the "weights are inputs, not payloads" rule is pinned structurally (`tensor_specs == params + 1`, a `stablehlo.constant` count ceiling, and an O(`seq_len`) bound on the largest dense literal).
 `test_iree_llvm_cpu.py` proves the same property behaviourally on `iree`/`llvm-cpu` for both families and a real `tiny_llama` checkpoint: parity vs the family reference *and* vs the numpy interpreter, bit-identical reruns, the one-program structure (one compiled entry function, no `external_call`/`runtime_call` ops), and the two measured plumbing pitfalls — `iree_compile_args` must reach `etl.compile` (pinned by spying on `etl.pipeline.compile`, never by timing) and llvm-cpu needs `--iree-llvmcpu-target-cpu=host`.
-`test_real_checkpoints.py` is the guarded real-checkpoint suite (`require_model` download → `load_hf` → whole-model forward → `reference`): real config values, canonical key/parameter counts, `inputs == keys + 1` (weights are always explicit inputs), traced op count, export size with zero compiler required, and logit parity — including `sshleifer/tiny-gpt2` (legacy-format checkpoint, ordinary ~0.13 logits) and an exact-erf `tiny-random-Mistral` that runs numpy-backend-only.
+`test_real_checkpoints.py` is the guarded real-checkpoint suite (`require_model` download → `load_hf` → whole-model forward → `reference`): real config values, canonical key/parameter counts, the tied contract on real weights (a tied tree carries exactly one embedding array and **no** `lm_head.weight`, so `tiny_gpt2` is 36 keys / 102,714 params and the shipped tied head copy is verified-against-the-embedding and dropped, while untied `tiny_llama` keeps its own head, 21 keys / 1,032,272 params), `inputs == keys + 1` (weights are always explicit inputs), traced op count, export size with zero compiler required, and logit parity — including `sshleifer/tiny-gpt2` (legacy-format checkpoint, ordinary ~0.13 logits) and an exact-erf `tiny-random-Mistral` that runs numpy-backend-only.
 `test_torch_oracle.py` is the optional **external** oracle (real `transformers` + `torch` on CPU) that can catch a canonicalisation bug both etl_hf implementations would share: golden-fixture parity (`bench_logs/hf_goldens/`), in-process HF-forward parity (tolerances 1e-4 abs for tiny checkpoints, 1e-3 abs **and** 1e-5 relative for real-size ones), strict validation of the fixture format, and `test_etl_hf_never_imports_torch`. Its oracle is gated lazily (`_oracle_available()` probes `importlib.util.find_spec` for the `skipif`, `_oracle()` imports and caches the pair on first use inside a test), so its three torch-free cases (golden-fixture parity, the fixture-format check, the import-hygiene check) collect and run without torch.
 `hf_download.py` is imported by `test_real_checkpoints.py` and `test_torch_oracle.py`; `test_weights.py` keeps its own tiny `_download` helper (same `$TMPDIR/etl_hf_models` cache, no `ETL_HF_MODELS_DIR` support) so its three real-checkpoint reader tests stay self-contained.
 
@@ -90,7 +90,7 @@ The compiled-path tests must never assert timings (they would be flaky); measure
 | `./test_public_api.py` | Package exports, docstrings, submodule reachability, import hygiene (subprocess). |
 | `./test_real_checkpoints.py` | Real downloaded checkpoints end-to-end (network- and `ETL_HF_BIG`-gated). |
 | `./test_reference.py` | The independent pure-numpy oracle primitives. |
-| `./test_torch_oracle.py` | Optional torch/transformers external oracle + golden-fixture contract (6 collected: 3 need torch, 3 are torch-free). |
+| `./test_torch_oracle.py` | Optional torch/transformers external oracle + golden-fixture contract (11 collected: 8 need torch, 3 are torch-free). |
 | `./hf_download.py` | Guarded checkpoint downloader/cache helper + CLI (test utility, stdlib only). |
 | `../` | The package under test (`etl_hf`: config, weights, ops, reference, families, build, models). |
 | `../../etl/` | The tensor library the package builds on (read-only from here). |

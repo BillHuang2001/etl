@@ -78,8 +78,9 @@ _BIG = pytest.mark.skipif(
 )
 
 #: Memory headroom required before the optional 124M GPT-2 is attempted: the
-#: measured peak RSS is ~1.1 GB (weights + numpy artifact + the reference run),
-#: so demand twice that and skip (not fail) on a smaller host.
+#: measured peak RSS is ~1.1 GB (the canonical 124.4M-parameter float32 tree plus
+#: the raw checkpoint dict held while canonicalising, then the reference run), so
+#: demand twice that and skip (not fail) on a smaller host.
 _BIG_MODEL_MIN_MEMORY = 2 * 1024**3
 
 
@@ -145,9 +146,11 @@ def _llama_param_count(cfg) -> int:
     Per layer: ``q``/``o`` are ``(hidden, hidden)``, ``k``/``v`` are
     ``(hidden, kv_heads * head_dim)`` (GQA-aware), the two RMSNorm scales are
     ``hidden`` each, and the SwiGLU MLP is three ``hidden × intermediate``
-    matrices. Embedding and (untied) ``lm_head`` are ``vocab × hidden`` each, the
-    final norm ``hidden``. Used to check the loaded checkpoint against arithmetic
-    rather than against itself.
+    matrices. The token embedding is ``vocab × hidden`` and the final norm
+    ``hidden``; ``lm_head`` is its own ``hidden × vocab`` matrix **only** when the
+    config is untied — a tied head IS ``embed.weight`` (one graph input, used
+    transposed), so it contributes nothing. Used to check the loaded checkpoint
+    against arithmetic rather than against itself.
 
     Args:
         cfg: an :class:`etl_hf.config.ModelConfig` of the ``llama`` family.
@@ -166,10 +169,9 @@ def _llama_param_count(cfg) -> int:
     return (
         cfg.num_hidden_layers * per_layer
         + cfg.vocab_size * hidden  # embed
-        + hidden * cfg.vocab_size  # lm_head (a separate array even when tied)
+        + (0 if cfg.tie_word_embeddings else hidden * cfg.vocab_size)  # untied lm_head
         + hidden  # final_norm
     )
-
 
 def _gpt2_param_count(cfg) -> int:
     """Parameter count of the gpt2 family computed independently from the config.
@@ -177,9 +179,10 @@ def _gpt2_param_count(cfg) -> int:
     Per layer: four biased ``(hidden, hidden)`` attention projections, two biased
     LayerNorms (``2 * hidden`` each), and the biased MLP pair ``(hidden, inner)``
     / ``(inner, hidden)``. Plus the token embedding ``vocab × hidden``, the
-    learned positional table ``positions × hidden``, a biased final LayerNorm and
-    a separate ``lm_head`` matrix (HF stores the tied head transposed, so the
-    canonical tree holds it twice — the documented double count).
+    learned positional table ``positions × hidden`` and a biased final LayerNorm.
+    The output head is a separate ``hidden × vocab`` matrix **only** when the
+    config is untied — a tied head IS ``embed.weight`` (one graph input, used
+    transposed), so it contributes nothing.
 
     Args:
         cfg: an :class:`etl_hf.config.ModelConfig` of the ``gpt2`` family.
@@ -200,7 +203,7 @@ def _gpt2_param_count(cfg) -> int:
         + cfg.vocab_size * hidden  # embed
         + cfg.max_position_embeddings * hidden  # learned positions
         + 2 * hidden  # final_norm (weight + bias)
-        + hidden * cfg.vocab_size  # lm_head
+        + (0 if cfg.tie_word_embeddings else hidden * cfg.vocab_size)  # untied lm_head
     )
 
 
@@ -326,7 +329,7 @@ def _available_memory_bytes() -> int:
 # 1. tiny-random-LlamaForCausalLM — safetensors, 2 layers, no GQA
 # ---------------------------------------------------------------------------
 def test_tiny_random_llama_matches_the_numpy_reference():
-    """safetensors checkpoint → 21 canonical tensors (1,032,272 params) → parity 3e-8."""
+    """An **untied** safetensors checkpoint → 21 canonical tensors (1,032,272 params) → 3e-8."""
     model = _load("tiny_llama", seq_len=8)
     cfg = model.config
     # The real values from this checkpoint's config.json (asserted, not assumed).
@@ -343,6 +346,17 @@ def test_tiny_random_llama_matches_the_numpy_reference():
     specs = model.param_specs()
     assert set(params) == set(specs), "params() and param_specs() must describe one tree"
     assert len(params) == 21
+    # Untied: the head is its own canonical array, never an alias of the embedding.
+    assert "lm_head.weight" in params and "lm_head.weight" in specs, (
+        "tie_word_embeddings=False must keep a separate lm_head.weight entry"
+    )
+    assert params["lm_head.weight"].shape == (cfg.hidden_size, cfg.vocab_size), (
+        f"the head must be (hidden, vocab) = {(cfg.hidden_size, cfg.vocab_size)}, "
+        f"got {params['lm_head.weight'].shape}"
+    )
+    assert not np.allclose(params["lm_head.weight"], params["embed.weight"].T), (
+        "an untied head is its own checkpoint tensor — it must not equal the embedding"
+    )
     assert all(isinstance(value, np.ndarray) for value in params.values())
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
     # Independent accounting (see _llama_param_count) and the spec-tree arithmetic.
@@ -404,6 +418,7 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
 
     params = model.params()
     assert len(params) == 21
+    assert "lm_head.weight" in params, "tie_word_embeddings=False keeps a separate head"
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
     expected = _llama_param_count(cfg)
     assert expected == 2_061_408, f"mistral param arithmetic changed: {expected:,}"
@@ -437,6 +452,12 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
 def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
     """``n_embd=2`` GPT-2 read from a real **legacy** ``pytorch_model.bin`` → parity 1.5e-8.
 
+    The checkpoint ships a ``lm_head.weight`` that is a byte-copy of its
+    ``wte.weight`` and its config ties the two, so this is also the real-checkpoint
+    pin for the tied contract: the shipped head is verified against the embedding,
+    consumed and dropped, and the canonical tree is **36 keys / 102,714 params**
+    with exactly one embedding array and no ``lm_head.weight``.
+
     Historical note: while the legacy reader ignored the per-storage int64
     element-count prefix, every storage was read 8·k bytes off and this
     checkpoint's logits came out ~1e-44 (and constant) instead of the ~0.128
@@ -456,22 +477,42 @@ def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
 
     directory = hf_download.require_model("tiny_gpt2")
     assert not list(directory.glob("*.safetensors")), "tiny-gpt2 ships a legacy torch .bin"
-    assert len(weights.load_checkpoint(directory)) > 0
+    raw = weights.load_checkpoint(directory)
+    assert len(raw) > 0
+    # The shipped head is the tied copy: it must be identical to the embedding the
+    # canonicaliser keeps (this is what makes consuming-and-dropping it safe).
+    assert "lm_head.weight" in raw, "this checkpoint is expected to ship its tied head"
+    embed_key = "transformer.wte.weight" if "transformer.wte.weight" in raw else "wte.weight"
+    assert embed_key in raw, f"tiny-gpt2 must ship the token embedding, keys: {sorted(raw)}"
+    np.testing.assert_array_equal(
+        raw["lm_head.weight"],
+        raw[embed_key],
+    )
 
     params = model.params()
     specs = model.param_specs()
     assert set(params) == set(specs)
-    assert len(params) == 37
+    assert len(params) == 36
+    assert "lm_head.weight" not in params and "lm_head.weight" not in specs, (
+        f"a tied config has no separate head: {sorted(name for name in params if 'lm_head' in name)}"
+    )
+    assert params["embed.weight"].shape == (cfg.vocab_size, cfg.hidden_size), (
+        f"the one tied embedding must stay (vocab, hidden) = "
+        f"{(cfg.vocab_size, cfg.hidden_size)}, got {params['embed.weight'].shape}"
+    )
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
     expected = _gpt2_param_count(cfg)
-    assert expected == 203_228, f"gpt2 param arithmetic changed: {expected:,}"
+    assert expected == 102_714, f"gpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == _total_params(specs) == expected, (
         f"parameter accounting: params={_total_params(params):,} "
         f"specs={_total_params(specs):,} arithmetic={expected:,} [{_describe(model)}]"
     )
 
     graph = _trace(model)
-    assert len(graph.tensor_specs) == len(params) + 1
+    assert len(graph.tensor_specs) == len(params) + 1, (
+        f"the tied head must not add a graph input: {len(graph.tensor_specs)} inputs for "
+        f"{len(params)} parameters [{_describe(model, graph)}]"
+    )
     # Measured here: max|ref| ≈ 0.128 (normal scale — the legacy reader now reads
     # the real weights), max_abs ≈ 1.5e-8, max_rel_vs_scale ≈ 1.2e-7. The scale is
     # pinned so a checkpoint (or a reader) that produced degenerate logits again
@@ -556,7 +597,7 @@ def test_static_shape_policy_sequence_length_is_baked_into_the_graph():
 # ---------------------------------------------------------------------------
 @_BIG
 def test_real_distilgpt2_end_to_end():
-    """distilgpt2 (6 layers / 768 wide / 82M real params) → parity ~1.6e-4 abs."""
+    """distilgpt2 (6 layers / 768 wide / 81,912,576 params) → parity ~1.5e-4 abs."""
     directory = hf_download.require_model("distilgpt2")
     model = load_hf(directory, seq_len=32)
     cfg = model.config
@@ -571,17 +612,20 @@ def test_real_distilgpt2_end_to_end():
     params = model.params()
     specs = model.param_specs()
     assert set(params) == set(specs)
-    assert len(params) == 101
+    assert len(params) == 100
+    # Tied: the head IS the embedding, so the canonical tree is exactly the real
+    # model's parameter count and carries no duplicate lm_head array.
+    assert "lm_head.weight" not in params and "lm_head.weight" not in specs, (
+        f"distilgpt2 is tied: no separate head, got "
+        f"{sorted(name for name in params if 'lm_head' in name)}"
+    )
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
     expected = _gpt2_param_count(cfg)
-    # 120,509,952 in the canonical tree; the real model is 81.9M because the tied
-    # head is stored transposed (the documented double count).
-    assert expected == 120_509_952, f"distilgpt2 param arithmetic changed: {expected:,}"
+    assert expected == 81_912_576, f"distilgpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == _total_params(specs) == expected, (
         f"parameter accounting: params={_total_params(params):,} "
         f"specs={_total_params(specs):,} arithmetic={expected:,} [{_describe(model)}]"
     )
-
     graph = _trace(model)
     assert len(graph.tensor_specs) == len(params) + 1, (
         f"graph inputs: {len(graph.tensor_specs)} for {len(params)} parameters "
@@ -614,7 +658,7 @@ def test_real_distilgpt2_end_to_end():
 
 @_BIG
 def test_real_gpt2_end_to_end_when_memory_allows():
-    """gpt2 124M (12 layers / 163M canonical params) → parity ~2.1e-4 abs, best effort."""
+    """gpt2 124M (12 layers / 124,439,808 canonical params) → ~2.1e-4 abs, best effort."""
     available = _available_memory_bytes()
     if 0 < available < _BIG_MODEL_MIN_MEMORY:
         pytest.skip(
@@ -627,17 +671,21 @@ def test_real_gpt2_end_to_end_when_memory_allows():
     assert (cfg.num_hidden_layers, cfg.hidden_size) == (12, 768)
     assert (cfg.num_attention_heads, cfg.head_dim) == (12, 64)
     assert (cfg.vocab_size, cfg.hidden_act) == (50257, "gelu_new")
+    assert cfg.tie_word_embeddings is True
 
     params = model.params()
-    assert len(params) == 197
+    assert len(params) == 196
+    # Tied: no duplicate head array, so the canonical tree equals the 124M model.
+    assert "lm_head.weight" not in params and "lm_head.weight" not in model.param_specs(), (
+        f"gpt2 is tied: no separate head, got "
+        f"{sorted(name for name in params if 'lm_head' in name)}"
+    )
     expected = _gpt2_param_count(cfg)
-    # 163,037,184 canonical; 124.4M real (the tied head again).
-    assert expected == 163_037_184, f"gpt2 param arithmetic changed: {expected:,}"
+    assert expected == 124_439_808, f"gpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == expected, (
         f"parameter accounting: params={_total_params(params):,} arithmetic={expected:,} "
         f"[{_describe(model)}]"
     )
-
     graph = _trace(model)
     assert len(graph.tensor_specs) == len(params) + 1
     assert _ops_total(graph) > 400, (

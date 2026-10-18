@@ -23,7 +23,7 @@ All four are `SymbolicTensor` graph builders (assembly only, no numerics of thei
 
 Canonical names are flat `dict[str, np.ndarray]` keys (`params` is never nested), shared verbatim between `param_specs` (specs) and `canonicalize_weights` (loaded arrays) — one shape table per family is the single source of truth for both.
 
-**llama** (`etl_hf/models/llama.py`, `9·L + 3` keys = `2 + 9·L + 1`):
+**llama** (`etl_hf/models/llama.py`, `9·L + 3` keys = `2 + 9·L + 1` untied, `9·L + 2` tied — the head is `embed.weight`):
 
 | Canonical key | Shape | HF source (transposed at load where marked) |
 |---|---|---|
@@ -38,11 +38,11 @@ Canonical names are flat `dict[str, np.ndarray]` keys (`params` is never nested)
 | `layers.{i}.mlp.up.weight` | `(hidden, intermediate)` | `...mlp.up_proj.weight`, transposed |
 | `layers.{i}.mlp.down.weight` | `(intermediate, hidden)` | `...mlp.down_proj.weight`, transposed |
 | `final_norm.weight` | `(hidden,)` | `model.norm.weight` |
-| `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight`, transposed, or `embed.weightᵀ` when tied |
+| `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight`, transposed — **untied only** (a tied config has no such key) |
 
 The llama builds are bias-free: any `*.bias` key in the checkpoint raises `HFUnsupportedError` (naming the offending keys and the `attention_bias=False` / `mlp_bias=False` remedy), and `model.rotary_emb.inv_freq` is the one deliberately ignored key (a stale buffer; the forward recomputes frequencies).
 
-**gpt2** (`etl_hf/models/gpt2.py`, `16·L + 5` keys = `2 + 16·L + 3`):
+**gpt2** (`etl_hf/models/gpt2.py`, `16·L + 5` keys = `2 + 16·L + 3` untied, `16·L + 4` tied — the head is `embed.weight`):
 
 | Canonical key | Shape | HF source (base key, `transformer.` prefix stripped) |
 |---|---|---|
@@ -55,7 +55,7 @@ The llama builds are bias-free: any `*.bias` key in the checkpoint raises `HFUns
 | `layers.{i}.mlp.fc1.{weight,bias}` | `(hidden, intermediate)` / `(intermediate,)` | `h.{i}.mlp.c_fc.{weight,bias}` |
 | `layers.{i}.mlp.fc2.{weight,bias}` | `(intermediate, hidden)` / `(hidden,)` | `h.{i}.mlp.c_proj.{weight,bias}` |
 | `final_norm.{weight,bias}` | `(hidden,)` | `ln_f.{weight,bias}` |
-| `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight` transposed, or `embed.weightᵀ` when tied |
+| `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight` transposed — **untied only** (a tied config has no such key) |
 
 The fused `h.{i}.attn.c_attn` `(hidden, 3·hidden)` tensor and its `(3·hidden,)` bias are split **at load time** into the `q`, `k`, `v` column blocks `[0:H]`, `[H:2H]`, `[2H:3H]` (HF's `query, key, value` order), so the graph never slices a fused matrix.
 Both `transformer.`-prefixed and bare key spellings are accepted (mixing allowed); two keys that normalise onto the same canonical slot raise `HFWeightError` instead of last-one-wins, and the derived causal buffers `h.{i}.attn.bias` / `h.{i}.attn.masked_bias` are the only ignored keys.
@@ -65,7 +65,7 @@ Both `transformer.`-prefixed and bare key spellings are accepted (mixing allowed
 Every `*.weight` matrix fed to `etl.dot(x, W)` — i.e. every `linear` operand — is `(in_features, out_features)`.
 Llama/Mistral/Qwen2 linears are stored `(out, in)` by HF and are transposed at load (`np.ascontiguousarray(np.transpose(...))`).
 GPT-2's `Conv1D` layers already compute `x @ W + b` with `(in, out)` weights, so they are **not** transposed; GPT-2's `lm_head` is an `nn.Linear` `(vocab, hidden)` and **is** transposed to `(hidden, vocab)`.
-Tied embeddings: `lm_head.weight` aliases `embed.weight` (as its transpose) only when the checkpoint ships no `lm_head` **and** the config ties them; a tied config whose checkpoint carries a disagreeing `lm_head` raises `HFWeightError` (never silently picks one), and an untied config with no `lm_head` raises `HFWeightError`.
+Tied embeddings are **one array, not two**: with `tie_word_embeddings=True` the head IS `embed.weight`, so `param_specs`/`canonicalize_weights` emit no `lm_head.weight` key and the graph feeds the one embedding input to the token gather and (as `etl.transpose(embed)`) to the final projection. A tied checkpoint that ships its own `lm_head.weight` must agree with the embedding — it is verified, consumed and dropped; a disagreement raises `HFWeightError` (never silently picks one), and an untied config with no `lm_head` raises `HFWeightError`.
 Every canonicalised array is `float32`, C-contiguous and writable (`int`/`float` inputs accepted, `bool`/complex rejected).
 
 ## Graph conventions
@@ -112,7 +112,7 @@ Dict insertion order carries no graph meaning (`core.flatten` sorts dict keys); 
 |---|---|
 | `./__init__.py` | Package marker only (`__all__ = []`) — no imports, no re-exports. |
 | `./_common.py` | Shared block assembly: `linear`, `attention`, `gated_mlp`, `two_layer_mlp` (no family-specific code). |
-| `./llama.py` | Llama/Mistral/Qwen2 family: RMSNorm + RoPE + GQA + SwiGLU; `9·L + 3` bias-free weights. |
-| `./gpt2.py` | GPT-2 family: LayerNorm + learned positions + `gelu_new` + tied head; `16·L + 5` weights, fused QKV split at load. |
+| `./llama.py` | Llama/Mistral/Qwen2 family: RMSNorm + RoPE + GQA + SwiGLU; `9·L + 3` bias-free weights (`9·L + 2` when tied). |
+| `./gpt2.py` | GPT-2 family: LayerNorm + learned positions + `gelu_new` + tied head; `16·L + 5` weights (`16·L + 4` when tied), fused QKV split at load. |
 | `../` | Build/registry layer that consumes these entry points (`build_model`, `load_hf`, `HFModel`, `FAMILIES`). |
 | `../../etl/` | The tensor library whose public ops and `@etl.defn` this package composes (read-only from here). |
