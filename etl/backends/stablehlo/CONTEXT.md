@@ -117,7 +117,9 @@ StableHLO 1.0 removed `stablehlo.eigh`/`qr`/`svd` (iree 3.11 ships only `cholesk
 
 - `erf`/`gelu`: no `stablehlo.erf` exists (erf is CHLO-only); gelu's erf-based decomposition defers with it — no silent approximation. `cholesky`/`qr`/`svd` have StableHLO counterparts but are not wired; `matrix_rank`/`matrix_exp` need SVD-cutoff / Padé decompositions.
 - `external_call` defers at the EXPORTER level by design: the iree adapter SPLITS external-call graphs BEFORE export (see `../CONTEXT.md`); direct-export users see the deferral.
-- Unmapped names (`call`, `tril`, `triu`, `cumsum`, `solve`, …) also count as deferred via `status()` — there is no v1 mapping for them.
+- Unmapped names also count as deferred via `status()` (`ops.py:344-353`) and reach the SAME `Writer._unsupported` error (`writer.py:4886-4891`). Exhaustive v1 unmapped list: `call`, `tril`, `triu`, `cumsum`, `cumprod`, `flip`, `roll`, `nan_to_num`, `solve`.
+  Deferral therefore has TWO namespaces — the explicit `DEFERRED_OPS` frozenset (`ops.py:235-268`, 30 names) and the unmapped remainder — and both raise the identical message, so an op's membership in `DEFERRED_OPS` is documentation, not a distinct mechanism.
+- Dense-transformer consequences: `gelu`/`erf`, `cumsum`, `triu`/`tril`, `flip`, `roll` have no v1 emission, so erf-GELU, RoPE via `cumsum`, and mask building via `triu` all defer — build causal masks / position tables as `etl.constant` tensors and compose GELU without `erf` (tanh approximation, or an in-graph polynomial erf). `sigmoid`/`tanh`/`exp`/`divide`/`power`/`maximum`/`select`/`compare` all export directly, so SiLU (Llama) and softmax are expressible.
 - Complex-number elementwise beyond `cast` is additionally deferred (a dtype check in the writer, not an op name).
 - `argmax`/`argmin` are NOT deferred — they are composed (see the emitters). Mnemonics were verified against the StableHLO spec at implementation time; an op with no spec mnemonic is deferred rather than emitted with an invented one.
 
