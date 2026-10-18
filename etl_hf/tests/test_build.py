@@ -11,18 +11,25 @@ What is pinned here:
 * **parity** — the compiled pipeline (numpy interpreter) against each family's
   independent pure-numpy reference;
 * **the default-option matrix** (:func:`etl_hf.build.resolve_build_options`) —
-  the two measured pitfalls (``opt_level`` injection, and the llvm-cpu-only
-  ``iree_compile_args`` that must reach the *compile* stage), including "explicit
-  wins", "the caller's dict is not mutated" and the ``ETL_BACKEND`` env default;
+  the measured pitfalls (``opt_level`` injection including the **ROCm** ``"O1"``
+  rule, and the llvm-cpu-only ``iree_compile_args`` that must reach the
+  *compile* stage), including "explicit wins", "``ETL_OPT_LEVEL`` wins", "the
+  caller's dict is not mutated" and the ``ETL_BACKEND``/``ETL_TARGET_BACKENDS``
+  env defaults;
 * **memoisation** — identical ``build_model`` calls return the identical
   ``Executable``; a different ``seq_len``/``batch_size``/option/private cache does
   not;
 * **the activation gate** — an erf-based activation is rejected on a compiled
   backend *before tracing*, with both remedies named, and needs no iree install;
 * **explicit input handling** — the single documented host coercion
-  (integral ids → int32), ``DTypeError``/``ShapeError`` for everything else, and
-  etl's structure errors propagating untouched for a bad params tree;
-* **explicit placement** — ``place_params`` is one visible ``Tensor.to`` per leaf;
+  (integral ids → int32), ``DTypeError``/``ShapeError`` for everything else, an
+  ``etl.Tensor`` of ids forwarded to ``etl.run`` **verbatim** (the
+  device-resident path), and etl's structure errors propagating untouched for a
+  bad params tree;
+* **explicit placement** — ``place_params``/``place_ids`` are one visible
+  ``Tensor.to`` each, with their argument error tables;
+* **``HFModel.forward`` is host-facing** — device params are refused with the
+  device-resident recipe named (never a hidden device-to-host copy);
 * **``load_hf``/``HFModel``** — checkpoint → config + canonical params, the
   documented default ``seq_len``, shape errors that name the model's length.
 """
@@ -43,10 +50,12 @@ from etl_hf import build as build_module
 from etl_hf import families, ops
 from etl_hf.build import (
     DEFAULT_LLVM_CPU_COMPILE_ARGS,
+    DEFAULT_ROCM_OPT_LEVEL,
     DEFAULT_SEQ_LEN,
     HFModel,
     build_model,
     load_hf,
+    place_ids,
     place_params,
     resolve_build_options,
     run_model,
@@ -132,6 +141,20 @@ def make_ids(cfg: ModelConfig, batch: int, seq: int, seed: int = 1) -> np.ndarra
 def max_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Max absolute difference (the number reported in parity assertions)."""
     return float(np.max(np.abs(np.asarray(a, np.float64) - np.asarray(b, np.float64))))
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_option_env(monkeypatch):
+    """Clear the process env knobs the option matrix reads (per test).
+
+    ``ETL_OPT_LEVEL``/``ETL_TARGET_BACKENDS`` are consulted by
+    :func:`resolve_build_options` (explicit > env > etl_hf default), so a
+    developer shell that exports them must not change what the *defaults* are
+    asserted to be. Tests that exercise the env set it themselves with the same
+    ``monkeypatch``, which wins over this fixture's deletes.
+    """
+    monkeypatch.delenv("ETL_OPT_LEVEL", raising=False)
+    monkeypatch.delenv("ETL_TARGET_BACKENDS", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +491,126 @@ def test_resolve_never_injects_llvm_cpu_flags_for_cuda_or_rocm():
         device = etl.core.Device(kind, 0)
         name, resolved = resolve_build_options("iree", device, {})
         assert name == "iree"
-        assert resolved["opt_level"] == "O3"
+        # ROCm gets the codegen-safe O1 default (see the O1 tests below); cuda
+        # keeps O3. Neither ever receives the llvm-cpu flags.
+        expected = "O1" if kind in ("rocm", "hip") else "O3"
+        assert resolved["opt_level"] == expected, kind
         assert "iree_compile_args" not in resolved, kind
     _, resolved = resolve_build_options(
         "iree", None, {"target_backends": ["cuda", "rocm"]}
     )
     assert "iree_compile_args" not in resolved
+
+
+def test_default_rocm_opt_level_is_the_codegen_safe_one():
+    """The ROCm default is ``O1`` (upstream iree fails at O2/O3 on these shapes)."""
+    assert DEFAULT_ROCM_OPT_LEVEL == "O1"
+    assert build_module.DEFAULT_OPT_LEVEL == "O3"
+
+
+def test_resolve_injects_o1_for_a_rocm_device():
+    """The documented GPU path: ``device=Device('rocm', 0)`` → iree + O1."""
+    for kind in ("rocm", "hip"):
+        device = etl.core.Device(kind, 0)
+        name, resolved = resolve_build_options(None, device, {})
+        assert name == "iree"
+        assert resolved["opt_level"] == DEFAULT_ROCM_OPT_LEVEL == "O1"
+        assert "iree_compile_args" not in resolved
+    # a rocm device with the iree backend named explicitly behaves the same
+    assert resolve_build_options("iree", etl.core.Device("rocm", 1), {})[1] == {
+        "opt_level": "O1"
+    }
+
+
+def test_resolve_injects_o1_for_explicit_rocm_targets():
+    for targets in (["rocm"], ["hip"], ["rocm", "hip"], "rocm"):
+        _, resolved = resolve_build_options("iree", None, {"target_backends": targets})
+        assert resolved["opt_level"] == "O1", targets
+        assert resolved["target_backends"] == targets  # untouched
+        assert "iree_compile_args" not in resolved
+
+
+def test_resolve_injects_o1_through_the_target_backends_env(monkeypatch):
+    monkeypatch.setenv("ETL_TARGET_BACKENDS", "rocm")
+    _, resolved = resolve_build_options("iree", None, {})
+    assert resolved["opt_level"] == "O1"
+    monkeypatch.setenv("ETL_TARGET_BACKENDS", " hip ")
+    _, resolved = resolve_build_options("iree", None, {})
+    assert resolved["opt_level"] == "O1"
+    # an explicit target list beats the env (and decides the level)
+    _, resolved = resolve_build_options("iree", None, {"target_backends": ["llvm-cpu"]})
+    assert resolved["opt_level"] == "O3"
+    # the env's rocm targets also beat the device-derived llvm-cpu default
+    _, resolved = resolve_build_options("iree", etl.core.Device("cpu", 0), {})
+    assert resolved["opt_level"] == "O1"
+    # ... and then the llvm-cpu flags are NOT injected (targets are not llvm-cpu)
+    assert "iree_compile_args" not in resolved
+
+
+def test_resolve_keeps_o3_for_every_non_rocm_target():
+    cases = [
+        (None, {}),  # llvm-cpu via no device
+        (etl.core.Device("cpu", 0), {}),
+        (etl.core.Device("cuda", 0), {}),
+        (None, {"target_backends": ["llvm-cpu"]}),
+        (None, {"target_backends": ["cuda"]}),
+        # a mixed set containing a non-rocm target stays on O3
+        (None, {"target_backends": ["rocm", "llvm-cpu"]}),
+        (None, {"target_backends": ["rocm", "cuda"]}),
+        (None, {"target_backends": ["gfx942"]}),
+    ]
+    for device, options in cases:
+        _, resolved = resolve_build_options("iree", device, options)
+        assert resolved["opt_level"] == "O3", (device, options)
+    # non-iree compiled backends have no targets ⇒ unchanged O3 default
+    for backend in ("xla", "tvm"):
+        assert resolve_build_options(backend, etl.core.Device("rocm", 0), {})[1][
+            "opt_level"
+        ] == "O3", backend
+    # numpy stays option-untouched even on a rocm device
+    assert resolve_build_options("numpy", etl.core.Device("rocm", 0), {})[1] == {}
+
+
+def test_resolve_explicit_opt_level_wins_over_the_rocm_default():
+    rocm = etl.core.Device("rocm", 0)
+    for explicit in ("O3", "O0", 2):
+        _, resolved = resolve_build_options("iree", rocm, {"opt_level": explicit})
+        assert resolved["opt_level"] == explicit
+    _, resolved = resolve_build_options(
+        "iree", None, {"target_backends": ["rocm"], "opt_level": "O2"}
+    )
+    assert resolved["opt_level"] == "O2"
+
+
+def test_resolve_etl_opt_level_env_wins_over_the_rocm_default(monkeypatch):
+    """``ETL_OPT_LEVEL`` (etl's own knob) beats etl_hf's injected default."""
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    for device in (etl.core.Device("rocm", 0), None):
+        _, resolved = resolve_build_options("iree", device, {})
+        assert "opt_level" not in resolved, device
+    _, resolved = resolve_build_options("xla", None, {})
+    assert "opt_level" not in resolved
+    # a blank value is treated as unset
+    monkeypatch.setenv("ETL_OPT_LEVEL", "   ")
+    _, resolved = resolve_build_options("iree", etl.core.Device("rocm", 0), {})
+    assert resolved["opt_level"] == "O1"
+    # an explicit argument still beats the env
+    monkeypatch.setenv("ETL_OPT_LEVEL", "O2")
+    _, resolved = resolve_build_options("iree", etl.core.Device("rocm", 0), {})
+    assert "opt_level" not in resolved
+    _, resolved = resolve_build_options(
+        "iree", etl.core.Device("rocm", 0), {"opt_level": "O3"}
+    )
+    assert resolved["opt_level"] == "O3"
+
+
+def test_resolve_does_not_mutate_the_caller_options_for_rocm():
+    options = {"target_backends": ["rocm"]}
+    resolve_build_options("iree", None, options)
+    assert options == {"target_backends": ["rocm"]}
+    empty: dict = {}
+    resolve_build_options(None, etl.core.Device("rocm", 0), empty)
+    assert empty == {}
 
 
 def test_resolve_honours_explicit_options():
@@ -660,6 +797,104 @@ def test_run_model_accepts_placed_device_params(llama_case):
 
 
 # ---------------------------------------------------------------------------
+# run_model: ids as an etl.Tensor (the device-resident path)
+# ---------------------------------------------------------------------------
+def test_run_model_accepts_a_cpu_tensor_of_ids(llama_case):
+    _, params, ids, executable = llama_case
+    np.testing.assert_array_equal(
+        run_model(executable, params, etl.from_numpy(ids)).numpy(),
+        run_model(executable, params, ids).numpy(),
+    )
+
+
+def test_run_model_forwards_a_tensor_of_ids_verbatim(llama_case, monkeypatch):
+    """The tensor reaches ``etl.run`` as the SAME object — no cast, no copy."""
+    _, params, ids, executable = llama_case
+    tensor_ids = etl.from_numpy(ids)
+    seen: list = []
+    real_run = etl.run
+
+    def spy(exe, run_params, run_ids):
+        seen.append((exe, run_params, run_ids))
+        return real_run(exe, run_params, run_ids)
+
+    monkeypatch.setattr(etl, "run", spy)
+    logits = run_model(executable, params, tensor_ids)
+    assert len(seen) == 1
+    exe, run_params, run_ids = seen[0]
+    assert exe is executable
+    assert run_params is params
+    assert run_ids is tensor_ids  # no np.asarray, no ascontiguousarray, no cast
+    assert isinstance(run_ids, etl.Tensor)
+    expected = real_run(executable, params, ids)
+    np.testing.assert_array_equal(logits.numpy(), np.asarray(expected.numpy()))
+
+
+def test_run_model_does_not_retype_a_tensor_of_ids(llama_case, monkeypatch):
+    """A host array is cast to int32; a Tensor's data is never re-typed.
+
+    So an int64 *tensor* reaches etl's dtype-strict run boundary unchanged and
+    fails there, while the equivalent host array is cast and runs — which is
+    exactly the documented asymmetry, pinned here.
+    """
+    _, params, ids, executable = llama_case
+    int64_tensor = etl.from_numpy(ids.astype(np.int64))
+    forwarded: list = []
+    real_run = etl.run
+
+    def spy(exe, run_params, run_ids):
+        forwarded.append(run_ids)
+        return real_run(exe, run_params, run_ids)
+
+    monkeypatch.setattr(etl, "run", spy)
+    with pytest.raises(etl.DTypeError) as excinfo:
+        run_model(executable, params, int64_tensor)
+    assert forwarded == [int64_tensor], "run_model must not cast a Tensor"
+    assert "int64" in str(excinfo.value)
+    # the host-array path performs the one documented coercion
+    np.testing.assert_array_equal(
+        run_model(executable, params, ids.astype(np.int64)).numpy(),
+        real_run(executable, params, ids).numpy(),
+    )
+
+
+def test_run_model_host_ids_are_forwarded_as_int32(llama_case, monkeypatch):
+    """The unchanged host path still coerces to a contiguous int32 array."""
+    _, params, ids, executable = llama_case
+    forwarded: list = []
+    real_run = etl.run
+
+    def spy(exe, run_params, run_ids):
+        forwarded.append(run_ids)
+        return real_run(exe, run_params, run_ids)
+
+    monkeypatch.setattr(etl, "run", spy)
+    run_model(executable, params, ids.astype(np.int64))
+    assert len(forwarded) == 1
+    forwarded_ids = forwarded[0]
+    assert isinstance(forwarded_ids, np.ndarray)
+    assert forwarded_ids.dtype == np.int32
+    assert forwarded_ids.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(forwarded_ids, ids)
+
+
+def test_run_model_rejects_bad_tensor_ids(llama_case):
+    """The Tensor path keeps the same explicit error table as the array path."""
+    _, params, ids, executable = llama_case
+    with pytest.raises(etl.ShapeError) as excinfo:
+        run_model(executable, params, etl.from_numpy(ids[0]))
+    assert "2-D" in str(excinfo.value) and "etl.Tensor" in str(excinfo.value)
+    with pytest.raises(etl.ShapeError) as excinfo:
+        run_model(executable, params, etl.from_numpy(ids[:, :3]))
+    message = str(excinfo.value)
+    assert "(2, 3)" in message and "(2, 5)" in message and "Tensor" in message
+    with pytest.raises(etl.DTypeError) as excinfo:
+        run_model(executable, params, etl.from_numpy(ids.astype(np.float32)))
+    message = str(excinfo.value)
+    assert "float32" in message and "input_ids" in message
+
+
+# ---------------------------------------------------------------------------
 # place_params
 # ---------------------------------------------------------------------------
 def test_place_params_is_one_explicit_transfer_per_leaf():
@@ -699,6 +934,55 @@ def test_place_params_accepts_non_contiguous_arrays():
     params = {"a": np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]}
     placed = place_params(params, etl.core.Device("cpu", 0))
     np.testing.assert_array_equal(placed["a"].numpy(), params["a"])
+
+
+# ---------------------------------------------------------------------------
+# place_ids
+# ---------------------------------------------------------------------------
+def test_place_ids_is_an_explicit_int32_transfer():
+    ids = np.arange(6, dtype=np.int64).reshape(2, 3)
+    placed = place_ids(ids, etl.core.Device("cpu", 0))
+    assert isinstance(placed, etl.Tensor)
+    assert placed.device == etl.core.Device("cpu", 0)
+    assert placed.shape == (2, 3)
+    # the same single documented id coercion run_model performs on a host array
+    assert placed.dtype == np.int32
+    np.testing.assert_array_equal(placed.numpy(), ids)
+
+
+def test_place_ids_moves_an_existing_tensor_without_retyping():
+    tensor = etl.from_numpy(np.arange(6, dtype=np.int64).reshape(2, 3))
+    placed = place_ids(tensor, etl.core.Device("cpu", 0))
+    assert placed is tensor, "moving to the tensor's own device is a no-op"
+    assert placed.dtype == np.int64, "a Tensor's data is never re-typed"
+
+
+def test_place_ids_rejects_bad_arguments():
+    device = etl.core.Device("cpu", 0)
+    with pytest.raises(etl.DTypeError) as excinfo:
+        place_ids(np.zeros((2, 3), dtype=np.float32), device)
+    assert "place_ids" in str(excinfo.value) and "float32" in str(excinfo.value)
+    with pytest.raises(etl.DTypeError):
+        place_ids(etl.from_numpy(np.zeros((2, 3), dtype=np.float64)), device)
+    with pytest.raises(etl.ShapeError) as excinfo:
+        place_ids(np.zeros((3,), dtype=np.int32), device)
+    assert "2-D" in str(excinfo.value)
+    with pytest.raises(etl.ShapeError):
+        place_ids(etl.from_numpy(np.zeros((2, 3, 4), dtype=np.int32)), device)
+    for bad in ("cpu", 0, None, ("cpu", 0)):
+        with pytest.raises(TypeError) as excinfo:
+            place_ids(np.zeros((2, 3), dtype=np.int32), bad)  # type: ignore[arg-type]
+        assert "Device" in str(excinfo.value)
+
+
+def test_place_ids_drives_a_run(llama_case):
+    """``place_params`` + ``place_ids`` run bit-identically to the host path."""
+    _, params, ids, executable = llama_case
+    device = etl.core.Device("cpu", 0)
+    np.testing.assert_array_equal(
+        run_model(executable, place_params(params, device), place_ids(ids, device)).numpy(),
+        run_model(executable, params, ids).numpy(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1135,66 @@ def test_hfmodel_validates_its_parameter_tree(tmp_path):
     assert "expected" in str(excinfo.value)
     with pytest.raises(TypeError):
         HFModel(cfg, [("embed.weight", params["embed.weight"])], seq_len=4)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# HFModel.forward is host-facing (device params are refused, never copied back)
+# ---------------------------------------------------------------------------
+class _FakeDevicePayload:
+    """Metadata-only non-cpu payload — no data movement is ever attempted.
+
+    A real cuda/rocm tensor needs a device *and* a transfer provider, neither of
+    which exists on a CPU-only host. ``core.Tensor`` documents a duck-typed
+    payload protocol (``shape``/``dtype``/``device`` + host materialization), so
+    this reproduces the device-resident *shape* of the situation: the code under
+    test only reads ``Tensor.device``, which is the point — the helper must
+    refuse BEFORE any host copy, so ``to_host()`` asserting proves it never ran.
+    """
+
+    def __init__(self, array: np.ndarray, device) -> None:
+        self.shape = tuple(array.shape)
+        self.dtype = array.dtype
+        self.device = device
+        self._array = array
+
+    def to_host(self) -> np.ndarray:  # pragma: no cover - must never be called
+        raise AssertionError("a non-cpu payload must never be host-copied")
+
+
+def test_hfmodel_forward_rejects_device_params_with_the_recipe(tmp_path):
+    cfg = llama_config()
+    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
+    params = make_params(cfg, seed=17)
+    device = etl.core.Device("cuda", 0)
+    device_params = dict(params)
+    device_params["embed.weight"] = etl.core.Tensor(
+        _FakeDevicePayload(params["embed.weight"], device)
+    )
+    ids = make_ids(cfg, batch=1, seq=4, seed=18)
+    with pytest.raises(etl.DeviceError) as excinfo:
+        model.forward(params=device_params, input_ids=ids)
+    message = str(excinfo.value)
+    assert "embed.weight" in message
+    assert str(device) in message  # names where the offending leaf lives
+    for named in ("run_model", "place_params", "place_ids"):
+        assert named in message, named
+    assert "Device('cpu', 0)" in message  # the one explicit D2H for host logits
+
+
+def test_hfmodel_forward_accepts_cpu_tensors_and_tensor_ids(tmp_path):
+    """cpu Tensors (etl's own rule: host-addressable) keep working."""
+    cfg = llama_config()
+    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
+    ids = make_ids(cfg, batch=1, seq=4, seed=19)
+    expected = model.forward(input_ids=ids)
+    device = etl.core.Device("cpu", 0)
+    np.testing.assert_array_equal(
+        model.forward(params=place_params(model.params(), device), input_ids=ids),
+        expected,
+    )
+    np.testing.assert_array_equal(
+        model.forward(input_ids=place_ids(ids, device)), expected
+    )
 
 
 # ---------------------------------------------------------------------------

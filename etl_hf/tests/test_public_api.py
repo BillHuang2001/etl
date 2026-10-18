@@ -36,6 +36,7 @@ _EXPECTED_EXPORTS = {
     "ModelConfig": ("etl_hf.config", "ModelConfig"),
     "build_model": ("etl_hf.build", "build_model"),
     "load_hf": ("etl_hf.build", "load_hf"),
+    "place_ids": ("etl_hf.build", "place_ids"),
     "place_params": ("etl_hf.build", "place_params"),
     "run_model": ("etl_hf.build", "run_model"),
     "PackPlan": ("etl_hf.pack", "PackPlan"),
@@ -103,7 +104,14 @@ def test_every_public_name_has_a_docstring():
 
 def test_public_functions_document_their_arguments():
     """Every parameter of a public function is mentioned in its docstring."""
-    for name in ("build_model", "run_model", "place_params", "load_hf", "get_family"):
+    for name in (
+        "build_model",
+        "run_model",
+        "place_params",
+        "place_ids",
+        "load_hf",
+        "get_family",
+    ):
         function = getattr(etl_hf, name)
         doc = inspect.getdoc(function) or ""
         for parameter in inspect.signature(function).parameters:
