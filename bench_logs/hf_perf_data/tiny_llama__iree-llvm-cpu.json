@@ -64,7 +64,7 @@
   "notes": [],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpxxKXvU/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -78,9 +78,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 8.698,
+    "load_hf_ms": 8.2543,
     "weight_bytes_f32": 4129088,
-    "trace_ms": 59.5428,
+    "trace_ms": 54.3264,
     "ir_ops": 170,
     "ir_distinct_ops": 24,
     "ir_histogram": {
@@ -109,7 +109,7 @@
       "return": 1,
       "sin": 1
     },
-    "export_ms": 5.529,
+    "export_ms": 4.7793,
     "stablehlo_bytes": 28895,
     "stablehlo_lines": 301,
     "stablehlo_constants": 35
@@ -119,29 +119,29 @@
     "opt_level_sweep": {
       "O3": "compiled"
     },
-    "lower_ms": 32.481,
-    "compile_ms": 1235.4112,
-    "load_ms": 20.5029,
-    "stage_sum_ms": 1288.3951,
+    "lower_ms": 29.6579,
+    "compile_ms": 1147.008,
+    "load_ms": 20.0619,
+    "stage_sum_ms": 1196.7278,
     "artifact_bytes": 66026,
     "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": "O3",
-    "public_build_ms": 1401.7799,
+    "public_build_ms": 1201.891,
     "public_build_same_device": "Device(kind='cpu', index=0)"
   },
   "run": {
     "batch": 1,
     "seq_len": 8,
     "api": "etl_hf.run_model(host params, host ids)",
-    "first_call_ms": 5.1697,
+    "first_call_ms": 4.003,
     "n": 7,
-    "best_ms": 2.0317,
-    "median_ms": 2.0742,
-    "mean_ms": 2.0724,
-    "stdev_ms": 0.0265,
+    "best_ms": 2.1044,
+    "median_ms": 2.2513,
+    "mean_ms": 2.2227,
+    "stdev_ms": 0.0682,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 3937.59
+    "tokens_per_s": 3801.56
   },
   "parity": {
     "logits_shape": [
@@ -161,7 +161,7 @@
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 2.99,
+    "duration_s": 2.67,
     "stdout_tail": [
       "[stage] place params / prepare run",
       "[stage] first run",

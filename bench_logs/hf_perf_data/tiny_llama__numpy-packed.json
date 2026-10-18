@@ -53,7 +53,7 @@
   ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpW4QLgx/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -67,9 +67,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 8.9085,
+    "load_hf_ms": 8.2617,
     "weight_bytes_f32": 4129088,
-    "trace_ms": 70.0643,
+    "trace_ms": 61.0969,
     "ir_ops": 191,
     "ir_distinct_ops": 24,
     "ir_histogram": {
@@ -98,11 +98,11 @@
       "return": 1,
       "sin": 1
     },
-    "export_ms": 5.5058,
+    "export_ms": 5.0544,
     "stablehlo_bytes": 32205,
     "stablehlo_lines": 322,
     "stablehlo_constants": 35,
-    "pack_params_ms": 2.2509,
+    "pack_params_ms": 2.049,
     "packed_inputs": 4
   },
   "build": {
@@ -110,29 +110,29 @@
     "opt_level_sweep": {
       "default": "compiled"
     },
-    "lower_ms": 8.6836,
-    "compile_ms": 4.6565,
-    "load_ms": 6.9981,
-    "stage_sum_ms": 20.3382,
+    "lower_ms": 7.683,
+    "compile_ms": 4.1701,
+    "load_ms": 5.7901,
+    "stage_sum_ms": 17.6433,
     "artifact_bytes": null,
     "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": null,
-    "public_build_ms": 103.5506,
+    "public_build_ms": 93.6946,
     "public_build_same_device": "Device(kind='cpu', index=0)"
   },
   "run": {
     "batch": 1,
     "seq_len": 8,
     "api": "etl_hf.run_model(host params, host ids)",
-    "first_call_ms": 2.12,
+    "first_call_ms": 1.8032,
     "n": 7,
-    "best_ms": 1.1533,
-    "median_ms": 1.1786,
-    "mean_ms": 1.1797,
-    "stdev_ms": 0.0193,
+    "best_ms": 1.1122,
+    "median_ms": 1.1453,
+    "mean_ms": 1.1471,
+    "stdev_ms": 0.0237,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 6936.62
+    "tokens_per_s": 7192.95
   },
   "parity": {
     "logits_shape": [
@@ -152,7 +152,7 @@
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 0.42,
+    "duration_s": 0.37,
     "stdout_tail": [
       "[stage] place params / prepare run",
       "[stage] first run",

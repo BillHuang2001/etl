@@ -37,10 +37,19 @@ Run-level env overrides: none
 
 | model | family | act | params | weight inputs | graph inputs | IR ops | distinct op defs | StableHLO | constants | trace | export | pack (host) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `tiny_llama` | llama | silu | 1,032,272 | 21 | 22 | 170 | 24 | 28.2 KB | 35 | 50.7 ms | 4.8 ms | — |
-| `tiny_gpt2` | gpt2 | gelu_new | 102,714 | 36 | 37 | 170 | 19 | 32.8 KB | 52 | 52.5 ms | 5.3 ms | — |
-| `distilgpt2` | gpt2 | gelu_new | 81,912,576 | 100 | 101 | 450 | 19 | 88.1 KB | 128 | 120.2 ms | 9.4 ms | — |
-| `gpt2` | gpt2 | gelu_new | 124,439,808 | 196 | 197 | 870 | 19 | 170.9 KB | 242 | 225.6 ms | 17.7 ms | — |
+| `tiny_llama` | llama | silu | 1,032,272 | 21 | 22 | 170 | 24 | 28.2 KB | 35 | 52.8 ms | 4.7 ms | — |
+| `tiny_gpt2` | gpt2 | gelu_new | 102,714 | 36 | 37 | 170 | 19 | 32.8 KB | 52 | 54.6 ms | 4.7 ms | — |
+| `distilgpt2` | gpt2 | gelu_new | 81,912,576 | 100 | 101 | 450 | 19 | 88.1 KB | 128 | 126.1 ms | 10.1 ms | — |
+| `gpt2` | gpt2 | gelu_new | 124,439,808 | 196 | 197 | 870 | 19 | 170.9 KB | 242 | 253.0 ms | 19.8 ms | — |
+
+### Packed weights (`pack_weights=True`)
+
+| model | family | act | params | weight inputs | graph inputs | IR ops | distinct op defs | StableHLO | constants | trace | export | pack (host) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `tiny_llama` | llama | silu | 1,032,272 | 4 | 5 | 191 | 24 | 31.5 KB | 35 | 61.1 ms | 5.1 ms | 2.0 ms |
+| `tiny_gpt2` | gpt2 | gelu_new | 102,714 | 3 | 4 | 206 | 20 | 37.9 KB | 52 | 64.0 ms | 5.3 ms | 0.1 ms |
+| `distilgpt2` | gpt2 | gelu_new | 81,912,576 | 3 | 4 | 550 | 20 | 103.0 KB | 128 | 155.9 ms | 10.3 ms | 90.1 ms |
+| `gpt2` | gpt2 | gelu_new | 124,439,808 | 3 | 4 | 1,066 | 20 | 200.4 KB | 242 | 293.8 ms | 17.7 ms | 118.7 ms |
 
 `graph inputs` = weight inputs + 1 (the `(batch, seq_len)` int32 `input_ids`). The IR op count differs between the packed/unpacked graphs because the packed one adds its in-graph `slice` unpacking; it is identical for every backend of the same graph — the traced program, not a backend artifact.
 
@@ -48,18 +57,30 @@ Run-level env overrides: none
 
 | model | backend | device | opt_level used | lower | compile | load | stage sum | public build |
 |---|---|---|---|---|---|---|---|---|
-| `tiny_llama` | `numpy` | cpu:0 | — | 7.1 ms | 3.8 ms | 3.8 ms | 14.7 ms | 79.6 ms |
-| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 29.5 ms | 1,133.0 ms | 8.9 ms | 1,171.4 ms | 1,193.1 ms |
-| `tiny_llama` | `iree-rocm` | rocm:0 | `O3` (default `None` rejected) | 13.6 ms | 936.0 ms | 214.6 ms | 1,164.1 ms | 1,045.9 ms |
-| `tiny_gpt2` | `numpy` | cpu:0 | — | 8.0 ms | 3.9 ms | 4.0 ms | 15.9 ms | 78.2 ms |
-| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 13.9 ms | 935.3 ms | 17.1 ms | 966.3 ms | 1,081.8 ms |
-| `tiny_gpt2` | `iree-rocm` | rocm:0 | `O3` (default `None` rejected) | 13.7 ms | 751.9 ms | 207.5 ms | 973.1 ms | 882.8 ms |
-| `distilgpt2` | `numpy` | cpu:0 | — | 17.0 ms | 9.7 ms | 9.7 ms | 36.3 ms | — |
-| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | `O3` (default `None` rejected) | 22.3 ms | 2,085.1 ms | 16.0 ms | 2,123.5 ms | — |
-| `distilgpt2` | `iree-rocm` | rocm:0 | `O1` (default `None` rejected) | 14.9 ms | 1,305.3 ms | 204.1 ms | 1,524.2 ms | — |
-| `gpt2` | `numpy` | cpu:0 | — | 30.6 ms | 19.6 ms | 18.9 ms | 69.1 ms | — |
+| `tiny_llama` | `numpy` | cpu:0 | — | 7.1 ms | 3.8 ms | 3.7 ms | 14.6 ms | 85.4 ms |
+| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | `O3` | 29.7 ms | 1,147.0 ms | 20.1 ms | 1,196.7 ms | 1,201.9 ms |
+| `tiny_llama` | `iree-rocm` | rocm:0 | `O1` | 13.8 ms | 910.6 ms | 209.0 ms | 1,133.5 ms | 1,033.9 ms |
+| `tiny_llama` | `numpy-packed` | cpu:0 | — | 7.7 ms | 4.2 ms | 5.8 ms | 17.6 ms | 93.7 ms |
+| `tiny_llama` | `iree-llvm-cpu-packed` | cpu:0 | `O3` | 14.4 ms | 1,235.2 ms | 13.6 ms | 1,263.2 ms | 1,297.0 ms |
+| `tiny_llama` | `iree-rocm-packed` | rocm:0 | `O1` | 14.4 ms | 1,063.1 ms | 200.9 ms | 1,278.5 ms | 1,206.6 ms |
+| `tiny_gpt2` | `numpy` | cpu:0 | — | 7.2 ms | 3.9 ms | 5.6 ms | 16.7 ms | 82.0 ms |
+| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | `O3` | 14.1 ms | 947.2 ms | 18.5 ms | 979.9 ms | 1,022.1 ms |
+| `tiny_gpt2` | `iree-rocm` | rocm:0 | `O1` | 15.6 ms | 781.6 ms | 204.2 ms | 1,001.3 ms | 900.9 ms |
+| `tiny_gpt2` | `numpy-packed` | cpu:0 | — | 8.0 ms | 4.4 ms | 6.4 ms | 18.8 ms | 107.7 ms |
+| `tiny_gpt2` | `iree-llvm-cpu-packed` | cpu:0 | `O3` | 15.6 ms | 975.5 ms | 11.6 ms | 1,002.6 ms | 1,055.1 ms |
+| `tiny_gpt2` | `iree-rocm-packed` | rocm:0 | `O1` | 14.7 ms | 890.5 ms | 204.9 ms | 1,110.2 ms | 1,043.9 ms |
+| `distilgpt2` | `numpy` | cpu:0 | — | 18.7 ms | 9.6 ms | 9.6 ms | 37.9 ms | — |
+| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | `O3` | 22.2 ms | 2,040.4 ms | 11.7 ms | 2,074.2 ms | — |
+| `distilgpt2` | `iree-rocm` | rocm:0 | `O1` | 22.3 ms | 1,307.4 ms | 211.6 ms | 1,541.3 ms | — |
+| `distilgpt2` | `numpy-packed` | cpu:0 | — | 20.0 ms | 11.6 ms | 11.3 ms | 42.9 ms | — |
+| `distilgpt2` | `iree-llvm-cpu-packed` | cpu:0 | `O3` | 26.5 ms | 2,307.9 ms | 12.6 ms | 2,347.0 ms | — |
+| `distilgpt2` | `iree-rocm-packed` | rocm:0 | `O1` | 28.0 ms | 3,455.7 ms | 216.1 ms | 3,699.8 ms | — |
+| `gpt2` | `numpy` | cpu:0 | — | 29.8 ms | 20.8 ms | 21.3 ms | 71.9 ms | — |
 | `gpt2` | `iree-llvm-cpu` | cpu:0 | — | — | — | — | — | — |
 | `gpt2` | `iree-rocm` | rocm:0 | — | — | — | — | — | — |
+| `gpt2` | `numpy-packed` | cpu:0 | — | 33.2 ms | 23.3 ms | 22.2 ms | 78.7 ms | — |
+| `gpt2` | `iree-llvm-cpu-packed` | cpu:0 | `O3` | 42.3 ms | 3,048.0 ms | 19.5 ms | 3,109.8 ms | — |
+| `gpt2` | `iree-rocm-packed` | rocm:0 | `O1` | 40.0 ms | 5,972.3 ms | 203.1 ms | 6,215.4 ms | — |
 
 `opt_level used` is the level the row was actually built at; the resolved default is recorded per leg in `build.opt_level_default` / `build.opt_level_used` (the library defaults: `O3` for llvm-cpu, `O1` for an all-ROCm target set — section 7 explains the O2/O3 ROCm rejection that forces it). Compile time is the IREE compile of the whole-model graph (the numpy interpreter has no compile step). `public build` is the cold `etl_hf.build_model` total where measured — it re-runs the stages, so it should be ≳ the stage sum (it also does `load_hf`-side work and graph memoisation bookkeeping).
 
@@ -67,18 +88,30 @@ Run-level env overrides: none
 
 | model | backend | device | first call | warm best | warm median | tokens/s | +d2h best | restage best (anti-pattern) |
 |---|---|---|---|---|---|---|---|---|
-| `tiny_llama` | `numpy` | cpu:0 | 1.74 ms | 1.05 ms | 1.08 ms | 7,613 | — | — |
-| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | 3.99 ms | 1.91 ms | 2.17 ms | 4,192 | — | — |
-| `tiny_llama` | `iree-rocm` | rocm:0 | 0.68 ms | 0.18 ms | 0.19 ms | 45,558 | 0.64 ms | 1.81 ms |
-| `tiny_gpt2` | `numpy` | cpu:0 | 1.75 ms | 0.98 ms | 0.99 ms | 8,157 | — | — |
-| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | 1.17 ms | 0.49 ms | 0.50 ms | 16,458 | — | — |
-| `tiny_gpt2` | `iree-rocm` | rocm:0 | 0.70 ms | 0.19 ms | 0.20 ms | 41,797 | 0.86 ms | 2.35 ms |
-| `distilgpt2` | `numpy` | cpu:0 | 32.56 ms | 14.01 ms | 14.44 ms | 2,284 | — | — |
-| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | 309.61 ms | 266.39 ms | 270.16 ms | 120 | — | — |
-| `distilgpt2` | `iree-rocm` | rocm:0 | 3.50 ms | 3.02 ms | 3.04 ms | 10,600 | 5.23 ms | 98.12 ms |
-| `gpt2` | `numpy` | cpu:0 | 73.43 ms | 28.67 ms | 35.43 ms | 1,116 | — | — |
+| `tiny_llama` | `numpy` | cpu:0 | 1.81 ms | 1.14 ms | 1.20 ms | 7,029 | — | — |
+| `tiny_llama` | `iree-llvm-cpu` | cpu:0 | 4.00 ms | 2.10 ms | 2.25 ms | 3,802 | — | — |
+| `tiny_llama` | `iree-rocm` | rocm:0 | 0.60 ms | 0.20 ms | 0.22 ms | 39,761 | 0.67 ms | 1.94 ms |
+| `tiny_llama` | `numpy-packed` | cpu:0 | 1.80 ms | 1.11 ms | 1.15 ms | 7,193 | — | — |
+| `tiny_llama` | `iree-llvm-cpu-packed` | cpu:0 | 4.26 ms | 1.75 ms | 2.07 ms | 4,580 | — | — |
+| `tiny_llama` | `iree-rocm-packed` | rocm:0 | 0.68 ms | 0.17 ms | 0.18 ms | 47,676 | 0.66 ms | 0.93 ms |
+| `tiny_gpt2` | `numpy` | cpu:0 | 1.64 ms | 0.97 ms | 0.99 ms | 8,237 | — | — |
+| `tiny_gpt2` | `iree-llvm-cpu` | cpu:0 | 1.54 ms | 0.63 ms | 0.65 ms | 12,704 | — | — |
+| `tiny_gpt2` | `iree-rocm` | rocm:0 | 0.70 ms | 0.21 ms | 0.22 ms | 37,665 | 0.89 ms | 2.37 ms |
+| `tiny_gpt2` | `numpy-packed` | cpu:0 | 1.71 ms | 1.02 ms | 1.04 ms | 7,821 | — | — |
+| `tiny_gpt2` | `iree-llvm-cpu-packed` | cpu:0 | 1.30 ms | 0.48 ms | 0.50 ms | 16,526 | — | — |
+| `tiny_gpt2` | `iree-rocm-packed` | rocm:0 | 0.56 ms | 0.16 ms | 0.16 ms | 50,251 | 0.87 ms | 0.47 ms |
+| `distilgpt2` | `numpy` | cpu:0 | 39.19 ms | 17.72 ms | 17.87 ms | 1,806 | — | — |
+| `distilgpt2` | `iree-llvm-cpu` | cpu:0 | 298.85 ms | 258.14 ms | 264.11 ms | 124 | — | — |
+| `distilgpt2` | `iree-rocm` | rocm:0 | 1.77 ms | 1.24 ms | 1.26 ms | 25,728 | 3.52 ms | 95.45 ms |
+| `distilgpt2` | `numpy-packed` | cpu:0 | 35.24 ms | 16.95 ms | 17.26 ms | 1,888 | — | — |
+| `distilgpt2` | `iree-llvm-cpu-packed` | cpu:0 | 296.09 ms | 291.68 ms | 298.10 ms | 110 | — | — |
+| `distilgpt2` | `iree-rocm-packed` | rocm:0 | 1.65 ms | 1.11 ms | 1.11 ms | 28,949 | 3.35 ms | 262.87 ms |
+| `gpt2` | `numpy` | cpu:0 | 62.70 ms | 28.59 ms | 29.50 ms | 1,119 | — | — |
 | `gpt2` | `iree-llvm-cpu` | cpu:0 | — | — | — | — | — | — |
 | `gpt2` | `iree-rocm` | rocm:0 | — | — | — | — | — | — |
+| `gpt2` | `numpy-packed` | cpu:0 | 61.76 ms | 28.42 ms | 28.74 ms | 1,126 | — | — |
+| `gpt2` | `iree-llvm-cpu-packed` | cpu:0 | 407.46 ms | 397.56 ms | 402.86 ms | 80 | — | — |
+| `gpt2` | `iree-rocm-packed` | rocm:0 | 7.50 ms | 7.07 ms | 7.08 ms | 4,527 | 9.37 ms | 399.09 ms |
 
 `+d2h best` = same device loop with one explicit `Tensor.to(cpu)` of the logits per call (what you pay if you need the logits on the host); `restage best` = the whole weight tree re-placed on the device every call — the documented anti-pattern, and why the device loop above is the fast iteration pattern. Device rows are driven through `etl_hf.run_model(exe, place_params(...), place_ids(...))` — the public `etl_hf` API, no raw `etl.run` short-circuit (the leg records `run.api`).
 
@@ -89,15 +122,27 @@ Run-level env overrides: none
 | `tiny_llama` | `numpy` | 0.349 | 8.94e-08 | 6.27e-09 | 2.56e-07 | — | ok |
 | `tiny_llama` | `iree-llvm-cpu` | 0.349 | 7.45e-08 | 4.58e-09 | 2.14e-07 | 8.94e-08 | ok |
 | `tiny_llama` | `iree-rocm` | 0.349 | 8.94e-08 | 6.04e-09 | 2.56e-07 | 8.94e-08 | ok |
+| `tiny_llama` | `numpy-packed` | 0.349 | 8.94e-08 | 6.27e-09 | 2.56e-07 | 0.00 | ok |
+| `tiny_llama` | `iree-llvm-cpu-packed` | 0.349 | 7.45e-08 | 4.58e-09 | 2.14e-07 | 8.94e-08 | ok |
+| `tiny_llama` | `iree-rocm-packed` | 0.349 | 8.94e-08 | 6.04e-09 | 2.56e-07 | 8.94e-08 | ok |
 | `tiny_gpt2` | `numpy` | 0.129 | 0.00 | 0.00 | 0.00 | — | ok |
 | `tiny_gpt2` | `iree-llvm-cpu` | 0.129 | 0.00 | 0.00 | 0.00 | 0.00 | ok |
 | `tiny_gpt2` | `iree-rocm` | 0.129 | 0.00 | 0.00 | 0.00 | 0.00 | ok |
+| `tiny_gpt2` | `numpy-packed` | 0.129 | 0.00 | 0.00 | 0.00 | 0.00 | ok |
+| `tiny_gpt2` | `iree-llvm-cpu-packed` | 0.129 | 0.00 | 0.00 | 0.00 | 0.00 | ok |
+| `tiny_gpt2` | `iree-rocm-packed` | 0.129 | 0.00 | 0.00 | 0.00 | 0.00 | ok |
 | `distilgpt2` | `numpy` | 82.115 | 1.07e-04 | 1.14e-05 | 1.30e-06 | — | ok |
 | `distilgpt2` | `iree-llvm-cpu` | 82.115 | 2.21e-04 | 2.33e-05 | 2.69e-06 | 2.14e-04 | ok |
 | `distilgpt2` | `iree-rocm` | 82.115 | 2.21e-04 | 2.58e-05 | 2.69e-06 | 2.29e-04 | ok |
+| `distilgpt2` | `numpy-packed` | 82.115 | 1.07e-04 | 1.14e-05 | 1.30e-06 | 0.00 | ok |
+| `distilgpt2` | `iree-llvm-cpu-packed` | 82.115 | 2.21e-04 | 2.33e-05 | 2.69e-06 | 2.14e-04 | ok |
+| `distilgpt2` | `iree-rocm-packed` | 82.115 | 2.21e-04 | 2.58e-05 | 2.69e-06 | 2.29e-04 | ok |
 | `gpt2` | `numpy` | 138.724 | 1.53e-04 | 2.22e-05 | 1.10e-06 | — | ok |
-| `gpt2` | `iree-llvm-cpu` | — | — | — | — | — | **skipped**: graph consumes 197 inputs, above the ~161-input IREE runtime limit |
-| `gpt2` | `iree-rocm` | — | — | — | — | — | **skipped**: graph consumes 197 inputs, above the ~161-input IREE runtime limit |
+| `gpt2` | `iree-llvm-cpu` | — | — | — | — | — | **skipped**: UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit |
+| `gpt2` | `iree-rocm` | — | — | — | — | — | **skipped**: UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit |
+| `gpt2` | `numpy-packed` | 138.724 | 1.53e-04 | 2.22e-05 | 1.10e-06 | 0.00 | ok |
+| `gpt2` | `iree-llvm-cpu-packed` | 138.724 | 3.05e-04 | 3.71e-05 | 2.20e-06 | 3.51e-04 | ok |
+| `gpt2` | `iree-rocm-packed` | 138.724 | 2.90e-04 | 3.90e-05 | 2.09e-06 | 3.36e-04 | ok |
 
 Golden absmax per model (the scale that turns an absolute delta into a relative one): `tiny_llama` 0.349, `tiny_gpt2` 0.129, `distilgpt2` 82.115, `gpt2` 138.724.
 
@@ -107,25 +152,37 @@ Golden absmax per model (the scale that turns an absolute delta into a relative 
 
 | model | numpy (cpu) | iree llvm-cpu | iree rocm (device-resident) | rocm / numpy | rocm / llvm-cpu | numpy / llvm-cpu |
 |---|---|---|---|---|---|---|
-| `tiny_llama` | 1.05 ms | 1.91 ms | 0.18 ms | 5.98× | 10.87× | 1.82× |
-| `tiny_gpt2` | 0.98 ms | 0.49 ms | 0.19 ms | 5.12× | 2.54× | 0.50× |
-| `distilgpt2` | 14.01 ms | 266.39 ms | 3.02 ms | 4.64× | 88.24× | 19.01× |
-| `gpt2` | 28.67 ms | — | — | — | — | — |
+| `tiny_llama` | 1.14 ms | 2.10 ms | 0.20 ms | 5.66× | 10.46× | 1.85× |
+| `tiny_gpt2` | 0.97 ms | 0.63 ms | 0.21 ms | 4.57× | 2.96× | 0.65× |
+| `distilgpt2` | 17.72 ms | 258.14 ms | 1.24 ms | 14.25× | 207.55× | 14.57× |
+| `gpt2` | 28.59 ms | — | — | — | — | — |
+
+### Packed weights
+
+| model | numpy (cpu) | iree llvm-cpu | iree rocm (device-resident) | rocm / numpy | rocm / llvm-cpu | numpy / llvm-cpu |
+|---|---|---|---|---|---|---|
+| `tiny_llama` | 1.11 ms | 1.75 ms | 0.17 ms | 6.63× | 10.41× | 1.57× |
+| `tiny_gpt2` | 1.02 ms | 0.48 ms | 0.16 ms | 6.43× | 3.04× | 0.47× |
+| `distilgpt2` | 16.95 ms | 291.68 ms | 1.11 ms | 15.33× | 263.87× | 17.21× |
+| `gpt2` | 28.42 ms | 397.56 ms | 7.07 ms | 4.02× | 56.24× | 13.99× |
 
 Speedup columns are latency ratios (`A/B > 1` ⇒ B is faster). Two regimes are visible and both are measured, not assumed: `numpy / llvm-cpu > 1` means plain OpenBLAS beats the compiled CPU graph, while `rocm / llvm-cpu` is the real GPU-vs-CPU comparison — these graphs are hundreds of separate IREE dispatches, so the device-resident GPU path wins on parallel dispatch, not on tensor-core throughput (these models are far too small for that).
 
 ## 6. Findings
 
-- **Parity.** Every measured leg — packed and unpacked — reproduces the torch/transformers golden logits to fp32 accumulation order: the largest deviation anywhere in the matrix is `2.21e-04` (distilgpt2 / iree-llvm-cpu). Deltas are 1e-8-class on the tiny checkpoints and 1e-4-class on the 82M/124M ones, whose logits reach |max| ≈ 80–300 (i.e. ~1e-6 relative).
-- **Compiled vs the numpy interpreter** on the identical weights: largest max-abs is `2.29e-04` (distilgpt2). The numpy backend is the reference here, so this isolates backend numerics from checkpoint parsing.
-- **On CPU (unpacked weights) the numpy interpreter is competitive-to-faster than the compiled graph** (numpy faster on 2 of 3 measured models): `tiny_llama` numpy 1.05 ms vs llvm-cpu 1.91 ms (numpy 1.82× faster), `tiny_gpt2` numpy 0.98 ms vs llvm-cpu 0.49 ms (llvm-cpu 2.02× faster), `distilgpt2` numpy 14.01 ms vs llvm-cpu 266.39 ms (numpy 19.01× faster). The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE dispatch overhead per op (these graphs are hundreds of small ops). **The compiled path's value is the GPU**, not CPU speed.
-- **GPU (MI300X, ROCm, device-resident, unpacked weights)**: `tiny_llama` 0.18 ms — 5.98× faster than numpy, 10.87× faster than iree-llvm-cpu, `tiny_gpt2` 0.19 ms — 5.12× faster than numpy, 2.54× faster than iree-llvm-cpu, `distilgpt2` 3.02 ms — 4.64× faster than numpy, 88.24× faster than iree-llvm-cpu.
-- **ROCm `opt_level` default = `O1`, and the rejection above it is real (measured, never asserted):** `distilgpt2` / `iree-rocm` — built at `opt_level=O1`, while `O3` fails with `'func.func' op failed to distribute` and `O2` fails with `'func.func' op failed to distribute`. That `'func.func' op failed to distribute` is an upstream `iree-compile` ROCm codegen failure on the LayerNorm-shaped reduce (not an etl/etl_hf bug), so the library now injects `opt_level="O1"` for an all-ROCm target set — these rows are measured at that default, and the higher levels are re-attempted only to record the verbatim error.
-- **Per-call restaging is the anti-pattern, measured here:** re-placing the whole weight tree on the device every call costs `tiny_llama`/`iree-rocm` 1.81 ms vs 0.18 ms for the same-device loop (10.3×), `tiny_gpt2`/`iree-rocm` 2.35 ms vs 0.19 ms for the same-device loop (12.3×), `distilgpt2`/`iree-rocm` 98.12 ms vs 3.02 ms for the same-device loop (32.5×). The same-device loop (`place_params` + `place_ids` once, feed device tensors back) is the iteration pattern to use — with packed weights it also stages 3–8 leaves instead of ~100–200.
-- **Reading the logits back to the host costs extra**: same loop plus one explicit `Tensor.to(cpu)` per call is `tiny_llama`/`iree-rocm` 0.64 ms (vs 0.18 ms), `tiny_gpt2`/`iree-rocm` 0.86 ms (vs 0.19 ms), `distilgpt2`/`iree-rocm` 5.23 ms (vs 3.02 ms).
-- **The ~161-consumed-input cliff is real — but only for UNPACKED graphs.** `gpt2` / `iree-llvm-cpu`, `gpt2` / `iree-rocm` stay refused: those graphs declare more distinct inputs than IREE's Python runtime can invoke (SIGSEGV, exit `-11`, measured in section 7). The same models DO run compiled once packed — `pack_weights=True` collapses the weight tree into a handful of inputs, and the packed rows above are real measurements, not extrapolations.
-- **Compile cost is a one-off**: the largest measured compile is `2,085 ms` (`distilgpt2` / `iree-llvm-cpu`); everything after it is the per-call latency above. `etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, batch, packed)`, so repeated builds of the same shape reuse the executable.
-- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the device-resident GPU rows look launch-bound rather than compute-bound. The forward graph is hundreds of small ops (measured IR op counts: `tiny_llama` 170, `tiny_gpt2` 170, `distilgpt2` 450) that StableHLO/IREE lower into many narrow dispatches, so the per-call time is dominated by dispatch + kernel-launch overhead instead of arithmetic. That would explain the observed GPU-vs-numpy margins of 5.98×, 5.12×, 4.64× — a narrow band that shows no clean trend across the parameter-count range measured. **Not verified here** — the probe records no dispatch count and no per-op GPU timeline; confirming it would need an IREE trace / `--iree-hal-trace-execution` run, which this probe does not do.
+- **Parity.** Every measured leg — packed and unpacked — reproduces the torch/transformers golden logits to fp32 accumulation order: the largest deviation anywhere in the matrix is `3.05e-04` (gpt2 / iree-llvm-cpu-packed). Deltas are 1e-8-class on the tiny checkpoints and 1e-4-class on the 82M/124M ones, whose logits reach |max| ≈ 80–300 (i.e. ~1e-6 relative).
+- **Packing does not change numerics.** The packed numpy rows are **bit-identical** to the unpacked numpy reference (`max-abs 0.00`) on `tiny_llama`, `tiny_gpt2`, `distilgpt2`, `gpt2` — `pack_params` is a pure host-side concatenation and the in-graph `etl.slice` unpacking returns the very same values. The largest packed-vs-unpacked-reference delta anywhere is `3.51e-04` (`gpt2` / `iree-llvm-cpu-packed`), i.e. the compiled kernels' fp32 accumulation order, not packing.
+- **Compiled vs the numpy interpreter** on the identical weights: largest max-abs is `3.51e-04` (gpt2). The numpy backend is the reference here, so this isolates backend numerics from checkpoint parsing.
+- **On CPU (unpacked weights) the numpy interpreter is competitive-to-faster than the compiled graph** (numpy faster on 2 of 3 measured models): `tiny_llama` numpy 1.14 ms vs llvm-cpu 2.10 ms (numpy 1.85× faster), `tiny_gpt2` numpy 0.97 ms vs llvm-cpu 0.63 ms (llvm-cpu 1.54× faster), `distilgpt2` numpy 17.72 ms vs llvm-cpu 258.14 ms (numpy 14.57× faster). The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE dispatch overhead per op (these graphs are hundreds of small ops). **The compiled path's value is the GPU**, not CPU speed.
+- **On CPU (packed weights) the numpy interpreter is competitive-to-faster than the compiled graph** (numpy faster on 3 of 4 measured models): `tiny_llama` numpy 1.11 ms vs llvm-cpu 1.75 ms (numpy 1.57× faster), `tiny_gpt2` numpy 1.02 ms vs llvm-cpu 0.48 ms (llvm-cpu 2.11× faster), `distilgpt2` numpy 16.95 ms vs llvm-cpu 291.68 ms (numpy 17.21× faster), `gpt2` numpy 28.42 ms vs llvm-cpu 397.56 ms (numpy 13.99× faster). The numpy path uses OpenBLAS for every matmul; the compiled graph pays IREE dispatch overhead per op (these graphs are hundreds of small ops). **The compiled path's value is the GPU**, not CPU speed.
+- **GPU (MI300X, ROCm, device-resident, unpacked weights)**: `tiny_llama` 0.20 ms — 5.66× faster than numpy, 10.46× faster than iree-llvm-cpu, `tiny_gpt2` 0.21 ms — 4.57× faster than numpy, 2.96× faster than iree-llvm-cpu, `distilgpt2` 1.24 ms — 14.25× faster than numpy, 207.55× faster than iree-llvm-cpu.
+- **GPU (MI300X, ROCm, device-resident, packed weights)**: `tiny_llama` 0.17 ms — 6.63× faster than numpy, 10.41× faster than iree-llvm-cpu, `tiny_gpt2` 0.16 ms — 6.43× faster than numpy, 3.04× faster than iree-llvm-cpu, `distilgpt2` 1.11 ms — 15.33× faster than numpy, 263.87× faster than iree-llvm-cpu, `gpt2` 7.07 ms — 4.02× faster than numpy, 56.24× faster than iree-llvm-cpu.
+- **ROCm `opt_level` default = `O1`, and the rejection above it is real (measured, never asserted):** `distilgpt2` / `iree-rocm` — built at `opt_level=O1`, while `O3` fails with `'func.func' op failed to distribute` and `O2` fails with `'func.func' op failed to distribute`; `distilgpt2` / `iree-rocm-packed` — built at `opt_level=O1`, while `O3` fails with `'func.func' op failed to distribute` and `O2` fails with `'func.func' op failed to distribute`; `gpt2` / `iree-rocm-packed` — built at `opt_level=O1`, while `O3` fails with `'func.func' op failed to distribute` and `O2` fails with `'func.func' op failed to distribute`. That `'func.func' op failed to distribute` is an upstream `iree-compile` ROCm codegen failure on the LayerNorm-shaped reduce (not an etl/etl_hf bug), so the library now injects `opt_level="O1"` for an all-ROCm target set — these rows are measured at that default, and the higher levels are re-attempted only to record the verbatim error.
+- **Per-call restaging is the anti-pattern, measured here:** re-placing the whole weight tree on the device every call costs `tiny_llama`/`iree-rocm` 1.94 ms vs 0.20 ms for the same-device loop (9.6×), `tiny_llama`/`iree-rocm-packed` 0.93 ms vs 0.17 ms for the same-device loop (5.5×), `tiny_gpt2`/`iree-rocm` 2.37 ms vs 0.21 ms for the same-device loop (11.2×), `tiny_gpt2`/`iree-rocm-packed` 0.47 ms vs 0.16 ms for the same-device loop (2.9×), `distilgpt2`/`iree-rocm` 95.45 ms vs 1.24 ms for the same-device loop (76.7×), `distilgpt2`/`iree-rocm-packed` 262.87 ms vs 1.11 ms for the same-device loop (237.8×), `gpt2`/`iree-rocm-packed` 399.09 ms vs 7.07 ms for the same-device loop (56.5×). The same-device loop (`place_params` + `place_ids` once, feed device tensors back) is the iteration pattern to use — with packed weights it also stages 3–8 leaves instead of ~100–200.
+- **Reading the logits back to the host costs extra**: same loop plus one explicit `Tensor.to(cpu)` per call is `tiny_llama`/`iree-rocm` 0.67 ms (vs 0.20 ms), `tiny_llama`/`iree-rocm-packed` 0.66 ms (vs 0.17 ms), `tiny_gpt2`/`iree-rocm` 0.89 ms (vs 0.21 ms), `tiny_gpt2`/`iree-rocm-packed` 0.87 ms (vs 0.16 ms), `distilgpt2`/`iree-rocm` 3.52 ms (vs 1.24 ms), `distilgpt2`/`iree-rocm-packed` 3.35 ms (vs 1.11 ms), `gpt2`/`iree-rocm-packed` 9.37 ms (vs 7.07 ms).
+- **The ~161-consumed-input cliff is real — but only for UNPACKED graphs.** `gpt2` / `iree-llvm-cpu`, `gpt2` / `iree-rocm` stay refused: those graphs declare more distinct inputs than IREE's Python runtime can invoke (SIGSEGV, exit `-11`, measured in section 7). The same models DO run compiled once packed: `gpt2` / `iree-llvm-cpu-packed`, `gpt2` / `iree-rocm-packed` — `pack_weights=True` collapses the weight tree into a handful of inputs, and the packed rows above are real measurements, not extrapolations.
+- **Compile cost is a one-off**: the largest measured compile is `5,972 ms` (`gpt2` / `iree-rocm-packed`); everything after it is the per-call latency above. `etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, batch, packed)`, so repeated builds of the same shape reuse the executable.
+- **HYPOTHESIS (not measured — stated as a hypothesis, not a result):** the device-resident GPU rows look launch-bound rather than compute-bound. The forward graph is hundreds of small ops (measured IR op counts: `tiny_llama` 170, `tiny_gpt2` 170, `distilgpt2` 450) that StableHLO/IREE lower into many narrow dispatches, so the per-call time is dominated by dispatch + kernel-launch overhead instead of arithmetic. That would explain the observed GPU-vs-numpy margins of 5.66×, 4.57×, 14.25×, 6.63×, 6.43×, 15.33×, 4.02× — a narrow band that shows no clean trend across the parameter-count range measured. **Not verified here** — the probe records no dispatch count and no per-op GPU timeline; confirming it would need an IREE trace / `--iree-hal-trace-execution` run, which this probe does not do.
 
 ## 7. The ~161-consumed-input cliff: measured, and resolved by packing
 
@@ -133,10 +190,10 @@ IREE's Python runtime **SIGSEGVs without a Python exception** when a graph consu
 
 | model | unpacked graph inputs | unpacked compiled legs | packed graph inputs | packed compiled legs |
 |---|---|---|---|---|
-| `tiny_llama` | 22 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
-| `tiny_gpt2` | 37 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
-| `distilgpt2` | 101 | `iree-llvm-cpu` ok, `iree-rocm` ok | — |  |
-| `gpt2` | 197 | `iree-llvm-cpu` skipped, `iree-rocm` skipped | — |  |
+| `tiny_llama` | 22 | `iree-llvm-cpu` ok, `iree-rocm` ok | 5 | `numpy-packed` ok, `iree-llvm-cpu-packed` ok, `iree-rocm-packed` ok |
+| `tiny_gpt2` | 37 | `iree-llvm-cpu` ok, `iree-rocm` ok | 4 | `numpy-packed` ok, `iree-llvm-cpu-packed` ok, `iree-rocm-packed` ok |
+| `distilgpt2` | 101 | `iree-llvm-cpu` ok, `iree-rocm` ok | 4 | `numpy-packed` ok, `iree-llvm-cpu-packed` ok, `iree-rocm-packed` ok |
+| `gpt2` | 197 | `iree-llvm-cpu` skipped, `iree-rocm` skipped | 4 | `numpy-packed` ok, `iree-llvm-cpu-packed` ok, `iree-rocm-packed` ok |
 
 To show that the refusal describes a real runtime limit and not a guess, each refused leg is attempted ONCE in its own subprocess (CPU targets only — a live GPU context is never put in front of a deliberate SIGSEGV):
 
@@ -150,53 +207,83 @@ The attempt dies with exit code(s) `-11` **without a Python exception** — a ha
 
 ### `gpt2` / `iree-llvm-cpu` — **skipped**
 
-- exit code: `0`; wall time 0.89 s
-- note: graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option — compiled rows stay 'pending packing'; numpy row is measured
-- note: pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)
+- exit code: `0`; wall time 0.93 s
+- note: UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) — this leg is refused up front; the PACKED form of the same model is measured separately as `gpt2` / `iree-llvm-cpu-packed`
 
 ### `gpt2` / `iree-rocm` — **skipped**
 
-- exit code: `0`; wall time 0.89 s
-- note: graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option — compiled rows stay 'pending packing'; numpy row is measured
-- note: pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)
+- exit code: `0`; wall time 0.92 s
+- note: UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) — this leg is refused up front; the PACKED form of the same model is measured separately as `gpt2` / `iree-rocm-packed`
 
 ## 9. Per-leg notes
 
 - `tiny_llama` / `iree-rocm`:
   - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
-  - device-resident run driven through etl.run with an explicitly placed ids Tensor (etl_hf.run_model converts ids to a host ndarray, which a non-cpu executable rejects at the run boundary)
-  - restage = etl_hf.place_params(host params) + run per call (the documented per-call restaging anti-pattern)
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
+- `tiny_llama` / `numpy-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (4 inputs); the graph unpacks them with static etl.slice
+- `tiny_llama` / `iree-llvm-cpu-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (4 inputs); the graph unpacks them with static etl.slice
+- `tiny_llama` / `iree-rocm-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (4 inputs); the graph unpacks them with static etl.slice
+  - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
 - `tiny_gpt2` / `iree-rocm`:
   - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
-  - device-resident run driven through etl.run with an explicitly placed ids Tensor (etl_hf.run_model converts ids to a host ndarray, which a non-cpu executable rejects at the run boundary)
-  - restage = etl_hf.place_params(host params) + run per call (the documented per-call restaging anti-pattern)
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
+- `tiny_gpt2` / `numpy-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `tiny_gpt2` / `iree-llvm-cpu-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `tiny_gpt2` / `iree-rocm-packed`:
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+  - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
 - `distilgpt2` / `numpy`:
   - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
 - `distilgpt2` / `iree-llvm-cpu`:
   - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
 - `distilgpt2` / `iree-rocm`:
-  - opt_level=O3 (the etl_hf default) was REJECTED by the compiler; this row is measured at opt_level=O1. Per-level outcome: {'O3': "'func.func' op failed to distribute", 'O2': "'func.func' op failed to distribute", 'O1': 'compiled'}
   - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
   - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
-  - device-resident run driven through etl.run with an explicitly placed ids Tensor (etl_hf.run_model converts ids to a host ndarray, which a non-cpu executable rejects at the run boundary)
-  - restage = etl_hf.place_params(host params) + run per call (the documented per-call restaging anti-pattern)
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
+- `distilgpt2` / `numpy-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `distilgpt2` / `iree-llvm-cpu-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `distilgpt2` / `iree-rocm-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+  - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
 - `gpt2` / `numpy`:
-  - this graph consumes 197 inputs (> the ~161 IREE runtime limit); the numpy row is still a normal measurement, the compiled rows of this model are the ones blocked
+  - this graph consumes 197 inputs (> the ~161 IREE runtime limit); the numpy row is still a normal measurement, the UNPACKED compiled rows of this model are the refused ones
   - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
 - `gpt2` / `iree-llvm-cpu`:
-  - graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option — compiled rows stay 'pending packing'; numpy row is measured
-  - pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)
+  - UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) — this leg is refused up front; the PACKED form of the same model is measured separately as `gpt2` / `iree-llvm-cpu-packed`
 - `gpt2` / `iree-rocm`:
-  - graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option — compiled rows stay 'pending packing'; numpy row is measured
-  - pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)
+  - UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) — this leg is refused up front; the PACKED form of the same model is measured separately as `gpt2` / `iree-rocm-packed`
+- `gpt2` / `numpy-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `gpt2` / `iree-llvm-cpu-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+- `gpt2` / `iree-rocm-packed`:
+  - public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs
+  - packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice
+  - place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost
+  - restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)
 
 ## 10. Reproducibility (same leg, second run)
 
 | leg | warm best run 1 | warm best run 2 | Δ | parity run 1 | parity run 2 |
 |---|---|---|---|---|---|
-| `tiny_llama` / `iree-llvm-cpu` | 1.91 ms | 1.82 ms | -4.6% | 7.45e-08 | 7.45e-08 |
-| `tiny_llama` / `iree-rocm` | 0.18 ms | 0.19 ms | +9.5% | 8.94e-08 | 8.94e-08 |
-| `tiny_llama` / `numpy` | 1.05 ms | 1.07 ms | +1.7% | 8.94e-08 | 8.94e-08 |
+| `gpt2` / `iree-rocm-packed` | 7.07 ms | 7.06 ms | -0.1% | 2.90e-04 | 2.90e-04 |
+| `tiny_llama` / `iree-rocm` | 0.20 ms | 0.21 ms | +2.5% | 8.94e-08 | 8.94e-08 |
+| `tiny_llama` / `iree-rocm-packed` | 0.17 ms | 0.17 ms | +4.2% | 8.94e-08 | 8.94e-08 |
 
 Parity is expected to be *identical* across runs (deterministic kernels); latency is expected to wobble by a few percent on a shared host (another job may be using the GPU).
 

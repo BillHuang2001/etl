@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "gpt2",
     "golden": "gpt2",
@@ -50,6 +50,7 @@
     "vocab_size": 50257,
     "tie_word_embeddings": true,
     "config_digest": "f222c9fee6b84ca3",
+    "packed": false,
     "param_count": 124439808,
     "weight_inputs": 196,
     "graph_inputs": 197
@@ -60,6 +61,7 @@
     "device": "cpu:0",
     "options": {},
     "device_resident": false,
+    "packed": false,
     "resolved_backend": "numpy",
     "resolved_options": {}
   },
@@ -71,12 +73,12 @@
   "status": "ok",
   "errors": [],
   "notes": [
-    "this graph consumes 197 inputs (> the ~161 IREE runtime limit); the numpy row is still a normal measurement, the compiled rows of this model are the ones blocked",
+    "this graph consumes 197 inputs (> the ~161 IREE runtime limit); the numpy row is still a normal measurement, the UNPACKED compiled rows of this model are the refused ones",
     "public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs"
   ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -90,9 +92,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 444.2051,
+    "load_hf_ms": 453.8497,
     "weight_bytes_f32": 497759232,
-    "trace_ms": 225.5716,
+    "trace_ms": 252.9973,
     "ir_ops": 870,
     "ir_distinct_ops": 19,
     "ir_histogram": {
@@ -116,35 +118,37 @@
       "less_equal": 1,
       "return": 1
     },
-    "export_ms": 17.7131,
+    "export_ms": 19.8475,
     "stablehlo_bytes": 174963,
     "stablehlo_lines": 1858,
     "stablehlo_constants": 242
   },
   "build": {
-    "lower_ms": 30.5893,
-    "compile_ms": 19.596,
-    "load_ms": 18.871,
-    "stage_sum_ms": 69.0563,
-    "artifact_bytes": null,
-    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_default": null,
     "opt_level_sweep": {
       "default": "compiled"
     },
+    "lower_ms": 29.7952,
+    "compile_ms": 20.8445,
+    "load_ms": 21.2664,
+    "stage_sum_ms": 71.9062,
+    "artifact_bytes": null,
+    "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": null
   },
   "run": {
     "batch": 1,
     "seq_len": 32,
-    "first_call_ms": 73.4272,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 62.6958,
     "n": 7,
-    "best_ms": 28.6745,
-    "median_ms": 35.4329,
-    "mean_ms": 43.6797,
-    "stdev_ms": 19.8602,
+    "best_ms": 28.5907,
+    "median_ms": 29.4984,
+    "mean_ms": 29.6509,
+    "stdev_ms": 0.7297,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 1115.97
+    "tokens_per_s": 1119.25
   },
   "parity": {
     "logits_shape": [
@@ -159,13 +163,18 @@
     "mean_abs_vs_golden": 2.2211253963178024e-05,
     "max_rel_vs_golden": 1.0999378901033197e-06,
     "logits_source": "this leg",
-    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/_numpy_logits_gpt2.npz"
+    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/_numpy_logits_gpt2.npz",
+    "reference": "numpy backend (this leg)"
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 1.76,
+    "duration_s": 1.68,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/gpt2__numpy.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/gpt2__numpy.json (status=ok)"
     ],
     "stderr_tail": []
   }

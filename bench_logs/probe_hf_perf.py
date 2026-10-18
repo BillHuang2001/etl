@@ -1675,7 +1675,7 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
         out.append(
             "- **Packing does not change numerics.** The packed numpy rows are **bit-identical** "
             "to the unpacked numpy reference (`max-abs 0.00`) on "
-            + ", ".join(f"`{row[0]}`" for row in exact)
+            + ", ".join(f"`{m}`" for m in dict.fromkeys(row[0] for row in exact))
             + " — `pack_params` is a pure host-side concatenation and the in-graph `etl.slice` "
             "unpacking returns the very same values. The largest packed-vs-unpacked-reference "
             f"delta anywhere is `{value:.2e}` (`{model}` / `{backend}`), i.e. the compiled "

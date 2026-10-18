@@ -152,62 +152,57 @@ fails with `RuntimeError: ROCm runtime is not linked into this build; cannot
 launch kernels.` (`rocm_fallback_module.cc:59`); etl's tvm adapter is
 additionally CPU-only by design (`adapters/tvm.py:304`).
 
-## `probe_hf_perf.py` + `hf_perf_results.md` + `hf_perf_data/` — whole-forward perf/parity matrix (numpy / iree-llvm-cpu / iree-rocm)
+## `probe_hf_perf.py` + `hf_perf_results.md` + `hf_perf_data/` — whole-forward perf/parity matrix (numpy / iree-llvm-cpu / iree-rocm × unpacked / packed)
 
-Measures the `etl_hf` full-model forward as ONE graph across three legs per checkpoint:
-`numpy` (interpreter, cpu:0), `iree-llvm-cpu` (`target_backends=["llvm-cpu"]`,
-`--iree-llvmcpu-target-cpu=host`, `opt_level="O3"`), and `iree-rocm` (device-resident on
-`Device("rocm", 0)` — `place_params` ONCE, then a same-device `etl.run` loop, never per-call
-`.to(device)`; the per-call restage is measured separately as the documented anti-pattern).
-Models: `tiny_llama` (1.03M params / 22 graph inputs), `tiny_gpt2` (103K / 37), `distilgpt2`
-(81.9M / 101), `gpt2` (124.4M / 197). Per leg it records param/weight-input/graph-input counts,
-IR ops + histogram, StableHLO bytes/constants, trace/export/lower/compile/load ms, first-call ms,
-warm best/median ms, tokens/s, d2h and restage variants, and parity (max-abs vs the stored torch
-goldens in `./hf_goldens/` AND vs the numpy backend's logits, cached as
-`hf_perf_data/_numpy_logits_<model>.npz`).
+Measures the `etl_hf` full-model forward as ONE graph across **six legs per checkpoint** — three
+backend paths each measured **unpacked** (one graph input per weight) and **packed**
+(`build(...)/HFModel.build(pack_weights=True)` + `HFModel.pack_params`, key suffix `-packed`):
+`numpy` (interpreter), `iree-llvm-cpu` (host inputs, library default `opt_level="O3"` +
+`--iree-llvmcpu-target-cpu=host`/`--iree-opt-data-tiling`), `iree-rocm` (device-resident on
+`Device("rocm", 0)` — the per-call restage anti-pattern is measured separately). All compiled
+rows are built with the **library defaults from `etl_hf.resolve_build_options`** (the probe no
+longer hard-codes options; the all-ROCm default is `opt_level="O1"`).
+Models (goldens in `./hf_goldens/`): `tiny_llama`, `tiny_gpt2`, `distilgpt2`, `gpt2`;
+checkpoints resolve from `$ETL_HF_MODELS_DIR` else `$TMPDIR/etl_hf_models/<slug>` (never downloaded).
 
-Run (each leg is its own subprocess, so one crash cannot kill the matrix; results are written per
-leg and the report is regenerated from the JSONs, never hand-edited):
+Per leg it records graph size (param/weight-input/graph-input counts, IR ops + histogram,
+StableHLO bytes/constants, trace/export ms, `pack_params_ms`), lower/compile/load +
+`public_build`, `opt_level_default`/`opt_level_used`/`opt_level_sweep`, first/warm
+(best/median/mean) call, tokens/s, `+d2h`, restage, `run.api` (which public API drove it), and
+parity vs the torch goldens AND vs the *unpacked* numpy reference (packed numpy rows are
+bit-identical: `0.00`).
+
+Run (one subprocess per leg, so a crash cannot kill the matrix; results are written per leg and
+the report is regenerated from the JSONs, never hand-edited):
 
 ```
-uv run --isolated --extra iree python bench_logs/probe_hf_perf.py              # full matrix (~36 s) + report
-uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report     # re-render from existing JSONs
+uv run --isolated --extra iree python bench_logs/probe_hf_perf.py                     # full 24-leg matrix (~110 s)
+uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --opt-level-evidence # + re-attempt rejected opt levels
+uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report            # markdown only
 ```
 
-Checkpoints are never downloaded: it resolves `$ETL_HF_MODELS_DIR`, else
-`$TMPDIR/etl_hf_models/<slug>` (shared with the `etl_hf` test helper + the goldens generator).
+Headline (best warm ms/call, `hf_perf_data/*.json`): unpacked — `tiny_llama` numpy 1.14 /
+llvm-cpu 2.10 / rocm 0.20, `tiny_gpt2` 0.97 / 0.63 / 0.21, `distilgpt2` 17.72 / 258.14 / 1.24;
+packed — `tiny_llama` 1.11 / 1.75 / 0.17, `tiny_gpt2` 1.02 / 0.48 / 0.16, `distilgpt2` 16.95 /
+291.68 / 1.11, **`gpt2` 28.42 / 397.56 / 7.07** (4.02× numpy; 56× llvm-cpu). Parity vs the
+torch goldens: ≤8.9e-8 (tiny), 2.2e-4 (distilgpt2), 3.05e-4 (gpt2 packed, absmax 138.7).
 
-Headline measured results (JSONs in `./hf_perf_data/`): warm best per call — `tiny_llama`
-numpy 1.05 / llvm-cpu 1.91 / **rocm 0.18 ms** (45,558 tok/s); `tiny_gpt2` 0.98 / 0.49 / **0.19**;
-`distilgpt2` 14.01 / 266.39 / **3.02 ms** (10,600 tok/s); `gpt2` numpy 28.67 ms (compiled rows
-blocked). GPU vs numpy 4.6–6.0×, GPU vs llvm-cpu up to 88× (`distilgpt2`). On CPU numpy/OpenBLAS
-is competitive-to-faster (numpy 1.82× / 19.0× faster on `tiny_llama` / `distilgpt2`; llvm-cpu
-2.02× faster only on `tiny_gpt2`) — the compiled path's value is the GPU. Per-call restaging costs
-10.3× / 12.3× / 32.5× the same-device loop; adding a d2h readback costs 0.64 / 0.86 / 5.23 ms.
-Parity vs torch goldens: `tiny_llama` ≤8.9e-8, `tiny_gpt2` bit-exact (0.0), `distilgpt2` 2.21e-04
-(absmax 82.1), `gpt2` 1.53e-04 (absmax 138.7); vs the numpy backend ≤2.29e-04.
-
-Two measured blockers (reported, never worked around here):
-1. **`iree-compile` for rocm rejects `opt_level="O3"`/`"O2"` on `distilgpt2`**
-   (`'func.func' op failed to distribute`, at the LayerNorm variance `stablehlo.reduce`
-   `tensor<1x32x768xf32>` → `tensor<1x32xf32>`); `O1`/`O0` compile, so that row is measured at
-   `opt_level="O1"` and recorded in `build.opt_level_sweep` / `build.opt_level_used`. The probe
-   sweeps requested → O3 → O2 → O1 → O0 per leg.
-2. **`gpt2` (197 graph inputs) cannot run compiled**: IREE's Python runtime SIGSEGVs above ~161
-   consumed inputs. A deliberate one-shot subprocess attempt recorded **exit code `-11` with no
-   Python exception** (`hf_perf_data/gpt2__iree-llvm-cpu.crash.json`), so the compiled rows are
-   marked *pending weight packing*; `etl_hf` v1 exposes no `pack_weights` option (probed via
-   `inspect.signature` on `build_model`, `HFModel.build`, `HFModel.graph_fn`). Those rows are NOT
-   extrapolated. The oversize crash probe runs on cpu-kind targets only — never provoke an IREE
-   SIGSEGV with a live GPU context.
-3. **`etl_hf.run_model` gap (etl_hf, not `bench_logs`)**: it converts `input_ids` to a host
-   ndarray, which a non-cpu executable rejects at the run boundary (`core.DeviceError`). The
-   device-resident rows therefore drive `etl.run(exe, placed_params, placed_ids)` directly.
-
-Also measured: `place_params` cold cost is much higher than steady state (distilgpt2 197 ms cold,
-~106 ms steady) — first use builds iree's thread-local HAL device + staging buffer. Reproducibility
-is checked by re-running `--sanity-rows` (default `tiny_llama:{numpy,iree-llvm-cpu,iree-rocm}`);
-warm-best spread was ±1.7 / ±4.6 / ±9.5 % with parity identical across runs.
+Facts pinned by this matrix (all measured, nothing extrapolated):
+1. **The ~161-consumed-input cliff is real for UNPACKED graphs only** — unpacked `gpt2` (197
+   inputs) is refused up front and the deliberate isolated attempt dies with exit `-11` and no
+   Python exception (`gpt2__iree-llvm-cpu.crash.json`); the packed graph declares 4 inputs
+   (`gpt2`) / 4–5 (others) and its compiled rows are measured normally.
+2. **Packing does not change numerics** — the packed numpy rows are bit-identical to the
+   unpacked numpy reference on all four checkpoints; packed IR op counts are higher only because
+   of the in-graph static `etl.slice` unpacking (`gpt2` 870 → 1,066).
+3. **ROCm `opt_level` default is `O1` for a reason, measured** — `--opt-level-evidence`
+   re-attempts the higher levels after a successful build and `O3`/`O2` both fail with
+   `'func.func' op failed to distribute` (upstream `iree-compile` ROCm codegen on the
+   LayerNorm-shaped reduce) for `distilgpt2` and `gpt2`, unpacked and packed. Evidence lives in
+   each leg's `build.opt_level_sweep`.
+4. **Device rows use the public API** — `etl_hf.run_model(exe, place_params(...),
+   place_ids(...))`; `run.api` records it. No raw `etl.run` short-circuit is needed any more
+   (the old "`run_model` converts ids to host" gap is closed).
 
 ## Known gotchas
 

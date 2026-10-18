@@ -1,0 +1,161 @@
+{
+  "schema": 2,
+  "model": {
+    "name": "tiny_gpt2",
+    "golden": "tiny_gpt2",
+    "seq_len": 8,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/tiny_gpt2",
+    "family": "gpt2",
+    "model_type": "gpt2",
+    "hidden_act": "gelu_new",
+    "num_hidden_layers": 2,
+    "hidden_size": 2,
+    "vocab_size": 50257,
+    "tie_word_embeddings": true,
+    "config_digest": "573f391d464ea301",
+    "packed": true,
+    "param_count": 102714,
+    "weight_inputs": 3,
+    "graph_inputs": 4
+  },
+  "backend": {
+    "key": "numpy-packed",
+    "backend": "numpy",
+    "device": "cpu:0",
+    "options": {},
+    "device_resident": false,
+    "packed": true,
+    "resolved_backend": "numpy",
+    "resolved_options": {}
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "ok",
+  "errors": [],
+  "notes": [
+    "packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice"
+  ],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 5.507,
+    "weight_bytes_f32": 410856,
+    "trace_ms": 64.0265,
+    "ir_ops": 206,
+    "ir_distinct_ops": 20,
+    "ir_histogram": {
+      "slice": 36,
+      "add": 33,
+      "multiply": 30,
+      "constant": 24,
+      "dot": 17,
+      "reshape": 11,
+      "transpose": 11,
+      "reduce_mean": 10,
+      "subtract": 8,
+      "divide": 7,
+      "sqrt": 5,
+      "exp": 2,
+      "gather": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "tanh": 2,
+      "broadcast": 1,
+      "cast": 1,
+      "less_equal": 1,
+      "return": 1
+    },
+    "export_ms": 5.2701,
+    "stablehlo_bytes": 38850,
+    "stablehlo_lines": 414,
+    "stablehlo_constants": 52,
+    "pack_params_ms": 0.0898,
+    "packed_inputs": 3
+  },
+  "build": {
+    "opt_level_default": null,
+    "opt_level_sweep": {
+      "default": "compiled"
+    },
+    "lower_ms": 7.9536,
+    "compile_ms": 4.4422,
+    "load_ms": 6.3726,
+    "stage_sum_ms": 18.7684,
+    "artifact_bytes": null,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_used": null,
+    "public_build_ms": 107.7021,
+    "public_build_same_device": "Device(kind='cpu', index=0)"
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 8,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 1.7061,
+    "n": 7,
+    "best_ms": 1.0229,
+    "median_ms": 1.0421,
+    "mean_ms": 1.0687,
+    "stdev_ms": 0.0629,
+    "warmup": 2,
+    "iters": 7,
+    "tokens_per_s": 7820.9
+  },
+  "parity": {
+    "logits_shape": [
+      1,
+      8,
+      50257
+    ],
+    "logits_absmax": 0.12893779575824738,
+    "logits_mean": -1.2993103155167773e-05,
+    "golden_absmax": 0.12893779575824738,
+    "max_abs_vs_golden": 0.0,
+    "mean_abs_vs_golden": 0.0,
+    "max_rel_vs_golden": 0.0,
+    "logits_source": "this leg",
+    "reference": "numpy backend (unpacked leg)",
+    "max_abs_vs_numpy_backend": 0.0
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 0.39,
+    "stdout_tail": [
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/tiny_gpt2__numpy-packed.json (status=ok)"
+    ],
+    "stderr_tail": []
+  }
+}

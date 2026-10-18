@@ -1,0 +1,237 @@
+{
+  "schema": 2,
+  "model": {
+    "name": "gpt2",
+    "golden": "gpt2",
+    "seq_len": 32,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/gpt2",
+    "family": "gpt2",
+    "model_type": "gpt2",
+    "hidden_act": "gelu_new",
+    "num_hidden_layers": 12,
+    "hidden_size": 768,
+    "vocab_size": 50257,
+    "tie_word_embeddings": true,
+    "config_digest": "f222c9fee6b84ca3",
+    "packed": true,
+    "param_count": 124439808,
+    "weight_inputs": 3,
+    "graph_inputs": 4
+  },
+  "backend": {
+    "key": "iree-rocm-packed",
+    "backend": "iree",
+    "device": "rocm:0",
+    "options": {
+      "target_backends": [
+        "rocm"
+      ]
+    },
+    "device_resident": true,
+    "packed": true,
+    "resolved_backend": "iree",
+    "resolved_options": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O1"
+    }
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "ok",
+  "errors": [],
+  "notes": [
+    "public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs",
+    "packed weights: host params concatenated ONCE with HFModel.pack_params (3 inputs); the graph unpacks them with static etl.slice",
+    "place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost",
+    "restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)"
+  ],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 442.1984,
+    "weight_bytes_f32": 497759232,
+    "trace_ms": 293.9121,
+    "ir_ops": 1066,
+    "ir_distinct_ops": 20,
+    "ir_histogram": {
+      "slice": 196,
+      "add": 183,
+      "multiply": 160,
+      "constant": 114,
+      "dot": 97,
+      "transpose": 61,
+      "reshape": 51,
+      "reduce_mean": 50,
+      "subtract": 38,
+      "divide": 37,
+      "sqrt": 25,
+      "exp": 12,
+      "reduce_max": 12,
+      "reduce_sum": 12,
+      "tanh": 12,
+      "gather": 2,
+      "broadcast": 1,
+      "cast": 1,
+      "less_equal": 1,
+      "return": 1
+    },
+    "export_ms": 17.7691,
+    "stablehlo_bytes": 205257,
+    "stablehlo_lines": 2054,
+    "stablehlo_constants": 242,
+    "pack_params_ms": 121.548,
+    "packed_inputs": 3
+  },
+  "build": {
+    "opt_level_default": "O1",
+    "opt_level_sweep": {
+      "O1": "compiled"
+    },
+    "lower_ms": 39.1377,
+    "compile_ms": 5973.1118,
+    "load_ms": 207.6075,
+    "stage_sum_ms": 6219.857,
+    "artifact_bytes": 500718,
+    "executable_device": "Device(kind='rocm', index=0)",
+    "opt_level_used": "O1"
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "place_params_ms": 572.9552,
+    "place_params_leaves": 3,
+    "place_params_steady": {
+      "n": 3,
+      "best_ms": 341.2346,
+      "median_ms": 386.4551,
+      "mean_ms": 406.1961,
+      "stdev_ms": 76.7601
+    },
+    "place_ids_ms": 17.1248,
+    "api": "etl_hf.run_model(placed params, place_ids(ids))",
+    "first_call_ms": 7.637,
+    "n": 7,
+    "best_ms": 7.0632,
+    "median_ms": 7.0687,
+    "mean_ms": 7.0741,
+    "stdev_ms": 0.0112,
+    "warmup": 2,
+    "iters": 7,
+    "tokens_per_s": 4530.52,
+    "d2h": {
+      "n": 3,
+      "best_ms": 1.9686,
+      "median_ms": 2.1203,
+      "mean_ms": 2.1164,
+      "stdev_ms": 0.1459
+    },
+    "warm_with_d2h": {
+      "n": 7,
+      "best_ms": 9.4324,
+      "median_ms": 9.6561,
+      "mean_ms": 9.6319,
+      "stdev_ms": 0.1801
+    },
+    "restage": {
+      "n": 3,
+      "best_ms": 311.8065,
+      "median_ms": 379.6225,
+      "mean_ms": 363.8244,
+      "stdev_ms": 46.1916
+    },
+    "restage_placement_only": {
+      "n": 3,
+      "best_ms": 350.6679,
+      "median_ms": 403.293,
+      "mean_ms": 388.4415,
+      "stdev_ms": 32.9608
+    }
+  },
+  "parity": {
+    "logits_shape": [
+      1,
+      32,
+      50257
+    ],
+    "logits_absmax": 138.72413635253906,
+    "logits_mean": -102.00896453857422,
+    "golden_absmax": 138.72409057617188,
+    "max_abs_vs_golden": 0.0002899169921875,
+    "mean_abs_vs_golden": 3.900446608895436e-05,
+    "max_rel_vs_golden": 2.0898821730952477e-06,
+    "logits_source": "this leg",
+    "max_abs_vs_numpy_backend": 0.000335693359375,
+    "reference": "numpy backend (unpacked leg)"
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 11.79,
+    "stdout_tail": [
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/gpt2__iree-rocm-packed.sanity.json (status=ok)"
+    ],
+    "stderr_tail": [
+      " - leaked function \"allowed_usage\"",
+      "nanobind: this is likely caused by a reference counting issue in the binding code.",
+      "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
+    ]
+  }
+}

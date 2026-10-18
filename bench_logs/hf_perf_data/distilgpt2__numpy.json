@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "distilgpt2",
     "golden": "distilgpt2",
@@ -50,6 +50,7 @@
     "vocab_size": 50257,
     "tie_word_embeddings": true,
     "config_digest": "50b3823d63d4c821",
+    "packed": false,
     "param_count": 81912576,
     "weight_inputs": 100,
     "graph_inputs": 101
@@ -60,6 +61,7 @@
     "device": "cpu:0",
     "options": {},
     "device_resident": false,
+    "packed": false,
     "resolved_backend": "numpy",
     "resolved_options": {}
   },
@@ -75,7 +77,7 @@
   ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -89,9 +91,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 277.5136,
+    "load_hf_ms": 276.062,
     "weight_bytes_f32": 327650304,
-    "trace_ms": 120.2489,
+    "trace_ms": 126.1093,
     "ir_ops": 450,
     "ir_distinct_ops": 19,
     "ir_histogram": {
@@ -115,35 +117,37 @@
       "less_equal": 1,
       "return": 1
     },
-    "export_ms": 9.4113,
+    "export_ms": 10.0507,
     "stablehlo_bytes": 90176,
     "stablehlo_lines": 970,
     "stablehlo_constants": 128
   },
   "build": {
-    "lower_ms": 16.9934,
-    "compile_ms": 9.6633,
-    "load_ms": 9.6779,
-    "stage_sum_ms": 36.3346,
-    "artifact_bytes": null,
-    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_default": null,
     "opt_level_sweep": {
       "default": "compiled"
     },
+    "lower_ms": 18.7388,
+    "compile_ms": 9.6023,
+    "load_ms": 9.5525,
+    "stage_sum_ms": 37.8936,
+    "artifact_bytes": null,
+    "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": null
   },
   "run": {
     "batch": 1,
     "seq_len": 32,
-    "first_call_ms": 32.5648,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 39.1939,
     "n": 7,
-    "best_ms": 14.0099,
-    "median_ms": 14.4389,
-    "mean_ms": 14.4206,
-    "stdev_ms": 0.3784,
+    "best_ms": 17.7213,
+    "median_ms": 17.8658,
+    "mean_ms": 17.9115,
+    "stdev_ms": 0.1723,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 2284.1
+    "tokens_per_s": 1805.74
   },
   "parity": {
     "logits_shape": [
@@ -158,13 +162,18 @@
     "mean_abs_vs_golden": 1.139715823228471e-05,
     "max_rel_vs_golden": 1.3007573897994007e-06,
     "logits_source": "this leg",
-    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/_numpy_logits_distilgpt2.npz"
+    "wrote_numpy_reference": "/root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/_numpy_logits_distilgpt2.npz",
+    "reference": "numpy backend (this leg)"
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 1.1,
+    "duration_s": 1.18,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/distilgpt2__numpy.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/distilgpt2__numpy.json (status=ok)"
     ],
     "stderr_tail": []
   }

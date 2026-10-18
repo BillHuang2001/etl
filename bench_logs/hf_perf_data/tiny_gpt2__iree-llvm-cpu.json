@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "tiny_gpt2",
     "golden": "tiny_gpt2",
@@ -26,6 +26,7 @@
     "vocab_size": 50257,
     "tie_word_embeddings": true,
     "config_digest": "573f391d464ea301",
+    "packed": false,
     "param_count": 102714,
     "weight_inputs": 36,
     "graph_inputs": 37
@@ -37,14 +38,10 @@
     "options": {
       "target_backends": [
         "llvm-cpu"
-      ],
-      "opt_level": "O3",
-      "iree_compile_args": [
-        "--iree-llvmcpu-target-cpu=host",
-        "--iree-opt-data-tiling"
       ]
     },
     "device_resident": false,
+    "packed": false,
     "resolved_backend": "iree",
     "resolved_options": {
       "target_backends": [
@@ -67,7 +64,7 @@
   "notes": [],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -81,9 +78,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 4.5301,
+    "load_hf_ms": 5.3265,
     "weight_bytes_f32": 410856,
-    "trace_ms": 52.5789,
+    "trace_ms": 54.379,
     "ir_ops": 170,
     "ir_distinct_ops": 19,
     "ir_histogram": {
@@ -107,37 +104,39 @@
       "less_equal": 1,
       "return": 1
     },
-    "export_ms": 4.8959,
+    "export_ms": 4.7578,
     "stablehlo_bytes": 33580,
     "stablehlo_lines": 378,
     "stablehlo_constants": 52
   },
   "build": {
-    "lower_ms": 13.9024,
-    "compile_ms": 935.3089,
-    "load_ms": 17.1164,
-    "stage_sum_ms": 966.3277,
-    "artifact_bytes": 57722,
-    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_default": "O3",
     "opt_level_sweep": {
       "O3": "compiled"
     },
+    "lower_ms": 14.1151,
+    "compile_ms": 947.249,
+    "load_ms": 18.4909,
+    "stage_sum_ms": 979.855,
+    "artifact_bytes": 57722,
+    "executable_device": "Device(kind='cpu', index=0)",
     "opt_level_used": "O3",
-    "public_build_ms": 1081.8052,
+    "public_build_ms": 1022.1122,
     "public_build_same_device": "Device(kind='cpu', index=0)"
   },
   "run": {
     "batch": 1,
     "seq_len": 8,
-    "first_call_ms": 1.1731,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 1.5381,
     "n": 7,
-    "best_ms": 0.4861,
-    "median_ms": 0.5029,
-    "mean_ms": 0.5034,
-    "stdev_ms": 0.0145,
+    "best_ms": 0.6297,
+    "median_ms": 0.6487,
+    "mean_ms": 0.6564,
+    "stdev_ms": 0.0265,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 16457.52
+    "tokens_per_s": 12704.46
   },
   "parity": {
     "logits_shape": [
@@ -152,16 +151,21 @@
     "mean_abs_vs_golden": 0.0,
     "max_rel_vs_golden": 0.0,
     "logits_source": "this leg",
-    "max_abs_vs_numpy_backend": 0.0
+    "max_abs_vs_numpy_backend": 0.0,
+    "reference": "numpy backend"
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 2.29,
+    "duration_s": 2.26,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/tiny_gpt2__iree-llvm-cpu.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/tiny_gpt2__iree-llvm-cpu.json (status=ok)"
     ],
     "stderr_tail": [
-      " - leaked function \"\"",
+      " - leaked function \"__repr__\"",
       "nanobind: this is likely caused by a reference counting issue in the binding code.",
       "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
     ]

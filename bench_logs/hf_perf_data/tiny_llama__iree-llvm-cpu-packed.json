@@ -1,0 +1,182 @@
+{
+  "schema": 2,
+  "model": {
+    "name": "tiny_llama",
+    "golden": "tiny_random_llama",
+    "seq_len": 8,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/tiny_llama",
+    "family": "llama",
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "num_hidden_layers": 2,
+    "hidden_size": 16,
+    "vocab_size": 32000,
+    "tie_word_embeddings": false,
+    "config_digest": "2d3a50f18a1a185a",
+    "packed": true,
+    "param_count": 1032272,
+    "weight_inputs": 4,
+    "graph_inputs": 5
+  },
+  "backend": {
+    "key": "iree-llvm-cpu-packed",
+    "backend": "iree",
+    "device": "cpu:0",
+    "options": {
+      "target_backends": [
+        "llvm-cpu"
+      ]
+    },
+    "device_resident": false,
+    "packed": true,
+    "resolved_backend": "iree",
+    "resolved_options": {
+      "target_backends": [
+        "llvm-cpu"
+      ],
+      "opt_level": "O3",
+      "iree_compile_args": [
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-opt-data-tiling"
+      ]
+    }
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "ok",
+  "errors": [],
+  "notes": [
+    "packed weights: host params concatenated ONCE with HFModel.pack_params (4 inputs); the graph unpacks them with static etl.slice"
+  ],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 8.1208,
+    "weight_bytes_f32": 4129088,
+    "trace_ms": 60.6411,
+    "ir_ops": 191,
+    "ir_distinct_ops": 24,
+    "ir_histogram": {
+      "multiply": 32,
+      "slice": 29,
+      "reshape": 21,
+      "constant": 19,
+      "dot": 19,
+      "add": 15,
+      "transpose": 10,
+      "divide": 7,
+      "concatenate": 5,
+      "reduce_mean": 5,
+      "sqrt": 5,
+      "negate": 4,
+      "cast": 3,
+      "subtract": 3,
+      "exp": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "sigmoid": 2,
+      "cos": 1,
+      "gather": 1,
+      "less_equal": 1,
+      "power": 1,
+      "return": 1,
+      "sin": 1
+    },
+    "export_ms": 4.7318,
+    "stablehlo_bytes": 32205,
+    "stablehlo_lines": 322,
+    "stablehlo_constants": 35,
+    "pack_params_ms": 2.2514,
+    "packed_inputs": 4
+  },
+  "build": {
+    "opt_level_default": "O3",
+    "opt_level_sweep": {
+      "O3": "compiled"
+    },
+    "lower_ms": 14.4296,
+    "compile_ms": 1235.1918,
+    "load_ms": 13.6034,
+    "stage_sum_ms": 1263.2248,
+    "artifact_bytes": 75962,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_used": "O3",
+    "public_build_ms": 1297.0449,
+    "public_build_same_device": "Device(kind='cpu', index=0)"
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 8,
+    "api": "etl_hf.run_model(host params, host ids)",
+    "first_call_ms": 4.259,
+    "n": 7,
+    "best_ms": 1.7466,
+    "median_ms": 2.0696,
+    "mean_ms": 2.006,
+    "stdev_ms": 0.1698,
+    "warmup": 2,
+    "iters": 7,
+    "tokens_per_s": 4580.33
+  },
+  "parity": {
+    "logits_shape": [
+      1,
+      8,
+      32000
+    ],
+    "logits_absmax": 0.3487534523010254,
+    "logits_mean": 0.00015656855248380452,
+    "golden_absmax": 0.3487534821033478,
+    "max_abs_vs_golden": 7.450580596923828e-08,
+    "mean_abs_vs_golden": 4.583393220514154e-09,
+    "max_rel_vs_golden": 2.1363459268286533e-07,
+    "logits_source": "this leg",
+    "max_abs_vs_numpy_backend": 8.940696716308594e-08,
+    "reference": "numpy backend (unpacked leg)"
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 2.84,
+    "stdout_tail": [
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/tiny_llama__iree-llvm-cpu-packed.json (status=ok)"
+    ],
+    "stderr_tail": [
+      " - leaked function \"\"",
+      "nanobind: this is likely caused by a reference counting issue in the binding code.",
+      "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
+    ]
+  }
+}

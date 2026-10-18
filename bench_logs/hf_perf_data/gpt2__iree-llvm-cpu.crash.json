@@ -1,0 +1,30 @@
+{
+  "schema": 2,
+  "model": {
+    "name": "gpt2",
+    "golden": "gpt2"
+  },
+  "backend": {
+    "key": "iree-llvm-cpu",
+    "backend": "iree",
+    "device": "cpu:0",
+    "packed": false
+  },
+  "status": "crash",
+  "errors": [
+    "leg subprocess produced no record (exit=-11); the process died before writing JSON \u2014 most likely the documented IREE runtime input-count SIGSEGV"
+  ],
+  "notes": [],
+  "process": {
+    "exit_code": -11,
+    "duration_s": 3.73,
+    "stdout_tail": [
+      "[stage] lower (opt_level=O3)",
+      "[stage] compile",
+      "[stage] load",
+      "[stage] place params / prepare run",
+      "[stage] first run"
+    ],
+    "stderr_tail": []
+  }
+}

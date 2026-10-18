@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "distilgpt2",
     "golden": "distilgpt2",
@@ -50,6 +50,7 @@
     "vocab_size": 50257,
     "tie_word_embeddings": true,
     "config_digest": "50b3823d63d4c821",
+    "packed": false,
     "param_count": 81912576,
     "weight_inputs": 100,
     "graph_inputs": 101
@@ -61,10 +62,10 @@
     "options": {
       "target_backends": [
         "rocm"
-      ],
-      "opt_level": "O3"
+      ]
     },
     "device_resident": true,
+    "packed": false,
     "resolved_backend": "iree",
     "resolved_options": {
       "target_backends": [
@@ -81,15 +82,13 @@
   "status": "ok",
   "errors": [],
   "notes": [
-    "opt_level=O3 (the etl_hf default) was REJECTED by the compiler; this row is measured at opt_level=O1. Per-level outcome: {'O3': \"'func.func' op failed to distribute\", 'O2': \"'func.func' op failed to distribute\", 'O1': 'compiled'}",
     "public build_model total not measured (expensive re-compile); stage_sum_ms is the composition build_model performs",
     "place_params_ms is the COLD placement (first use builds the iree thread-local HAL device + staging buffer); place_params_steady is the steady-state per-placement cost",
-    "device-resident run driven through etl.run with an explicitly placed ids Tensor (etl_hf.run_model converts ids to a host ndarray, which a non-cpu executable rejects at the run boundary)",
-    "restage = etl_hf.place_params(host params) + run per call (the documented per-call restaging anti-pattern)"
+    "restage = etl_hf.place_params(host params) + etl_hf.run_model per call (the documented per-call restaging anti-pattern)"
   ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -103,9 +102,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 282.3955,
+    "load_hf_ms": 271.7707,
     "weight_bytes_f32": 327650304,
-    "trace_ms": 120.2185,
+    "trace_ms": 129.3152,
     "ir_ops": 450,
     "ir_distinct_ops": 19,
     "ir_histogram": {
@@ -129,74 +128,80 @@
       "less_equal": 1,
       "return": 1
     },
-    "export_ms": 9.4249,
+    "export_ms": 9.3123,
     "stablehlo_bytes": 90176,
     "stablehlo_lines": 970,
     "stablehlo_constants": 128
   },
   "build": {
-    "lower_ms": 14.8798,
-    "compile_ms": 1305.2853,
-    "load_ms": 204.0713,
-    "stage_sum_ms": 1524.2363,
+    "opt_level_default": "O1",
+    "opt_level_evidence_attempts": [
+      "O3",
+      "O2"
+    ],
+    "opt_level_sweep": {
+      "O1": "compiled",
+      "O3": "'func.func' op failed to distribute",
+      "O2": "'func.func' op failed to distribute"
+    },
+    "lower_ms": 22.2827,
+    "compile_ms": 1307.3844,
+    "load_ms": 211.5922,
+    "stage_sum_ms": 1541.2593,
     "artifact_bytes": 94854,
     "executable_device": "Device(kind='rocm', index=0)",
-    "opt_level_sweep": {
-      "O3": "'func.func' op failed to distribute",
-      "O2": "'func.func' op failed to distribute",
-      "O1": "compiled"
-    },
     "opt_level_used": "O1"
   },
   "run": {
     "batch": 1,
     "seq_len": 32,
-    "place_params_ms": 273.9564,
+    "place_params_ms": 196.6736,
     "place_params_leaves": 100,
     "place_params_steady": {
       "n": 3,
-      "best_ms": 101.8708,
-      "median_ms": 110.5842,
-      "mean_ms": 121.9922,
-      "stdev_ms": 27.6506
+      "best_ms": 139.5215,
+      "median_ms": 150.9255,
+      "mean_ms": 157.3591,
+      "stdev_ms": 21.7791
     },
-    "place_ids_ms": 0.2148,
-    "first_call_ms": 3.4967,
+    "place_ids_ms": 0.1757,
+    "api": "etl_hf.run_model(placed params, place_ids(ids))",
+    "first_call_ms": 1.7688,
     "n": 7,
-    "best_ms": 3.019,
-    "median_ms": 3.0399,
-    "mean_ms": 3.0567,
-    "stdev_ms": 0.0583,
+    "best_ms": 1.2438,
+    "median_ms": 1.2606,
+    "mean_ms": 1.2714,
+    "stdev_ms": 0.0298,
     "warmup": 2,
     "iters": 7,
-    "tokens_per_s": 10599.54,
+    "tokens_per_s": 25727.61,
     "d2h": {
       "n": 3,
-      "best_ms": 2.589,
-      "median_ms": 2.6597,
-      "mean_ms": 2.7997,
-      "stdev_ms": 0.3058
+      "best_ms": 2.7306,
+      "median_ms": 2.8712,
+      "mean_ms": 2.8583,
+      "stdev_ms": 0.1218
     },
     "warm_with_d2h": {
       "n": 7,
-      "best_ms": 5.2314,
-      "median_ms": 5.5593,
-      "mean_ms": 5.51,
-      "stdev_ms": 0.1724
+      "best_ms": 3.5154,
+      "median_ms": 3.7833,
+      "mean_ms": 3.7826,
+      "stdev_ms": 0.1396
     },
     "restage": {
       "n": 3,
-      "best_ms": 98.1248,
-      "median_ms": 101.7073,
-      "mean_ms": 101.9912,
-      "stdev_ms": 4.0159
+      "best_ms": 95.4466,
+      "median_ms": 121.9164,
+      "mean_ms": 125.7788,
+      "stdev_ms": 32.4364
     },
     "restage_placement_only": {
       "n": 3,
-      "best_ms": 108.0951,
-      "median_ms": 153.1444,
-      "mean_ms": 140.7404,
-      "stdev_ms": 28.5419
+      "best_ms": 105.7583,
+      "median_ms": 148.564,
+      "mean_ms": 137.2235,
+      "stdev_ms": 27.6013
     }
   },
   "parity": {
@@ -212,16 +217,21 @@
     "mean_abs_vs_golden": 2.584597677923739e-05,
     "max_rel_vs_golden": 2.6944260298478184e-06,
     "logits_source": "this leg",
-    "max_abs_vs_numpy_backend": 0.0002288818359375
+    "max_abs_vs_numpy_backend": 0.0002288818359375,
+    "reference": "numpy backend"
   },
   "process": {
     "exit_code": 0,
     "duration_s": 5.55,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/distilgpt2__iree-rocm.json (status=ok)"
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/distilgpt2__iree-rocm.json (status=ok)"
     ],
     "stderr_tail": [
-      " - leaked function \"\"",
+      " - leaked function \"end_profiling\"",
       "nanobind: this is likely caused by a reference counting issue in the binding code.",
       "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
     ]

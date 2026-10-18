@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "model": {
     "name": "gpt2",
     "golden": "gpt2",
@@ -50,10 +50,11 @@
     "vocab_size": 50257,
     "tie_word_embeddings": true,
     "config_digest": "f222c9fee6b84ca3",
+    "packed": false,
     "param_count": 124439808,
     "weight_inputs": 196,
     "graph_inputs": 197,
-    "pack_weights_api": null
+    "graph_inputs_gate": 161
   },
   "backend": {
     "key": "iree-rocm",
@@ -62,10 +63,10 @@
     "options": {
       "target_backends": [
         "rocm"
-      ],
-      "opt_level": "O3"
+      ]
     },
-    "device_resident": true
+    "device_resident": true,
+    "packed": false
   },
   "measurement": {
     "iters": 7,
@@ -75,12 +76,11 @@
   "status": "skipped",
   "errors": [],
   "notes": [
-    "graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option \u2014 compiled rows stay 'pending packing'; numpy row is measured",
-    "pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)"
+    "UNPACKED graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) \u2014 this leg is refused up front; the PACKED form of the same model is measured separately as `gpt2` / `iree-rocm-packed`"
   ],
   "env": {
     "python": "3.14.8",
-    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "executable": "/root/.cache/uv/builds-v0/.tmp0gosgP/bin/python",
     "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
     "machine": "x86_64",
     "numpy": "2.5.2",
@@ -94,9 +94,9 @@
     "cpu_count": 20
   },
   "graph": {
-    "load_hf_ms": 442.8257,
+    "load_hf_ms": 441.9053,
     "weight_bytes_f32": 497759232,
-    "trace_ms": 230.0947,
+    "trace_ms": 238.7977,
     "ir_ops": 870,
     "ir_distinct_ops": 19,
     "ir_histogram": {
@@ -120,16 +120,19 @@
       "less_equal": 1,
       "return": 1
     },
-    "export_ms": 19.4263,
+    "export_ms": 17.8176,
     "stablehlo_bytes": 174963,
     "stablehlo_lines": 1858,
     "stablehlo_constants": 242
   },
   "process": {
     "exit_code": 0,
-    "duration_s": 0.89,
+    "duration_s": 0.92,
     "stdout_tail": [
-      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/gpt2__iree-rocm.json (status=skipped)"
+      "[stage] gpt2/iree-rocm: load_hf",
+      "[stage] trace",
+      "[stage] stablehlo export",
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A50/bench_logs/hf_perf_data/gpt2__iree-rocm.json (status=skipped)"
     ],
     "stderr_tail": []
   }
