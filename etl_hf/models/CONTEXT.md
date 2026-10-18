@@ -3,7 +3,7 @@
 ## Intent
 
 One module per HuggingFace model family: each module owns the HF-key → canonical-weight map, the `etl.TensorSpec` tree, the whole-model `@etl.defn` forward graph, and an independent pure-numpy reference forward used as the parity oracle.
-Every family module exposes the same pinned four-entry interface — `param_specs(cfg)`, `graph(cfg, seq_len, batch_size=1)`, `reference(cfg, params, input_ids)`, `canonicalize_weights(cfg, raw)` — plus `FAMILY` (the `etl_hf` family key wired into `ModelConfig.family`) and, when the architecture covers several HF `model_type`s, a `MODEL_TYPES` tuple.
+Every family module exposes the same pinned four-entry interface — `param_specs(cfg)`, `graph(cfg, seq_len, batch_size=1, *, pack_plan=None)`, `reference(cfg, params, input_ids)`, `canonicalize_weights(cfg, raw)` — plus `FAMILY` (the `etl_hf` family key wired into `ModelConfig.family`) and, when the architecture covers several HF `model_type`s, a `MODEL_TYPES` tuple.
 `./etl_hf/models/__init__.py` imports and re-exports nothing (`__all__ = []`); family modules are reached by qualified path (`etl_hf.models.llama`, `etl_hf.models.gpt2`), which keeps this package clear of the cycle that would form with `etl_hf/families.py` (that module imports both family modules to build the `FAMILIES` registry).
 Imports stay in-layer: `etl`, `etl_hf.ops` (graph idioms), `etl_hf.models._common` (block wiring), `etl_hf.reference` (numpy oracle primitives), `etl_hf.config` (`ModelConfig`) and `etl_hf.errors` — nothing here imports `etl_hf.build` or `etl_hf.families`.
 All shapes are static (`seq_len`/`batch_size` are graph specialisation values), all weights are explicit graph **inputs** (`etl.constant` is never used), and every canonicalisation/validation failure is an explicit `HFConfigError` / `HFWeightError` / `HFUnsupportedError`.
@@ -70,7 +70,7 @@ Every canonicalised array is `float32`, C-contiguous and writable (`int`/`float`
 
 ## Graph conventions
 
-`graph(cfg, seq_len, batch_size=1)` returns a fresh `@etl.defn` callable each call, with the positional signature `(params, input_ids) -> logits`.
+`graph(cfg, seq_len, batch_size=1, *, pack_plan=None)` returns a fresh `@etl.defn` callable each call, with the positional signature `(params, input_ids) -> logits`. The optional `pack_plan` (an `etl_hf.pack.PackPlan`) is the ONE hook the opt-in packed-weights mode needs: when it is not `None` the forward's first statement is `params = pack_plan.unpack(params)`, which maps the few packed graph inputs back onto the canonical keys with static `etl.slice`s, and the rest of the body is unchanged (identical code in both families — never a second forward implementation). With `pack_plan=None` the behaviour is byte-identical to the canonical tree.
 `input_ids` is `(batch_size, seq_len)` `etl.int32`; `logits` is `(batch_size, seq_len, vocab_size)` `float32`.
 Weights are always read from `params` by their canonical flat key and supplied as explicit graph inputs — never `etl.constant`, so the exported program's text stays O(1) in the weight sizes.
 Layout is pre-LN residual: `x += attn(norm(x))`, then `h = norm(x)`, `x += mlp(h)`, then a final norm and the `lm_head` projection.

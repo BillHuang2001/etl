@@ -29,8 +29,13 @@ Guards, in order:
 * **Real-size checkpoints are opt-in** behind ``ETL_HF_BIG=1``
   (``distilgpt2`` ≈ 0.34 GB of weights, ``gpt2`` ≈ 0.52 GB), and the 124M GPT-2
   is additionally skipped when the host does not have the memory headroom.
-* **No torch / transformers / iree**: the oracle is plain numpy and the default
-  backend for a cpu device is the numpy interpreter.
+* **No torch / transformers / iree in the default path**: the oracle is plain
+  numpy and the default backend for a cpu device is the numpy interpreter.  The
+  single exception is the opt-in packed-weights case
+  (``test_real_gpt2_packed_runs_on_iree_llvm_cpu``, section 7), which needs
+  ``ETL_HF_BIG=1`` **and** the optional ``iree`` extra and skips cleanly without
+  either (``pip install iree-base-compiler iree-base-runtime`` / ``uv run
+  --extra iree``).
 
 ``sshleifer/tiny-gpt2`` ships the **legacy** (pre-torch-1.6) ``pytorch_model.bin``
 layout, so its parity claim is also the reader's end-to-end check: the legacy
@@ -52,6 +57,7 @@ import json
 import os
 import shutil
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -60,7 +66,7 @@ import etl
 from etl.backends import stablehlo
 from etl_hf import ops as hf_ops
 from etl_hf import weights
-from etl_hf.build import load_hf, place_params
+from etl_hf.build import load_hf, place_params, run_model
 from etl_hf.errors import HFConfigError, HFWeightError
 from etl_hf.tests import hf_download
 from etl_hf.tests.test_export import _count_ops
@@ -76,6 +82,32 @@ _BIG = pytest.mark.skipif(
     reason="real-size checkpoints are opt-in: set ETL_HF_BIG=1 "
     "(downloads distilgpt2 ≈ 0.34 GB / gpt2 ≈ 0.52 GB of weights)",
 )
+
+
+def _iree_available() -> bool:
+    """Probe for the IREE Python bindings without importing them into ``etl_hf``.
+
+    The probe lives here (not in :mod:`etl_hf`) so ``import etl_hf`` stays
+    numpy-only: a partial/absent install must *skip* the compiled case, never
+    error, and never be imported at package scope.
+    """
+    try:
+        import iree.compiler  # noqa: F401 - presence probe only
+        import iree.runtime  # noqa: F401 - presence probe only
+    except Exception:  # noqa: BLE001 - a broken install must skip, not error
+        return False
+    return True
+
+
+IREE_AVAILABLE = _iree_available()
+
+#: The compiled pin (section 7) needs the optional ``iree`` extra.
+requires_iree = pytest.mark.skipif(
+    not IREE_AVAILABLE,
+    reason="iree (iree.compiler / iree.runtime) is not installed; "
+    "run with `uv run --extra iree --with pytest`",
+)
+
 
 #: Memory headroom required before the optional 124M GPT-2 is attempted: the
 #: measured peak RSS is ~1.1 GB (the canonical 124.4M-parameter float32 tree plus
@@ -703,7 +735,225 @@ def test_real_gpt2_end_to_end_when_memory_allows():
 
 
 # ---------------------------------------------------------------------------
-# 7. no silent device / dtype / shape surprises
+# 7. packed weights on iree/llvm-cpu — the 124M GPT-2 payoff (ETL_HF_BIG=1)
+# ---------------------------------------------------------------------------
+_GOLDEN_DIR = Path(__file__).resolve().parents[2] / "bench_logs" / "hf_goldens"
+
+#: The IREE Python runtime limit packing exists for: a program that CONSUMES more
+#: than this many distinct inputs SIGSEGVs on the first run (measured bracket
+#: 161 works / 162 crashes — see ``./etl_hf/CONTEXT.md``).
+IREE_CONSUMED_INPUT_CLIFF = 161
+
+#: The packed 124M ``gpt2`` plan: 3 concatenated weight inputs (``packed.0``
+#: ``(125009, 768)``, ``packed.1`` ``(121344,)``, ``packed.2`` ``(9216, 3072)``)
+#: plus the ``input_ids`` leaf = **4** declared inputs, versus 197 unpacked.
+PACKED_GPT2_INPUTS = 3
+PACKED_GPT2_DECLARED = PACKED_GPT2_INPUTS + 1
+
+#: fp32 parity budget of a compiled graph against the numpy interpreter, relative
+#: to the logit scale (``max|logits|`` ≈ 139 for this checkpoint).
+PACKED_RTOL = 1e-5
+PACKED_ATOL = 1e-3
+
+#: Consecutive runs the compiled packed executable must survive unchanged (the
+#: unpacked graph crashes on the FIRST run — exit 139 — so repetition is the
+#: interesting part).
+PACKED_STABILITY_RUNS = 12
+
+#: The packed ``iree``/llvm-cpu build peaks at ~1.7 GB RSS (canonical 124.4M f32
+#: tree + its 475 MB packed copy + the compiled artifact), so demand ~3 GB of
+#: available host memory and skip (never fail) on a smaller host.
+_PACKED_MIN_MEMORY = 3 * 1024**3
+
+#: Numbers measured on the host that wrote this file for the packed 124M ``gpt2``
+#: on ``iree``/``llvm-cpu`` at ``seq_len=32`` — **reported, never asserted**: a
+#: timing threshold would turn a busy host into a red test, and none of these is
+#: a correctness property.  (``first_call``/``warm`` are best-of-12 medians; the
+#: numpy interpreter stays far ahead on CPU, so packing's payoff here is
+#: *runnability*, not speed — 197 → 4 inputs, at numpy-equivalent latency and
+#: with the same fp32 numbers.)
+MEASURED: dict[str, object] = {
+    "canonical_keys": 196,
+    "packed_inputs": PACKED_GPT2_INPUTS,
+    "declared_inputs": PACKED_GPT2_DECLARED,
+    "load_hf_s": 0.46,
+    "pack_s": 0.12,
+    "trace_s": 0.22,
+    "lower_s": 0.12,
+    "compile_s": 3.2,
+    "load_s": 0.02,
+    "build_s": 3.4,
+    "first_call_ms": 417.0,
+    "warm_median_ms": 405.0,
+    "warm_best_ms": 401.0,
+    "warm_stdev_ms": 3.0,
+    "numpy_packed_median_ms": 29.6,
+    "numpy_unpacked_median_ms": 29.4,
+    "iree_vs_numpy_max_abs": 3.5e-4,
+    "iree_vs_numpy_rel": 2.5e-6,
+    "iree_vs_golden_max_abs": 3.1e-4,
+    "iree_vs_golden_rel": 2.2e-6,
+    "unpacked_control": "SIGSEGV: exit 139, empty stderr, after a successful "
+    "compile + load of the 197-input program",
+}
+
+
+def _golden_logits(slug: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read ``<repo>/bench_logs/hf_goldens/<slug>.npz`` as ``(input_ids, logits)``.
+
+    The fixtures are plain ``numpy.savez`` archives (never pickled), so they are
+    read with ``allow_pickle=False`` and validated by key.  A missing or
+    malformed fixture **skips** — ``bench_logs/`` is a read-only sibling area, so
+    this module must not fail over an absent artifact it cannot regenerate.
+
+    Args:
+        slug: fixture name (``"gpt2"``).
+
+    Returns:
+        tuple: ``(input_ids, logits)`` — ``(batch, seq_len)`` int ids and the
+        real HuggingFace ``(batch, seq_len, vocab_size)`` float32 logits.
+    """
+    path = _GOLDEN_DIR / f"{slug}.npz"
+    if not path.is_file():
+        pytest.skip(f"no golden fixture at {path} (read-only bench_logs/ area)")
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if "input_ids" not in archive.files or "logits" not in archive.files:
+                pytest.skip(f"{path} carries no input_ids/logits arrays")
+            return np.asarray(archive["input_ids"]), np.asarray(archive["logits"])
+    except (OSError, ValueError, EOFError) as exc:  # pragma: no cover - broken fixture
+        pytest.skip(f"{path} is not a readable numpy archive: {exc}")
+
+
+@_BIG
+@requires_iree
+def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
+    """124M ``gpt2`` packed → **4** inputs instead of 197, runs 12× unchanged on iree.
+
+    The unpacked 124M GPT-2 compiles and loads fine on ``iree``/llvm-cpu and then
+    dies on the first run — IREE's Python runtime SIGSEGVs on a program that
+    consumes more than ~161 distinct inputs (measured control, in its own
+    subprocess: **exit 139, empty stderr**, 197 declared inputs).  Packing
+    (:mod:`etl_hf.pack`, ``pack_weights=True``) is what makes the case runnable:
+    the same weights arrive as 3 concatenated inputs and are sliced back in-graph.
+
+    What this pins:
+
+    * the packed plan really is the small number (3 weight inputs, 4 declared with
+      ``input_ids``) and covers every canonical element exactly once;
+    * the compiled executable **runs 12 times without crashing** and every run is
+      **bit-identical** to the first (the unpacked program never reaches run #1);
+    * the numbers are unchanged by packing: fp32 parity against the numpy
+      interpreter's packed forward (relative-to-absmax budget
+      :data:`PACKED_RTOL`) and against the stored HuggingFace golden
+      (:data:`PACKED_ATOL` / :data:`PACKED_RTOL`).
+
+    No timing assertion: the measured latencies live in :data:`MEASURED` (this
+    host: build ≈ 3.4 s, first call ≈ 0.42 s, warm median ≈ 0.41 s — the numpy
+    interpreter is ~14× faster at this size, so the compiled payoff is
+    runnability, not speed).
+    """
+    available = _available_memory_bytes()
+    if 0 < available < _PACKED_MIN_MEMORY:
+        pytest.skip(
+            f"the packed 124M gpt2 build peaks at ~1.7 GB RSS; only "
+            f"{available / 1024**2:.0f} MB of host memory is available"
+        )
+    input_ids, want_golden = _golden_logits("gpt2")
+    if input_ids.shape != (1, 32):
+        pytest.skip(f"golden gpt2 ids shape {input_ids.shape} is not (1, 32)")
+
+    model = load_hf(hf_download.require_model("gpt2"), seq_len=32)
+    params = model.params()
+    assert len(params) == 196, f"expected 196 canonical keys, got {len(params)}"
+
+    # --- the packed plan: 196 canonical arrays → 3 concatenated inputs -------
+    plan = model.pack_plan()
+    assert len(plan.specs) == PACKED_GPT2_INPUTS, (
+        f"the 124M gpt2 must pack to {PACKED_GPT2_INPUTS} weight inputs, got "
+        f"{len(plan.specs)}: "
+        f"{ {name: tuple(map(int, spec.shape)) for name, spec in plan.specs.items()} }"
+    )
+    assert list(plan.specs) == [f"packed.{i}" for i in range(PACKED_GPT2_INPUTS)], (
+        f"packed inputs must be named packed.0..packed.{PACKED_GPT2_INPUTS - 1}, got "
+        f"{list(plan.specs)}"
+    )
+    assert len(model.param_specs(pack_weights=True)) == PACKED_GPT2_INPUTS
+    packed_elements = sum(
+        int(np.prod(tuple(map(int, spec.shape)), dtype=np.int64))
+        for spec in plan.specs.values()
+    )
+    canonical_elements = sum(int(array.size) for array in params.values())
+    assert packed_elements == canonical_elements == 124_439_808, (
+        f"packing must be lossless: packed={packed_elements:,} vs "
+        f"canonical={canonical_elements:,} elements"
+    )
+    packed = model.pack_params(params)
+    assert set(packed) == set(plan.specs), (
+        f"pack_params must key by the plan's inputs, got {sorted(packed)}"
+    )
+
+    # --- numpy interpreter reference (packing is exact: no reordering) -------
+    numpy_exe = model.build(backend="numpy", pack_weights=True, cache=etl.CompileCache())
+    assert len(numpy_exe.signature.input_specs) == PACKED_GPT2_DECLARED
+    want = run_model(numpy_exe, packed, input_ids).numpy()
+    assert want.shape == want_golden.shape == (1, 32, 50257), (
+        f"logits shape: numpy {want.shape} vs golden {want_golden.shape}"
+    )
+
+    # --- the compiled packed graph ------------------------------------------
+    executable = model.build(backend="iree", pack_weights=True, cache=etl.CompileCache())
+    declared = len(executable.signature.input_specs)
+    assert declared == PACKED_GPT2_DECLARED, (
+        f"the compiled packed executable must declare {PACKED_GPT2_DECLARED} inputs "
+        f"({PACKED_GPT2_INPUTS} weights + ids), got {declared} "
+        f"(unpacked declares {len(params) + 1})"
+    )
+    assert declared < IREE_CONSUMED_INPUT_CLIFF, (
+        f"{declared} declared inputs is at/over the IREE runtime cliff of "
+        f"{IREE_CONSUMED_INPUT_CLIFF} consumed inputs — the packed plan must keep "
+        f"the program well below it"
+    )
+
+    # --- 12 consecutive runs: no SIGSEGV, bit-identical logits ---------------
+    outputs = []
+    for run in range(PACKED_STABILITY_RUNS):
+        got = run_model(executable, packed, input_ids).numpy()
+        assert got.shape == want.shape, f"run {run}: shape {got.shape} != {want.shape}"
+        assert bool(np.isfinite(got).all()), f"run {run}: compiled logits are not finite"
+        if outputs:
+            first = outputs[0]
+            assert np.array_equal(got, first), (
+                f"run {run} of the packed iree/llvm-cpu executable is not bit-identical "
+                f"to run 0 (max-abs {float(np.max(np.abs(got.astype(np.float64) - first.astype(np.float64)))):g} "
+                f"— same inputs must give the same program output"
+            )
+        outputs.append(got)
+    assert len(outputs) == PACKED_STABILITY_RUNS
+    got = outputs[0]
+
+    # --- parity: compiled vs the interpreter, and vs the HuggingFace golden --
+    max_abs, max_rel = _parity(got, want)
+    assert max_abs <= PACKED_ATOL and max_rel <= PACKED_RTOL, (
+        f"packed iree/llvm-cpu logits drifted from the numpy interpreter: "
+        f"max_abs={max_abs:.3e} (budget {PACKED_ATOL:.1e}), "
+        f"max_rel_vs_scale={max_rel:.3e} (budget {PACKED_RTOL:.1e}) — measured "
+        f"≈{MEASURED['iree_vs_numpy_max_abs']:.1e} / "
+        f"{MEASURED['iree_vs_numpy_rel']:.1e} here"
+    )
+    golden_abs, golden_rel = _parity(got, want_golden)
+    assert golden_abs <= PACKED_ATOL and golden_rel <= PACKED_RTOL, (
+        f"packed iree/llvm-cpu logits drifted from the stored HuggingFace golden "
+        f"({_GOLDEN_DIR / 'gpt2.npz'}): max_abs={golden_abs:.3e} (budget "
+        f"{PACKED_ATOL:.1e}), max_rel_vs_scale={golden_rel:.3e} (budget "
+        f"{PACKED_RTOL:.1e}) — measured ≈"
+        f"{MEASURED['iree_vs_golden_max_abs']:.1e} / "
+        f"{MEASURED['iree_vs_golden_rel']:.1e} here"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. no silent device / dtype / shape surprises
 # ---------------------------------------------------------------------------
 def test_params_are_float32_transfer_explicitly_and_never_guess():
     """``params`` are float32 host arrays; placement is explicit; a bad config is loud."""

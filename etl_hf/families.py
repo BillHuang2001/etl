@@ -6,7 +6,7 @@ covers, and the four functions a family module must implement::
 
     canonicalize_weights(cfg, raw) -> dict[str, np.ndarray]
     param_specs(cfg)               -> dict[str, etl.TensorSpec]
-    graph(cfg, seq_len, batch_size=1) -> @etl.defn forward(params, input_ids)
+    graph(cfg, seq_len, batch_size=1, *, pack_plan=None) -> @etl.defn forward
     reference(cfg, params, input_ids) -> np.ndarray
 
 Adding a family is **one module plus one entry in** :data:`FAMILIES` — nothing
@@ -56,8 +56,12 @@ class FamilySpec:
             state dict → canonical ``(in_features, out_features)`` weight map.
         param_specs: ``(cfg) -> dict[str, etl.TensorSpec]`` — the graph-input
             spec of every canonical parameter.
-        graph: ``(cfg, seq_len, batch_size=1) -> Callable`` — the ``@etl.defn``
-            forward pass ``(params, input_ids) -> logits``.
+        graph: ``(cfg, seq_len, batch_size=1, *, pack_plan=None) -> Callable`` —
+            the ``@etl.defn`` forward pass ``(params, input_ids) -> logits``.
+            ``pack_plan`` is an optional :class:`etl_hf.pack.PackPlan`: when
+            given, the forward unpacks the plan's few packed params inputs back
+            into the canonical dict as its first statement (``None`` keeps one
+            graph input per canonical weight).
         reference: ``(cfg, params, input_ids) -> np.ndarray`` — the independent
             pure-numpy forward used as the parity oracle.
     """
