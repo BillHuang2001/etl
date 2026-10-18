@@ -32,13 +32,14 @@ Guards, in order:
 * **No torch / transformers / iree**: the oracle is plain numpy and the default
   backend for a cpu device is the numpy interpreter.
 
-Degenerate checkpoints are handled honestly rather than papered over:
-``sshleifer/tiny-gpt2`` has ``n_embd=2`` and its logits are denormal
-(``~1e-44``) and *constant*, so its parity claim is **relative to the logit
-scale** (and its "not collapsed" check is skipped by design, since the reference
-itself has zero spread).  ``tiny-random-Mistral`` uses ``hidden_act: "gelu"``
-(exact erf), a documented StableHLO v1 deferral, so it runs on the **numpy
-backend only** — never compiled here.
+``sshleifer/tiny-gpt2`` ships the **legacy** (pre-torch-1.6) ``pytorch_model.bin``
+layout, so its parity claim is also the reader's end-to-end check: the legacy
+trailer prefixes every storage blob with an int64 element count, and reading it
+wrong shifts every storage and produces garbage weights (historically:
+``~1e-44`` logits instead of the ``~0.128`` these weights actually produce).
+``tiny-random-Mistral`` uses ``hidden_act: "gelu"`` (exact erf), a documented
+StableHLO v1 deferral, so it runs on the **numpy backend only** — never compiled
+here.
 
 The numbers quoted in the docstrings below are what this host measured while
 writing the file; every assertion message re-states the numbers it actually
@@ -104,8 +105,9 @@ def _parity(got, want) -> tuple[float, float]:
 
     ``max_rel_vs_scale`` is the maximum absolute difference divided by the
     reference's own magnitude (``max(1e-45, max|want|)``): the only meaningful
-    figure for a checkpoint whose logits are denormal (``tiny_gpt2``, ~1e-44) and
-    the honest one for the real checkpoints, whose logits reach |max| ≈ 68–147.
+    figure for a checkpoint whose logits are near-denormal (mis-read legacy
+    checkpoints used to land there) and the honest one for the real checkpoints,
+    whose logits reach |max| ≈ 0.13–147.
 
     Args:
         got: logits produced by the compiled/in-``etl`` forward.
@@ -430,10 +432,18 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
 
 
 # ---------------------------------------------------------------------------
-# 3. sshleifer/tiny-gpt2 — legacy .bin, n_embd=2, denormal logits
+# 3. sshleifer/tiny-gpt2 — legacy .bin (the legacy reader's end-to-end check)
 # ---------------------------------------------------------------------------
-def test_tiny_gpt2_degenerate_checkpoint_matches_relatively():
-    """``n_embd=2`` GPT-2: logits are ~1e-44, so parity is judged relative to scale."""
+def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
+    """``n_embd=2`` GPT-2 read from a real **legacy** ``pytorch_model.bin`` → parity 1.5e-8.
+
+    Historical note: while the legacy reader ignored the per-storage int64
+    element-count prefix, every storage was read 8·k bytes off and this
+    checkpoint's logits came out ~1e-44 (and constant) instead of the ~0.128
+    its weights really produce — a wrong-scale parity claim that had to be
+    stated relatively. With the prefix consumed the weights are the real ones,
+    so the normal absolute budget applies again.
+    """
     model = _load("tiny_gpt2", seq_len=8)
     cfg = model.config
     assert (cfg.model_type, cfg.family) == ("gpt2", "gpt2")
@@ -462,17 +472,16 @@ def test_tiny_gpt2_degenerate_checkpoint_matches_relatively():
 
     graph = _trace(model)
     assert len(graph.tensor_specs) == len(params) + 1
-    # An absolute tolerance is meaningless here (the reference logits are ~1e-44
-    # denormals), so judge against the logit scale itself — and pin the scale, so
-    # a checkpoint that suddenly produced normal-sized logits would be noticed.
-    _, want, _, max_rel = _check_forward(
-        model, _ids(1, 8), atol=1e-40, rtol=1e-6, graph=graph, spread=False
-    )
+    # Measured here: max|ref| ≈ 0.128 (normal scale — the legacy reader now reads
+    # the real weights), max_abs ≈ 1.5e-8, max_rel_vs_scale ≈ 1.2e-7. The scale is
+    # pinned so a checkpoint (or a reader) that produced degenerate logits again
+    # would be noticed instead of passing a relative-only claim.
+    _, want, max_abs, max_rel = _check_forward(model, _ids(1, 8), atol=1e-5, rtol=1e-6, graph=graph)
     scale = float(np.abs(want).max())
-    assert scale < 1e-40, (
-        f"tiny-gpt2 logits were expected to be denormal-scale, got max|ref|={scale:.3e}"
+    assert 0.1 < scale < 1.0, (
+        f"tiny-gpt2 reference logits should be normal-scale (~0.128), got max|ref|={scale:.3e}"
     )
-    # Measured here: max_abs == 0.0 exactly, max_rel_vs_scale == 0.0.
+    assert max_abs < 1e-6, f"tiny_gpt2 absolute parity regressed: max_abs={max_abs:.3e}"
     assert max_rel <= 1e-6, f"tiny_gpt2 relative parity regressed: {max_rel:.3e}"
 
 
