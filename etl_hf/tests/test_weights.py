@@ -210,8 +210,16 @@ def _fake_torch_modules():
                 sys.modules[name] = module
 
 
-def tensor_spec(name, flat, size=None, stride=None, offset=0, storage="FloatStorage", wrapper="v2"):
-    """Describe one tensor view over a fresh flat storage."""
+def tensor_spec(
+    name, flat, size=None, stride=None, offset=0, storage="FloatStorage", wrapper="v2",
+    storage_key=None,
+):
+    """Describe one tensor view over a fresh flat storage.
+
+    ``storage_key`` makes the view reuse an existing storage key instead of
+    allocating its own (``str(index)``) — i.e. several tensors sharing one
+    storage blob, which is what torch produces for a tensor and its transpose.
+    """
     flat = np.ascontiguousarray(flat)
     if size is None:
         size = flat.shape
@@ -226,8 +234,8 @@ def tensor_spec(name, flat, size=None, stride=None, offset=0, storage="FloatStor
         "offset": int(offset),
         "storage": storage,
         "wrapper": wrapper,
+        "storage_key": storage_key,
     }
-
 
 def contiguous_stride(size) -> tuple[int, ...]:
     """Row-major (C-order) element strides for ``size``."""
@@ -250,14 +258,29 @@ def expected_view(spec) -> np.ndarray:
 
 
 def _build_state(specs, api, extra_entries=None):
-    """Build a picklable state dict + the raw storage blobs it references."""
+    """Build a picklable state dict + the raw storage blobs it references.
+
+    Returns ``(state, storages, numels)``: ``storages`` maps storage key → raw
+    little-endian bytes, ``numels`` the element count of each storage (the
+    legacy format's per-blob prefix). Specs sharing a ``storage_key`` share one
+    blob.
+    """
     state = collections.OrderedDict()
     storages: dict[str, bytes] = {}
+    numels: dict[str, int] = {}
     for index, spec in enumerate(specs):
-        key = str(index)
+        key = str(spec.get("storage_key") or index)
         flat = np.ascontiguousarray(spec["flat"])
-        storages[key] = flat.tobytes()
-        ref = _StorageRef(api.storage_type(spec["storage"]), key, flat.size)
+        if key in storages:
+            if storages[key] != flat.tobytes():
+                raise AssertionError(
+                    f"test fixture bug: views over shared storage {key!r} disagree on the "
+                    f"flat data"
+                )
+        else:
+            storages[key] = flat.tobytes()
+            numels[key] = int(flat.size)
+        ref = _StorageRef(api.storage_type(spec["storage"]), key, int(flat.size))
         tensor = _TensorFixture(
             ref, spec["offset"], api.size_type(spec["size"]), api.size_type(spec["stride"]), api.rebuild
         )
@@ -266,8 +289,7 @@ def _build_state(specs, api, extra_entries=None):
         state[spec["name"]] = tensor
     for name, value in (extra_entries or {}).items():
         state[name] = value
-    return state, storages
-
+    return state, storages, numels
 
 def _write_zip_archive(path, data_pkl: bytes, storages, *, prefix="archive", drop=()) -> Path:
     """Write a torch-1.6-style zip archive around an already-pickled ``data.pkl``."""
@@ -295,7 +317,7 @@ def write_torch_zip(
 ) -> Path:
     """Write a synthetic zip-format torch checkpoint (torch ≥ 1.6 layout)."""
     with _fake_torch_modules() as api:
-        state, storages = _build_state(specs, api, extra_entries)
+        state, storages, _numels = _build_state(specs, api, extra_entries)
         outer = {"state_dict": state, "epoch": 3} if wrap_state_dict else state
         stream = io.BytesIO()
         pickler = _FixturePickler(stream, protocol=2)
@@ -313,15 +335,43 @@ def write_torch_zip_with_pickle(path, obj) -> Path:
 
 
 def write_torch_legacy(
-    path, specs, *, extra_entries=None, order=None, truncate_last=0, trailer_key=None
+    path,
+    specs,
+    *,
+    extra_entries=None,
+    order=None,
+    truncate_last=0,
+    trailer_key=None,
+    declared_counts=None,
+    truncate=None,
+    trailing=b"",
 ) -> Path:
-    """Write a synthetic legacy torch checkpoint (magic + protocol + sysinfo + …)."""
+    """Write a synthetic legacy torch checkpoint, mirroring torch's layout exactly.
+
+    The format (torch's ``_legacy_save``) is::
+
+        int64 magic (0x1950A86A20F9469CFC6C)   # pickled
+        int 1001                               # pickled protocol version
+        dict sys_info                          # pickled
+        state dict                             # pickled (tensors via persistent ids)
+        list of storage keys                   # pickled
+        per key: int64 element count + raw little-endian storage bytes
+
+    The ``int64`` element-count prefix is what
+    ``StorageMethods._write_file(..., save_size=True)`` writes with
+    ``struct.pack("=q", storage.size())`` — the zip format has no such prefix.
+
+    ``declared_counts`` overrides the written element count for a key (corruption
+    tests), ``truncate`` chops bytes off the very end of the file, and
+    ``trailing`` appends junk after the last storage.
+    """
     path = Path(path)
     with _fake_torch_modules() as api:
-        state, storages = _build_state(specs, api, extra_entries)
+        state, storages, numels = _build_state(specs, api, extra_entries)
         keys = list(storages) if order is None else list(order)
         if trailer_key is not None:
             keys = keys + [trailer_key]
+        declared = dict(declared_counts or {})
         with open(path, "wb") as handle:
             pickle.dump(_LEGACY_MAGIC, handle, protocol=2)
             pickle.dump(_LEGACY_PROTOCOL, handle, protocol=2)
@@ -332,9 +382,12 @@ def write_torch_legacy(
                 raw = storages.get(key, b"")
                 if truncate_last and position == len(keys) - 1:
                     raw = raw[: max(0, len(raw) - truncate_last)]
+                handle.write(struct.pack("<q", declared.get(key, numels.get(key, 0))))
                 handle.write(raw)
+            handle.write(trailing)
+    if truncate:
+        path.write_bytes(path.read_bytes()[: -truncate])
     return path
-
 
 # ---------------------------------------------------------------------------
 # safetensors: happy paths
@@ -647,6 +700,15 @@ def test_inert_torch_size_unpickles_through_copyreg():
 
 # ---------------------------------------------------------------------------
 # torch legacy format
+#
+# The legacy layout is torch's ``_legacy_save``: pickled magic, pickled protocol
+# int ``1001``, pickled ``sys_info`` dict, the pickled state dict, the pickled
+# list of storage keys, then per key an 8-byte little-endian int64 element count
+# (``StorageMethods._write_file(..., save_size=True)`` →
+# ``struct.pack("=q", storage.size())``) followed by that storage's raw bytes.
+# ``write_torch_legacy`` above emits exactly that; **no test here requires
+# torch** — the ``torch.*`` globals are fake modules registered only while
+# pickling (see ``_fake_torch_modules``).
 # ---------------------------------------------------------------------------
 
 
@@ -668,6 +730,70 @@ def test_torch_legacy_roundtrip(tmp_path):
     np.testing.assert_array_equal(state["view"], np.array([[1, 3, 5], [2, 4, 6]], dtype=np.float32))
 
 
+def test_torch_legacy_single_f32_storage_exact_values(tmp_path):
+    """One float32 storage: the per-storage int64 prefix must be consumed, not read as data."""
+    values = np.array([1.0, -0.0, 0.5, -2.25, 1e-38], dtype=np.float32)
+    path = write_torch_legacy(tmp_path / "pytorch_model.bin", [tensor_spec("w", values)])
+    state = read_torch_bin(path)
+    assert state["w"].dtype == np.float32
+    np.testing.assert_array_equal(state["w"], values)
+    # Bit-exact, including the negative zero.
+    assert state["w"].tobytes() == values.tobytes()
+
+
+def test_torch_legacy_two_storages_mixed_dtypes_exact_values(tmp_path):
+    """Two storages of different dtypes: the second blob must not be shifted by 8 bytes."""
+    f32 = np.array([0.25, -1.5, 3.75], dtype=np.float32)
+    i64 = np.array([-(2**40), 0, 7, 2**40 + 1], dtype=np.int64)
+    path = write_torch_legacy(
+        tmp_path / "pytorch_model.bin",
+        [
+            tensor_spec("f", f32),
+            tensor_spec("i", i64, storage="LongStorage"),
+        ],
+    )
+    state = read_torch_bin(path)
+    assert state["f"].dtype == np.float32
+    assert state["i"].dtype == np.int64
+    np.testing.assert_array_equal(state["f"], f32)
+    np.testing.assert_array_equal(state["i"], i64)
+
+
+def test_torch_legacy_shared_storage_offset_and_negative_stride(tmp_path):
+    """Two views over ONE storage: a stored offset plus a transposed and a reversed stride."""
+    flat = np.arange(12, dtype=np.float32)
+    base = tensor_spec("base", flat, size=(2, 4), stride=(4, 1), offset=2, storage_key="0")
+    transposed = tensor_spec("t", flat, size=(4, 2), stride=(1, 4), offset=2, storage_key="0")
+    reversed_view = tensor_spec("r", flat, size=(2, 4), stride=(-4, 1), offset=6, storage_key="0")
+    path = write_torch_legacy(tmp_path / "pytorch_model.bin", [base, transposed, reversed_view])
+
+    # The storage blob is written exactly once, with one int64 prefix.
+    blob = path.read_bytes()
+    assert blob.endswith(struct.pack("<q", flat.size) + flat.tobytes())
+
+    state = read_torch_bin(path)
+    for spec in (base, transposed, reversed_view):
+        np.testing.assert_array_equal(state[spec["name"]], expected_view(spec))
+    np.testing.assert_array_equal(state["base"], np.array([[2, 3, 4, 5], [6, 7, 8, 9]], np.float32))
+    np.testing.assert_array_equal(state["t"], np.array([[2, 6], [3, 7], [4, 8], [5, 9]], np.float32))
+    np.testing.assert_array_equal(state["r"], np.array([[6, 7, 8, 9], [2, 3, 4, 5]], np.float32))
+
+
+def test_torch_legacy_zero_element_storage(tmp_path):
+    """A 0-element storage writes ``declared == 0`` and no data bytes."""
+    empty = np.zeros((0,), dtype=np.float32)
+    other = np.array([1.5, -2.5], dtype=np.float32)
+    path = write_torch_legacy(
+        tmp_path / "pytorch_model.bin",
+        [tensor_spec("empty", empty, size=(0,)), tensor_spec("w", other)],
+    )
+    assert struct.pack("<q", 0) + struct.pack("<q", 2) + other.tobytes() in path.read_bytes()
+    state = read_torch_bin(path)
+    assert state["empty"].shape == (0,)
+    assert state["empty"].dtype == np.float32
+    np.testing.assert_array_equal(state["w"], other)
+
+
 def test_torch_legacy_truncated_storage_bytes(tmp_path):
     path = write_torch_legacy(
         tmp_path / "pytorch_model.bin",
@@ -679,6 +805,46 @@ def test_torch_legacy_truncated_storage_bytes(tmp_path):
     assert "truncated" in str(err.value)
 
 
+def test_torch_legacy_truncated_element_count_prefix(tmp_path):
+    """A cut that eats into the int64 prefix is an explicit error, not garbage data."""
+    path = write_torch_legacy(
+        tmp_path / "pytorch_model.bin",
+        [tensor_spec("w", np.arange(4, dtype=np.float32))],
+        truncate=20,  # 16 data bytes + 4 of the 8-byte prefix
+    )
+    with pytest.raises(HFWeightError) as err:
+        read_torch_bin(path)
+    message = str(err.value)
+    assert "0" in message and "element-count prefix" in message
+
+
+def test_torch_legacy_wrong_declared_element_count(tmp_path):
+    """A prefix disagreeing with the pickle stream is rejected, naming the storage key."""
+    path = write_torch_legacy(
+        tmp_path / "pytorch_model.bin",
+        [tensor_spec("w", np.arange(4, dtype=np.float32))],
+        declared_counts={"0": 3},
+    )
+    with pytest.raises(HFWeightError) as err:
+        read_torch_bin(path)
+    message = str(err.value)
+    assert "'0'" in message
+    assert "3 elements" in message and "4" in message
+
+
+def test_torch_legacy_trailing_junk_after_last_storage(tmp_path):
+    """Unconsumed bytes after the last blob must fail loudly (a mis-parse is never silent)."""
+    path = write_torch_legacy(
+        tmp_path / "pytorch_model.bin",
+        [tensor_spec("w", np.arange(2, dtype=np.float32))],
+        trailing=b"\x00" * 4,
+    )
+    with pytest.raises(HFWeightError) as err:
+        read_torch_bin(path)
+    message = str(err.value)
+    assert "4 unexpected trailing bytes" in message
+
+
 def test_torch_legacy_unknown_storage_key_in_trailer(tmp_path):
     path = write_torch_legacy(
         tmp_path / "pytorch_model.bin",
@@ -688,6 +854,26 @@ def test_torch_legacy_unknown_storage_key_in_trailer(tmp_path):
     with pytest.raises(HFWeightError) as err:
         read_torch_bin(path)
     assert "99" in str(err.value)
+
+
+def test_torch_legacy_without_element_count_prefix_is_rejected(tmp_path):
+    """The pre-fix (prefix-less) layout must now fail explicitly instead of shifting bytes."""
+    values = np.arange(4, dtype=np.float32)
+    path = tmp_path / "pytorch_model.bin"
+    with _fake_torch_modules() as api:
+        state, _storages, numels = _build_state([tensor_spec("w", values)], api)
+        with open(path, "wb") as handle:
+            pickle.dump(_LEGACY_MAGIC, handle, protocol=2)
+            pickle.dump(_LEGACY_PROTOCOL, handle, protocol=2)
+            pickle.dump({"protocol_version": _LEGACY_PROTOCOL, "little_endian": True}, handle, protocol=2)
+            _FixturePickler(handle, protocol=2).dump(state)
+            pickle.dump(list(numels), handle, protocol=2)
+            for key in numels:
+                handle.write(values.tobytes())  # no int64 element count
+    with pytest.raises(HFWeightError) as err:
+        read_torch_bin(path)
+    message = str(err.value)
+    assert "declares" in message and "'0'" in message
 
 
 def test_torch_reader_rejects_non_checkpoint_file(tmp_path):

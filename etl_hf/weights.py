@@ -6,10 +6,13 @@ package, no etl tensor API):
 * :func:`read_safetensors` — the safetensors container
   (``u64 LE header length`` + JSON header + raw tensor buffer).
 * :func:`read_torch_bin` — ``pytorch_model.bin``, in **both** on-disk formats:
-  the zip format (torch ≥ 1.6: ``*/data.pkl`` + ``*/data/<key>`` storage blobs)
-  and the legacy format (magic number + protocol 1001 + ``sys_info`` + the
-  pickled state dict + the pickled storage-key list + the raw storage bytes in
-  that key order).
+  the zip format (torch ≥ 1.6: ``*/data.pkl`` + ``*/data/<key>`` storage blobs,
+  each blob being the storage's raw bytes with **no** length prefix) and the
+  legacy format (magic number + protocol 1001 + ``sys_info`` + the pickled
+  state dict + the pickled storage-key list + one ``[8-byte little-endian
+  int64 element count][raw storage bytes]`` pair per listed key, in that key
+  order — torch's ``StorageMethods._write_file(..., save_size=True)`` writes the
+  count with ``struct.pack("=q", storage.size())``).
 * :func:`load_checkpoint` — a model directory or file, including sharded
   checkpoints via ``model.safetensors.index.json`` /
   ``pytorch_model.bin.index.json``.
@@ -560,7 +563,15 @@ def _read_torch_zip(path: Path) -> dict:
 
 
 def _read_torch_legacy(path: Path) -> dict:
-    """Read the legacy format: headers + state dict + key list + raw storages."""
+    """Read the legacy format: headers + state dict + key list + storage blobs.
+
+    Every storage blob in the trailer is preceded by an 8-byte little-endian
+    signed int64 element count — torch's ``StorageMethods._write_file(...,
+    save_size=True)`` emits ``struct.pack("=q", storage.size())`` right before
+    the raw bytes (:func:`_read_torch_storage_prefix`). The prefix is validated
+    against the element count carried by the pickle stream's persistent ids, and
+    the stream must be consumed exactly (trailing bytes are an error).
+    """
     try:
         blob = path.read_bytes()
     except OSError as exc:
@@ -582,6 +593,7 @@ def _read_torch_legacy(path: Path) -> dict:
                 f"{path}: legacy trailer lists storage key {key!r} that the pickle stream "
                 f"never referenced"
             )
+        _read_torch_storage_prefix(path, stream, key, storage)
         want = storage.numel * storage.stype.itemsize
         raw = stream.read(want)
         if len(raw) != want:
@@ -590,7 +602,41 @@ def _read_torch_legacy(path: Path) -> dict:
                 f"bytes, only {len(raw)} remain"
             )
         storage.raw = raw
+    trailing = len(blob) - stream.tell()
+    if trailing:
+        raise HFWeightError(
+            f"{path}: {trailing} unexpected trailing bytes after the last storage blob — the "
+            f"legacy torch checkpoint layout was not understood (every storage in the trailer is "
+            f"prefixed by an 8-byte little-endian int64 element count)"
+        )
     return _unwrap_state_dict(obj, path)
+
+
+def _read_torch_storage_prefix(
+    path: Path, stream: io.BytesIO, key: str, storage: _Storage
+) -> None:
+    """Consume and validate one storage's 8-byte int64 element-count prefix.
+
+    The legacy format interleaves the trailer as ``[int64 numel][raw bytes]`` per
+    storage key (``save_size=True`` in torch's storage writer). A prefix that
+    disagrees with the count in the pickle stream means the file was not written
+    that way, so reading on would produce silently garbage tensors — it is an
+    explicit error instead.
+    """
+    prefix = stream.read(8)
+    if len(prefix) != 8:
+        raise HFWeightError(
+            f"{path}: truncated legacy torch checkpoint — the 8-byte element-count prefix of "
+            f"storage {key!r} is incomplete ({len(prefix)} of 8 bytes remain); the pickle stream "
+            f"declares {storage.numel} elements"
+        )
+    (declared,) = struct.unpack("<q", prefix)
+    if declared != storage.numel:
+        raise HFWeightError(
+            f"{path}: legacy torch checkpoint storage {key!r} declares {declared} elements on "
+            f"disk but the pickle stream declares {storage.numel} — the checkpoint is corrupt or "
+            f"not in the legacy torch layout"
+        )
 
 
 def read_torch_bin(path) -> dict[str, np.ndarray]:
@@ -605,6 +651,12 @@ def read_torch_bin(path) -> dict[str, np.ndarray]:
     :class:`~etl_hf.errors.HFWeightError`. Dtypes follow the module dtype
     policy (f16/bf16 → f32). No key mapping and no transposition happens here —
     that is the per-family canonicaliser's job.
+
+    Storage blobs are laid out differently in the two formats: the zip format
+    stores each storage as a bare ``*/data/<key>`` member (no length prefix),
+    while the legacy format appends, per listed key, an 8-byte little-endian
+    int64 element count followed by that storage's raw bytes — the count is
+    validated against the pickle stream and the file must be consumed exactly.
     """
     path = Path(path)
     if not path.is_file():
