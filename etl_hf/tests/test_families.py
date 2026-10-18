@@ -162,7 +162,9 @@ def test_tied_specs_drop_the_head_for_every_family():
         spec = get_family(cfg.family)
         assert cfg.tie_word_embeddings is True
         tied = spec.param_specs(cfg)
-        untied_cfg = ModelConfig.from_dict(dict(raw, **overrides, tie_word_embeddings=False))
+        untied_raw = dict(raw, **overrides)
+        untied_raw["tie_word_embeddings"] = False
+        untied_cfg = ModelConfig.from_dict(untied_raw)
         untied = spec.param_specs(untied_cfg)
         assert len(tied) == expected_tied, cfg.family
         assert len(untied) == expected_tied + 1, cfg.family
