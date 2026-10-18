@@ -1,13 +1,19 @@
 """Parity + canonicalisation tests for the GPT-2 family (``etl_hf.models.gpt2``).
 
-Self-contained: no network, no torch, no checkpoint files. Every case builds a
-small synthetic GPT-2 config + parameter set from :func:`gpt2.param_specs`,
-stages the real graph through ``etl.evaluate`` on the numpy interpreter backend,
-and compares against :func:`gpt2.reference` (a pure-numpy, per-head-loop
-formulation of the same forward). The canonicalisation cases additionally drive
-the loader from a hand-built **HF-shaped** state dict (``c_attn`` fused,
-``Conv1D`` orientation, optional ``transformer.`` prefix) so that a wrong QKV
-split or a stray transpose cannot pass unnoticed.
+Self-contained: no network required (the one real-checkpoint case is guarded by
+:func:`etl_hf.tests.hf_download.require_model` and skips offline), no torch, no
+locally written checkpoint files. Every case builds a small synthetic GPT-2
+config + parameter set from :func:`gpt2.param_specs`, stages the real graph
+through ``etl.evaluate`` on the numpy interpreter backend, and compares against
+:func:`gpt2.reference` (a pure-numpy, per-head-loop formulation of the same
+forward). The canonicalisation cases additionally drive the loader from a
+hand-built **HF-shaped** state dict (``c_attn`` fused, ``Conv1D`` orientation,
+optional ``transformer.`` prefix) so that a wrong QKV split or a stray transpose
+cannot pass unnoticed.
+
+Section 4 also pins the **tied-weight contract**: ``tie_word_embeddings=True``
+means the output head IS ``embed.weight``, so there is no ``lm_head.weight``
+key, exactly one embedding array, and no extra graph input.
 """
 
 from __future__ import annotations
@@ -18,9 +24,11 @@ import pytest
 import etl
 from etl_hf import ops
 from etl_hf import reference as numpy_reference
+from etl_hf.build import HFModel, load_hf, run_model
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFWeightError
 from etl_hf.models import gpt2
+from etl_hf.tests import hf_download
 
 #: Base synthetic config: tiny but non-degenerate (non-square MLP, 4 heads).
 BASE_CONFIG: dict = {
@@ -452,24 +460,26 @@ def test_canonicalize_ignores_attention_buffers():
 
 
 def test_canonicalize_tied_without_head_aliases_embedding():
-    """Tied config + no ``lm_head.weight`` → the head is ``wte`` transposed."""
+    """Tied config + no ``lm_head.weight`` → no head key at all (the head IS the embedding)."""
     cfg = make_config(tie_word_embeddings=True)
     state = make_hf_state_dict(cfg, include_lm_head=False)
     canonical = gpt2.canonicalize_weights(cfg, state)
+    assert "lm_head.weight" not in canonical
+    assert set(canonical) == set(gpt2.param_specs(cfg))
     np.testing.assert_array_equal(
-        canonical["lm_head.weight"], canonical["embed.weight"].T
+        canonical["embed.weight"], hf_tensor(state, "wte.weight")
     )
-    assert canonical["lm_head.weight"].shape == (cfg.hidden_size, cfg.vocab_size)
+    assert canonical["embed.weight"].shape == (cfg.vocab_size, cfg.hidden_size)
 
 
 def test_canonicalize_tied_with_consistent_head():
-    """Tied config + a ``lm_head.weight`` equal to ``wte`` → transposed head."""
+    """Tied config + a ``lm_head.weight`` equal to ``wte`` → verified, consumed, dropped."""
     cfg = make_config(tie_word_embeddings=True)
     state = make_hf_state_dict(cfg, include_lm_head=True, tie_lm_head=True)
+    # No "unexpected key" error: the shipped copy was consumed, not ignored.
     canonical = gpt2.canonicalize_weights(cfg, state)
-    np.testing.assert_array_equal(
-        canonical["lm_head.weight"], canonical["embed.weight"].T
-    )
+    assert "lm_head.weight" not in canonical
+    assert set(canonical) == set(gpt2.param_specs(cfg))
 
 
 def test_canonicalize_tied_with_inconsistent_head_raises():
@@ -593,16 +603,29 @@ def test_param_specs_types_and_shapes():
     assert specs["layers.0.mlp.fc2.weight"].shape == (cfg.intermediate_size, hidden)
     assert specs["layers.1.attn.o.weight"].shape == (hidden, hidden)
     assert specs["final_norm.weight"].shape == (hidden,)
-    assert specs["lm_head.weight"].shape == (hidden, cfg.vocab_size)
+    # Tied (this config): the head reuses embed.weight, so there is no head spec.
+    assert "lm_head.weight" not in specs
     for spec in specs.values():
         assert spec.dtype == np.float32
 
 
+def test_param_specs_untied_keeps_the_head():
+    """An untied config keeps the separate ``(hidden, vocab)`` head spec."""
+    cfg = make_config(tie_word_embeddings=False)
+    specs = gpt2.param_specs(cfg)
+    assert specs["lm_head.weight"].shape == (cfg.hidden_size, cfg.vocab_size)
+    assert specs["lm_head.weight"].dtype == np.float32
+    assert len(specs) == len(gpt2.param_specs(make_config())) + 1
+
+
 def test_param_specs_scale_with_layer_count():
-    """Exactly ``16 * num_hidden_layers + 5`` parameters (no shared/aliased keys)."""
+    """``16 * num_hidden_layers + 4`` tied / ``+ 5`` untied parameters (no aliases)."""
     for layers in (1, 2, 3):
         cfg = make_config(n_layer=layers)
-        assert len(gpt2.param_specs(cfg)) == 16 * layers + 5
+        assert cfg.tie_word_embeddings is True
+        assert len(gpt2.param_specs(cfg)) == 16 * layers + 4
+        untied = make_config(n_layer=layers, tie_word_embeddings=False)
+        assert len(gpt2.param_specs(untied)) == 16 * layers + 5
 
 
 def test_graph_output_shape_and_dtype():
@@ -617,13 +640,36 @@ def test_graph_output_shape_and_dtype():
 
 
 def test_graph_takes_weights_as_inputs_only():
-    """The traced graph has exactly ``len(param_specs) + 1`` tensor inputs."""
+    """The traced graph has exactly ``len(param_specs) + 1`` tensor inputs.
+
+    This config is tied, so the output head is **not** among them: the one
+    ``embed.weight`` input feeds both the gather and the projection.
+    """
     cfg = make_config()
     specs = gpt2.param_specs(cfg)
+    assert "lm_head.weight" not in specs
     forward = gpt2.graph(cfg, seq_len=4, batch_size=2)
     traced = etl.trace(forward, specs, etl.TensorSpec((2, 4), etl.int32))
     assert len(traced.tensor_specs) == len(specs) + 1
     assert traced.tensor_specs[-1].dtype == np.int32
+
+
+def test_untied_graph_takes_the_head_as_an_input():
+    """An untied config keeps the head as a normal extra graph input."""
+    tied = make_config()
+    untied = make_config(tie_word_embeddings=False)
+
+    def inputs_of(cfg: ModelConfig) -> int:
+        """Trace ``cfg``'s graph at one static shape and count its tensor inputs."""
+        traced = etl.trace(
+            gpt2.graph(cfg, 4, 1),
+            gpt2.param_specs(cfg),
+            etl.TensorSpec((1, 4), etl.int32),
+        )
+        return len(traced.tensor_specs)
+
+    assert "lm_head.weight" in gpt2.param_specs(untied)
+    assert inputs_of(untied) == inputs_of(tied) + 1
 
 
 def test_graph_is_a_defn_not_callable():
@@ -757,14 +803,19 @@ def test_reference_rejects_bad_ids():
 
 
 def test_reference_rejects_param_mismatch():
-    """``reference`` requires exactly the canonical parameter set."""
+    """``reference`` requires exactly the canonical parameter set (tied: no head key)."""
     cfg = make_config()
     params = make_params(cfg)
     ids = make_ids(cfg, batch=1, seq=4)
+    assert "lm_head.weight" not in params
     incomplete = dict(params)
-    del incomplete["lm_head.weight"]
-    with pytest.raises(HFWeightError, match="lm_head.weight"):
+    del incomplete["embed.weight"]
+    with pytest.raises(HFWeightError, match="embed.weight"):
         gpt2.reference(cfg, incomplete, ids)
+    redundant = dict(params)
+    redundant["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
+    with pytest.raises(HFWeightError, match="lm_head.weight"):
+        gpt2.reference(cfg, redundant, ids)
     extended = dict(params)
     extended["extra.weight"] = np.zeros((2,), dtype=np.float32)
     with pytest.raises(HFWeightError, match="extra.weight"):
@@ -773,6 +824,114 @@ def test_reference_rejects_param_mismatch():
     wrong["embed.weight"] = np.zeros((3, 3), dtype=np.float32)
     with pytest.raises(HFWeightError, match="embed.weight"):
         gpt2.reference(cfg, wrong, ids)
+
+
+# ===========================================================================
+# 5b. the tied-weight contract (one embedding input for gather AND output head)
+# ===========================================================================
+def test_tied_canonical_tree_holds_one_embedding_array():
+    """No second array duplicates the embedding (the head is not materialised)."""
+    cfg = make_config(n_layer=1)
+    canonical = gpt2.canonicalize_weights(cfg, make_hf_state_dict(cfg))
+    embed = canonical["embed.weight"]
+    # Content-based (shapes collide in a tiny config), so a transposed copy of the
+    # embedding under any other key fails, whatever its shape.
+    copies = [
+        name
+        for name, array in canonical.items()
+        if name != "embed.weight"
+        and (np.array_equal(array, embed) or np.array_equal(array, embed.T))
+    ]
+    assert copies == []
+    assert set(canonical) == set(gpt2.param_specs(cfg))
+    assert not any("lm_head" in name for name in canonical)
+
+
+def test_tied_graph_matches_the_reference_and_reuses_the_embedding():
+    """The tied graph's logits equal the oracle's (head = embedding transpose)."""
+    cfg = make_config(tie_word_embeddings=True)
+    state = make_hf_state_dict(cfg, seed=17)
+    params = gpt2.canonicalize_weights(cfg, state)
+    ids = make_ids(cfg, batch=2, seq=5)
+    max_abs = assert_parity(cfg, params, ids)
+    assert max_abs < 1e-5, f"tied parity regressed: max-abs {max_abs:.3e}"
+    # The same weights through the FUSED-HF oracle agree as well.
+    np.testing.assert_allclose(
+        run_graph(cfg, params, ids),
+        fused_qkv_reference(cfg, state, ids),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_tied_and_untied_graphs_agree():
+    """Tied ≡ untied-with-head=embeddingᵀ (same one embedding, same numbers)."""
+    tied = make_config(n_layer=1)
+    untied = make_config(n_layer=1, tie_word_embeddings=False)
+    params = gpt2.canonicalize_weights(tied, make_hf_state_dict(tied, seed=19))
+    with_head = dict(params)
+    with_head["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
+    ids = make_ids(tied, batch=1, seq=4)
+    np.testing.assert_allclose(
+        run_graph(tied, params, ids),
+        run_graph(untied, with_head, ids),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_untied_checkpoint_with_head_round_trips_unchanged():
+    """The untied path is untouched: its head key comes from the checkpoint."""
+    cfg = make_config(tie_word_embeddings=False)
+    params = gpt2.canonicalize_weights(
+        cfg, make_hf_state_dict(cfg, tie_lm_head=False)
+    )
+    assert set(params) == set(gpt2.param_specs(cfg))
+    assert "lm_head.weight" in params
+    assert_parity(cfg, params, make_ids(cfg, batch=1, seq=4))
+
+
+def test_hfmodel_accepts_a_tied_tree_and_rejects_a_redundant_head():
+    """``HFModel`` mirrors the specs: the tied tree has no head, a redundant one is an error."""
+    cfg = make_config(n_layer=1)
+    params = gpt2.canonicalize_weights(cfg, make_hf_state_dict(cfg))
+    model = HFModel(cfg, params, seq_len=4)
+    assert set(model.params()) == set(model.param_specs()) == set(gpt2.param_specs(cfg))
+    assert "lm_head.weight" not in model.params()
+
+    ids = make_ids(cfg, batch=1, seq=4)
+    np.testing.assert_allclose(
+        model.forward(input_ids=ids), model.reference(input_ids=ids), rtol=1e-5, atol=1e-6
+    )
+
+    redundant = dict(params)
+    redundant["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
+    with pytest.raises(HFWeightError, match="lm_head.weight"):
+        HFModel(cfg, redundant, seq_len=4)
+    with pytest.raises(etl.ETLError, match="lm_head.weight"):
+        run_model(model.build(), redundant, ids)
+
+
+def test_real_tiny_gpt2_tied_checkpoint_dedupes_its_shipped_head():
+    """The real ``sshleifer/tiny-gpt2`` ships ``lm_head.weight``: verified, deduped.
+
+    The checkpoint's head is a byte-copy of ``wte.weight``, so canonicalisation
+    must consume it (never leave it as an unexpected key) and drop it — the tied
+    tree has one fewer key and the graph keeps numpy-interpreter parity.
+    """
+    model = load_hf(hf_download.require_model("tiny_gpt2"), seq_len=8)
+    cfg = model.config
+    assert cfg.tie_word_embeddings is True
+    params = model.params()
+    assert "lm_head.weight" not in params
+    assert set(params) == set(model.param_specs())
+    assert params["embed.weight"].shape == (cfg.vocab_size, cfg.hidden_size)
+    ids = (np.arange(8, dtype=np.int32) * 7 % cfg.vocab_size).reshape(1, 8)
+    got = model.forward(input_ids=ids)
+    want = model.reference(input_ids=ids)
+    max_abs = float(np.max(np.abs(got - want)))
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+    assert max_abs < 1e-6, f"tiny_gpt2 tied parity: max-abs {max_abs:.3e}"
 
 
 # ===========================================================================

@@ -148,6 +148,29 @@ def test_llama_spec_covers_mistral_and_qwen2():
     assert set(get_family("llama").model_types) == {"llama", "mistral", "qwen2"}
 
 
+# ---------------------------------------------------------------------------
+# the tied-weight contract at the registry level
+# ---------------------------------------------------------------------------
+def test_tied_specs_drop_the_head_for_every_family():
+    """Both families honour ``tie_word_embeddings``: tied drops ``lm_head.weight``."""
+    cases = (
+        (_LLAMA_JSON, {"tie_word_embeddings": True}, 2 + 9),
+        (_GPT2_JSON, {}, 16 + 4),
+    )
+    for raw, overrides, expected_tied in cases:
+        cfg = ModelConfig.from_dict(dict(raw, **overrides))
+        spec = get_family(cfg.family)
+        assert cfg.tie_word_embeddings is True
+        tied = spec.param_specs(cfg)
+        untied_raw = dict(raw, **overrides)
+        untied_raw["tie_word_embeddings"] = False
+        untied_cfg = ModelConfig.from_dict(untied_raw)
+        untied = spec.param_specs(untied_cfg)
+        assert len(tied) == expected_tied, cfg.family
+        assert len(untied) == expected_tied + 1, cfg.family
+        assert set(untied) - set(tied) == {"lm_head.weight"}, cfg.family
+
+
 def test_gpt2_spec_covers_only_gpt2():
     assert get_family("gpt2").model_types == ("gpt2",)
 

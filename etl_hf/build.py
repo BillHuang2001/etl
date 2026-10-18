@@ -684,9 +684,12 @@ class HFModel:
     """A loaded HuggingFace checkpoint: config + canonical params + graph.
 
     The object keeps the **canonical** parameter tree (``(in_features,
-    out_features)`` linears, tied head resolved) — never the raw HF state dict —
-    so memory is one copy of the weights in canonical form. Nothing is compiled
-    until :meth:`build`/:meth:`forward` runs, and nothing moves devices unless
+    out_features)`` linears, one array per parameter) — never the raw HF state
+    dict — so memory is one copy of the weights in canonical form. A tied output
+    head is **not** a separate canonical entry: it aliases ``embed.weight``
+    (``tie_word_embeddings=True``), so the tied tree carries one key fewer and no
+    duplicated embedding array. Nothing is compiled until
+    :meth:`build`/:meth:`forward` runs, and nothing moves devices unless
     :func:`place_params` is called explicitly.
 
     Attributes:
@@ -800,6 +803,9 @@ class HFModel:
     # -- introspection ------------------------------------------------------
     def params(self) -> dict[str, np.ndarray]:
         """Return the canonical host parameter tree.
+
+        A tied model's tree holds ``embed.weight`` **once** (the head aliases it),
+        so no array is duplicated for ``tie_word_embeddings=True``.
 
         Returns:
             dict[str, np.ndarray]: a fresh dict of the canonical arrays (same

@@ -11,6 +11,9 @@ Two things are pinned here:
   hide: exact key sets, exact orientation, exact values, tie resolution, and one
   explicit error per failure mode.
 
+Section 12 pins the **tied-weight contract**: ``tie_word_embeddings=True`` means
+the output head IS ``embed.weight``, so there is no ``lm_head.weight`` key,
+exactly one embedding array, and no extra graph input.
 Everything here is offline and numpy-only (no torch / transformers / network):
 configs are dicts, checkpoints are synthetic seeded arrays, and "weights" are
 random but well-scaled so fp32 stays well-conditioned.
@@ -23,6 +26,7 @@ import pytest
 
 import etl
 from etl_hf import ops
+from etl_hf.build import HFModel, run_model
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
 from etl_hf.models import llama
@@ -320,21 +324,24 @@ def test_canonicalize_ignores_rotary_inv_freq():
 
 
 def test_canonicalize_tied_head_absent_derives_from_embedding():
-    """tied + no ``lm_head.weight`` → ``embed.weight.T``."""
+    """tied + no ``lm_head.weight`` → no head key: the head IS ``embed.weight``."""
     cfg = _cfg(tie_word_embeddings=True)
     state = _hf_state_dict(cfg, head="absent")
     params = llama.canonicalize_weights(cfg, state)
-    assert np.array_equal(
-        params["lm_head.weight"], state["model.embed_tokens.weight"].T
-    )
+    assert "lm_head.weight" not in params
+    assert set(params) == set(llama.param_specs(cfg))
+    assert np.array_equal(params["embed.weight"], state["model.embed_tokens.weight"])
 
 
 def test_canonicalize_tied_head_present_and_consistent():
-    """tied + a consistent ``lm_head.weight`` → accepted (transposed)."""
+    """tied + an equal ``lm_head.weight`` → verified, consumed and dropped (no head key)."""
     cfg = _cfg(tie_word_embeddings=True)
     state = _hf_state_dict(cfg, head="tied")
     params = llama.canonicalize_weights(cfg, state)
-    assert np.array_equal(params["lm_head.weight"], state["lm_head.weight"].T)
+    # Dropped, not an "unexpected key": the shipped copy was consumed.
+    assert "lm_head.weight" not in params
+    assert set(params) == set(llama.param_specs(cfg))
+    assert np.array_equal(params["embed.weight"], state["model.embed_tokens.weight"])
 
 
 def test_canonicalize_tied_head_present_but_inconsistent():
@@ -623,3 +630,88 @@ def test_graph_returns_a_fresh_defn_each_call():
     second = llama.graph(cfg, 4)
     assert first is not second
     assert getattr(first, "__etl_defn__", False)
+
+
+# ---------------------------------------------------------------------------
+# 12. the tied-weight contract (one embedding input for gather AND output head)
+# ---------------------------------------------------------------------------
+def test_param_specs_omit_the_tied_head():
+    """Tied drops ``lm_head.weight``; untied keeps it — one key is the difference."""
+    untied = llama.param_specs(_cfg(tie_word_embeddings=False))
+    tied = llama.param_specs(_cfg(tie_word_embeddings=True))
+    layers = _cfg().num_hidden_layers
+    assert len(untied) == 2 + 9 * layers + 1
+    assert len(tied) == 2 + 9 * layers
+    assert set(untied) - set(tied) == {"lm_head.weight"}
+    assert tied["embed.weight"].shape == (32, 16)  # (vocab, hidden_size)
+    assert untied["lm_head.weight"].shape == (16, 32)  # (hidden_size, vocab)
+
+
+def test_tied_canonical_tree_holds_one_embedding_array():
+    """No returned array is a second copy of the embedding (no derived head array)."""
+    cfg = _cfg(tie_word_embeddings=True)
+    params = llama.canonicalize_weights(cfg, _hf_state_dict(cfg, head="absent"))
+    embed = params["embed.weight"]
+    copies = [
+        name
+        for name, array in params.items()
+        if name != "embed.weight"
+        and (np.array_equal(array, embed) or np.array_equal(array, embed.T))
+    ]
+    assert copies == []
+    assert not any("lm_head" in name for name in params)
+    for array in params.values():
+        assert array.dtype == np.float32 and array.flags["C_CONTIGUOUS"]
+
+
+def test_tied_graph_takes_no_extra_head_input():
+    """The traced tied graph has ``len(param_specs) + 1`` inputs (weights + ids)."""
+    cfg = _cfg(tie_word_embeddings=True)
+    specs = llama.param_specs(cfg)
+    _, traced = _traced(cfg, seq=4)
+    assert len(traced.tensor_specs) == len(specs) + 1
+    assert traced.tensor_specs[-1].dtype == etl.int32
+    untied = _cfg(tie_word_embeddings=False)
+    _, untied_traced = _traced(untied, seq=4)
+    assert len(untied_traced.tensor_specs) == len(traced.tensor_specs) + 1
+
+
+def test_tied_graph_matches_the_reference():
+    """The tied path is numerically identical to the oracle (head = embedᵀ)."""
+    cfg = _cfg(tie_word_embeddings=True)
+    assert "lm_head.weight" not in llama.param_specs(cfg)
+    max_abs = _assert_parity(cfg, seq=4)
+    assert max_abs < 1e-6, f"tied parity regressed: max-abs {max_abs:.3e}"
+
+
+def test_tied_and_untied_graphs_agree():
+    """Tied ≡ untied-with-head=embedᵀ (same one embedding, same numbers)."""
+    tied_cfg = _cfg(tie_word_embeddings=True)
+    untied_cfg = _cfg(tie_word_embeddings=False)
+    params = _params(tied_cfg)
+    with_head = dict(params)
+    with_head["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
+    ids = _ids(tied_cfg, 1, 4)
+    got = _run(tied_cfg, 4, 1, params, ids)
+    want = _run(untied_cfg, 4, 1, with_head, ids)
+    assert np.allclose(got, want, rtol=1e-6, atol=1e-6)
+    assert np.allclose(llama.reference(tied_cfg, params, ids), want, rtol=1e-6, atol=1e-6)
+
+
+def test_hfmodel_accepts_a_tied_tree_and_rejects_a_redundant_head():
+    """``HFModel`` mirrors the specs: no head key for tied, a redundant one is an error."""
+    cfg = _cfg(tie_word_embeddings=True)
+    params = llama.canonicalize_weights(cfg, _hf_state_dict(cfg, head="absent"))
+    model = HFModel(cfg, params, seq_len=4)
+    assert set(model.params()) == set(model.param_specs()) == set(llama.param_specs(cfg))
+    assert "lm_head.weight" not in model.params()
+    ids = _ids(cfg, 1, 4)
+    np.testing.assert_allclose(
+        model.forward(input_ids=ids), model.reference(input_ids=ids), rtol=1e-5, atol=1e-5
+    )
+    redundant = dict(params)
+    redundant["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
+    with pytest.raises(HFWeightError, match="lm_head.weight"):
+        HFModel(cfg, redundant, seq_len=4)
+    with pytest.raises(etl.ETLError, match="lm_head.weight"):
+        run_model(model.build(), redundant, ids)
