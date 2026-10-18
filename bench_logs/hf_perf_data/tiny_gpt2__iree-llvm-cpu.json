@@ -1,0 +1,169 @@
+{
+  "schema": 1,
+  "model": {
+    "name": "tiny_gpt2",
+    "golden": "tiny_gpt2",
+    "seq_len": 8,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/tiny_gpt2",
+    "family": "gpt2",
+    "model_type": "gpt2",
+    "hidden_act": "gelu_new",
+    "num_hidden_layers": 2,
+    "hidden_size": 2,
+    "vocab_size": 50257,
+    "tie_word_embeddings": true,
+    "config_digest": "573f391d464ea301",
+    "param_count": 102714,
+    "weight_inputs": 36,
+    "graph_inputs": 37
+  },
+  "backend": {
+    "key": "iree-llvm-cpu",
+    "backend": "iree",
+    "device": "cpu:0",
+    "options": {
+      "target_backends": [
+        "llvm-cpu"
+      ],
+      "opt_level": "O3",
+      "iree_compile_args": [
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-opt-data-tiling"
+      ]
+    },
+    "device_resident": false,
+    "resolved_backend": "iree",
+    "resolved_options": {
+      "target_backends": [
+        "llvm-cpu"
+      ],
+      "opt_level": "O3",
+      "iree_compile_args": [
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-opt-data-tiling"
+      ]
+    }
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "ok",
+  "errors": [],
+  "notes": [],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 4.5301,
+    "weight_bytes_f32": 410856,
+    "trace_ms": 52.5789,
+    "ir_ops": 170,
+    "ir_distinct_ops": 19,
+    "ir_histogram": {
+      "add": 33,
+      "multiply": 30,
+      "constant": 24,
+      "dot": 17,
+      "reshape": 11,
+      "transpose": 11,
+      "reduce_mean": 10,
+      "subtract": 8,
+      "divide": 7,
+      "sqrt": 5,
+      "exp": 2,
+      "gather": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "tanh": 2,
+      "broadcast": 1,
+      "cast": 1,
+      "less_equal": 1,
+      "return": 1
+    },
+    "export_ms": 4.8959,
+    "stablehlo_bytes": 33580,
+    "stablehlo_lines": 378,
+    "stablehlo_constants": 52
+  },
+  "build": {
+    "lower_ms": 13.9024,
+    "compile_ms": 935.3089,
+    "load_ms": 17.1164,
+    "stage_sum_ms": 966.3277,
+    "artifact_bytes": 57722,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_sweep": {
+      "O3": "compiled"
+    },
+    "opt_level_used": "O3",
+    "public_build_ms": 1081.8052,
+    "public_build_same_device": "Device(kind='cpu', index=0)"
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 8,
+    "first_call_ms": 1.1731,
+    "n": 7,
+    "best_ms": 0.4861,
+    "median_ms": 0.5029,
+    "mean_ms": 0.5034,
+    "stdev_ms": 0.0145,
+    "warmup": 2,
+    "iters": 7,
+    "tokens_per_s": 16457.52
+  },
+  "parity": {
+    "logits_shape": [
+      1,
+      8,
+      50257
+    ],
+    "logits_absmax": 0.12893779575824738,
+    "logits_mean": -1.2993103155167773e-05,
+    "golden_absmax": 0.12893779575824738,
+    "max_abs_vs_golden": 0.0,
+    "mean_abs_vs_golden": 0.0,
+    "max_rel_vs_golden": 0.0,
+    "logits_source": "this leg",
+    "max_abs_vs_numpy_backend": 0.0
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 2.29,
+    "stdout_tail": [
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/tiny_gpt2__iree-llvm-cpu.json (status=ok)"
+    ],
+    "stderr_tail": [
+      " - leaked function \"\"",
+      "nanobind: this is likely caused by a reference counting issue in the binding code.",
+      "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
+    ]
+  }
+}

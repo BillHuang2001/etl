@@ -1,0 +1,174 @@
+{
+  "schema": 1,
+  "model": {
+    "name": "tiny_llama",
+    "golden": "tiny_random_llama",
+    "seq_len": 8,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/tiny_llama",
+    "family": "llama",
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "num_hidden_layers": 2,
+    "hidden_size": 16,
+    "vocab_size": 32000,
+    "tie_word_embeddings": false,
+    "config_digest": "2d3a50f18a1a185a",
+    "param_count": 1032272,
+    "weight_inputs": 21,
+    "graph_inputs": 22
+  },
+  "backend": {
+    "key": "iree-llvm-cpu",
+    "backend": "iree",
+    "device": "cpu:0",
+    "options": {
+      "target_backends": [
+        "llvm-cpu"
+      ],
+      "opt_level": "O3",
+      "iree_compile_args": [
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-opt-data-tiling"
+      ]
+    },
+    "device_resident": false,
+    "resolved_backend": "iree",
+    "resolved_options": {
+      "target_backends": [
+        "llvm-cpu"
+      ],
+      "opt_level": "O3",
+      "iree_compile_args": [
+        "--iree-llvmcpu-target-cpu=host",
+        "--iree-opt-data-tiling"
+      ]
+    }
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "ok",
+  "errors": [],
+  "notes": [],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 8.0585,
+    "weight_bytes_f32": 4129088,
+    "trace_ms": 50.5374,
+    "ir_ops": 170,
+    "ir_distinct_ops": 24,
+    "ir_histogram": {
+      "multiply": 32,
+      "reshape": 21,
+      "constant": 19,
+      "dot": 19,
+      "add": 15,
+      "transpose": 10,
+      "slice": 8,
+      "divide": 7,
+      "concatenate": 5,
+      "reduce_mean": 5,
+      "sqrt": 5,
+      "negate": 4,
+      "cast": 3,
+      "subtract": 3,
+      "exp": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "sigmoid": 2,
+      "cos": 1,
+      "gather": 1,
+      "less_equal": 1,
+      "power": 1,
+      "return": 1,
+      "sin": 1
+    },
+    "export_ms": 4.6719,
+    "stablehlo_bytes": 28895,
+    "stablehlo_lines": 301,
+    "stablehlo_constants": 35
+  },
+  "build": {
+    "lower_ms": 13.7215,
+    "compile_ms": 1105.368,
+    "load_ms": 9.9793,
+    "stage_sum_ms": 1129.0687,
+    "artifact_bytes": 66026,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "opt_level_sweep": {
+      "O3": "compiled"
+    },
+    "opt_level_used": "O3",
+    "public_build_ms": 1171.2019,
+    "public_build_same_device": "Device(kind='cpu', index=0)"
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 8,
+    "first_call_ms": 3.9189,
+    "n": 7,
+    "best_ms": 1.8204,
+    "median_ms": 2.1526,
+    "mean_ms": 2.0837,
+    "stdev_ms": 0.1332,
+    "warmup": 2,
+    "iters": 7,
+    "tokens_per_s": 4394.64
+  },
+  "parity": {
+    "logits_shape": [
+      1,
+      8,
+      32000
+    ],
+    "logits_absmax": 0.3487534523010254,
+    "logits_mean": 0.00015656855248380452,
+    "golden_absmax": 0.3487534821033478,
+    "max_abs_vs_golden": 7.450580596923828e-08,
+    "mean_abs_vs_golden": 4.583393220514154e-09,
+    "max_rel_vs_golden": 2.1363459268286533e-07,
+    "logits_source": "this leg",
+    "max_abs_vs_numpy_backend": 8.940696716308594e-08
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 2.62,
+    "stdout_tail": [
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/tiny_llama__iree-llvm-cpu.sanity.json (status=ok)"
+    ],
+    "stderr_tail": [
+      " - leaked function \"get_buffer\"",
+      "nanobind: this is likely caused by a reference counting issue in the binding code.",
+      "See https://nanobind.readthedocs.io/en/latest/refleaks.html"
+    ]
+  }
+}

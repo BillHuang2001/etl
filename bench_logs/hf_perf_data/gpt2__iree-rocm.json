@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "model": {
+    "name": "gpt2",
+    "golden": "gpt2",
+    "seq_len": 32,
+    "batch": 1,
+    "golden_input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "checkpoint_dir": "/tmp/genesis/task_44e3d8a36419a36d/etl_hf_models/gpt2",
+    "family": "gpt2",
+    "model_type": "gpt2",
+    "hidden_act": "gelu_new",
+    "num_hidden_layers": 12,
+    "hidden_size": 768,
+    "vocab_size": 50257,
+    "tie_word_embeddings": true,
+    "config_digest": "f222c9fee6b84ca3",
+    "param_count": 124439808,
+    "weight_inputs": 196,
+    "graph_inputs": 197,
+    "pack_weights_api": null
+  },
+  "backend": {
+    "key": "iree-rocm",
+    "backend": "iree",
+    "device": "rocm:0",
+    "options": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O3"
+    },
+    "device_resident": true
+  },
+  "measurement": {
+    "iters": 7,
+    "warmup": 2,
+    "restage_iters": 3
+  },
+  "status": "skipped",
+  "errors": [],
+  "notes": [
+    "graph consumes 197 inputs, above the ~161-input IREE runtime limit (SIGSEGV at invoke) and etl_hf v1 has no pack_weights option \u2014 compiled rows stay 'pending packing'; numpy row is measured",
+    "pack_weights API probe: absent from etl_hf v1 (no pack_weights kwarg on build_model/HFModel.build, no pack_weights helper)"
+  ],
+  "env": {
+    "python": "3.14.8",
+    "executable": "/root/.cache/uv/builds-v0/.tmpTaTVgP/bin/python",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "numpy": "2.5.2",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "ETL_BACKEND": null,
+    "ETL_TARGET_BACKENDS": null,
+    "ETL_OPT_LEVEL": null,
+    "ETL_HF_MODELS_DIR": null,
+    "TMPDIR": "/tmp/genesis/task_44e3d8a36419a36d",
+    "cpu_count": 20
+  },
+  "graph": {
+    "load_hf_ms": 442.8257,
+    "weight_bytes_f32": 497759232,
+    "trace_ms": 230.0947,
+    "ir_ops": 870,
+    "ir_distinct_ops": 19,
+    "ir_histogram": {
+      "add": 183,
+      "multiply": 160,
+      "constant": 114,
+      "dot": 97,
+      "transpose": 61,
+      "reshape": 51,
+      "reduce_mean": 50,
+      "subtract": 38,
+      "divide": 37,
+      "sqrt": 25,
+      "exp": 12,
+      "reduce_max": 12,
+      "reduce_sum": 12,
+      "tanh": 12,
+      "gather": 2,
+      "broadcast": 1,
+      "cast": 1,
+      "less_equal": 1,
+      "return": 1
+    },
+    "export_ms": 19.4263,
+    "stablehlo_bytes": 174963,
+    "stablehlo_lines": 1858,
+    "stablehlo_constants": 242
+  },
+  "process": {
+    "exit_code": 0,
+    "duration_s": 0.89,
+    "stdout_tail": [
+      "[leg] wrote /root/etl/.genesis/workers/worker_T1_A43/bench_logs/hf_perf_data/gpt2__iree-rocm.json (status=skipped)"
+    ],
+    "stderr_tail": []
+  }
+}
