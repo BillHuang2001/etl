@@ -140,8 +140,10 @@ exact-type + qualified-name fallback, cycle detection, read-only decoded
 arrays), `container.py` (byte-layout save/load, atomic writes, strict
 validation), `cache.py` (`compute_key`, `FileCache`). Validated end-to-end
 (codec→container→cache round-trips, tamper detection, version mismatch,
-atomicity, recompute-on-corrupt) via inline scripts; the pytest suite in
-`../tests/persist/` does not exist yet (owned by root).
+atomicity, recompute-on-corrupt) by the pytest suite in `../tests/persist/`
+(5 files, 91 tests: `test_codec.py` 33, `test_container.py` 22,
+`test_cache.py` 16, `test_persistence_errors.py` 15,
+`test_integration.py` 5 — owned by root, read-only from here).
 
 ## Notes for agents
 
