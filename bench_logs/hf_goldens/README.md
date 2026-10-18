@@ -13,6 +13,7 @@ plain numpy. Only the **regeneration** script needs torch, and it must run in a 
 bench_logs/hf_goldens/
 ├── README.md                 # this file
 ├── probe_hf_goldens.py       # (in ./bench_logs/) the generator — needs torch+transformers
+├── verify_hf_goldens_meta.py # (in ./bench_logs/) numpy-only meta/npz contract check
 ├── oracle_report.json        # machine-readable summary of the last generation run
 ├── <slug>.npz                # logits (f32 (1,S,V)) + input_ids (i32 (1,S))
 ├── <slug>.meta.json          # model id, config summary, versions, recipes, sanity numbers,
@@ -107,6 +108,26 @@ Notes baked into the metadata because they are easy to get wrong:
   **ordinary magnitude (absmax 0.129)**, NOT denormal. The ~1e-44 outputs previously observed on
   `sshleifer/tiny-gpt2` come from the *compiled* (iree) leg of the old probe, so a ~1e-44 etl result
   is a real bug, not checkpoint degeneracy — this oracle is the reference that distinguishes them.
+
+## Required `<slug>.meta.json` keys
+
+The `etl_hf` golden-fixture consumer reads a fixed contract out of each `<slug>.meta.json`. These
+keys are **required** (regeneration must keep emitting them):
+
+| key | type | meaning |
+|---|---|---|
+| `model` | str | the HuggingFace repo id, e.g. `sshleifer/tiny-gpt2` — **the key the consumer reads** |
+| `model_id` | str | legacy spelling of the same repo id; **must equal `model`** (kept for backward compatibility) |
+| `slug` | str | the fixture slug = the file stem (`<slug>.npz`, `<slug>.meta.json`, `<slug>.keys.txt`) |
+| `seq_len` | int | `S`: the sequence length of the fixed `input_ids` (`8` for the tinies, `32` for `distilgpt2`/`gpt2`) |
+| `vocab_size` | int | vocabulary size — the last dim of `logits` (`(1, S, vocab_size)`) |
+| `dtype` | str | `"float32"` — the dtype the model was run and the logits were saved in |
+| `input_ids_recipe` | str | the exact recipe that rebuilds the saved ids: `input_ids[0, i] = (i * 7 + 3) % vocab_size` |
+
+Everything else in the meta (`config_summary`, `raw_config`, `versions`, `from_pretrained_kwargs`,
+`logits_*` sanity numbers, `flags`, `tie_observation`, `skip_keys_non_parameter`, `weights`, `npz`)
+is descriptive/regeneration provenance — useful when diagnosing a mismatch, not part of the
+consumer's minimum contract.
 
 ## Weight-file / key-name observations (the `etl_hf` key-mapping gotchas)
 

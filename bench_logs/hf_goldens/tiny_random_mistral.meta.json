@@ -1,4 +1,5 @@
 {
+  "model": "hf-internal-testing/tiny-random-MistralForCausalLM",
   "model_id": "hf-internal-testing/tiny-random-MistralForCausalLM",
   "slug": "tiny_random_mistral",
   "resolved_model_type": "mistral",

@@ -18,7 +18,7 @@ suite's ``pytest.importorskip("torch")`` guards):
 What it writes (all under ``bench_logs/hf_goldens/``):
 
     <slug>.npz            logits (f32, (1,S,V)) + input_ids (i32, (1,S))
-    <slug>.meta.json      model id / config summary / versions / recipes / sanity numbers
+    <slug>.meta.json      model (+ model_id) / config summary / versions / recipes / sanity numbers
     <slug>.keys.txt       full on-disk weight tensor listing (name + shape + dtype)
     README.md             how to regenerate + what each file means (written separately)
 
@@ -272,6 +272,10 @@ def run_model(model_id: str, slug: str, seq_len: int) -> dict:
         flags.append(f"hidden_act={hidden_act!r} is EXACT erf-GELU — NOT exportable by etl v1")
 
     meta = {
+        # ``model`` is the key the ``etl_hf`` golden-fixture consumer reads (HF repo id);
+        # ``model_id`` is the legacy spelling kept for backward compatibility — both carry
+        # the same value.
+        "model": model_id,
         "model_id": model_id,
         "slug": slug,
         "resolved_model_type": cfg.model_type,

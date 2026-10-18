@@ -1,4 +1,5 @@
 {
+  "model": "hf-internal-testing/tiny-random-LlamaForCausalLM",
   "model_id": "hf-internal-testing/tiny-random-LlamaForCausalLM",
   "slug": "tiny_random_llama",
   "resolved_model_type": "llama",

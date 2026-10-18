@@ -23,6 +23,12 @@ Generator: `./probe_hf_goldens.py`. It imports torch+transformers, so it **must*
 throwaway `$TMPDIR` venv — never the repo `.venv`, whose `pytest.importorskip("torch")` guards
 would flip to real runs. Reading the fixtures needs numpy only (no torch in tests).
 
+Each `<slug>.meta.json` must carry `model` (the HF repo id — the key the `etl_hf` consumer reads)
+alongside the legacy `model_id` (same value), plus `slug`, `seq_len`, `vocab_size`, `dtype`,
+`input_ids_recipe`; the generator emits `model` first, immediately before `model_id`. Contract check
+(numpy only, no torch): `uv run python bench_logs/verify_hf_goldens_meta.py` — reloads all five
+metas + npz files and asserts `model == model_id`, the required keys, preserved key ordering /
+`json.dumps(indent=2)` formatting, and the logits/ids shapes, dtypes and `input_ids` recipe.
 Pinned checkpoints: `hf-internal-testing/tiny-random-LlamaForCausalLM` (`tiny_random_llama`, S=8,
 safetensors, silu, untied), `hf-internal-testing/tiny-random-MistralForCausalLM`
 (`tiny_random_mistral`, S=8, legacy torch `.bin`, **GQA 2:1**, `hidden_act: "gelu"` = exact
