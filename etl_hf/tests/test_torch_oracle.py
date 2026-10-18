@@ -12,7 +12,10 @@ itself never imports them (pinned in ``tests/test_public_api.py`` and by
 :func:`test_etl_hf_never_imports_torch` below).  Both are pulled in with
 ``pytest.importorskip`` at module scope, so in this repository's default
 environment (numpy only) the whole file reports as **skipped** instead of
-erroring, and every test here is an opt-in extra when they are installed.
+erroring, and every test here is an opt-in extra when they are installed.  (A
+module-level skip is one skip, not one per test — run this file with ``-rs`` to
+see the reason line, and expect pytest's "no tests collected" exit status when
+this file is the only thing selected.)
 
 Golden fixture contract
 -----------------------
