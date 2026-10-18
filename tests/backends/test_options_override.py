@@ -602,19 +602,31 @@ def test_iree_resolve_compile_args_deny_list(flag, fragment):
 
 
 # ---------------------------------------------------------------------------
-# 3. iree runtime-flag paths (fake iree.runtime — no IREE dependency)
+# 3. iree runtime-flag paths (complete fake iree + iree.runtime — runs in a
+#    compiler-free environment; a real imported package is patched+restored)
 # ---------------------------------------------------------------------------
-
 
 def _install_fake_iree_runtime(monkeypatch, parse_flags_impl):
     """Install a fake ``iree.runtime`` module (flags.parse_flags recorder) so
-    the cuda-runtime-flag helpers are pinned deterministically without the
-    real runtime. Returns the recorded ``parse_flags`` call tuples.
+    the cuda-runtime-flag helpers are pinned deterministically without a
+    working IREE install. Returns the recorded ``parse_flags`` call tuples.
 
-    ``import iree.runtime as rt`` resolves the submodule through
-    ``getattr(iree, "runtime")`` when the real ``iree`` package is loaded, so
-    the package attribute is patched in addition to the ``sys.modules``
-    entry (both restored by monkeypatch afterwards).
+    The adapter imports with ``import iree.runtime as rt``, which imports the
+    PARENT package ``iree`` first and then resolves the ``runtime`` attribute
+    (falling back to ``sys.modules["iree.runtime"]``). So the fake is only
+    complete when BOTH layers exist:
+
+    * real ``iree`` already imported — patch its ``runtime`` attribute (and
+      the ``sys.modules`` submodule entries) so the attribute lookup finds the
+      fake, restored by monkeypatch afterwards;
+    * real ``iree`` absent (compiler-free environment) — install a minimal
+      fake package module (``__path__ = []``) in ``sys.modules`` as well,
+      otherwise ``import iree`` raises ``ModuleNotFoundError`` before the
+      ``iree.runtime`` entry is ever consulted.
+
+    Every install goes through ``monkeypatch`` (``setitem`` deletes keys that
+    did not exist and ``setattr`` restores the real attribute), so no fake or
+    patched attribute leaks between tests.
     """
     import sys
 
@@ -628,10 +640,18 @@ def _install_fake_iree_runtime(monkeypatch, parse_flags_impl):
     flags = types.ModuleType("iree.runtime.flags")
     flags.parse_flags = _parse_flags
     fake.flags = flags
-    monkeypatch.setitem(sys.modules, "iree.runtime", fake)
+
     iree_pkg = sys.modules.get("iree")
-    if iree_pkg is not None:
-        monkeypatch.setattr(iree_pkg, "runtime", fake, raising=False)
+    if iree_pkg is None:
+        iree_pkg = types.ModuleType("iree")
+        iree_pkg.__path__ = []  # a package, so ``import iree.runtime`` works
+        monkeypatch.setitem(sys.modules, "iree", iree_pkg)
+    # Patch the package attribute (a fresh fake package, or a REAL imported
+    # one) so the ``import iree.runtime as rt`` attribute lookup resolves to
+    # the fake; monkeypatch restores it on teardown.
+    monkeypatch.setattr(iree_pkg, "runtime", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "iree.runtime", fake)
+    monkeypatch.setitem(sys.modules, "iree.runtime.flags", flags)
     return calls
 
 
