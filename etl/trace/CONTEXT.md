@@ -241,6 +241,15 @@ an explicit `length` LARGER than a statically-known leading dim raises
 `TraceError`. Symbolic length → `TraceError` (dynamic-scan region ops
 reserved; no silent fallback).
 
+## Structured weight-DICT inputs (hundreds of named tensors)
+
+The supported pattern for "one dict of N named weight tensors → one graph": pass the dict as ONE positional `specs` argument and declare the defn with one matching parameter.
+
+- `trace(fn, *specs)` treats the whole `specs` TUPLE as one pytree (`_flatten_specs`, `trace.py:333`), so `etl.build(model, {"w1": TensorSpec(...), ..., "w400": ...})` gives the traced function its dict back as its single argument — N tensor leaves, N block args, N flat leaves, no cap anywhere (`return` op arity is `(0, None)`, function args unbounded, IR/persist serialization is linear JSON+base64).
+- Nesting is arbitrary (dict/list/tuple/namedtuple/dataclass, mixed, and a registered pytree node's children), and dict KEY ORDER DOES NOT MATTER: `_tree.py:244` sorts keys, so insertion order never affects `tensor_specs`/block-arg order and a run-time dict may be built in any order.
+- Static leaves may sit beside tensors in the SAME dict: each `_is_static_value` leaf (None/bool/int/float/complex/str/Enum/np.dtype/slice/`core.Dim`/`core.DimExpr`/`core.Device`/np.ndarray) is recorded in `static_values` and re-validated (kind + value) on every run — it specializes the graph, never occupies a block arg. A small config object must be a user dataclass with all-static fields (it is then descended field-wise), not an opaque object (opaque objects → `TraceError`).
+- Symbolic dims: `etl.dim("batch")` / `Dim(name, size)` / `DimExpr` arithmetic, freely mixed with int and `None` dims inside one shape. `Dim` equality is `(name, size)` structural, so separately constructed same-name `Dim`s unify — reuse of one object is NOT required. Caveat: run-time shape checking is PER-LEAF and stateless (`graph._check_shape`, `pipeline._validate_tensor_meta`) — there is no dim-binding environment in v1, so the same `Dim("B")` across two inputs is NOT cross-checked, and `Dim(name)`-without-size / `None` dims accept ANY size. Tying dims together is only enforced by trace-time shape inference in `ir`.
+
 ## Caching & performance (what the 2025-08 cleanup did, where the time goes)
 
 Measured after the cleanup (same machine, `$TMPDIR/etl_trace_bench.py`):
@@ -324,6 +333,7 @@ editing messages, keep the wording of existing paths intact.
 
 ## Known warts
 
+- **Trace-tree dict sorting is NOT wrapped, unlike `core.flatten`.** `_tree.py::_flatten_into` step 7 does a bare `keys = sorted(obj)` (no try/except), whereas `core.tree._flatten_into` and `pipeline._fast_structure_walk` wrap the same call into `flatten: cannot sort dict keys of mixed types (types: [...])`. Consequence: a dict with unorderable mixed-type keys (e.g. `{"a": spec, 1: spec}`) passed as a TRACE input (or as a `cond`/`while_loop`/`scan` operand, since control flow uses the same walker) raises the raw Python `TypeError` from `sorted` with no guidance. Keys of one sortable type are fine — they need NOT be strings (`int` keys work), they just must be mutually orderable.
 - **`_is_static_value` numpy-scalar asymmetry** (`_tree.py`): `np.float64`/`np.float32`-family values that are real Python `float`/`complex`/`str` subclasses (e.g. `np.float64`, `np.complex128`, `np.str_`) PASS the `isinstance(obj, (float, complex, str))` checks and count as static, while `np.int32`/`np.int64`/`np.uint*`/`np.bool_` (not Python `int`/`bool` subclasses) and `np.float32` are REJECTED — pinned by `tests/ops/test_getitem.py::test_numpy_scalar_key_unsupported_v1` and `tests/trace/test_static_snapshot.py::test_non_static_specs_are_rejected` ("is neither a core.TensorSpec nor a static"). `np.ndarray` leaves ARE static (accepted class — snapshotted at trace time, validated with `_static_equal`/`np.array_equal` semantics at run time in `Graph.flatten_inputs` and in the cond/while static cross-checks; pinned by `tests/trace/test_static_snapshot.py::test_ndarray_static_arg_accepted_and_preserved` + `tests/ops/test_getitem.py::test_ndarray_static_arg_accepted_and_preserved`); ndarrays still become TENSOR inputs via `TensorSpec` or `etl.evaluate` (which derives specs from them) — the two paths are distinct.
 - **`get_location` is ~89% of trace time** (`etl/ops/_utils.py`,
   `inspect.stack()` per op). Escape hatch: `ETL_DISABLE_LOCATIONS=1`. Fix
