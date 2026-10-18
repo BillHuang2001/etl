@@ -127,6 +127,51 @@ is the fallback with a `UserWarning`, and `@handle.batching_rule` /
 `@handle.vjp_rule` provide explicit transform rules — else the portable
 auto-fallback applies.
 
+## Run a HuggingFace model compiled (`etl_hf`)
+
+`etl_hf` is a separate top-level package built **on** etl (etl core stays free of
+layers/loaders): it reads a real checkpoint — `config.json` plus
+`model.safetensors` / `pytorch_model.bin` — and runs the **whole model forward
+pass as ONE etl graph**, so the model goes through the same explicit
+`trace → lower → compile → load → run` pipeline as any other graph. It is
+numpy-only: the checkpoint readers are pure numpy (`safetensors`, sharded
+indexes and both `pytorch_model.bin` encodings), and `torch`/`transformers`/
+`iree` are never imported at module scope.
+
+```python
+import etl, etl_hf
+
+model = etl_hf.load_hf("/path/to/checkpoint", seq_len=32)  # config + canonical weights, nothing compiled
+logits = model.forward(input_ids=ids)                      # whole forward as ONE graph (numpy interpreter)
+
+exe = model.build(backend="iree")                          # trace → lower → compile → load, once
+logits_iree = model.forward(input_ids=ids, backend="iree")
+
+ref = model.reference(input_ids=ids)                       # independent pure-numpy oracle
+tensors = etl_hf.place_params(model.params(), etl.core.Device("cuda", 0))  # one explicit .to per leaf
+out = etl.run(model.build(backend="iree", device=etl.core.Device("cuda", 0)), tensors, ids)
+```
+
+- **Families:** `llama` (also `mistral` / `qwen2` configs — RMSNorm, RoPE, GQA,
+  SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions,
+  `gelu_new`, tied head). Weights are always **explicit graph inputs** (never
+  `etl.constant`), one graph per static `(config, seq_len, batch)` — memoised
+  with `build_cached`.
+- **Parity:** validated against real HuggingFace (`torch`/`transformers`)
+  logits on five checkpoints (`tiny-random-llama`, `tiny-random-mistral`,
+  `tiny-gpt2`, `distilgpt2`, `gpt2`): ≤1.5e-4 max-abs on the 124M models
+  (≈1e-6 relative), fp32 accumulation-order only.
+- **Compiled:** a 12-layer/124M graph (870 IR ops, 175 KB StableHLO) compiles
+  on iree/llvm-cpu in ~2.5 s; whole-graph iree runs match the numpy backend.
+  One upstream limitation is explicit rather than silent: IREE's Python runtime
+  SIGSEGVs on graphs that **consume** more than ~160 distinct inputs, so
+  124M GPT-2 (196 weights) runs on the numpy interpreter, while ≤9-layer models
+  (`distilgpt2`, 101 inputs) run compiled — fuse weights to go bigger.
+- **Deferred by design (explicit errors):** exact-`erf` GELU configs
+  (`hidden_act: "gelu"`) are numpy-backend-only (`erf` is a StableHLO v1
+  deferral); dynamic shapes, kv-cache/incremental decode, and generation loops
+  are out of scope — this is the forward graph, not a serving stack.
+
 ## etl vs torch, jax, nx
 
 etl is the only one of the four with **no eager mode and no implicit tracing**:
