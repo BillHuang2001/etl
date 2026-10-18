@@ -163,6 +163,23 @@ atomicity, recompute-on-corrupt) by the pytest suite in `../tests/persist/`
   module-level if artifacts must round-trip.
 - Decoded numpy arrays are read-only and never alias the file bytes;
   `numpy.generic` decodes back to the numpy scalar (not an array).
+- **General-purpose payload container, NOT a weight-file reader.** The
+  container is untyped: `payload_type` is any non-empty caller string (no
+  registration/enum — `"widgets"` in tests, `"etl.graph"` in trace), and
+  `payload_fields` is ANY codec-encodable value, so a
+  `dict[str, np.ndarray]` (100–400 named weight arrays) saves + loads
+  directly today (`{"arrays": {"weights": ..., ...}}` is exercised in
+  `../tests/persist/test_container.py:34`). Cost: JSON + base64 npy in one
+  in-memory string, ~4/3 size blowup, whole payload materialized on both
+  save and load. Decode returns arrays `setflags(write=False)` — copy
+  (`np.array(a)`) if a consumer needs a writable buffer.
+- **No external array-format reader exists here** — no `.npy`/`.npz`/
+  `safetensors`/pickle/torch loader, no `np.load`/`np.save` on a PATH.
+  `codec.py:388`/`:236` call `np.save`/`np.load` on `io.BytesIO` ONLY, one
+  array per `"numpy.ndarray"` envelope (base64 inside the container JSON),
+  `allow_pickle=False` (object-dtype arrays → `PersistenceError`). Reading
+  a HF checkpoint must happen in caller code; persist can only store the
+  decoded arrays afterwards.
 - FileCache corrupt entries are never propagated — treated as a miss
   (recompute + atomic overwrite when `compute_fn` is given, else `None`).
   This is the only place errors are "swallowed", and it is the documented
