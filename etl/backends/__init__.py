@@ -66,6 +66,9 @@ __all__ = [
 # order cannot clobber any backend's provider. ``registry.get(name)``
 # records the preferred transfer backend per kind, and ``Tensor.to``
 # resolves the preferred backend's slot first, falling back to these thunks.
+# The ``"vulkan"`` kind has NO thunk here: the iree adapter is the only
+# backend that serves it, so its ``register()`` fills both its per-backend
+# slot AND the flat DEFAULT slot for vulkan.
 
 def _cuda_transfer_thunk(tensor, device):
     """Lazy "cuda" placement provider: delegates to the iree adapter.

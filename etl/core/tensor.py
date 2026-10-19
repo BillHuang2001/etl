@@ -211,8 +211,8 @@ def _get_device_transfer_provider(kind: str) -> Callable:
         raise DeviceError(
             f"no device-transfer provider is registered for device kind "
             f"{kind!r}: Tensor.to cannot place data on devices of this "
-            "kind. The etl iree backend registers a 'cuda' placement "
-            "provider when activated — see "
+            "kind. The etl iree backend registers placement providers for the "
+            "'cuda', 'rocm'/'hip' and 'vulkan' kinds when activated — see "
             "core.register_device_transfer_provider."
         )
     return provider

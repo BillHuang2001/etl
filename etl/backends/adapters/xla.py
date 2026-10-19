@@ -138,7 +138,8 @@ def _check_kind_served(
     if device.kind not in _NON_CPU_KINDS:
         raise core.BackendError(
             "the xla adapter supports CPU ('cpu') and accelerator "
-            f"('cuda'/'rocm', alias 'hip') devices, got {device!r}"
+            f"('cuda'/'rocm', alias 'hip') devices, got {device!r} — a "
+            "'vulkan' device is served by the iree backend instead"
         )
     if platform_name is not None:
         served = _PLATFORM_KINDS.get(platform_name.lower())

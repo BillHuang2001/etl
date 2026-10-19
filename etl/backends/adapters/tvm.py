@@ -322,7 +322,8 @@ class TvmBackend(CompilerBackend):
             if device.kind != "cpu":
                 raise core.BackendError(
                     f"the tvm backend v1 supports CPU devices only, got "
-                    f"device kind {device.kind!r}"
+                    f"device kind {device.kind!r} — the iree backend serves "
+                    "the 'cuda', 'rocm'/'hip' and 'vulkan' kinds"
                 )
         self.check_available()
         payload = artifact.payload

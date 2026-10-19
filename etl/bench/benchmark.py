@@ -74,14 +74,16 @@ def benchmark(examples=None, *, use_torch=None, repeats=20, warmup=2,
             ``core.BackendError``).
         device: device to run on — ``None`` (``Device("cpu", 0)``), a
             ``core.Device``, or a ``"KIND[:INDEX]"`` string (e.g. ``"cpu"``,
-            ``"cuda"``, ``"cuda:3"``, ``"rocm:0"`` — ``"hip"`` is the alias
-            of ``"rocm"``). The report records the formatted device.
+            ``"cuda"``, ``"cuda:3"``, ``"rocm:0"``, ``"vulkan:0"`` — ``"hip"``
+            is the alias of ``"rocm"``). The report records the formatted
+            device.
         **backend_options: extra options passed through to ``etl.build``
-            (compile options for compiler backends). For any non-numpy
-            backend without an explicit ``target_backends`` option, the
-            device-derived default is injected: ``["cuda"]`` on a cuda
-            device, ``["rocm"]`` on a rocm (or ``"hip"``) device,
-            ``["llvm-cpu"]`` otherwise (an explicit option always wins).
+            (compile options for compiler backends). For an iree backend
+            without an explicit ``target_backends`` option, the device-derived
+            default is injected: ``["cuda"]`` on a cuda device, ``["rocm"]``
+            on a rocm (or ``"hip"``) device, ``["vulkan-spirv"]`` on a vulkan
+            device, ``["llvm-cpu"]`` otherwise (an explicit option always
+            wins).
 
     Returns:
         :class:`BenchmarkReport` with one :class:`ExampleResult` per example
