@@ -121,6 +121,7 @@ import os
 import signal as signal_module
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -887,6 +888,17 @@ def child_env(leg_key: str) -> dict:
     # never reach the network from a leg
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    if leg_key.startswith("torchcompile"):
+        # torch.compile's Inductor backend caches compiler artifacts under $HOME
+        # (``~/.triton/cache``, ``~/.cache/torch/inductor``).  $HOME is read-only on
+        # some hosts, which makes the leg fail with
+        # ``InductorError: OSError: [Errno 30] Read-only file system: '~/.triton'``
+        # before it measures anything.  Redirect the caches to a writable temp tree
+        # unless the caller already chose one.
+        cache_root = Path(tempfile.gettempdir()) / "hf_bench_cache"
+        env.setdefault("TRITON_HOME", str(cache_root / "triton"))
+        env.setdefault("TRITON_CACHE_DIR", str(cache_root / "triton" / "cache"))
+        env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_root / "inductor"))
     if leg_key.startswith("xla"):
         # REQUIRED on this host: HIP-graph command buffers SIGSEGV inside
         # PJRT_Executable_Execute (see bench_logs/CONTEXT.md).
