@@ -101,8 +101,7 @@ Adding a family = one new module here + one `FamilySpec` entry in `etl_hf/famili
 Declaring `MODEL_TYPES` is optional (llama declares it, gpt2 does not) and `__all__` is not the interface — gpt2's `__all__` omits `FAMILY` while the registry reads the attribute directly.
 Export-unsafe activations are gated before tracing: `graph()` resolves the activation eagerly (unknown name → `HFUnsupportedError`) and the compiled-path refusal for `gelu`/`erf` lives in `etl_hf.pipeline.build` (`_check_activation`) via `etl_hf.ops.activation_is_export_safe` (`EXPORT_UNSAFE_ACTIVATIONS`), never a silent tanh substitute.
 Never `etl.constant` a weight here: the tests bound the graph's inlined data instead — a small `constant` **element** budget (`test_graph_has_no_constant_payloads`, ≤ 64 elements), a `stablehlo.constant` count ceiling and an O(`seq_len`) largest-dense-literal bound in the export suite, plus an op count independent of `seq_len`.
-Checkpoint tensors are validated (presence, dtype, shape) before the graph ever sees them, so a mismatched checkpoint fails at load, not inside lowering.
-Dict insertion order carries no graph meaning (`core.flatten` sorts dict keys); the canonical order only keeps specs and loaded arrays reported identically.
+Checkpoint tensors are validated (presence, dtype, shape) before the graph ever sees them, so a mismatched checkpoint fails at load, not inside lowering; dict insertion order carries no graph meaning (`core.flatten` sorts dict keys), the canonical order only keeps specs and loaded arrays reported identically.
 
 ## Routing Table
 
