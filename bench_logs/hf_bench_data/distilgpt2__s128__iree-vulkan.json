@@ -7,13 +7,13 @@
     "golden_slug": "distilgpt2",
     "seq_len": 128,
     "leg": "iree-vulkan",
-    "timestamp": "2026-10-19T13:07:02Z",
+    "timestamp": "2026-10-19T15:22:01Z",
     "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
-    "git_commit": "f83327fb081928fd5dddfee32c99e7da43306261",
+    "git_commit": "ba55c316a585457dd5057fb250dc714e998cf4df",
     "python": "3.14.8",
     "executable": "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
     "command": [
-      "/root/etl/.genesis/workers/worker_T1_A9/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",
@@ -87,25 +87,17 @@
     "batch": 1
   },
   "notes": [
-    "ran on IREE's Vulkan HAL through the benchmark-only shim bench_logs/hf_bench_vulkan.py install() (8 patched site(s), never a library change); the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
+    "ran on IREE's Vulkan HAL through the UNMODIFIED public API (etl_hf.build/run on Device(kind='vulkan', index=0), target vulkan-spirv inferred from the device) \u2014 the library owns the `vulkan` device kind, so no harness-side patch is involved; the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
     "pack: auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers"
   ],
   "errors": [
     "build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulkan-spirv):\nError invoking IREE compiler tool iree-compile\nError code: 1\nDiagnostics:\n<stdin>:124:12: error: failed to legalize operation 'vector.from_elements' that was explicitly marked illegal: %1201 = \"vector.from_elements\"(%562, %564, %566, %568) : (i64, i64, i64, i64) -> vector<4xi64> loc(callsite(\"<stdin>\":124:12 at \"<stdin>\":2:3))\n    %121 = \"stablehlo.gather\"(%31, %120) {dimension_numbers = #stablehlo.gather<offset_dims = [2], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 2>, slice_sizes = array<i64: 1, 768>} : (tensor<1024x768xf32>, tensor<1x128x1xi64>) -> tensor<1x128x768xf32>\n           ^\n<stdin>:2:3: note: called from\n  func.func @main(%arg0: tensor<88145x768xf32>, %arg1: tensor<61440xf32>, %arg2: tensor<4608x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {\n  ^\n<stdin>:155:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<\"vulkan-spirv\", \"vulkan-spirv-fb\", {iree_codegen.target_info = #iree_gpu.target<arch = \"vp_android_baseline_2022\", features = \"spirv:v1.3,cap:Shader\", wgp = <compute = fp32|int32, storage = b32, subgroup = none, subgroup_size_choices = [64], max_workgroup_sizes = [128, 128, 64], max_thread_count_per_workgroup = 128, max_workgroup_memory_bytes = 16384, max_workgroup_counts = [65535, 65535, 65535]>>}>\n    %154 = \"stablehlo.reduce\"(%149, %150) ({\n           ^\n<stdin>:2:3: note: called from\n  func.func @main(%arg0: tensor<88145x768xf32>, %arg1: tensor<61440xf32>, %arg2: tensor<4608x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {\n  ^\n\n\nInvoked with:\n iree-compile /tmp/genesis/task_c162727155a78af5/vk-venv/lib/python3.14/site-packages/iree/compiler/tools/../_mlir_libs/iree-compile - --iree-input-type=stablehlo --iree-vm-bytecode-module-output-format=flatbuffer-binary --iree-hal-target-backends=vulkan-spirv --mlir-print-debuginfo --mlir-print-op-on-diagnostic=false --iree-input-demote-f64-to-f32=false --iree-opt-level=O3\n\nNeed more information? Set IREE_SAVE_TEMPS=/some/dir in your environment to save all artifacts and reproducers.\n"
   ],
   "vulkan": {
-    "shim": "bench_logs/hf_bench_vulkan.py install()",
-    "shim_patched_sites": [
-      "etl/backends/adapters/iree.py:1071 IreeBackend._resolve_compile_options",
-      "etl/backends/adapters/iree.py:1326/1346 IreeBackend.load",
-      "etl/backends/adapters/iree.py:1817 _staged_input",
-      "etl/backends/adapters/iree.py:2907 transfer providers",
-      "etl/backends/adapters/iree.py:460 _artifact_target",
-      "etl/backends/adapters/iree.py:486 _GPU_DEVICE_KINDS",
-      "etl/backends/adapters/iree.py:536 _acquire_runtime_device",
-      "etl/pipeline.py:405 _resolve_backend_device"
-    ],
-    "shim_patch_count": 8,
+    "public_api": true,
+    "etl_device": "Device(kind='vulkan', index=0)",
+    "target_backends": "inferred from the device by etl.pipeline (['vulkan-spirv'])",
+    "compile_target": "vulkan-spirv",
     "icd_env_var": "ETL_VULKAN_ICD",
     "icd_path": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
     "vk_icd_filenames": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
@@ -116,9 +108,16 @@
     "device_vendor_id": "0x10005",
     "device_type": "CPU",
     "iree_device_count": 1,
-    "iree_device_id": 101927872,
+    "iree_device_id": 398591600,
     "iree_device_path": "6d657361-3235-2e32-2e38-2d3075627500",
-    "compile_target": "vulkan-spirv",
+    "compile_options_default": {
+      "target_backends": "'vulkan-spirv' (inferred from Device('vulkan', N))",
+      "opt_level": "O3 (library default for a non-ROCm target set)",
+      "vulkan_target": "unset \u2014 IREE's default Vulkan profile vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)"
+    },
+    "compile_options_hand_picked": {},
+    "compile_options_hand_picked_uses_vulkan_target": false,
+    "compile_options_note": "NO hand-picked flag: library defaults apply, so this cell is a reproducible defaults measurement",
     "note": "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) \u2014 see bench_logs/vulkan_findings.md"
   },
   "model": {
@@ -238,11 +237,11 @@
     ]
   },
   "graph": {
-    "load_hf_ms": 284.6827,
+    "load_hf_ms": 298.7728,
     "unpacked_graph_inputs": 101,
     "packed_graph_inputs": 4,
     "pack_plan_inputs": 3,
-    "param_specs_ms": 0.0878,
+    "param_specs_ms": 0.105,
     "weight_inputs": 3,
     "graph_inputs": 4,
     "packed_input_names": [
@@ -250,7 +249,7 @@
       "packed.1",
       "packed.2"
     ],
-    "trace_ms": 177.3348,
+    "trace_ms": 207.1819,
     "ir_ops": 550,
     "ir_distinct_ops": 20,
     "ir_histogram": {
@@ -276,7 +275,7 @@
       "return": 1
     },
     "stablehlo_bytes": 107371,
-    "stablehlo_export_ms": 10.3718
+    "stablehlo_export_ms": 12.8375
   },
   "parity": {
     "ids_source": "synthesized (i*7+3) % vocab_size=50257 [golden fixture is 1x32 (input_ids (1, 32)) but this cell is 1x128 \u2014 compare against the torch / numpy legs]",
@@ -427,7 +426,7 @@
   "process": {
     "returncode": 0,
     "signal": null,
-    "duration_s": 3.47,
+    "duration_s": 3.62,
     "timed_out": false,
     "stderr_tail": [],
     "stdout_tail": [
@@ -440,7 +439,7 @@
     ],
     "command": [
       "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
-      "/root/etl/.genesis/workers/worker_T1_A9/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",

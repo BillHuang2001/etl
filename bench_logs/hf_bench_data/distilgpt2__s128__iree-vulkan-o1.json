@@ -7,13 +7,13 @@
     "golden_slug": "distilgpt2",
     "seq_len": 128,
     "leg": "iree-vulkan-o1",
-    "timestamp": "2026-10-19T13:22:50Z",
+    "timestamp": "2026-10-19T15:22:35Z",
     "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
-    "git_commit": "aed13ddf55c9f963452179c801788a00c12ff096",
+    "git_commit": "ba55c316a585457dd5057fb250dc714e998cf4df",
     "python": "3.14.8",
     "executable": "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
     "command": [
-      "/root/etl/.genesis/workers/worker_T1_A11/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan-o1",
       "--models",
@@ -89,8 +89,8 @@
     "batch": 1
   },
   "notes": [
-    "ran on IREE's Vulkan HAL through the benchmark-only shim bench_logs/hf_bench_vulkan.py install() (8 patched site(s), never a library change); the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
-    "HAND-PICKED compile option(s) {'opt_level': 'O1'}: the library default opt_level=\"O3\" cannot translate this graph for vulkan-spirv (IREE's default Vulkan profile allows 16384 B of workgroup memory), so this cell is a Vulkan-EXECUTION probe, not a defaults measurement \u2014 see bench_logs/vulkan_findings.md",
+    "ran on IREE's Vulkan HAL through the UNMODIFIED public API (etl_hf.build/run on Device(kind='vulkan', index=0), target vulkan-spirv inferred from the device) \u2014 the library owns the `vulkan` device kind, so no harness-side patch is involved; the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
+    "HAND-PICKED compile option(s) {'opt_level': 'O1'}: the library default opt_level=\"O3\" cannot translate this graph for vulkan-spirv (IREE's default Vulkan profile allows 16384 B of workgroup memory), so this cell is a Vulkan-EXECUTION probe, not a defaults measurement (vulkan_target was left at the default profile) \u2014 see bench_logs/vulkan_findings.md",
     "pack: auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers",
     "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)",
     "packed weights: the canonical tree is concatenated ONCE on the host into 3 inputs (the graph unpacks them with static slices)",
@@ -98,18 +98,10 @@
   ],
   "errors": [],
   "vulkan": {
-    "shim": "bench_logs/hf_bench_vulkan.py install()",
-    "shim_patched_sites": [
-      "etl/backends/adapters/iree.py:1071 IreeBackend._resolve_compile_options",
-      "etl/backends/adapters/iree.py:1326/1346 IreeBackend.load",
-      "etl/backends/adapters/iree.py:1817 _staged_input",
-      "etl/backends/adapters/iree.py:2907 transfer providers",
-      "etl/backends/adapters/iree.py:460 _artifact_target",
-      "etl/backends/adapters/iree.py:486 _GPU_DEVICE_KINDS",
-      "etl/backends/adapters/iree.py:536 _acquire_runtime_device",
-      "etl/pipeline.py:405 _resolve_backend_device"
-    ],
-    "shim_patch_count": 8,
+    "public_api": true,
+    "etl_device": "Device(kind='vulkan', index=0)",
+    "target_backends": "inferred from the device by etl.pipeline (['vulkan-spirv'])",
+    "compile_target": "vulkan-spirv",
     "icd_env_var": "ETL_VULKAN_ICD",
     "icd_path": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
     "vk_icd_filenames": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
@@ -120,20 +112,18 @@
     "device_vendor_id": "0x10005",
     "device_type": "CPU",
     "iree_device_count": 1,
-    "iree_device_id": 548498464,
+    "iree_device_id": 998819584,
     "iree_device_path": "6d657361-3235-2e32-2e38-2d3075627500",
-    "compile_target": "vulkan-spirv",
     "compile_options_default": {
-      "target_backends": [
-        "vulkan-spirv"
-      ],
+      "target_backends": "'vulkan-spirv' (inferred from Device('vulkan', N))",
       "opt_level": "O3 (library default for a non-ROCm target set)",
-      "iree_vulkan_target": "IREE's default Vulkan profile vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)"
+      "vulkan_target": "unset \u2014 IREE's default Vulkan profile vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)"
     },
     "compile_options_hand_picked": {
       "opt_level": "O1"
     },
-    "compile_options_note": "HAND-PICKED compile option(s) {'opt_level': 'O1'} on top of the library defaults \u2014 this cell is a PROBE of what the Vulkan backend can execute, NOT a library-defaults measurement (the default O3 cannot compile the 124M-class graphs for vulkan-spirv; see bench_logs/vulkan_findings.md)",
+    "compile_options_hand_picked_uses_vulkan_target": false,
+    "compile_options_note": "HAND-PICKED compile option(s) {'opt_level': 'O1'} on top of the library defaults (`vulkan_target` NOT set \u2014 IREE's default SPIR-V profile) \u2014 this cell is a PROBE of what the Vulkan backend can execute, NOT a library-defaults measurement (the default opt_level=\"O3\" cannot compile the 124M-class graphs for vulkan-spirv; see bench_logs/vulkan_findings.md)",
     "note": "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) \u2014 see bench_logs/vulkan_findings.md"
   },
   "model": {
@@ -253,11 +243,11 @@
     ]
   },
   "graph": {
-    "load_hf_ms": 284.7815,
+    "load_hf_ms": 297.9782,
     "unpacked_graph_inputs": 101,
     "packed_graph_inputs": 4,
     "pack_plan_inputs": 3,
-    "param_specs_ms": 0.0882,
+    "param_specs_ms": 0.0974,
     "weight_inputs": 3,
     "graph_inputs": 4,
     "packed_input_names": [
@@ -265,7 +255,7 @@
       "packed.1",
       "packed.2"
     ],
-    "trace_ms": 183.2833,
+    "trace_ms": 182.7956,
     "ir_ops": 550,
     "ir_distinct_ops": 20,
     "ir_histogram": {
@@ -291,8 +281,8 @@
       "return": 1
     },
     "stablehlo_bytes": 107371,
-    "stablehlo_export_ms": 10.2711,
-    "pack_params_ms": 80.7805
+    "stablehlo_export_ms": 13.023,
+    "pack_params_ms": 77.6029
   },
   "parity": {
     "ids_source": "synthesized (i*7+3) % vocab_size=50257 [golden fixture is 1x32 (input_ids (1, 32)) but this cell is 1x128 \u2014 compare against the torch / numpy legs]",
@@ -464,52 +454,52 @@
   },
   "build": {
     "stage_timing": "build_total",
-    "build_total_ms": 1809.8045,
+    "build_total_ms": 1806.6308,
     "executable_device": "Device(kind='vulkan', index=0)",
     "resolved_options": {
       "opt_level": "O1"
     },
-    "build_total_cached_ms": 0.2544
+    "build_total_cached_ms": 0.2403
   },
   "run": {
     "batch": 1,
     "seq_len": 128,
     "api": "etl_hf.run(exe, place_params(params, device), place_ids(ids, device))",
-    "first_call_ms": 11631.3328,
+    "first_call_ms": 11528.3121,
     "logits_device": "Device(kind='vulkan', index=0)",
     "n": 5,
-    "best_ms": 11453.4432,
-    "median_ms": 11480.6659,
-    "mean_ms": 11475.6405,
-    "stdev_ms": 16.5364,
+    "best_ms": 11477.2476,
+    "median_ms": 11495.2273,
+    "mean_ms": 11494.1447,
+    "stdev_ms": 16.6066,
     "warmup": 2,
-    "tokens_per_s": 11.18,
-    "peak_rss_mb": 1471.0,
+    "tokens_per_s": 11.15,
+    "peak_rss_mb": 1471.1,
     "d2h": {
       "n": 3,
-      "best_ms": 7.0627,
-      "median_ms": 7.2901,
-      "mean_ms": 7.2538,
-      "stdev_ms": 0.1757
+      "best_ms": 7.2209,
+      "median_ms": 7.231,
+      "mean_ms": 7.3064,
+      "stdev_ms": 0.1396
     },
     "warm_with_d2h": {
       "n": 5,
-      "best_ms": 11496.6468,
-      "median_ms": 11501.5789,
-      "mean_ms": 11507.9959,
-      "stdev_ms": 12.9318
+      "best_ms": 11486.6155,
+      "median_ms": 11499.933,
+      "mean_ms": 11510.88,
+      "stdev_ms": 27.6394
     }
   },
   "staging": {
-    "place_params_ms": 174.822,
+    "place_params_ms": 169.2946,
     "place_params_leaves": 3,
-    "place_ids_ms": 0.0538,
+    "place_ids_ms": 0.0561,
     "place_params_steady": {
       "n": 3,
-      "best_ms": 82.7099,
-      "median_ms": 83.9459,
-      "mean_ms": 112.5296,
-      "stdev_ms": 50.5826
+      "best_ms": 81.3465,
+      "median_ms": 86.1608,
+      "mean_ms": 113.7267,
+      "stdev_ms": 51.9707
     }
   },
   "checks": {
@@ -532,7 +522,7 @@
   "process": {
     "returncode": 0,
     "signal": null,
-    "duration_s": 188.43,
+    "duration_s": 188.56,
     "timed_out": false,
     "stderr_tail": [],
     "stdout_tail": [
@@ -545,7 +535,7 @@
     ],
     "command": [
       "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
-      "/root/etl/.genesis/workers/worker_T1_A11/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan-o1",
       "--models",

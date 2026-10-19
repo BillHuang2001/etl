@@ -7,13 +7,13 @@
     "golden_slug": "tiny_random_llama",
     "seq_len": 32,
     "leg": "iree-vulkan",
-    "timestamp": "2026-10-19T13:05:05Z",
+    "timestamp": "2026-10-19T15:21:49Z",
     "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
-    "git_commit": "d3eab657cca9e6ef0415263a7d761829a6cc067f",
+    "git_commit": "ba55c316a585457dd5057fb250dc714e998cf4df",
     "python": "3.14.8",
     "executable": "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
     "command": [
-      "/root/etl/.genesis/workers/worker_T1_A8/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",
@@ -87,25 +87,17 @@
     "batch": 1
   },
   "notes": [
-    "ran on IREE's Vulkan HAL through the benchmark-only shim bench_logs/hf_bench_vulkan.py install() (8 patched site(s), never a library change); the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
+    "ran on IREE's Vulkan HAL through the UNMODIFIED public API (etl_hf.build/run on Device(kind='vulkan', index=0), target vulkan-spirv inferred from the device) \u2014 the library owns the `vulkan` device kind, so no harness-side patch is involved; the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
     "pack: auto: unpacked (below the input limit, no staging benefit)",
     "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)",
     "device-resident: weights and ids are placed ONCE; the measured loop is a same-device loop (nothing is restaged, the output never auto-copies to the host)"
   ],
   "errors": [],
   "vulkan": {
-    "shim": "bench_logs/hf_bench_vulkan.py install()",
-    "shim_patched_sites": [
-      "etl/backends/adapters/iree.py:1071 IreeBackend._resolve_compile_options",
-      "etl/backends/adapters/iree.py:1326/1346 IreeBackend.load",
-      "etl/backends/adapters/iree.py:1817 _staged_input",
-      "etl/backends/adapters/iree.py:2907 transfer providers",
-      "etl/backends/adapters/iree.py:460 _artifact_target",
-      "etl/backends/adapters/iree.py:486 _GPU_DEVICE_KINDS",
-      "etl/backends/adapters/iree.py:536 _acquire_runtime_device",
-      "etl/pipeline.py:405 _resolve_backend_device"
-    ],
-    "shim_patch_count": 8,
+    "public_api": true,
+    "etl_device": "Device(kind='vulkan', index=0)",
+    "target_backends": "inferred from the device by etl.pipeline (['vulkan-spirv'])",
+    "compile_target": "vulkan-spirv",
     "icd_env_var": "ETL_VULKAN_ICD",
     "icd_path": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
     "vk_icd_filenames": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
@@ -116,9 +108,16 @@
     "device_vendor_id": "0x10005",
     "device_type": "CPU",
     "iree_device_count": 1,
-    "iree_device_id": 118586160,
+    "iree_device_id": 284146000,
     "iree_device_path": "6d657361-3235-2e32-2e38-2d3075627500",
-    "compile_target": "vulkan-spirv",
+    "compile_options_default": {
+      "target_backends": "'vulkan-spirv' (inferred from Device('vulkan', N))",
+      "opt_level": "O3 (library default for a non-ROCm target set)",
+      "vulkan_target": "unset \u2014 IREE's default Vulkan profile vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)"
+    },
+    "compile_options_hand_picked": {},
+    "compile_options_hand_picked_uses_vulkan_target": false,
+    "compile_options_note": "NO hand-picked flag: library defaults apply, so this cell is a reproducible defaults measurement",
     "note": "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) \u2014 see bench_logs/vulkan_findings.md"
   },
   "model": {
@@ -159,11 +158,11 @@
     ]
   },
   "graph": {
-    "load_hf_ms": 8.1093,
+    "load_hf_ms": 8.5255,
     "unpacked_graph_inputs": 22,
     "packed_graph_inputs": 5,
     "pack_plan_inputs": 4,
-    "param_specs_ms": 0.0341,
+    "param_specs_ms": 0.0375,
     "weight_inputs": 21,
     "graph_inputs": 22,
     "packed_input_names": [
@@ -172,7 +171,7 @@
       "packed.2",
       "packed.3"
     ],
-    "trace_ms": 59.4049,
+    "trace_ms": 64.228,
     "ir_ops": 170,
     "ir_distinct_ops": 24,
     "ir_histogram": {
@@ -202,7 +201,7 @@
       "sin": 1
     },
     "stablehlo_bytes": 29482,
-    "stablehlo_export_ms": 4.7568
+    "stablehlo_export_ms": 4.831
   },
   "parity": {
     "ids_source": "synthesized (i*7+3) % vocab_size=32000 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
@@ -278,52 +277,52 @@
   },
   "build": {
     "stage_timing": "build_total",
-    "build_total_ms": 852.9682,
+    "build_total_ms": 913.7405,
     "executable_device": "Device(kind='vulkan', index=0)",
     "resolved_options": {
       "opt_level": "O3"
     },
-    "build_total_cached_ms": 0.5738
+    "build_total_cached_ms": 0.5496
   },
   "run": {
     "batch": 1,
     "seq_len": 32,
     "api": "etl_hf.run(exe, place_params(params, device), place_ids(ids, device))",
-    "first_call_ms": 7.0217,
+    "first_call_ms": 7.7204,
     "logits_device": "Device(kind='vulkan', index=0)",
     "n": 5,
-    "best_ms": 1.5765,
-    "median_ms": 1.6188,
-    "mean_ms": 1.6148,
-    "stdev_ms": 0.0233,
+    "best_ms": 1.6172,
+    "median_ms": 1.6373,
+    "mean_ms": 1.6419,
+    "stdev_ms": 0.0187,
     "warmup": 2,
-    "tokens_per_s": 20298.13,
-    "peak_rss_mb": 154.0,
+    "tokens_per_s": 19787.29,
+    "peak_rss_mb": 155.9,
     "d2h": {
       "n": 3,
-      "best_ms": 1.3928,
-      "median_ms": 1.4069,
-      "mean_ms": 1.4793,
-      "stdev_ms": 0.1378
+      "best_ms": 1.5548,
+      "median_ms": 1.5788,
+      "mean_ms": 1.5744,
+      "stdev_ms": 0.0178
     },
     "warm_with_d2h": {
       "n": 5,
-      "best_ms": 3.732,
-      "median_ms": 3.7423,
-      "mean_ms": 3.7591,
-      "stdev_ms": 0.0306
+      "best_ms": 3.6492,
+      "median_ms": 3.6724,
+      "mean_ms": 3.6874,
+      "stdev_ms": 0.0375
     }
   },
   "staging": {
-    "place_params_ms": 2.4649,
+    "place_params_ms": 2.8188,
     "place_params_leaves": 21,
-    "place_ids_ms": 0.0413,
+    "place_ids_ms": 0.0587,
     "place_params_steady": {
       "n": 3,
-      "best_ms": 1.3052,
-      "median_ms": 1.3064,
-      "mean_ms": 1.5793,
-      "stdev_ms": 0.4738
+      "best_ms": 1.3144,
+      "median_ms": 1.3752,
+      "mean_ms": 1.8053,
+      "stdev_ms": 0.7981
     }
   },
   "checks": {
@@ -336,10 +335,10 @@
     "label": "ANTI-PATTERN: per-call host->device restage of the params tree",
     "detail": "etl_hf.place_params(host params, device) + etl_hf.run per call",
     "n": 5,
-    "best_ms": 3.904,
-    "median_ms": 3.968,
-    "mean_ms": 4.0938,
-    "stdev_ms": 0.3089
+    "best_ms": 3.8694,
+    "median_ms": 3.9272,
+    "mean_ms": 4.1192,
+    "stdev_ms": 0.4886
   },
   "logits": {
     "shape": [
@@ -355,7 +354,7 @@
   "process": {
     "returncode": 0,
     "signal": null,
-    "duration_s": 1.36,
+    "duration_s": 1.44,
     "timed_out": false,
     "stderr_tail": [],
     "stdout_tail": [
@@ -368,7 +367,7 @@
     ],
     "command": [
       "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
-      "/root/etl/.genesis/workers/worker_T1_A8/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",

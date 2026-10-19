@@ -7,13 +7,13 @@
     "golden_slug": "tiny_random_mistral",
     "seq_len": 32,
     "leg": "iree-vulkan",
-    "timestamp": "2026-10-19T13:07:23Z",
+    "timestamp": "2026-10-19T15:21:51Z",
     "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
-    "git_commit": "f83327fb081928fd5dddfee32c99e7da43306261",
+    "git_commit": "ba55c316a585457dd5057fb250dc714e998cf4df",
     "python": "3.14.8",
     "executable": "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
     "command": [
-      "/root/etl/.genesis/workers/worker_T1_A9/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",
@@ -87,26 +87,18 @@
     "batch": 1
   },
   "notes": [
-    "ran on IREE's Vulkan HAL through the benchmark-only shim bench_logs/hf_bench_vulkan.py install() (8 patched site(s), never a library change); the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
+    "ran on IREE's Vulkan HAL through the UNMODIFIED public API (etl_hf.build/run on Device(kind='vulkan', index=0), target vulkan-spirv inferred from the device) \u2014 the library owns the `vulkan` device kind, so no harness-side patch is involved; the device is 'lavapipe (LLVM 20.1.2, 256 bits)' (apiVersion 1.4.318, driver 25.2.8, type CPU) = SOFTWARE Vulkan on the CPU, so its timings are a Vulkan-path datapoint, never a GPU number",
     "pack: auto: unpacked (below the input limit, no staging benefit)",
-    "StableHLO export failed: BackendError: stablehlo export: op 'erf' at /root/etl/.genesis/workers/worker_T1_A9/etl_hf/ops.py:302 is not supported in v1 \u2014 decompose it into supported ops or use a future compiler adapter"
+    "StableHLO export failed: BackendError: stablehlo export: op 'erf' at /root/etl/.genesis/workers/worker_T1_A35/etl_hf/ops.py:302 is not supported in v1 \u2014 decompose it into supported ops or use a future compiler adapter"
   ],
   "errors": [
     "build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'iree'. Two remedies: build with backend='numpy' (the exact-erf host path \u2014 same numbers, no compilation), or use a tanh-approximate config (hidden_act='gelu_new'), which differs from exact erf GELU by at most ~5e-4 per activation value (measured max |gelu_tanh - gelu_erf| = 4.7e-4, peaking near |x| ~ 2.7)."
   ],
   "vulkan": {
-    "shim": "bench_logs/hf_bench_vulkan.py install()",
-    "shim_patched_sites": [
-      "etl/backends/adapters/iree.py:1071 IreeBackend._resolve_compile_options",
-      "etl/backends/adapters/iree.py:1326/1346 IreeBackend.load",
-      "etl/backends/adapters/iree.py:1817 _staged_input",
-      "etl/backends/adapters/iree.py:2907 transfer providers",
-      "etl/backends/adapters/iree.py:460 _artifact_target",
-      "etl/backends/adapters/iree.py:486 _GPU_DEVICE_KINDS",
-      "etl/backends/adapters/iree.py:536 _acquire_runtime_device",
-      "etl/pipeline.py:405 _resolve_backend_device"
-    ],
-    "shim_patch_count": 8,
+    "public_api": true,
+    "etl_device": "Device(kind='vulkan', index=0)",
+    "target_backends": "inferred from the device by etl.pipeline (['vulkan-spirv'])",
+    "compile_target": "vulkan-spirv",
     "icd_env_var": "ETL_VULKAN_ICD",
     "icd_path": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
     "vk_icd_filenames": "/tmp/genesis/task_c162727155a78af5/vk-lvp/lavapipe_icd.json",
@@ -117,9 +109,16 @@
     "device_vendor_id": "0x10005",
     "device_type": "CPU",
     "iree_device_count": 1,
-    "iree_device_id": 325147584,
+    "iree_device_id": 1068563008,
     "iree_device_path": "6d657361-3235-2e32-2e38-2d3075627500",
-    "compile_target": "vulkan-spirv",
+    "compile_options_default": {
+      "target_backends": "'vulkan-spirv' (inferred from Device('vulkan', N))",
+      "opt_level": "O3 (library default for a non-ROCm target set)",
+      "vulkan_target": "unset \u2014 IREE's default Vulkan profile vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)"
+    },
+    "compile_options_hand_picked": {},
+    "compile_options_hand_picked_uses_vulkan_target": false,
+    "compile_options_note": "NO hand-picked flag: library defaults apply, so this cell is a reproducible defaults measurement",
     "note": "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) \u2014 see bench_logs/vulkan_findings.md"
   },
   "model": {
@@ -160,11 +159,11 @@
     ]
   },
   "graph": {
-    "load_hf_ms": 20.0194,
+    "load_hf_ms": 21.1649,
     "unpacked_graph_inputs": 22,
     "packed_graph_inputs": 6,
     "pack_plan_inputs": 5,
-    "param_specs_ms": 0.0349,
+    "param_specs_ms": 0.0418,
     "weight_inputs": 21,
     "graph_inputs": 22,
     "packed_input_names": [
@@ -174,7 +173,7 @@
       "packed.3",
       "packed.4"
     ],
-    "trace_ms": 66.0965,
+    "trace_ms": 68.2608,
     "ir_ops": 194,
     "ir_distinct_ops": 25,
     "ir_histogram": {
@@ -247,10 +246,10 @@
   },
   "failed_stage": "build",
   "traceback_tail": [
-    "  File \"/root/etl/.genesis/workers/worker_T1_A9/etl_hf/pipeline.py\", line 537, in build",
+    "  File \"/root/etl/.genesis/workers/worker_T1_A35/etl_hf/pipeline.py\", line 544, in build",
     "    _check_activation(cfg, resolved_backend)",
     "    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^",
-    "  File \"/root/etl/.genesis/workers/worker_T1_A9/etl_hf/pipeline.py\", line 352, in _check_activation",
+    "  File \"/root/etl/.genesis/workers/worker_T1_A35/etl_hf/pipeline.py\", line 359, in _check_activation",
     "    raise HFUnsupportedError(",
     "    ...<7 lines>...",
     "    )",
@@ -259,7 +258,7 @@
   "process": {
     "returncode": 0,
     "signal": null,
-    "duration_s": 0.27,
+    "duration_s": 0.28,
     "timed_out": false,
     "stderr_tail": [],
     "stdout_tail": [
@@ -272,7 +271,7 @@
     ],
     "command": [
       "/tmp/genesis/task_c162727155a78af5/vk-venv/bin/python",
-      "/root/etl/.genesis/workers/worker_T1_A9/bench_logs/hf_bench.py",
+      "/root/etl/.genesis/workers/worker_T1_A35/bench_logs/hf_bench.py",
       "--leg",
       "iree-vulkan",
       "--models",
