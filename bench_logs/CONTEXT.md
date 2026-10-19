@@ -8,7 +8,12 @@ probe.
 `./hf_bench_vulkan.py` (+ `./vulkan_findings.md`) is the **IREE Vulkan / lavapipe** datapoint: a
 benchmark-only runtime shim that widens the IREE adapter's eight Vulkan string/dialect gates
 (monkeypatch, no `./etl/` or `./etl_hf/` edit) so `etl_hf`'s public `build`/`run` path executes a
-real checkpoint's whole forward on the software Vulkan device — see its own section below.
+real checkpoint's whole forward on the software Vulkan device — two harness legs, `iree-vulkan`
+(library defaults) and `iree-vulkan-o1` (hand-picked `opt_level="O1"`), see its own section below.
+`./vulkan_findings.md` also records the host verdict: **this AMD GPU cannot run Vulkan at all**
+(RADV CDNA3 policy gate, AMDVLK has no CDNA PAL path, and the amdgpu DRM device is stuck in a
+never-completing reset), plus the etl-core gap list (file:line) that a first-class `vulkan` device
+kind would need.
 Historical artifacts remain committed here: the 763a415-era xla-vs-iree fused
 4096×50 probes (`probe_xla_gpu.py`, `probe_iree_same_mlir.py`, `probe_parity.py`,
 `de_4096x50_fused_key1.mlir`/`.vmfb`, `clocks_*.log`, `_common.py`) — their
