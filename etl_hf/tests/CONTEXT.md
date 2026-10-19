@@ -2,7 +2,7 @@
 
 ## Intent
 
-Colocated tests for `etl_hf`: a separate top-level distribution, so they live here rather than under `./tests/`, which mirrors `etl` only (`pyproject.toml` `testpaths = ["tests", "etl_hf/tests"]`, package list `include = ["etl*"]`, `etl_hf.tests` excluded).
+Colocated tests for `etl_hf`: a source-only top-level package that ships in no wheel or sdist of `etl`, so its tests live here rather than under `./tests/`, which mirrors `etl` only (`pyproject.toml` `testpaths = ["tests", "etl_hf/tests"]`, package list `include = ["etl", "etl.*"]` — these globs cannot match `etl_hf`/`etl_hf.*`, and `exclude = ["etl_hf.tests", "etl_hf.tests.*"]` keeps the suite out of publishing as belt-and-braces).
 The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: `etl_hf.load` (checkpoint → config + params), `etl_hf.program` (memoised forward, specs, oracle), `etl_hf.pipeline` (build/run/predict/placement), joined only by ordinary values.
 Everything is offline and numpy-only by default (no torch, no compiler), so the contract verifies on a bare `uv run --with pytest` install; only the guarded checkpoint readers touch the network.
 
@@ -60,6 +60,7 @@ Network access never fails a run: `hf_download.require_model` turns `DownloadUna
 Checkpoints cache under `$ETL_HF_MODELS_DIR` if set, else `$TMPDIR/etl_hf_models`; a cached file is trusted only when non-empty and, for `*.safetensors`, when its 8-byte header length parses and fits in the file.
 `ETL_HF_BIG=1` re-enables 6 real-size cases (`test_real_checkpoints.py`, `test_iree_rocm.py`, `test_pack.py`), each also guarding `/proc/meminfo` `MemAvailable` (the packed 124M path peaks near 1.7 GB RSS plus device buffers).
 `@requires_iree` (module-level `find_spec` probe) gates the compiling tests; `test_iree_rocm.py` adds `@requires_rocm`, composing it with `etl.devices()` so a CPU host's skip reason separates "iree not installed" from "no rocm device".
+There is no `xla` test module: the compiled `xla` path is validated by the benchmark harness (`../../bench_logs/hf_bench.py` → `../../bench_logs/hf_bench_results.md`), which needs a user-provided PJRT plugin, not by this suite.
 No test requires torch: the compiled and conformance paths are numpy-only, and every optional dependency is imported lazily inside a function or probed in a subprocess.
 
 ## Golden fixtures

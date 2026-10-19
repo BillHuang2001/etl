@@ -219,6 +219,24 @@ behind your back. Opt-in weight packing is `forward_fn(cfg, pack_weights=True)`
   4–14× faster than the numpy interpreter and up to ~200× faster than
   iree/llvm-cpu. On CPU the numpy/OpenBLAS path is still the fast one (the
   compiler's value here is the GPU).
+- **Compared to PyTorch** (measured; full tables in `./bench_logs/hf_bench_results.md`):
+  on an AMD Instinct MI300X VF (gfx942, ROCm 7.1) across five checkpoints
+  (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2` 124M; `seq_len` 32
+  for all of them, 128 for the two real ones), batch 1, the whole forward as ONE
+  graph in the device-resident same-device loop (zero `asdevicearray` per call):
+  **`xla`/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and is
+  21.6×–35.6× faster than torch-cpu on the real models; **`iree`/rocm beats
+  torch-rocm in 5/6 (0.73×–9.13×)**, its one loss being `gpt2` at `seq_len=128`.
+  XLA's default fp32 `dot` is TF32-class, so the opt-in `dot_precision="HIGHEST"`
+  leg is the bit-accurate one (rel-to-absmax 1.5e-6–2.9e-6, argmax agreement 1.0,
+  for 3%–29% more latency). On CPU the numpy/OpenBLAS interpreter still wins the
+  large matmuls (`gpt2` s32: 28.9 ms interpreted vs 403 ms on llvm-cpu) — the CPU
+  and GPU stories are never conflated. Legs that cannot run fail explicitly, never
+  silently: `tiny_mistral` on `iree`/`xla` (its `gelu` needs `etl.erf`, a StableHLO
+  export v1 deferral), and `distilgpt2`/`gpt2` at `seq_len=128` on iree-llvm-cpu
+  (upstream `iree-compile` stack-allocation limit). There is no XLA CPU plugin on
+  that host, so the xla legs are ROCm-only — and they are the first `etl_hf` runs
+  on the XLA backend anywhere.
 - **Opt-in weight packing (`pack_weights=True`)** collapses the whole weight
   tree into ~4 graph inputs by host-side concatenation plus static in-graph
   slices (bit-identical to unpacked). It also works around a real upstream
@@ -256,8 +274,18 @@ step, and its sugar is documented shorthand only.
 pip install -e .          # numpy only — runs fully with the default numpy backend
 pip install -e ".[dev]"   # + pytest
 pip install -e ".[interop]"  # + torch (DLPack interop tests)
-pip install -e ".[compilers]"  # + IREE, TVM adapters (xla: user-provided PJRT plugin .so, no pip dep)
+pip install -e ".[bench]"    # + torch (etl.bench's PyTorch comparison column only)
+pip install -e ".[iree]"     # + IREE compiler/runtime adapters
+pip install -e ".[tvm]"      # + apache-tvm, jaxlib (its bundled MLIR bindings; `jax` itself is never imported)
+pip install -e ".[compilers]"  # + IREE and TVM adapters (xla: user-provided PJRT plugin .so, no pip dep)
+pip install -e ".[hf]"       # + torch, transformers — reference oracles for the etl_hf benchmarks only
 ```
+
+Extras are additive and each enables only its own capability; `numpy` stays the only
+hard dependency (`xla` has no extra at all — it loads a user-provided PJRT C API
+plugin `.so`, configured with `ETL_PJRT_PLUGIN` or the backend's `plugin_path`
+option). None of them installs `etl_hf`: it is a separate top-level package used
+from the checkout (see the `etl_hf` section above).
 
 ## Test
 
