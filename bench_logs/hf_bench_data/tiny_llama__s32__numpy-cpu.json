@@ -1,0 +1,306 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "etl",
+  "provenance": {
+    "model": "tiny_llama",
+    "golden_slug": "tiny_random_llama",
+    "seq_len": 32,
+    "leg": "numpy-cpu",
+    "timestamp": "2026-10-19T10:57:55Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "bd092767b813d359499aaf2952f1e98c435b3166",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "numpy-cpu",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": null
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": null,
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "numpy-cpu",
+    "kind": "etl",
+    "backend": "numpy",
+    "device": "cpu (host)",
+    "device_resident": false,
+    "options_requested": {},
+    "pack": {
+      "mode": "auto",
+      "packed": false,
+      "reason": "auto: unpacked (below the input limit, no staging benefit)"
+    },
+    "resolved_backend": "numpy",
+    "options_resolved": {}
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "pack: auto: unpacked (below the input limit, no staging benefit)",
+    "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_llama",
+    "batch": 1,
+    "family": "llama",
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "config_digest": "2d3a50f18a1a185a",
+    "vocab_size": 32000,
+    "hidden_size": 16,
+    "num_hidden_layers": 2,
+    "tie_word_embeddings": false,
+    "param_count": 1032272,
+    "param_bytes": 4129088,
+    "weight_keys": [
+      "embed.weight",
+      "final_norm.weight",
+      "layers.0.attn.k.weight",
+      "layers.0.attn.o.weight",
+      "layers.0.attn.q.weight",
+      "layers.0.attn.v.weight",
+      "layers.0.attn_norm.weight",
+      "layers.0.mlp.down.weight",
+      "layers.0.mlp.gate.weight",
+      "layers.0.mlp.up.weight",
+      "layers.0.mlp_norm.weight",
+      "layers.1.attn.k.weight",
+      "layers.1.attn.o.weight",
+      "layers.1.attn.q.weight",
+      "layers.1.attn.v.weight",
+      "layers.1.attn_norm.weight",
+      "layers.1.mlp.down.weight",
+      "layers.1.mlp.gate.weight",
+      "layers.1.mlp.up.weight",
+      "layers.1.mlp_norm.weight",
+      "lm_head.weight"
+    ]
+  },
+  "graph": {
+    "load_hf_ms": 9.6464,
+    "unpacked_graph_inputs": 22,
+    "packed_graph_inputs": 5,
+    "pack_plan_inputs": 4,
+    "param_specs_ms": 0.0355,
+    "weight_inputs": 21,
+    "graph_inputs": 22,
+    "packed_input_names": [
+      "packed.0",
+      "packed.1",
+      "packed.2",
+      "packed.3"
+    ],
+    "trace_ms": 51.8107,
+    "ir_ops": 170,
+    "ir_distinct_ops": 24,
+    "ir_histogram": {
+      "multiply": 32,
+      "reshape": 21,
+      "constant": 19,
+      "dot": 19,
+      "add": 15,
+      "transpose": 10,
+      "slice": 8,
+      "divide": 7,
+      "concatenate": 5,
+      "reduce_mean": 5,
+      "sqrt": 5,
+      "negate": 4,
+      "cast": 3,
+      "subtract": 3,
+      "exp": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "sigmoid": 2,
+      "cos": 1,
+      "gather": 1,
+      "less_equal": 1,
+      "power": 1,
+      "return": 1,
+      "sin": 1
+    },
+    "stablehlo_bytes": 29482,
+    "stablehlo_export_ms": 4.7452
+  },
+  "parity": {
+    "ids_source": "synthesized (i*7+3) % vocab_size=32000 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": false,
+      "reason": "golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs"
+    },
+    "vs_numpy": {
+      "comparable": false,
+      "reason": "same leg"
+    },
+    "vs_torch_cpu": {
+      "comparable": false,
+      "reason": "no logits on disk for the torch-cpu leg"
+    },
+    "vs_torch_rocm": {
+      "comparable": false,
+      "reason": "no logits on disk for the torch-rocm leg"
+    }
+  },
+  "build": {
+    "stage_timing": "build_total",
+    "build_total_ms": 75.3888,
+    "executable_device": "Device(kind='cpu', index=0)",
+    "resolved_options": {},
+    "build_total_cached_ms": 0.4372
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "etl_hf.run(exe, host params, host ids)",
+    "first_call_ms": 2.1287,
+    "logits_device": "Device(kind='cpu', index=0)",
+    "n": 5,
+    "best_ms": 1.5287,
+    "median_ms": 1.5944,
+    "mean_ms": 1.5979,
+    "stdev_ms": 0.0478,
+    "warmup": 2,
+    "tokens_per_s": 20932.82,
+    "peak_rss_mb": 68.3,
+    "d2h": {
+      "applicable": false,
+      "reason": "the output is already host-resident (cpu executable)"
+    }
+  },
+  "checks": {
+    "checked": true,
+    "asdevicearray_calls": 0,
+    "reason": null
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      32000
+    ],
+    "absmax": 0.4176534414291382,
+    "mean": 6.767003651475534e-05,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 0.5,
+    "timed_out": false,
+    "stderr_tail": [],
+    "stdout_tail": [
+      "[stage] place params / prepare run",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.json",
+      "[leg] tiny_llama/s32/numpy-cpu: ok -> bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "numpy-cpu",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}
