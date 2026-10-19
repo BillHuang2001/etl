@@ -705,11 +705,28 @@ class AsDeviceArrayCounter:
 # ---------------------------------------------------------------------------
 # versions table / report formatting
 # ---------------------------------------------------------------------------
+def env_source_display(path) -> str:
+    """Report form of the environment artifact path (never fabricated).
+
+    A recorded path that ends in ``bench_logs/hf_bench_env.json`` — i.e. the file the
+    measuring run found inside *some* checkout of this repo, typically a worker
+    worktree that exists for nobody else — is rendered as that repo-relative path, the
+    artifact that actually ships. Any other path is returned exactly as recorded.
+    """
+    text = str(path)
+    suffix = f"bench_logs/{ENV_JSON_NAME}"
+    if text.replace(os.sep, "/").endswith(suffix):
+        return suffix
+    return text
+
+
 def load_env_json(out_dirs) -> dict | None:
     """Read the provisioning artifact ``hf_bench_env.json`` if the runner produced it.
 
     Optional by design: the report degrades to the versions each leg recorded when
     the file is absent (the env-provisioning script is a separate artifact).
+    ``_source`` is the *report* form of the path (:func:`env_source_display`), not the
+    machine-specific one the measuring process happened to use.
     """
     for out_dir in [*out_dirs, HERE]:
         path = Path(out_dir) / ENV_JSON_NAME
@@ -718,7 +735,7 @@ def load_env_json(out_dirs) -> dict | None:
                 payload = json.loads(path.read_text())
             except Exception:
                 continue
-            payload["_source"] = str(path)
+            payload["_source"] = env_source_display(path)
             return payload
     return None
 

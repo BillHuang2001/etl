@@ -52,7 +52,7 @@ Timing parameters of this run: **5 warm samples after 2 warmup call(s)**, batch 
 
 ## 1. Environment
 
-Provisioned bench environment (`/root/etl/.genesis/workers/worker_T1_A21/bench_logs/hf_bench_env.json`, produced by `bench_logs/hf_bench_env.py`):
+Provisioned bench environment (`bench_logs/hf_bench_env.json`, produced by `bench_logs/hf_bench_env.py`):
 
 | key | value |
 |---|---|
@@ -65,8 +65,8 @@ Provisioned bench environment (`/root/etl/.genesis/workers/worker_T1_A21/bench_l
 | host.mem_total_gb | 235.9 |
 | host.python_system | 3.12.3 |
 | host.python_system_executable | /usr/bin/python3 |
-| host.repo_root | /root/etl/.genesis/workers/worker_T1_A17 |
-| host.tmpdir | /tmp/genesis/task_9ee05e7d6b4cb450 |
+| host.repo_root (worktree at measurement time) | /root/etl/.genesis/workers/worker_T1_A17 |
+| host.tmpdir (machine scratch dir, not a shipped artifact) | /tmp/genesis/task_9ee05e7d6b4cb450 |
 | host.rocm_smi.product | AMD Instinct MI300X VF |
 | host.rocm_smi.gfx | gfx942 |
 | host.rocm_smi.vendor | Advanced Micro Devices, Inc. [AMD/ATI] |
@@ -176,7 +176,7 @@ Provisioned bench environment (`/root/etl/.genesis/workers/worker_T1_A21/bench_l
 | versions.ml-dtypes | 0.6.0 |
 | versions.mpmath | 1.3.0 |
 | versions.networkx | 3.7 |
-| … | 135 more entries in /root/etl/.genesis/workers/worker_T1_A21/bench_logs/hf_bench_env.json |
+| … | 135 more entries in bench_logs/hf_bench_env.json |
 
 | package / variable | version(s) seen in the legs |
 |---|---|

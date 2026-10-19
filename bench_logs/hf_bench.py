@@ -138,6 +138,14 @@ ANTI_PATTERN_MODELS: tuple[str, ...] = ("tiny_llama",)
 PACK_BENEFICIAL_LEAVES = 50
 #: Skip the (backend-independent) StableHLO export above this many IR ops.
 EXPORT_OP_LIMIT = 4000
+#: Flattened ``hf_bench_env.json`` keys whose value is honest provenance but an
+#: **ephemeral** path (the worker checkout / machine scratch dir of the measuring run,
+#: neither of which exists for a reader): the value is kept verbatim, the row key just
+#: says what it is.
+EPHEMERAL_ENV_LABELS: dict[str, str] = {
+    "host.repo_root": "host.repo_root (worktree at measurement time)",
+    "host.tmpdir": "host.tmpdir (machine scratch dir, not a shipped artifact)",
+}
 
 
 def _progress(label: str) -> None:
@@ -1999,7 +2007,11 @@ def render_report(records, out_dirs) -> str:
         )
         add("")
         flat = _flatten(env_json)
-        rows = [[key, lib.fmt(value)] for key, value in list(flat.items()) if key != "_source"]
+        rows = [
+            [EPHEMERAL_ENV_LABELS.get(key, key), lib.fmt(value)]
+            for key, value in list(flat.items())
+            if key != "_source"
+        ]
         if len(rows) > 120:
             rows = rows[:120] + [["…", f"{len(flat) - 120} more entries in {env_json['_source']}"]]
         lines.extend(lib.md_table(["key", "value"], rows))
