@@ -107,8 +107,7 @@ Checkpoint tensors are validated (presence, dtype, shape) before the graph ever 
 | `./llama.py` | Llama/Mistral/Qwen2 family: RMSNorm + RoPE + GQA + SwiGLU; `9·L + 3` bias-free weights (`9·L + 2` when tied). |
 | `./gpt2.py` | GPT-2 family: LayerNorm + learned positions + `gelu_new` + tied head; `16·L + 5` weights (`16·L + 4` when tied), fused QKV split at load. |
 | `../families.py` | `FAMILIES`/`get_family`/`family_for_model_type`/`resolve_family` — imports both family modules and wraps their four entry points in `FamilySpec`s. |
-| `../program.py` | `forward_fn`/`param_specs`/`reference_logits`/`resolve_seq_len` — call `graph`/`param_specs`/`reference` through the family spec. |
-| `../load.py` | `load_config`/`load_params`/`load_hf`/`validate_params` — call `canonicalize_weights` (and `param_specs`) on a checkpoint. |
+| `../program.py` / `../load.py` | `forward_fn`/`param_specs`/`reference_logits`/`resolve_seq_len` and `load_config`/`load_params`/`load_hf`/`validate_params` — call `graph`/`param_specs`/`reference`/`canonicalize_weights` through the family spec. |
 | `../pipeline.py` | `build`/`run`/`predict`/`place_params`/`place_ids` + the resolved default-option matrix; owns the pre-trace activation export gate. |
 | `../tests/` | Family suites: `test_llama.py`/`test_gpt2.py` (canonicalisation, parity, no-constant pins), `test_families.py`, `test_export.py`, `test_pack.py`, `test_public_api.py`. |
 | `../../etl/` | The tensor library whose public ops and `@etl.defn` this package composes (read-only from here). |
