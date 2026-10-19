@@ -1,5 +1,15 @@
 # IREE Vulkan on this host: no AMD-GPU Vulkan path exists; lavapipe (software) runs, and `etl_hf` runs on it
 
+> **Status note (superseding):** the library work this document asked for landed — `vulkan` is now a
+> **first-class `etl` device kind** (`etl.core.Device("vulkan", N)`, `etl.pipeline` inferring
+> `target_backends=["vulkan-spirv"]`, the adapter's device-id/load/staging/transfer beds and the
+> `vulkan_target` compile option), so the benchmark legs run the **unmodified public API** and the
+> `install()` runtime shim described below has been **retired**. Every `hf_bench_vulkan.install()` /
+> `patched_sites()` recipe in this file is history, not a runnable instruction; the surviving module
+> holds harness-side `device_info()` / `physical_device_properties()` helpers and a `--check`
+> environment self-test. The host verdict, the device recipe (renamed lavapipe ICD, throwaway venv) and
+> the measurements below are unaffected and remain the record.
+
 ## Verdict
 
 **The AMD Instinct MI300X VF of this host cannot execute Vulkan, under any driver or configuration.**

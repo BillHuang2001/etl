@@ -16,8 +16,9 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
     iree-rocm           IREE compiled for ROCm (the MI300X), **device resident**
     iree-vulkan         IREE compiled for Vulkan (``vulkan-spirv``) on **lavapipe**,
                         i.e. SOFTWARE Vulkan on the CPU (not a GPU measurement),
-                        device resident; needs the benchmark-only shim
-                        ``bench_logs/hf_bench_vulkan.py`` and ``$ETL_VULKAN_ICD``
+                        device resident; ``vulkan`` is a first-class etl device
+                        kind, so the leg runs the UNMODIFIED public API and needs
+                        ``$ETL_VULKAN_ICD`` (the renamed lavapipe ICD)
     iree-vulkan-o1      the same Vulkan path with ONE hand-picked compile option,
                         ``opt_level="O1"`` — the library default ``O3`` cannot compile
                         the 124M-class graphs for ``vulkan-spirv``, so this leg is a
@@ -347,16 +348,17 @@ def measure_etl_leg(
         record["traceback_tail"] = traceback.format_exc().splitlines()[-8:]
         return record
 
-    # -- the Vulkan shim + the device it lands on (benchmark-only) ----------
-    # ``etl`` has no ``vulkan`` device kind, so a vulkan leg installs the runtime shim of
-    # ``bench_logs/hf_bench_vulkan.py`` (which widens eight string/dialect gates in the
-    # live iree adapter plus the device→target inference) BEFORE anything is built, and
-    # records what it patched plus the device it actually enumerated.  Nothing under
-    # ``./etl/`` or ``./etl_hf/`` knows the shim exists.  A vulkan leg without
-    # ``ETL_VULKAN_ICD`` fails HERE, as a record naming the variable — never as a
-    # silently empty device list.
+    # -- the Vulkan device: a first-class etl kind, unmodified public API ------
+    # ``"vulkan"`` is an ordinary ``etl.core.Device`` kind, so this leg runs
+    # ``etl_hf.build`` / ``etl_hf.run`` exactly like every other compiled leg — no
+    # monkeypatching, no hand-declared ``target_backends`` (``etl.pipeline``
+    # infers ``["vulkan-spirv"]`` from the device).  What is recorded here is the
+    # device's own provenance (IREE's enumeration + ``VkPhysicalDeviceProperties``
+    # from the loader) and which compile configuration the cell used.  A vulkan leg
+    # without ``ETL_VULKAN_ICD`` fails HERE, as a record naming the variable — never
+    # as a silently empty device list.
     if spec.device_kind == "vulkan":
-        _progress("vulkan shim")
+        _progress("vulkan device")
         try:
             import hf_bench_vulkan
 
@@ -368,13 +370,18 @@ def measure_etl_leg(
                     f"{seen!r}; the driver forwards one to the other "
                     "(hf_bench.child_env) — run the leg through bench_logs/hf_bench.py"
                 )
-            patched = hf_bench_vulkan.install()
+            device = etl.core.Device(hf_bench_vulkan.VULKAN_KIND, spec.device_index)
             enumerated = hf_bench_vulkan.device_info()
             properties = hf_bench_vulkan.physical_device_properties(spec.device_index)
+            uses_vulkan_target = "vulkan_target" in spec.options
             record["vulkan"] = {
-                "shim": "bench_logs/hf_bench_vulkan.py install()",
-                "shim_patched_sites": sorted(patched),
-                "shim_patch_count": len(patched),
+                "public_api": True,
+                "etl_device": str(device),
+                "target_backends": (
+                    "inferred from the device by etl.pipeline "
+                    f"([{hf_bench_vulkan.VULKAN_TARGET!r}])"
+                ),
+                "compile_target": hf_bench_vulkan.VULKAN_TARGET,
                 "icd_env_var": lib.VULKAN_ICD_ENV,
                 "icd_path": icd,
                 "vk_icd_filenames": seen,
@@ -387,24 +394,31 @@ def measure_etl_leg(
                 "iree_device_count": enumerated.get("count"),
                 "iree_device_id": enumerated.get("device_id"),
                 "iree_device_path": enumerated.get("path"),
-                "compile_target": hf_bench_vulkan.VULKAN_TARGET,
                 "compile_options_default": {
-                    "target_backends": [hf_bench_vulkan.VULKAN_TARGET],
+                    "target_backends": (
+                        f"{hf_bench_vulkan.VULKAN_TARGET!r} (inferred from "
+                        f"Device({hf_bench_vulkan.VULKAN_KIND!r}, N))"
+                    ),
                     "opt_level": "O3 (library default for a non-ROCm target set)",
-                    "iree_vulkan_target": "IREE's default Vulkan profile "
+                    "vulkan_target": "unset — IREE's default Vulkan profile "
                     "vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)",
                 },
                 "compile_options_hand_picked": dict(spec.options),
+                "compile_options_hand_picked_uses_vulkan_target": uses_vulkan_target,
                 "compile_options_note": (
                     "NO hand-picked flag: library defaults apply, so this cell is a "
                     "reproducible defaults measurement"
                     if not spec.options
                     else "HAND-PICKED compile option(s) "
-                    f"{dict(spec.options)} on top of the library defaults — this cell is "
-                    "a PROBE of what the Vulkan backend can execute, NOT a "
-                    "library-defaults measurement (the default "
-                    f"{'O3' if 'opt_level' in spec.options else 'options'} cannot compile "
-                    "the 124M-class graphs for vulkan-spirv; see "
+                    f"{dict(spec.options)} on top of the library defaults"
+                    + (
+                        " (including the SPIR-V profile via `vulkan_target`)"
+                        if uses_vulkan_target
+                        else " (`vulkan_target` NOT set — IREE's default SPIR-V profile)"
+                    )
+                    + " — this cell is a PROBE of what the Vulkan backend can execute, "
+                    "NOT a library-defaults measurement (the default opt_level=\"O3\" "
+                    "cannot compile the 124M-class graphs for vulkan-spirv; see "
                     "bench_logs/vulkan_findings.md)"
                 ),
                 "note": (
@@ -414,9 +428,11 @@ def measure_etl_leg(
                 ),
             }
             notes.append(
-                "ran on IREE's Vulkan HAL through the benchmark-only shim "
-                f"{record['vulkan']['shim']} ({len(patched)} patched site(s), never a "
-                "library change); the device is "
+                "ran on IREE's Vulkan HAL through the UNMODIFIED public API "
+                f"(etl_hf.build/run on {record['vulkan']['etl_device']}, target "
+                f"{hf_bench_vulkan.VULKAN_TARGET} inferred from the device) — the library "
+                "owns the `vulkan` device kind, so no harness-side patch is involved; the "
+                "device is "
                 f"{properties.get('name')!r} (apiVersion "
                 f"{properties.get('api_version')}, driver {properties.get('driver_version')},"
                 f" type {properties.get('device_type')}) = SOFTWARE Vulkan on the CPU, so "
@@ -429,10 +445,12 @@ def measure_etl_leg(
                     "opt_level=\"O3\" cannot translate this graph for vulkan-spirv "
                     "(IREE's default Vulkan profile allows 16384 B of workgroup memory), "
                     "so this cell is a Vulkan-EXECUTION probe, not a defaults measurement "
+                    "(vulkan_target was "
+                    f"{'set' if uses_vulkan_target else 'left at the default profile'}) "
                     "— see bench_logs/vulkan_findings.md"
                 )
         except Exception as exc:
-            return fail("vulkan shim", exc)    # -- checkpoint + config + ids -----------------------------------------
+            return fail("vulkan device", exc)
     _progress("load checkpoint")
     try:
         ckpt = lib.checkpoint_dir(model)
@@ -2243,9 +2261,9 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
 
     lavapipe is Mesa's **software** Vulkan implementation running on the CPU, so these
     are Vulkan-path correctness/perf datapoints and never GPU numbers. Every number is
-    read from a record, and the device facts (name / apiVersion / driverVersion / the
-    shim that made the path reachable) come from each record's own ``vulkan`` block, so
-    the section states what actually ran rather than what the harness hoped for.
+    read from a record, and the device facts (name / apiVersion / driverVersion) come
+    from each record's own ``vulkan`` block, so the section states what actually ran
+    rather than what the harness hoped for.
     """
     lines: list[str] = []
     add = lines.append
@@ -2274,23 +2292,38 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
     add("")
     add(
         f"`{leg_key}` — the whole forward as ONE `etl_hf` graph on "
-        "IREE's **Vulkan** HAL. The only Vulkan device this host exposes is **lavapipe** "
-        "(Mesa's software Vulkan implementation, `deviceType = CPU`), reached through the "
-        "benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (`install()` widens "
-        "eight string/dialect gates of the live iree adapter; nothing under `etl/` or "
-        "`etl_hf/` is modified) with the Vulkan loader pinned to a renamed lavapipe ICD by "
-        f"`VK_ICD_FILENAMES`, forwarded from `${lib.VULKAN_ICD_ENV}`. "
+        "IREE's **Vulkan** HAL. `vulkan` is a first-class `etl` device kind, so the leg "
+        "runs the **unmodified public API** — `etl_hf.build(...)` / `etl_hf.run(...)` on "
+        "`Device(\"vulkan\", 0)`, with `target_backends=[\"vulkan-spirv\"]` inferred from "
+        "the device by `etl.pipeline`; nothing beyond the library's own public API is "
+        "involved. "
+        "The only Vulkan device this host exposes is **lavapipe** (Mesa's software Vulkan "
+        "implementation, `deviceType = CPU`), reached through a renamed ICD pinned by the "
+        f"Vulkan loader with `VK_ICD_FILENAMES`, forwarded from `${lib.VULKAN_ICD_ENV}`. "
         "**These are not GPU numbers** — the same work runs on the CPU, slower than the "
         "interpreter on the large models."
     )
     add("")
+    uses_vulkan_target = any(
+        (_record_at(records, *key) or {}).get("vulkan", {}).get(
+            "compile_options_hand_picked_uses_vulkan_target"
+        )
+        for key in cells
+    )
     if hand_picked:
         add(
             f"**Compile configuration: HAND-PICKED** — `{leg_key}` passes "
             + ", ".join(f"`{k}={v!r}`" for k, v in sorted(hand_picked.items()))
-            + " to the build. Everything else is the library default "
-            "(`target_backends=['vulkan-spirv']`, i.e. IREE's default Vulkan profile "
-            "`vp_android_baseline_2022`, `max_workgroup_memory_bytes = 16384`). The "
+            + " to the build. Everything else is the library default (the compile "
+            "**target** is inferred from `Device(\"vulkan\", 0)` by `etl.pipeline` — "
+            "`vulkan-spirv` — and the SPIR-V **profile** is "
+            + (
+                "the hand-picked `vulkan_target`."
+                if uses_vulkan_target
+                else "left at IREE's default, `vp_android_baseline_2022` "
+                "(`max_workgroup_memory_bytes = 16384`)."
+            )
+            + " The "
             "library default `opt_level=\"O3\"` **cannot compile** the 124M-class graphs "
             "for `vulkan-spirv` — `seq_len` 32 fails with `function "
             "'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; "
@@ -2305,7 +2338,9 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
         add(
             "**Compile configuration: library defaults** — no hand-picked flag "
             "(the `opt_level` is whatever `etl_hf.pipeline.resolve_build_options` "
-            "resolves, `O3` for a non-ROCm target set)."
+            "resolves, `O3` for a non-ROCm target set; the compile target "
+            "`vulkan-spirv` is inferred from the device, and the SPIR-V profile is "
+            "IREE's default `vp_android_baseline_2022`)."
         )
         add("")
     device = next(
@@ -2317,16 +2352,24 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
         None,
     )
     if device:
+        # Records written before ``vulkan`` became a first-class kind carry none of the
+        # public-path keys; those clauses are simply omitted rather than rendered empty.
+        public_path = ""
+        if device.get("public_api") is not None:
+            public_path = (
+                f"; etl device `{lib.fmt(device.get('etl_device'))}`, compile target "
+                f"`{lib.fmt(device.get('compile_target'))}` — "
+                f"{lib.fmt(device.get('target_backends'))}, public API "
+                f"`{lib.fmt(device.get('public_api'))}`"
+            )
         add(
-            "Device the leg actually enumerated (recorded per cell under `vulkan`): "
+            "Device the leg actually ran on (recorded per cell under `vulkan`): "
             f"**{device.get('device_name')}** — apiVersion "
             f"`{device.get('device_api_version')}`, driverVersion "
             f"`{device.get('device_driver_version')}` "
             f"({device.get('device_driver_version_scheme')}), vendorID "
             f"`{device.get('device_vendor_id')}`, `deviceType = "
-            f"{device.get('device_type')}`; IREE compile target "
-            f"`{device.get('compile_target')}`; shim `{device.get('shim')}` "
-            f"({lib.fmt(device.get('shim_patch_count'))} patched site(s)); ICD from "
+            f"{device.get('device_type')}`{public_path}; ICD from "
             f"`${device.get('icd_env_var')}`."
         )
         add("")
@@ -2588,9 +2631,9 @@ def _reproduction_lines(records) -> list[str]:
         "iree-llvmcpu": "IREE compiled for llvm-cpu, host-resident inputs",
         "iree-rocm": "IREE compiled for ROCm, device-resident same-device loop",
         "iree-vulkan": "IREE compiled for Vulkan (`vulkan-spirv`) on lavapipe — "
-        "**software** Vulkan on the CPU, device-resident; needs the benchmark-only shim "
-        "`bench_logs/hf_bench_vulkan.py` and `ETL_VULKAN_ICD` (forwarded as "
-        "`VK_ICD_FILENAMES`)",
+        "**software** Vulkan on the CPU, device-resident; `vulkan` is a first-class etl "
+        "device kind (the target is inferred from it), so the leg runs the unmodified "
+        "public API and needs `ETL_VULKAN_ICD` (forwarded as `VK_ICD_FILENAMES`)",
         "iree-vulkan-o1": "the same Vulkan path with ONE hand-picked compile option, "
         "`opt_level=\"O1\"` — the library default `O3` cannot translate the 124M-class "
         "graphs for `vulkan-spirv`; a Vulkan-EXECUTION probe, not a defaults measurement",
@@ -3285,14 +3328,18 @@ def render_report(records, out_dirs) -> str:
     )
     if set(legs) & set(VULKAN_LEGS):
         add(
-            "* The `iree-vulkan` leg needs the benchmark-only runtime shim "
-            "`bench_logs/hf_bench_vulkan.py` (installed by the measuring path, never by the "
-            "library: `etl` has no `vulkan` device kind) and a Vulkan ICD pinned by "
-            f"`VK_ICD_FILENAMES`, which the driver forwards from `${lib.VULKAN_ICD_ENV}` — a "
-            "vulkan leg requested without it fails as a record naming that variable. The "
-            "device is lavapipe (**software** Vulkan on the CPU), so no row in this report "
-            "moves work to an accelerator for that leg; the shim's patched sites and the "
-            "device's apiVersion/driverVersion are recorded per cell under `vulkan`."
+            "* The `iree-vulkan` leg runs the **unmodified public API**: `vulkan` is a "
+            "first-class `etl` device kind, so `etl_hf.build(...)` / `etl_hf.run(...)` on "
+            "`Device(\"vulkan\", 0)` work as they do on any other device — "
+            "`etl.pipeline` infers the `vulkan-spirv` compile target from the device and "
+            "nothing beyond the library's own public API is involved. It does need a "
+            "Vulkan ICD "
+            f"pinned by `VK_ICD_FILENAMES`, which the driver forwards from "
+            f"`${lib.VULKAN_ICD_ENV}` — a vulkan leg requested without it fails as a "
+            "record naming that variable. The device is lavapipe (**software** Vulkan on "
+            "the CPU), so no row in this report moves work to an accelerator for that "
+            "leg; the device's name/apiVersion/driverVersion are recorded per cell under "
+            "`vulkan`."
         )
         add(
             "* The GPU columns of this report (`iree-rocm`, `xla-rocm`, `torch-rocm`, …) are "

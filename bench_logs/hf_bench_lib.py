@@ -169,12 +169,15 @@ LEGS: dict[str, LegSpec] = {
     # IREE's **Vulkan** HAL.  The only Vulkan device on this host is **lavapipe** (Mesa's
     # software Vulkan implementation running on the CPU — a correctness/perf datapoint,
     # never a GPU number), reached through a renamed ICD pinned by ``VK_ICD_FILENAMES``,
-    # which the driver forwards from :data:`VULKAN_ICD_ENV`.  ``etl`` has no ``vulkan``
-    # device kind, so the leg also needs the benchmark-only runtime shim
-    # ``bench_logs/hf_bench_vulkan.py`` installed before the build (the measuring path
-    # does that for every vulkan leg and records the shim in ``record["vulkan"]``).
-    # Options stay empty: the library defaults apply (``etl_hf.pipeline`` injects
-    # ``opt_level="O3"`` for a non-rocm target set, which compiles fine for vulkan-spirv).
+    # which the driver forwards from :data:`VULKAN_ICD_ENV`.
+    # ``"vulkan"`` is a **first-class ``etl`` device kind** (``etl.core.Device``), so the
+    # leg needs no shim and no hand-declared compile target: ``etl.pipeline`` infers
+    # ``target_backends=["vulkan-spirv"]`` from the device for the ``iree`` backend, so
+    # options stay EMPTY and the library defaults apply (``etl_hf.pipeline`` injects
+    # ``opt_level="O3"`` for a non-rocm target set, which compiles fine for
+    # vulkan-spirv).  The SPIR-V *profile* is a separate knob — the ``vulkan_target``
+    # compile option (``--iree-vulkan-target=<profile>``) — left unset here, i.e. IREE's
+    # default ``vp_android_baseline_2022``.
     "iree-vulkan": LegSpec(
         key="iree-vulkan",
         kind="etl",
@@ -193,11 +196,12 @@ LEGS: dict[str, LegSpec] = {
     # reduction) and at ``seq_len`` 128 with ``failed to legalize operation
     # 'vector.from_elements'`` (the packed in-graph gather).  ``O1`` (and ``O0``,
     # whose vmfb is byte-identical) compiles all four cells and they run bit-plausibly
-    # on lavapipe — see ``bench_logs/vulkan_findings.md``.  This is therefore an
-    # explicitly PROBE-flavoured leg: it is NOT a library-defaults measurement and
-    # every record says so (``record["vulkan"]["compile_options_hand_picked"]``),
-    # which is exactly why it is a separate key from ``iree-vulkan`` (whose O3
-    # cells stay recorded as failures, unweakened).
+    # on lavapipe — see ``bench_logs/vulkan_findings.md``.  ``vulkan_target`` is NOT
+    # used (no other flag is): the SPIR-V profile stays at IREE's default, so this leg
+    # differs from ``iree-vulkan`` in exactly one compile option, and every record says
+    # so (``record["vulkan"]["compile_options_hand_picked"]``) — which is why it is a
+    # separate key from ``iree-vulkan`` (whose O3 cells stay recorded as failures,
+    # unweakened).
     "iree-vulkan-o1": LegSpec(
         key="iree-vulkan-o1",
         kind="etl",

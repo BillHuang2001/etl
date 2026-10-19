@@ -5,15 +5,16 @@ experiments on this machine.
 The **current** HuggingFace benchmark is `./hf_bench.py` → `./hf_bench_results.md` (see its own
 section below); `./probe_hf_perf.py` is the older, narrower matrix kept as a working historical
 probe.
-`./hf_bench_vulkan.py` (+ `./vulkan_findings.md`) is the **IREE Vulkan / lavapipe** datapoint: a
-benchmark-only runtime shim that widens the IREE adapter's eight Vulkan string/dialect gates
-(monkeypatch, no `./etl/` or `./etl_hf/` edit) so `etl_hf`'s public `build`/`run` path executes a
-real checkpoint's whole forward on the software Vulkan device — two harness legs, `iree-vulkan`
-(library defaults) and `iree-vulkan-o1` (hand-picked `opt_level="O1"`), see its own section below.
-`./vulkan_findings.md` also records the host verdict: **this AMD GPU cannot run Vulkan at all**
+`./hf_bench_vulkan.py` (+ `./vulkan_findings.md`) is the **IREE Vulkan / lavapipe** datapoint:
+`vulkan` is a **first-class `etl` device kind**, so the two harness legs — `iree-vulkan` (library
+defaults) and `iree-vulkan-o1` (hand-picked `opt_level="O1"`) — run `etl_hf`'s public
+`build`/`run` path on `Device("vulkan", 0)` with no library change. `./hf_bench_vulkan.py` is now
+only harness-side device/provenance helpers (`device_info`, `physical_device_properties`) plus a
+`--check` environment self-test; see its own section below.
+`./vulkan_findings.md` records the host verdict: **this AMD GPU cannot run Vulkan at all**
 (RADV CDNA3 policy gate, AMDVLK has no CDNA PAL path, and the amdgpu DRM device is stuck in a
-never-completing reset), plus the etl-core gap list (file:line) that a first-class `vulkan` device
-kind would need.
+never-completing reset) — so every Vulkan number comes from lavapipe — plus the historical probe
+evidence (and the now-closed etl-core gap list that a first-class `vulkan` kind needed).
 Historical artifacts remain committed here: the 763a415-era xla-vs-iree fused
 4096×50 probes (`probe_xla_gpu.py`, `probe_iree_same_mlir.py`, `probe_parity.py`,
 `de_4096x50_fused_key1.mlir`/`.vmfb`, `clocks_*.log`, `_common.py`) — their
@@ -184,19 +185,22 @@ assumes.
 **`iree-vulkan` (lavapipe, software Vulkan on CPU).** IREE's Vulkan HAL, on the only Vulkan device this
 host exposes: **lavapipe**, Mesa's *software* Vulkan implementation (`deviceType = CPU`) — a Vulkan-path
 correctness/perf datapoint, never a GPU number (the AMD GPU cannot run Vulkan: Mesa RADV refuses CDNA3;
-see `./vulkan_findings.md`). `etl` has no `vulkan` device kind, so the leg needs the benchmark-only shim
-`./hf_bench_vulkan.py` (`install()` widens eight live-adapter string/dialect gates; nothing under
-`./etl/` or `./etl_hf/` knows it exists) plus the loader pinned to a renamed lavapipe ICD. The ICD is a
-**machine-local path and is never hard-coded**: the runner exports `ETL_VULKAN_ICD`, `child_env`
-forwards it to the leg as `VK_ICD_FILENAMES`, and a vulkan leg requested without it writes a record
-naming that variable (never a silently empty device list). Each record carries a `vulkan` provenance
-block — device name / apiVersion / driverVersion (read from `VkPhysicalDeviceProperties` via
-`hf_bench_vulkan.physical_device_properties()`), vendorID, `deviceType`, IREE device id/path, the ICD
-used, the shim and its patched sites, and an explicit `"note": "lavapipe = software Vulkan on CPU; not
-a GPU measurement"`. Compile options stay library defaults (`opt_level="O3"` for a non-rocm target set);
-`--pack auto` applies unchanged (tiny models unpacked, the 124M models packed). The GPU columns of the
-report are **reused records** measured before the GPU wedged — they are reference data, not a
-comparison with the software leg.
+see `./vulkan_findings.md`). `vulkan` is a first-class `etl` device kind, so the leg runs the
+**unmodified public API** on `Device("vulkan", 0)` — `etl.pipeline` infers
+`target_backends=["vulkan-spirv"]` from the device, so the leg declares no target; the loader is pinned
+to a renamed lavapipe ICD. The ICD is a **machine-local path and is never hard-coded**: the runner
+exports `ETL_VULKAN_ICD`, `child_env` forwards it to the leg as `VK_ICD_FILENAMES`, and a vulkan leg
+requested without it writes a record naming that variable (never a silently empty device list). Each
+record carries a `vulkan` provenance block — device name / apiVersion / driverVersion (read from
+`VkPhysicalDeviceProperties` via `hf_bench_vulkan.physical_device_properties()`), vendorID,
+`deviceType`, IREE device id/path, the ICD used, `public_api: true`, `etl_device`
+(`Device(kind='vulkan', index=0)`), the inferred `target_backends`, `compile_options_default`
+(opt_level default + the default SPIR-V profile) and `compile_options_hand_picked` (+ whether
+`vulkan_target` was used), and an explicit `"note": "lavapipe = software Vulkan on CPU; not a GPU
+measurement"`. Compile options stay library defaults (`opt_level="O3"` for a non-rocm target set,
+`vulkan_target` unset ⇒ IREE's `vp_android_baseline_2022`); `--pack auto` applies unchanged (tiny
+models unpacked, the 124M models packed). The GPU columns of the report are **reused records**
+measured before the GPU wedged — they are reference data, not a comparison with the software leg.
 One subprocess per `(model, seq_len, leg)`, with `--leg-timeout`; the child writes its own JSON and
 `.logits.npz` then `os._exit(0)`, so the xla/ROCm teardown abort cannot lose a record.
 A leg that cannot run is a RECORD (`*.error.json`) with its verbatim error/returncode/signal, never
@@ -365,19 +369,19 @@ Facts pinned by this matrix (all measured, nothing extrapolated):
 
 ## `hf_bench_vulkan.py` + `vulkan_findings.md` — `etl_hf` public build/run on IREE Vulkan (lavapipe)
 
-`./hf_bench_vulkan.py` is a **benchmark-only runtime shim** (never a library change; nothing under
-`./etl/`, `./etl_hf/`, `./tests/` knows it exists). `install()` monkeypatch-widens exactly eight gates
-in the live etl modules — compile-target whitelist (`iree.py:1071`), artifact label (`:460`),
-`_GPU_DEVICE_KINDS` (`:486`), the vulkan device-id resolution (`:536`), the CUDA staging tier
-(`:1817`), the load device-kind whitelist + `expected_target` (`:1326`/`:1346`) and the transfer-provider
-registration (`:2907`), plus `pipeline.py:360-412` device→`["vulkan-spirv"]` inference — and exposes
-`patched_sites()` / `device_info()` / `--check` (self-check, no model). Deliberately not patched
-(verified unnecessary for this path): `core/device.py devices()`, `iree.py:1417 _load_segments`,
-`etl_hf/pipeline.py:181`, `etl.io`. `./vulkan_findings.md` is the full record: feasibility/root cause
-(§1), the execution proof (§2), the eight shimmed sites plus the **remaining report-only gap list**
-with file:line for a first-class `vulkan` kind (§3: `core/device.py:122-159`, `iree.py:1417-1429`,
-`etl/io.py:304`, `etl/bench/_util.py:58-59`, `etl_hf/pipeline.py:181-199`), and the benchmark tables
-(§4).
+`./hf_bench_vulkan.py` holds **harness-side device/provenance helpers only** — nothing under `./etl/`,
+`./etl_hf/`, `./tests/` imports it and it patches nothing. `vulkan` is a **first-class `etl` device
+kind**, so the legs run the unmodified public API (`etl_hf.build` / `etl_hf.run` on
+`Device("vulkan", 0)`; `etl.pipeline` infers `target_backends=["vulkan-spirv"]` from the device). What
+the module still provides: `VULKAN_KIND`/`VULKAN_TARGET`, `device_info()` (what IREE's Vulkan driver
+enumerates), `physical_device_properties()` (`VkPhysicalDeviceProperties` via the loader: name /
+apiVersion / driverVersion / vendorID / deviceType) and `--check`, the environment self-test — it
+enumerates the device **and** proves the public path end to end (`etl.build`/`etl.run` of a tiny
+`@etl.defn` matmul on `Device("vulkan", 0)`, device-resident, max-abs vs numpy; exit 0 = environment
+OK). `./vulkan_findings.md` is the historical record: feasibility/root cause (§1), the execution proof
+(§2), the once-reported gap list for a first-class `vulkan` kind (§3 — since implemented in the
+library) and the benchmark tables (§4); its `install()`-shim recipes describe the retired shim and are
+kept as history only.
 
 **No AMD-GPU Vulkan path exists on this host** (§1 of the findings): RADV rejects CDNA3 by policy
 (`radv_physical_device.c:2122`, `radv: info: device 'GFX940' is not supported by RADV.`), AMDVLK
