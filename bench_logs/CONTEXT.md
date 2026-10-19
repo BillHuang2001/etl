@@ -167,13 +167,14 @@ PyTorch baselines. Environment provisioning is `./hf_bench_env.py`; raw records 
 `./hf_bench_data/`; the rendered report is `./hf_bench_results.md` (generated, never hand-edited).
 `./probe_hf_perf.py` below is the older narrower matrix — new measurements belong here.
 
-Legs: `numpy-cpu` (interpreter reference), `iree-llvmcpu`, `iree-rocm`, `iree-vulkan`, `xla-rocm`,
-`torch-cpu`, `torch-rocm` (fp32 eager `.eval()`/`no_grad()`, `torch.cuda.synchronize()` around each
-call), plus the opt-in `xla-rocm-fp32` (`dot_precision="HIGHEST"`), `torchcompile-cpu`,
+Legs: `numpy-cpu` (interpreter reference), `iree-llvmcpu`, `iree-rocm`, `iree-vulkan`, `iree-vulkan-o1`,
+`xla-rocm`, `torch-cpu`, `torch-rocm` (fp32 eager `.eval()`/`no_grad()`, `torch.cuda.synchronize()`
+around each call), plus the opt-in `xla-rocm-fp32` (`dot_precision="HIGHEST"`), `torchcompile-cpu`,
 `torchcompile-rocm`.
 `--phase cpu` = `numpy-cpu,iree-llvmcpu,torch-cpu`; `--phase gpu` = `iree-rocm,xla-rocm,torch-rocm`;
-`--phase vulkan` = `iree-vulkan`. The phases are run SEQUENTIALLY — the MI300X is shared, so never two
-GPU legs at once, and a software-Vulkan leg would steal the cores the cpu phase assumes.
+`--phase vulkan` = `iree-vulkan,iree-vulkan-o1`. The phases are run SEQUENTIALLY — the MI300X is
+shared, so never two GPU legs at once, and a software-Vulkan leg would steal the cores the cpu phase
+assumes.
 
 **`iree-vulkan` (lavapipe, software Vulkan on CPU).** IREE's Vulkan HAL, on the only Vulkan device this
 host exposes: **lavapipe**, Mesa's *software* Vulkan implementation (`deviceType = CPU`) — a Vulkan-path
