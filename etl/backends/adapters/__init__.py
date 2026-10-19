@@ -6,7 +6,11 @@ a separate module subclassing the shared ``etl.backends.compiler``
 
 - ``iree.py`` — IREE adapter (IMPLEMENTED): compiles the StableHLO payload
   with ``iree.compiler.compile_str`` and executes the VM flatbuffer through
-  ``iree.runtime`` (local-task driver). Singleton ``iree_backend``.
+  ``iree.runtime``. Serves the ``local-task`` (llvm-cpu), ``cuda``, ``hip``
+  (rocm) and ``vulkan`` HAL drivers — ``Device(kind, N)`` selects the driver,
+  and every GPU-class kind runs device-resident (explicit placement via
+  ``Tensor.to``, no implicit host↔device staging). Singleton
+  ``iree_backend``.
 - ``xla.py`` — XLA-via-PJRT adapter (IMPLEMENTED): drives a USER-PROVIDED
   PJRT C API plugin (a ``.so`` exporting ``GetPjRtApi``) through
   pure-stdlib ctypes — the vendored ABI translation lives in
