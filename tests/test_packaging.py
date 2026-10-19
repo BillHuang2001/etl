@@ -353,7 +353,8 @@ def _relative_entries(archive: Path) -> list[str]:
     with tarfile.open(archive) as tar:
         names = tar.getnames()
     root = names[0].split("/", 1)[0] if names else ""
-    return [n.split("/", 1)[1] if n.startswith(root + "/") else n for n in names]
+    entries = [n.split("/", 1)[1] if n.startswith(root + "/") else n for n in names]
+    return [e for e in entries if e]  # drop the archive's own root directory entry
 
 
 _STALE_HINT = (
