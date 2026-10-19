@@ -64,11 +64,29 @@ compilers = [
 # compares against PyTorch. The etl library itself never imports torch, and
 # `import etl` must work without it.
 bench = ["torch>=2.0"]
+# HuggingFace integration — OPTIONAL, and NOT shipped as part of `etl`.
+# (a) `etl_hf` is a separate top-level package that lives in this repo
+#     checkout (HuggingFace checkpoint loading / compiled execution built ON
+#     etl, one-way dependency). It is deliberately NOT part of the `etl`
+#     distribution: a wheel/sdist of `etl` contains no `etl_hf` — see
+#     [tool.setuptools.packages.find] below, which matches only `etl` /
+#     `etl.*`. Nothing installs `etl_hf` for you today; use it from a checkout.
+# (b) `pip install etl[hf]` pulls ONLY the optional oracle deps below — the
+#     real-torch/real-transformers reference implementations used to validate
+#     and benchmark `etl_hf`. They are NEVER runtime requirements: `etl_hf`'s
+#     own checkpoint readers (config.json + safetensors/pytorch_model.bin) are
+#     pure numpy + stdlib, and etl's hard dependencies stay numpy-only.
+# (c) `import etl` never imports `etl_hf`, torch, or transformers.
+hf = ["torch>=2.0", "transformers>=4.40"]
 
 [tool.setuptools.packages.find]
-include = ["etl*"]
-# etl_hf is a separate top-level package (HuggingFace model loading / compiled
-# execution built on etl). Its tests are colocated, not shipped.
+# ONLY the `etl` distribution: `etl` and its subpackages. `etl_hf` (the
+# separate top-level HuggingFace package in this checkout) must never be
+# installed as part of `etl`, and these setuptools globs cannot match it:
+# `etl.*` requires the literal `etl.` prefix, so `etl_hf` / `etl_hf.*` are
+# unmatched (and `include` no longer starts with the greedy `etl*` pattern).
+include = ["etl", "etl.*"]
+# Tests are colocated with their packages, never shipped.
 exclude = ["etl_hf.tests", "etl_hf.tests.*"]
 
 [tool.pytest.ini_options]
