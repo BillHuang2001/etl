@@ -5,6 +5,10 @@ experiments on this machine.
 The **current** HuggingFace benchmark is `./hf_bench.py` → `./hf_bench_results.md` (see its own
 section below); `./probe_hf_perf.py` is the older, narrower matrix kept as a working historical
 probe.
+`./hf_bench_vulkan.py` (+ `./vulkan_findings.md`) is the **IREE Vulkan / lavapipe** datapoint: a
+benchmark-only runtime shim that widens the IREE adapter's eight Vulkan string/dialect gates
+(monkeypatch, no `./etl/` or `./etl_hf/` edit) so `etl_hf`'s public `build`/`run` path executes a
+real checkpoint's whole forward on the software Vulkan device — see its own section below.
 Historical artifacts remain committed here: the 763a415-era xla-vs-iree fused
 4096×50 probes (`probe_xla_gpu.py`, `probe_iree_same_mlir.py`, `probe_parity.py`,
 `de_4096x50_fused_key1.mlir`/`.vmfb`, `clocks_*.log`, `_common.py`) — their
