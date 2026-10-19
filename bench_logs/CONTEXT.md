@@ -390,13 +390,15 @@ radeon ICD). Its `device_id` is a per-process UUID hash, never `index+1`.
 Throwaway venv `$TMPDIR/vk-venv` (iree-base-compiler/runtime 3.11 + numpy, CPython 3.14.8) with
 `etl`/`etl_hf` from the checkout via `PYTHONPATH`; `os._exit(0)` avoids the py3.14 nanobind exit dump.
 
-Measured — all seven `iree-vulkan` cells of the matrix, warmup 2 + best-of-5, batch 1, `--pack auto`
-(record per cell in `./hf_bench_data/*__iree-vulkan.json`, table in section 5c of the report):
+Measured — the matrix holds **65 cells (54 ok, 11 not ok)** over 11 legs, of which 7 are `iree-vulkan`
+and 7 `iree-vulkan-o1` (warmup 2 + best-of-5, batch 1, `--pack auto`; record per cell in
+`./hf_bench_data/*__iree-vulkan*.json`, tables in section 5c of the report).
+`iree-vulkan` — library defaults (`opt_level="O3"`): **2 of 7 cells run**.
 - **ok, unpacked: `tiny_llama` s32** (first 7.02 ms, best **1.577**, median 1.619, +d2h 1.393,
   `asdevicearray` **0**; parity vs `numpy-cpu` max_abs **8.94e-08**, rel-to-absmax 2.14e-07, argmax
   1.0) and **`tiny_gpt2` s32** (first 5.55, best **1.728**, median 1.747, +d2h 2.158,
   `asdevicearray` 0; max_abs **2.24e-08**, rel-to-absmax 1.73e-07, argmax 1.0). Both build in
-  ~0.7–0.95 s. On the CPU-vs-CPU comparison lavapipe sits at numpy-interpreter level (`tiny_llama`
+  0.68–0.85 s. On the CPU-vs-CPU comparison lavapipe sits at numpy-interpreter level (`tiny_llama`
   0.97× numpy, `tiny_gpt2` 0.70× numpy = numpy faster) and within 5–35% of `iree-llvmcpu` — a
   software rasterizer, so this is a Vulkan-path datapoint only.
 - **`tiny_mistral` s32: `HFUnsupportedError`** — the same exact-`erf`-GELU activation gate that
@@ -410,10 +412,27 @@ Measured — all seven `iree-vulkan` cells of the matrix, warmup 2 + best-of-5, 
   later with `failed to legalize operation 'vector.from_elements'` (an i64 4-lane vector out of the
   packed in-graph gather). The harness never hand-picks compiler flags, so these stay recorded
   failures rather than tuned runs.
+
+`iree-vulkan-o1` — the SAME graph/target with a hand-picked `opt_level="O1"`: **7 of 7 cells run**,
+so the four 124M-class cells exist only under this leg (`O2`/`O3` fail exactly as above). Each record
+marks the configuration (`compile_options_hand_picked`/`_default`/`_note`) and the report renders a
+"Compile configuration: HAND-PICKED" paragraph; the two legs are therefore never conflated.
+- `tiny_llama` s32 best **1.650** (median 1.718, +d2h 1.525), `tiny_gpt2` s32 best **1.923**
+  (1.967, +d2h 2.410), `tiny_mistral` still `HFUnsupportedError`.
+- `distilgpt2` s32 **141.851** (first 188.2, 0.10× numpy, 1.79× `iree-llvmcpu`, 0.06× torch-cpu),
+  `gpt2` s32 **174.589** (0.17× numpy, 2.31× `iree-llvmcpu`), `distilgpt2` s128 **11,453.44** and
+  `gpt2` s128 **11,626.02** (~0.01× numpy — `O1` leaves the 50257-wide packed gather unoptimized, so
+  the s128 cells are ~100× slower than the interpreter). `asdevicearray` is **0** in every cell.
+- parity vs the numpy interpreter: max_abs 8.94e-08–4.20e-04 with rel-to-absmax **~3e-06** on the real
+  models and **argmax agreement 1.0 everywhere** — the fp32 accumulation-order floor, no SPIR-V
+  fast-math divergence.
+
 A cell's `parity.vs_numpy` is only computed at measure time when that cell's `numpy-cpu`
 `*.logits.npz` dump is on disk: the run recipe is to write the numpy leg's dump (`--legs numpy-cpu
 --out $TMPDIR/vk-ref`) and copy back only the `.npz` — the committed `numpy-cpu` **record** is never
-re-measured. Lavapipe is CPU software — a Vulkan-path correctness/perf datapoint, never a GPU number.
+re-measured. Lavapipe is CPU software — a Vulkan-path correctness/perf datapoint, never a GPU number;
+the GPU columns of the report are records measured before the GPU wedged, shown for reference only
+and never ratioed against a software-Vulkan cell.
 
 ## Known gotchas
 
