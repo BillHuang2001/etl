@@ -58,8 +58,7 @@ Both `transformer.`-prefixed and bare key spellings are accepted (mixing allowed
 
 ## Orientation rule
 
-Every `*.weight` matrix fed to `etl.dot(x, W)` — i.e. every `linear` operand — is `(in_features, out_features)`.
-Llama/Mistral/Qwen2 linears are stored `(out, in)` by HF and are transposed at load (`np.ascontiguousarray(np.transpose(...))`); GPT-2's `Conv1D` layers already compute `x @ W + b` with `(in, out)` weights and are **not** transposed, while GPT-2's `lm_head` is an `nn.Linear` `(vocab, hidden)` and **is** transposed to `(hidden, vocab)`.
+Every `*.weight` matrix fed to `etl.dot(x, W)` — i.e. every `linear` operand — is `(in_features, out_features)`; Llama/Mistral/Qwen2 linears are stored `(out, in)` by HF and are transposed at load (`np.ascontiguousarray(np.transpose(...))`), while GPT-2's `Conv1D` layers already compute `x @ W + b` with `(in, out)` weights and are **not** transposed (GPT-2's `lm_head` is an `nn.Linear` `(vocab, hidden)` and **is**).
 Tied embeddings are **one array, not two**: with `tie_word_embeddings=True` the head IS `embed.weight`, so `param_specs`/`canonicalize_weights` emit no `lm_head.weight` key and the graph feeds the one embedding input to the token gather and (as `etl.transpose(embed)`) to the final projection.
 A tied checkpoint that ships its own `lm_head.weight` must agree with the embedding — it is verified, consumed and dropped; a disagreement raises `HFWeightError` (never silently picks one), and an untied config with no `lm_head` raises `HFWeightError`.
 Every canonicalised array is `float32`, C-contiguous and writable (`int`/`float` inputs accepted, `bool`/complex rejected).
