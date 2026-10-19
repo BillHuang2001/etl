@@ -178,6 +178,7 @@ PARITY_LABELS: dict[str, str] = {
 #: The parity statistics a parity row renders (and a record/digest block stores).
 PARITY_STAT_FIELDS: tuple[str, ...] = ("comparable", "max_abs", "rel_to_absmax", "argmax_agreement")
 
+
 def _progress(label: str) -> None:
     """Print a stage marker so a hard crash still says where it died.
 
@@ -1573,6 +1574,7 @@ def _parity_source_line(counts) -> str:
         "are gitignored (a run re-creates them and `--parity-digest` refreshes the digest), "
         "so `--report` is a function of committed files either way."
     )
+
 
 def _parity_table_lines(records, out_dirs, digest) -> list[str]:
     """Section 6: parity of every leg cell vs every reference available.
