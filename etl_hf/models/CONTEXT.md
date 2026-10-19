@@ -6,20 +6,19 @@ One module per HuggingFace model family: each module owns the HF-key → canonic
 Every family module exposes the same pinned four-entry interface — `param_specs(cfg)`, `graph(cfg, seq_len, batch_size=1, *, pack_plan=None)`, `reference(cfg, params, input_ids)`, `canonicalize_weights(cfg, raw)` — plus `FAMILY` (the `etl_hf` family key wired into `ModelConfig.family`) and, when the architecture covers several HF `model_type`s, a `MODEL_TYPES` tuple.
 `./etl_hf/models/__init__.py` imports and re-exports nothing (`__all__ = []`); family modules are reached by qualified path (`etl_hf.models.llama`, `etl_hf.models.gpt2`), and their imports stay in-layer: `etl`, `etl_hf.ops` (graph idioms), `etl_hf.models._common` (block wiring), `etl_hf.reference` (oracle primitives), `etl_hf.config` (`ModelConfig`), `etl_hf.errors` — never `etl_hf.families`/`program`/`load`/`pipeline`.
 The call direction runs one-way into this node: `etl_hf.families` imports both family modules to build the `FAMILIES` registry, and the resulting `FamilySpec` is what `etl_hf.program` (`forward_fn`/`param_specs`/`reference_logits`) and `etl_hf.load` (`load_params` → `canonicalize_weights`) call; no consumer is imported from here.
-All shapes are static (`seq_len`/`batch_size` are graph specialisation values), all weights are explicit graph **inputs** (`etl.constant` is never used), and every canonicalisation/validation failure is an explicit `HFConfigError` / `HFWeightError` / `HFUnsupportedError`.
+All shapes are static (`seq_len`/`batch_size` are graph specialisation values), weights are graph **inputs** (never `etl.constant`), and every canonicalisation/validation failure is an explicit `HFConfigError` / `HFWeightError` / `HFUnsupportedError`.
 
 ## Shared assembly (`_common.py`)
 
 `linear(x, weight, bias=None)` is `etl.dot(x, weight)` plus an optional broadcast bias: `x` is `(..., in_features)`, `weight` is `(in_features, out_features)`, `bias` is `(out_features,)`, result `(..., out_features)` in `x`'s dtype (no mixed-dtype cast — `etl.dot` does not auto-cast).
 `attention(q, k, v, mask, scale)` takes rank-4 head tensors `q` `(b, n_heads, s, head_dim)` and `k`/`v` `(b, n_heads, s_kv, head_dim)` **already repeated** by `etl_hf.ops.repeat_kv`, and returns the fused `(b, s, n_heads·head_dim)` layout the output projection consumes: `scores = dot(q, transpose(k, (0,1,3,2))) · scale (+ mask)` → `ops.softmax` → `dot(probs, v)` → `ops.merge_heads`; `mask` is a plain additive array broadcastable to `(b, n_heads, s, s_kv)` (normally the `(s, s)` table from `ops.causal_mask`, `None` = unmasked) and `scale` is conventionally `head_dim ** -0.5`.
 GQA/MQA stays outside that helper so `repeat_kv` is an explicit, compiler-visible op rather than a hidden reshape; the helper raises `HFUnsupportedError` for non-rank-4 operands, differing `k`/`v` shapes, mismatched `(batch, heads)`/`head_dim`, or a caller who forgot `repeat_kv`.
-`gated_mlp(x, w_gate, w_up, w_down, act)` is the bias-free SwiGLU MLP: `act(dot(x, w_gate)) * dot(x, w_up)` then `dot(·, w_down)`, with `x` `(..., hidden)`, gate/up `(hidden, intermediate)` and down `(intermediate, hidden)`.
-`two_layer_mlp(x, w1, b1, w2, b2, act)` is the GPT-2 MLP: `linear(act(linear(x, w1, b1)), w2, b2)` with `w1` `(hidden, intermediate)`, `b1` `(intermediate,)`, `w2` `(intermediate, hidden)`, `b2` `(hidden,)`; `None` biases are allowed.
+`gated_mlp(x, w_gate, w_up, w_down, act)` is the bias-free SwiGLU MLP `act(dot(x, w_gate)) * dot(x, w_up)` then `dot(·, w_down)`; `two_layer_mlp(x, w1, b1, w2, b2, act)` is the GPT-2 MLP `linear(act(linear(x, w1, b1)), w2, b2)` (`None` biases allowed), with `w1`/gate/up `(hidden, intermediate)` and `w2`/down `(intermediate, hidden)`.
 All four are `SymbolicTensor` graph builders (assembly only, no numerics of their own): concrete tensors surface as the underlying `etl.TraceError`, extents come from static shapes (a symbolic dim raises `HFUnsupportedError` naming the axis in `etl_hf.ops`), and `act` is always a builder from `etl_hf.ops.resolve_activation` (`silu`, `gelu_tanh`, `gelu_erf`, `relu`), resolved eagerly by each family's `graph()` so an unknown name fails before tracing.
 
 ## Canonical weight keys
 
-Canonical names are flat `dict[str, np.ndarray]` keys (`params` is never nested), shared verbatim between `param_specs` (specs) and `canonicalize_weights` (loaded arrays) — one shape table per family is the single source of truth for both.
+Canonical names are flat `dict[str, np.ndarray]` keys (`params` is never nested), shared verbatim between `param_specs` (specs) and `canonicalize_weights` (loaded arrays).
 
 **llama** (`etl_hf/models/llama.py`, `9·L + 3` keys = `2 + 9·L + 1` untied, `9·L + 2` tied — the head is `embed.weight`):
 
@@ -38,7 +37,7 @@ Canonical names are flat `dict[str, np.ndarray]` keys (`params` is never nested)
 | `final_norm.weight` | `(hidden,)` | `model.norm.weight` |
 | `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight`, transposed — **untied only** (a tied config has no such key) |
 
-The llama builds are bias-free: any `*.bias` key in the checkpoint raises `HFUnsupportedError` (naming the offending keys and the `attention_bias=False` / `mlp_bias=False` remedy), and `model.rotary_emb.inv_freq` is the one deliberately ignored key (a stale buffer; the forward recomputes frequencies).
+The llama builds are bias-free: any `*.bias` key raises `HFUnsupportedError` (naming the keys and the `attention_bias=False` / `mlp_bias=False` remedy), and `model.rotary_emb.inv_freq` is the one deliberately ignored key (a stale buffer; the forward recomputes frequencies).
 
 **gpt2** (`etl_hf/models/gpt2.py`, `16·L + 5` keys = `2 + 16·L + 3` untied, `16·L + 4` tied — the head is `embed.weight`):
 
@@ -56,7 +55,7 @@ The llama builds are bias-free: any `*.bias` key in the checkpoint raises `HFUns
 | `lm_head.weight` | `(hidden, vocab)` | `lm_head.weight` transposed — **untied only** (a tied config has no such key) |
 
 The fused `h.{i}.attn.c_attn` `(hidden, 3·hidden)` tensor and its `(3·hidden,)` bias are split **at load time** into the `q`, `k`, `v` column blocks `[0:H]`, `[H:2H]`, `[2H:3H]` (HF's `query, key, value` order), so the graph never slices a fused matrix.
-Both `transformer.`-prefixed and bare key spellings are accepted (mixing allowed); two keys that normalise onto the same canonical slot raise `HFWeightError` instead of last-one-wins, and the derived causal buffers `h.{i}.attn.bias` / `h.{i}.attn.masked_bias` are the only ignored keys.
+Both `transformer.`-prefixed and bare key spellings are accepted (mixing allowed); two keys normalising onto the same canonical slot raise `HFWeightError` instead of last-one-wins, and the derived causal buffers `h.{i}.attn.bias` / `h.{i}.attn.masked_bias` are the only ignored keys.
 
 ## Orientation rule
 
@@ -69,22 +68,21 @@ Every canonicalised array is `float32`, C-contiguous and writable (`int`/`float`
 ## Graph conventions
 
 `graph(cfg, seq_len, batch_size=1, *, pack_plan=None)` returns a fresh `@etl.defn` callable each call with the positional signature `(params, input_ids) -> logits`; `input_ids` is `(batch_size, seq_len)` `etl.int32` and `logits` is `(batch_size, seq_len, vocab_size)` `float32`.
-The optional `pack_plan` (an `etl_hf.pack.PackPlan`) is the ONE hook the opt-in packed-weights mode needs: when it is not `None` the forward's first statement is `params = pack_plan.unpack(params)`, which maps the few packed graph inputs back onto the canonical keys with static `etl.slice`s, and the rest of the body is unchanged (identical code in both families — never a second forward implementation); `pack_plan=None` reproduces the canonical-tree behaviour exactly.
-Weights are always read from `params` by their canonical flat key and supplied as explicit graph inputs — never `etl.constant`, so the exported program's text stays O(1) in the weight sizes.
+The optional `pack_plan` (an `etl_hf.pack.PackPlan`) is the ONE hook the opt-in packed-weights mode needs: when it is not `None` the forward's first statement is `params = pack_plan.unpack(params)`, mapping the few packed graph inputs back onto the canonical keys with static `etl.slice`s, and the rest of the body is unchanged (identical code in both families — never a second forward implementation).
+Weights are always read from `params` by their canonical flat key — never `etl.constant`, so the exported program's text stays O(1) in the weight sizes.
 Layout is pre-LN residual: `x += attn(norm(x))`, then `h = norm(x)`, `x += mlp(h)`, then a final norm and the `lm_head` projection.
 Normalisation is family-specific: llama uses RMSNorm (`etl_hf.ops.rms_norm`, no mean subtraction, no bias, `layer_norm_eps` = HF `rms_norm_eps`), GPT-2 uses HF `nn.LayerNorm` (`etl_hf.ops.layer_norm`, **biased**/divide-by-N variance plus eps inside the sqrt, affine weight and bias after).
-Positions: llama computes RoPE cos/sin **in-graph** (`etl_hf.ops.rope_cos_sin` from `arange` + `power` + `cos`/`sin`) and applies HF `rotate_half` via `etl_hf.ops.apply_rope` to `q` and `k` only; GPT-2 uses a learned position table (`etl.arange` → `etl.gather(pos_embed, ...)` → `etl.broadcast` over the batch axis), added to the token embeddings.
+Positions: llama computes RoPE cos/sin **in-graph** (`etl_hf.ops.rope_cos_sin` from `arange` + `power` + `cos`/`sin`) and applies HF `rotate_half` via `etl_hf.ops.apply_rope` to `q` and `k` only; GPT-2 uses a learned position table (`etl.arange` → `etl.gather(pos_embed, ...)` → `etl.broadcast` over the batch axis) added to the token embeddings.
 Masking: both families apply an **additive causal mask** — `0.0` on and below the diagonal (`j <= i`, a query attends to itself and the past) and `MASK_NEG` (`-1e4`, i.e. `etl_hf.ops.MASK_NEG` / `etl_hf.reference.MASK_NEG`) strictly above it, added to the scaled scores before the softmax so masked-out weights are exactly `0.0` in fp32; the mask is built from `arange`/`less_equal`/`cast` (`etl_hf.ops.causal_mask`), never a constant payload.
-Head layout: `etl_hf.ops.split_heads` `(b, s, n·hd) → (b, n, s, hd)`, `etl_hf.ops.merge_heads` back, and GQA via `etl_hf.ops.repeat_kv` with `n_rep = num_attention_heads // num_key_value_heads` (head `i` serves query heads `i·n_rep … i·n_rep + n_rep − 1`, i.e. `np.repeat`, never interleaved; `n_rep == 1` is the identity).
+Head layout: `etl_hf.ops.split_heads` `(b, s, n·hd) → (b, n, s, hd)` and `merge_heads` back; GQA via `etl_hf.ops.repeat_kv` with `n_rep = num_attention_heads // num_key_value_heads` (head `i` serves query heads `i·n_rep … i·n_rep + n_rep − 1`, i.e. `np.repeat`, never interleaved; `n_rep == 1` is the identity).
 `seq_len` is bounded by `cfg.max_position_embeddings` and rejected beyond it (`HFConfigError`): RoPE has no positions past it and GPT-2's learned table cannot extrapolate.
-The `reference` functions compose **only** `etl_hf.reference` primitives (no `etl` call on that path) in a deliberately different formulation — explicit per-head Python loops, hand-written mean/variance formulas, `math.erf`, plain `matmul` in the canonical `(in, out)` orientation — so a wrong transpose or head split shows up as a numeric difference rather than a shared bug.
+The `reference` functions compose **only** `etl_hf.reference` primitives (no `etl` call on that path) in a deliberately different formulation — per-head Python loops, hand-written mean/variance formulas, `math.erf`, plain `matmul` in the canonical `(in, out)` orientation — so a wrong transpose or head split shows up as a numeric difference rather than a shared bug.
 
 ## Per-family notes
 
 **llama** (`FAMILY = "llama"`, `MODEL_TYPES = ("llama", "mistral", "qwen2")`) covers every Llama-shaped checkpoint: RMSNorm, RoPE, GQA/MQA and a SwiGLU MLP.
-Config fields it consumes: `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (defaults to `num_attention_heads` in `etl_hf.config`), `intermediate_size`, `hidden_act`, `layer_norm_eps` (from HF `rms_norm_eps`), `max_position_embeddings`, `rope_theta` (default `10000.0`), `tie_word_embeddings` (default `False`) and an optional explicit `head_dim` override.
-`head_dim` is honoured verbatim — the q/k/v/o shapes derive from `num_attention_heads · head_dim` / `num_key_value_heads · head_dim`, never from an assumed `hidden_size // num_attention_heads`, and RoPE requires it to be even.
-Any non-empty `rope_scaling` (YaRN / linear / dynamic NTK) is rejected at **config parse** time with `HFUnsupportedError` (`etl_hf/config.py`), because a scaled-RoPE model would silently diverge from HF.
+Config fields it consumes: `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (defaults to `num_attention_heads`), `intermediate_size`, `hidden_act`, `layer_norm_eps` (from HF `rms_norm_eps`), `max_position_embeddings`, `rope_theta` (default `10000.0`), `tie_word_embeddings` (default `False`) and an optional explicit `head_dim` override, honoured verbatim — q/k/v/o shapes derive from `num_attention_heads · head_dim` / `num_key_value_heads · head_dim`, never from an assumed `hidden_size // num_attention_heads`, and RoPE requires `head_dim` to be even.
+Any non-empty `rope_scaling` (YaRN / linear / dynamic NTK) is rejected at **config parse** time (`etl_hf/config.py`, `HFUnsupportedError`) because a scaled-RoPE model would silently diverge from HF.
 An unexpected (unconsumed) checkpoint key, a shape that disagrees with the config, a missing required key (with difflib near-miss suggestions) and a foreign-family `ModelConfig` are all `HFWeightError` / `HFConfigError`.
 
 **gpt2** (`FAMILY = "gpt2"`, registry `model_types` derived from `etl_hf.config.FAMILY_BY_MODEL_TYPE` = `("gpt2",)`, which is what `openai-community/gpt2` and `distilgpt2` both declare) covers LayerNorm + learned positions + `gelu_new` + tied head.
