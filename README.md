@@ -1,294 +1,485 @@
-# etl — EvoX Tensor Library
+<div align="center">
+<img src="assets/etl-mark.svg" width="96" alt="etl">
 
-A minimal, explicit, compiler-neutral tensor graph runtime for Python.
+<h1 align="center">etl</h1>
 
-> **Make computation explicit, require large tensors to be explicit inputs, keep
-> `vmap` as transparent function-side sugar over `vectorize`, keep binding as
-> transparent argument-passing sugar, keep communication and multi-device tensor
-> preparation explicit, expose and persist the graph, and let compilers do the
-> compilation.**
+<p><strong>EvoX Tensor Library</strong> — a minimal, explicit, compiler-neutral tensor graph runtime.</p>
 
-etl provides an ergonomic tensor language for constructing, transforming,
-inspecting, caching, loading, and executing computational graphs. Optimization,
-kernel scheduling, memory planning, and code generation are left to external
-compilers (IREE, XLA via PJRT, TVM).
+<p>etl = <strong>EvoX Tensor Library</strong>. It is a Python tensor <em>language</em> whose program is an explicit SSA graph: you build the graph, etl owns the frontend (trace → transform → IR → StableHLO), and external ML compilers do the optimization, scheduling, memory planning and codegen. With no compiler installed it still runs — on a reference numpy interpreter.</p>
+
+<p>
+  <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
+  <a href="#backends"><img src="https://img.shields.io/badge/backends-numpy%20%C2%B7%20IREE%20%C2%B7%20XLA%20%C2%B7%20TVM-4c9a72?style=flat-square" alt="backends: numpy, IREE, XLA, TVM"></a>
+  <a href="#status--deferrals"><img src="https://img.shields.io/badge/tests-6716%20passing-4c9a72?style=flat-square" alt="tests: 6716 passing"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
+</p>
+
+<p><a href="#why-etl-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#backends">Backends</a> · <a href="#measured">Measured</a> · <a href="#how-etl-compares">vs others</a> · <a href="#install">Install</a></p>
+</div>
+
+---
+
+## Why etl exists
+
+A modern numerical framework fuses five different things into one opaque stack: a tensor language, a tracer, a compiler, a scheduler and an allocator. The result is convenient, and the program stops being an object you can hold — it is re-derived on every call, re-specialized when a Python value changes, re-captured when a guard fails, and the compiler quietly owns semantics the author never wrote down: implicit tracing, hidden caches, automatic resharding, eager/graph mode switches.
+
+etl splits that stack along one hard line. Above it is the **frontend**: a tensor language in which the program is an explicit, inspectable, persistable, transformable SSA graph, and every staging step is a public function with a public object for its result. Below it are **external compilers** — IREE, XLA via PJRT, TVM — which receive StableHLO and own how the computation executes. Nothing on the etl side pretends to be a compiler, and nothing below the line may change what the program means.
+
+## Four words
+
+**Minimal** — `numpy` is the only hard dependency; pure Python, no native code, no runtime, no code generator, no kernel library. The default backend interprets the IR with numpy kernels. *So what: no compiler toolchain stands between you and a running graph.*
+
+**Explicit** — every stage is a public function (`trace`, `lower`, `compile`, `load`, `run`) and every object a distinct public type (`Defn`, `Graph`, `LoweredProgram`, `CompiledArtifact`, `Executable`, `Tensor`); convenience APIs are documented shorthand whose exact expansion is in their docstrings. *So what: you can stop at any stage, inspect it, save it, or ship it.*
+
+**Compiler-neutral** — the contract with the backend world is EvoXIR in the frontend and StableHLO MLIR at the boundary. No vendor IR is the definition of the IR; no adapter is privileged. *So what: swapping IREE for XLA or TVM is a `backend=` argument, not a rewrite.*
+
+**Simple** — one obvious way per thing: `vmap` is sugar over `vectorize`, `bind` is argument-passing sugar, `build` is `trace → lower → compile → load`. No eager mode, no second semantics behind a flag. *So what: when the code surprises you, the surprise is in your graph.*
+
+## The stack: from a Python graph to an ML compiler
+
+<img src="assets/etl-stack.svg" alt="The explicit etl stack: defn → Graph (EvoXIR) → transforms → lower → LoweredProgram → compile (numpy interpreter or IREE / XLA-PJRT / TVM) → CompiledArtifact → load → Executable → run → Tensor" width="100%">
+
+| stage | public function | resulting object | what it produces | what it never does silently |
+|---|---|---|---|---|
+| graph function | `@etl.defn` | `Defn` | a Python callable marked as a graph *definition* | run eagerly — calling it on concrete tensors raises `TraceError` |
+| trace | `etl.trace(fn, *specs)` | `Graph` | EvoXIR: a region-based SSA module + input/output trees + snapshotted static values | compile, optimize, or turn a symbolic `Dim` into a constant |
+| transform | `etl.vectorize` / `vmap` / `grad` / `jvp` / `vjp` | `Graph` | an ordinary graph of ordinary ops | execute, or leave a `vmap`/`grad` op for a backend to interpret |
+| lower | `etl.lower(graph, backend=…)` | `LoweredProgram` | StableHLO MLIR text, or the backend's own payload | optimize or compile; an unsupported op is an explicit `BackendError` |
+| compile | `etl.compile(lowered, **opts)` | `CompiledArtifact` | the compiler's artifact (vmfb, PJRT executable, serialized program) | get replaced at load — a version/ABI mismatch is a `PersistenceError` |
+| load | `etl.load(artifact, device=…)` | `Executable` | a device-bound executable that can be called | move your data onto the device, or recompile for another target |
+| run | `etl.run(exe, *args)` | `Tensor` (tree) | outputs in the same pytree shape you passed in | copy results to the host, cast, reshard, or insert communication |
+
+**Two backends below the line.** The default path stops at `lower`: the **numpy interpreter** runs the EvoXIR program directly with numpy kernels — no compiler, no codegen, no artifact. The compiler paths take the *same* StableHLO text: **IREE** (llvm-cpu, cuda, rocm, vulkan-spirv), **XLA** (PJRT C API over a user-provided plugin `.so`) and **TVM** (StableHLO frontend + Relax VM).
+
+**Layer discipline** — a strict one-way import DAG, so every problem has one owner:
+
+```
+core  ←  ir  ←  ops  ←  { trace, numpy }  ←  { block, transforms, backends, dist, sparse, pipeline, persist }
+```
+
+<sub>`core` imports nothing from etl (numpy only) · `ir` imports `core` · `ops` imports `core`, `ir`, `trace`'s builder hook · `trace` imports `core`, `ir` (never `ops`) · each module to the right imports only what is to its left.</sub>
+
+## Quickstart — sixty seconds
+
+The explicit pipeline; every intermediate is a real object you can keep:
 
 ```python
 import etl
-import etl.numpy as enp
+from etl import TensorSpec
 
 @etl.defn
 def f(x, w):
-    return etl.dot(x, w) + 0.5
+    return etl.sum(etl.tanh(etl.dot(x, w)), axes=1)
 
-# Explicit staging: trace → lower → compile → load → run
-graph = etl.trace(f, etl.TensorSpec((4, 8), etl.float32), etl.TensorSpec((8, 4), etl.float32))
-lowered = etl.lower(graph)
-artifact = etl.compile(lowered)
-exe = etl.load(artifact, device="cpu")
-y = etl.run(exe, etl.ones((4, 8)), etl.zeros((8, 4)))
-
-# Convenience sugar (documented shorthand only):
-exe = etl.build(f, etl.TensorSpec((4, 8), etl.float32), etl.TensorSpec((8, 4), etl.float32))
+spec_x, spec_w = TensorSpec((4, 8), etl.float32), TensorSpec((8, 4), etl.float32)
+graph    = etl.trace(f, spec_x, spec_w)                       # Graph          (EvoXIR)
+lowered  = etl.lower(graph)                                   # LoweredProgram
+artifact = etl.compile(lowered)                               # CompiledArtifact
+exe      = etl.load(artifact, device="cpu")                   # Executable
+y        = etl.run(exe, etl.ones((4, 8)), etl.ones((8, 4)))   # Tensor
+print(y.numpy())     # [3.999999 3.999999 3.999999 3.999999]
+print(graph)         # <Graph 2 tensor inputs, 0 static values>
 ```
 
-Features:
-- Explicit graph construction — `@etl.defn` / `etl.trace`; no implicit tracing, no eager/graph mode switching
-- Graph transforms (graph→graph): `etl.vectorize` / `etl.vmap`, `etl.grad` / `etl.jvp` / `etl.vjp`
-- In-graph control flow: `etl.cond` / `etl.while_loop` / `etl.scan`
-- Explicit collectives: `etl.dist.all_reduce(...)` — the compiler may optimize, never invents, communication
-- Sparse tensors: `etl.sparse` (COO/CSR/CSC) — 16 graph ops, works with transforms and control flow
-- Key-based functional RNG: `etl.random.key(seed)` — deterministic, stateless, multi-algorithm
-- Custom kernels: `etl.external_call` + `etl.register_external_kernel` (30-second demo below); custom graph ops via `etl.block`
-- Reference CPU backend (numpy interpreter, default) + StableHLO MLIR export
-- Pluggable compiler adapters — IREE, XLA (via PJRT), TVM — optional extras, lazily
-  activated (`etl.lower(graph, backend="iree")`); the library runs with none installed
-- Symbolic shapes (`B = etl.dim("B")`), pytree-structured inputs/outputs, DLPack interop
-- Persistence/caching: serializable `Graph` / `LoweredProgram` / `CompiledArtifact`
+The same thing in one call — *documented shorthand, no extra semantics*:
 
 ```python
-# Same graph, real compilers (needs: pip install etl[iree] / etl[tvm];
-# the xla backend needs a user-provided PJRT plugin .so — ETL_PJRT_PLUGIN):
-exe = etl.build(f, etl.TensorSpec((4, 8), etl.float32), etl.TensorSpec((8, 4), etl.float32),
-                backend="iree", device="cpu")
+exe = etl.build(f, spec_x, spec_w, device="cpu")          # trace → lower → compile → load
+y   = etl.evaluate(f, etl.ones((4, 8)), etl.ones((8, 4))) # derive specs → build → run
 ```
 
-See `CONTEXT.md` for the architecture and `etl/CONTEXT.md` for the public API contract.
-
-## Custom kernels in 30 seconds
-
-`etl.external_call` plugs an opaque, named kernel into a `defn` graph — no etl
-op needs to know it, and the kernel is just numpy arrays in/out. The canonical
-worked example is `etl/bench/examples/op_external.py`; here is the real thing:
-a Triton/CUDA kernel hosted by IREE.
+Same graph, real compiler (`pip install etl[iree]`, or `etl[tvm]`, or a PJRT plugin `.so` for `xla`):
 
 ```python
-import etl
+exe = etl.build(f, spec_x, spec_w, backend="iree", device=etl.Device("cuda", 0),
+                target_backends=["cuda"], opt_level="O3")
+y   = etl.run(exe, etl.ones((4, 8)).to(exe.device), etl.ones((8, 4)).to(exe.device))
+```
 
-x, w = etl.ones((4, 8)), etl.ones((8, 4))      # concrete runtime Tensors
+**The payoff: transforms are graph → graph, so they compose.** A batched per-sample gradient is a `vmap` of a `grad` — no backend ever learns what either word means:
 
-# 1. Declare the call inside a defn graph — name + declared output specs
+```python
+@etl.defn
+def loss(x, y, w):
+    d = etl.subtract(etl.tanh(etl.dot(x, w)), y)
+    return etl.mean(etl.multiply(d, d))          # one scalar per sample
+
+per_sample_grad = etl.vmap(etl.grad(loss, argnums=(2,)), in_axes=(0, 0, None), out_axes=(0,))
+specs = (TensorSpec((8, 4, 8), etl.float32), TensorSpec((8, 4, 4), etl.float32),
+         TensorSpec((8, 4), etl.float32))        # 8 samples of [4, 8]; the weights are shared
+graph = per_sample_grad(*specs)                  # Graph — nothing has run yet
+exe   = etl.load(etl.compile(etl.lower(graph)), device="cpu")
+dw,   = etl.run(exe, etl.ones((8, 4, 8)), etl.zeros((8, 4, 4)), etl.ones((8, 4)))
+print(dw.shape, dw.dtype, dw.device)             # (8, 8, 4) float32 Device(kind='cpu', index=0)
+```
+
+**Device-resident iteration.** A non-cpu executable rejects host inputs at the run boundary, so the loop *is* the pattern: place state once, then feed each run's device outputs back as the next run's inputs — zero host round-trips, zero implicit staging. At DE scale (4096×50, ~8 IREE dispatches per step) this costs ~0.15–0.5 ms/step, against ~1.05–2.8 ms when re-staging the ~800 KB state each step.
+
+```python
+device = etl.Device("cuda", 0)
+exe = etl.build(step, *specs, backend="iree", device=device,   # step: @etl.defn
+                target_backends=["cuda"], opt_level="O3")       # (key, state) -> (state, key)
+state, key = etl.tensor(state0).to(device), etl.tensor(seed).to(device)  # upload once
+for _ in range(steps):
+    state, key = etl.run(exe, key, state)     # inputs and outputs stay on `device`
+host = state.to(etl.Device("cpu", 0)).numpy() # the only way back
+```
+
+## The value model
+
+Four concepts, deliberately not three. Python values *specialize* a graph, symbolic values are *program* values, and only a `Tensor` has storage.
+
+| concept | meaning | has storage? | guarantees |
+|---|---|---|---|
+| Python/static value | `None`, bool, int, float, str, `Enum`, dtype, `slice`, config objects | n/a | evaluated at trace time and snapshotted into the graph; changing it means a *new* graph — no hidden guards, no recompile-on-change |
+| `TensorSpec` | describes a future runtime tensor: `shape` (symbolic dims allowed), `dtype`, optional `device` | no | the only thing you can pass as a trace input besides static values |
+| `SymbolicTensor` | an SSA value inside a graph | **no** | `dtype`, symbolic shape, source location, SSA identity — and deliberately **no** `numpy()`, `data_ptr()` or `__dlpack__` |
+| `Tensor` | a materialized runtime tensor | yes | concrete shape/dtype and a **physical** `device`: numpy host data is `Device('cpu', 0)`, a device payload reports its real device |
+
+Because storage exists only on the last row, misuse fails where the mistake is: `etl.constant` is the single, warned way to embed host data into a graph; capturing a `Tensor` in a closure is a `TraceError`; `.numpy()` on a non-cpu tensor raises `DeviceError` (`.to(cpu)` first), so no API can copy your data behind your back.
+
+## Features
+
+### Explicit graph construction — and no eager mode
+
+`@etl.defn` marks a graph definition; it does not make the function callable on real data — calling it with a `Tensor` raises `TraceError` pointing at `etl.trace`/`etl.evaluate`. `etl.trace` turns the definition into a `Graph` you can print, verify, save, transform and lower:
+
+```python
+graph = etl.trace(f, spec_x, spec_w)
+graph.print()                  # the EvoXIR module, one op per line
+graph.verify()                 # explicit IR verification
+graph.save("f.etlgraph")       # portable, versioned JSON container
+```
+
+```
+module @"main" version 1 {
+  func @main(%arg0: tensor<4x8xf32>, %arg1: tensor<8x4xf32>) -> tensor<4xf32> {
+    %0 = etl.dot(%arg0, %arg1) : tensor<4x4xf32> loc("f.py":6:0)
+    %1 = etl.tanh(%0) : tensor<4x4xf32> loc("f.py":6:0)
+    %2 = etl.reduce_sum(%1) attributes {axes = [1], keepdims = False, reduce_op = "sum"} : tensor<4xf32>
+    etl.return(%2)
+  }
+}
+```
+
+### Graph → graph transforms
+
+`etl.vectorize`, `vmap`, `grad`, `jvp` and `vjp` are functions on graphs: a `Graph` in, a `Graph` out; a function/`Defn` in, a callable that builds one from specs out. The result is ordinary ops, so **a backend never sees `vmap`** — it sees the vectorized arithmetic a hand-written batched graph would have. An op with no batching or derivative rule is a `TransformError` naming the op, never a silent Python-loop fallback.
+
+```python
+@etl.defn
+def scalar_loss(x, y, w):
+    d = etl.subtract(etl.dot(x, w), y)
+    return etl.mean(etl.multiply(d, d))
+
+g  = etl.trace(scalar_loss, *specs)
+gb = etl.vmap(g, in_axes=(0, 0, None))    # batch the samples, share the weights
+gw = etl.grad(g, argnums=(2,))            # d/dw — still just a Graph
+```
+
+### In-graph control flow
+
+`etl.cond`, `etl.while_loop` and `etl.scan` trace their branch and body functions into IR regions, so control flow is part of the persisted program. Python control flow over a symbolic value fails loudly instead of tracing something you did not write.
+
+```python
+@etl.defn
+def sqrt_newton(x):
+    def cond_fn(s):
+        y, prev = s
+        return etl.greater(etl.abs(etl.subtract(y, prev)), 1e-6)
+    def body_fn(s):
+        y, prev = s
+        return 0.5 * (y + x / y), y
+    y, _prev = etl.while_loop(cond_fn, body_fn, (x, etl.constant(etl.zeros((), etl.float32))))
+    return y
+
+exe = etl.build(sqrt_newton, TensorSpec((), etl.float32), device="cpu")
+print(etl.run(exe, etl.tensor(2.0)).numpy())     # 1.4142135
+```
+
+A Python `if`/`while` on a symbolic value raises `TraceError: SymbolicTensor cannot be used as a Python boolean … runtime tensor control flow must use etl.cond`.
+
+### Symbolic shapes and pytree I/O
+
+A `Dim` is a named symbolic extent (`DimExpr` supports `+ - * // % min max` over dims and ints). Inputs and outputs are arbitrary pytrees, flattened once per call and validated structurally with first-mismatch-path errors; per-call host cost is leaf-driven, not graph-driven (~2–3.5 µs per tensor leaf, ~0 per op).
+
+```python
+B = etl.dim("B")
+
+@etl.defn
+def model(params, batch):
+    h = etl.tanh(etl.dot(batch["x"], params["w1"]) + params["b1"])
+    return {"logits": etl.dot(h, params["w2"]), "hidden": h}
+
+spec = ({"w1": TensorSpec((4, 8), etl.float32), "b1": TensorSpec((8,), etl.float32),
+         "w2": TensorSpec((8, 3), etl.float32)},
+        {"x": TensorSpec((B, 4), etl.float32)})      # symbolic batch
+exe = etl.build(model, *spec, device="cpu")          # one executable, any batch size
+out = etl.run(exe, {"w1": etl.ones((4, 8)), "b1": etl.zeros((8,)), "w2": etl.ones((8, 3))},
+              {"x": etl.ones((5, 4))})               # {'hidden': (5, 8), 'logits': (5, 3)}
+```
+
+### Explicit collectives and physical placement
+
+Collectives are ops in the graph (`etl.dist.*`); a compiler may optimize them, never invent them. Multi-device *data preparation* (`split_tensor`, `replicate_tensor`) is a separate, explicit host-memory utility. Placement is physical: a `Tensor`'s `device` is where its data actually is, `Tensor.to(device)` is the only transfer primitive, run outputs stay where they ran, and a mismatched input is a `DeviceError` **before** dispatch.
+
+```python
+@etl.defn
+def distributed_step(x):
+    grp = etl.dist.group("world", [0, 1])
+    return etl.dist.all_reduce(x, group=grp, op="sum")
+
+etl.trace(distributed_step, TensorSpec((4,), etl.float32)).print()
+#   %0 = etl.all_reduce(%arg0) attributes {group = "world", group_size = 2, reduce_op = "sum"}
+```
+
+### Sparse tensors
+
+`etl.sparse` is a first-class value model — `SparseTensor`/`CSRTensor`/`CSCTensor` for data, `SparseTensorSpec` at trace time, symbolic instances inside graphs — with 16 graph ops (COO/CSR/CSC conversion, union `add`, intersection `multiply`, `multiply_dense`, `reduce_sum`, `transpose`, `reshape`, `concatenate`, sparse@dense and dense@sparse `matmul`) and numpy kernels that validate structure at runtime. Batching and derivative rules travel with the ops, so sparse values flow through `vmap`/`grad` and through `cond`/`while_loop`/`scan`. Compiler backends defer sparse with an explicit `BackendError` suggesting `etl.sparse.to_dense`.
+
+```python
+s = etl.sparse.coo(np.array([[0, 0], [1, 2]]), np.array([1.5, 2.5], np.float32), (3, 4))
+
+@etl.defn
+def sparse_step(s):
+    return etl.sparse.to_dense(etl.sparse.multiply(s, s))
+
+exe = etl.build(sparse_step, etl.sparse.SparseTensorSpec.from_concrete(s), device="cpu")
+print(etl.run(exe, s).numpy())          # [[2.25 0 0 0] [0 0 6.25 0] [0 0 0 0]]
+```
+
+### Key-based functional RNG
+
+`etl.random` is stateless and deterministic: a key is a value, ops never consume it, and the same key with the same operands yields bit-identical numbers across processes. The algorithm *is* the key's static shape/dtype — `splitmix64` (rank-0 i64, default), `threefry2x32` (`(2,)` i32), `philox4x32_10` (`(4,)` i32). The default was chosen by measurement: splitmix64 is fastest on both CPU paths and ties on GPU, winning every ≥4M-element cuda cell; threefry2x32 wins the small-sample GPU cells and is one `algorithm=` argument away.
+
+```python
+@etl.defn
+def sample(key):
+    k1, k2 = etl.random.split(key)
+    return etl.random.normal(k1, (3, 2)), etl.random.randint(k2, (3,), 0, 10)
+
+exe = etl.build(sample, TensorSpec((), etl.int64), device="cpu")
+a, b = etl.run(exe, etl.random.key(42))     # same key, same bits — in any process
+```
+
+### Custom kernels
+
+When a kernel must stay opaque — Triton, hand-written CUDA, anything you cannot express as a graph — declare the call inside the graph and register the implementation out of band. Kernels resolve per backend (exact slot → default slot), may be **device-resident** (device tensors in and out, zero host round-trips) and may declare batched variants:
+
+```python
 @etl.defn
 def model(x, w):
     h = etl.external_call("triton_add", x, result=etl.TensorSpec((4, 8), etl.float32))
-    return etl.dot(h, w)                        # downstream ops consume it like any SSA value
+    return etl.dot(h, w)                    # downstream ops consume it like any SSA value
 
-# 2. The default (numpy) slot is mandatory — the idiomatic default is a stub
-#    that raises: a custom kernel targets specific hardware, so faking a CPU
-#    path is worse than failing loudly.
-def _no_cpu_fallback(*_):
-    raise etl.BackendError(
-        "'triton_add' is a Triton/CUDA kernel: no numpy fallback. "
-        "Run with backend='iree' on a CUDA device, or register a real "
-        "numpy implementation in the default slot."
-    )
-handle = etl.register_external_kernel("triton_add", _no_cpu_fallback)
+handle = etl.register_external_kernel("triton_add", _no_cpu_fallback)  # default slot
+handle.batch_variant(fused_add)                                        # batched kernel sugar
 
-# 3. The kernel — triton/torch are the kernel author's own toolchain: etl
-#    remains numpy-only, triton is not an etl dependency, and the kernel can
-#    be written against this interface from a separate repo.
-import triton
-import triton.language as tl
-import torch
-
-@triton.jit
-def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    x = tl.load(x_ptr + offs, mask=mask)
-    y = tl.load(y_ptr + offs, mask=mask)
-    tl.store(out_ptr + offs, x + y, mask=mask)
-
-# 4. Register it in the "iree" backend slot — numpy in, numpy out. The iree
-#    host-dispatch stages operands to host numpy at each graph boundary (v1:
-#    operands/results cross host↔device) and validates the result against the
-#    declared specs.
-@handle.impl("iree")
+@handle.impl("iree")                        # per-backend slot: numpy in, numpy out
 def triton_add_iree(x):
-    n = x.size
-    xt = torch.from_numpy(x).cuda()
-    yt = xt
-    out = torch.empty_like(xt)
-    add_kernel[(triton.cdiv(n, 1024),)](xt, yt, out, n, BLOCK=1024)
-    return out.cpu().numpy()
-
-y = etl.evaluate(model, x, w, backend="iree", target_backends=["cuda"])
+    ...
 ```
 
-Registration is a run-time, process-global concern: graphs carry only the
-kernel name, so a process that runs a saved graph must re-register its kernels.
-Every backend resolves the default slot when no exact slot exists — omitting
-it makes the numpy backend raise loudly anyway (exact backend slot → default
-slot → loud `BackendError`). The numpy backend validates count/dtype/shape
-against the declared specs and errors loudly on unknown names. For backends
-without host-dispatch (xla/tvm), `@handle.portable` over an `@etl.defn` graph
-is the fallback with a `UserWarning`, and `@handle.batching_rule` /
-`@handle.vjp_rule` provide explicit transform rules — else the portable
-auto-fallback applies.
+etl contains no Triton (or any other) kernel code — kernels are written against this interface in another repo, and graphs carry only the name, so a process that loads a saved graph must re-register its kernels. Backends without host dispatch fall back to a registered portable decomposition (`@handle.portable` over an `@etl.defn`) with a warning, or raise an explicit `BackendError`. Worked example: [`etl/bench/examples/op_external.py`](etl/bench/examples/op_external.py).
 
-## Run a HuggingFace model compiled (`etl_hf`)
+### Custom ops
 
-`etl_hf` is a separate top-level package built **on** etl (etl core stays free of
-layers/loaders): it reads a real checkpoint — `config.json` plus
-`model.safetensors` / `pytorch_model.bin` — and runs the **whole model forward
-pass as ONE etl graph**, so the model goes through the same explicit
-`trace → lower → compile → load → run` pipeline as any other graph. It is
-numpy-only: the checkpoint readers are pure numpy (`safetensors`, sharded
-indexes and both `pytorch_model.bin` encodings), and `torch`/`transformers`/
-`iree` are never imported at module scope.
+Not every custom op needs an external kernel. `etl.block` declares an op with specs, a portable decomposition written as an ordinary `@etl.defn` graph, optional per-backend implementations and optional batching/vjp rule registrations:
 
-The API is **functional** and follows etl's own value model — three layers that
-never blur:
+```python
+l2norm = etl.block("l2norm", inputs=[TensorSpec((4, 8), etl.float32)],
+                   outputs=[TensorSpec((4, 8), etl.float32)])
 
-- **checkpoint IO produces DATA.** `load_config(ckpt)` returns a frozen static
-  `ModelConfig` (one config = one graph), `load_params(ckpt, cfg)` the canonical
-  `dict[str, np.ndarray]` of host weights, and `load_hf(ckpt)` both at once as a
-  plain `LoadedModel(config, params, family, model_dir)` record with no methods.
-  Nothing here is traced, compiled or cached.
-- **`forward_fn` is the COMPUTE FUNCTION.** A pure `@etl.defn`
-  `(params, input_ids) -> logits` that captures **no** weights: every parameter
-  is an ordinary graph **input** (never `etl.constant`, so nothing is silently
-  inlined into the program), and the static specialisation
-  `(family, config, seq_len, batch_size, pack_weights)` is all the graph depends
-  on (`build`'s cache key adds the resolved backend, device and options).
-- **`build` / `run` are the explicit staging stages.** `build` *is*
-  `trace → lower → compile → load` (via `build_cached`, memoised, so an
-  identical specialisation returns the identical `Executable`); `run` is
-  validation + `etl.run`; `predict` is the one documented host-facing shorthand.
+@l2norm.portable
+@etl.defn
+def _l2norm(x):
+    return etl.divide(x, etl.sqrt(etl.sum(etl.square(x), axes=-1, keepdims=True)))
+
+@l2norm.impl("numpy")                                     # optional fast path
+def _l2norm_numpy(x):
+    return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+```
+
+The numpy backend keeps a registered impl as a `block_call` and dispatches it; other backends inline the portable. Compiler adapters declare `custom_blocks=False` in v1 and reject the graph with an explicit `BackendError` — never a silent reinterpretation.
+
+### Inspectable and persistable graphs
+
+Every stage object round-trips: a `Graph` as `.etlgraph`, a StableHLO `LoweredProgram` as `.mlir` text, a `CompiledArtifact` as `.etlartifact`. Loading with a mismatched backend, device or ABI is a `PersistenceError`, never a silent recompile. `etl.persist.Cache`/`FileCache` are the explicit caching primitives, and `build_cached` + `CompileCache` memoize the whole `trace → lower → compile → load` composition for meta-level loops (NAS, genetic programming, algorithm synthesis) that emit a different static program per outer iteration:
+
+```python
+cache = etl.CompileCache(maxsize=64)             # in-memory LRU; keys computed BEFORE tracing
+exe_a = etl.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
+exe_b = etl.build_cached(f, spec_x, spec_w, cache=cache, device="cpu")
+print(exe_a is exe_b, cache.hits, cache.misses)  # True 1 1
+```
+
+### Async host ↔ device copies
+
+`etl.io` schedules the explicit `Tensor.to` transfers on one process-global FIFO worker and hands back handles: validation is synchronous, transfer errors surface verbatim at `wait`/`result`, timeouts never cancel a copy. (Needs a device-transfer provider, e.g. `etl[iree]` on cuda/rocm.)
+
+```python
+copy = etl.io.prefetch(host_tensor, etl.Device("cuda", 0))   # -> AsyncCopy
+copy.direction                                    # "host_to_device"
+t = copy.result()                                 # wait + the device Tensor
+out = etl.io.sink(device_tensor)                  # -> AsyncCopy, "device_to_host"
+etl.io.wait_all()
+```
+
+### A conformance and benchmark harness
+
+`etl.bench` ships 98 curated example programs — operation-level, small-block and end-to-end — stages every one through the explicit pipeline, and compares against pure-numpy references (plus PyTorch when installed) while reporting precision and speed.
+
+```bash
+python -m etl.bench                              # 98 examples, numpy/cpu conformance in ~10 s
+python -m etl.bench --examples matmul,attention  # filter by name, category, or tag
+```
+
+## Backends
+
+| backend | how to enable | what it owns | validated on |
+|---|---|---|---|
+| **numpy interpreter** | nothing — the default | interprets EvoXIR directly with numpy kernels; all symbolic shapes | CPU (always) |
+| **StableHLO export** | nothing — `etl.backends.stablehlo.export(graph)` | MLIR text emission; also the lowering input for every compiler | n/a (text) |
+| **IREE** | `pip install etl[iree]`, `lower(..., backend="iree")` | IREE compile + HAL runtime, external-kernel host dispatch, device-resident payloads | llvm-cpu, CUDA, ROCm, Vulkan-SPIRV |
+| **XLA** | `ETL_PJRT_PLUGIN=/path/to/xla_plugin.so`, `backend="xla"` | PJRT C API via ctypes on a user-provided plugin `.so` — no `jax`/`jaxlib` | CUDA and ROCm (real plugins); CPU plumbing via a compiled test plugin |
+| **TVM** | `pip install etl[tvm]`, `backend="tvm"` | StableHLO frontend + Relax VM (jaxlib only for its MLIR bindings) | CPU end-to-end; ROCm compile-only |
+
+**`opt_level`** is a first-class compile option (`"O0"`–`"O3"`, `"0"`–`"3"`, ints), one spelling, env `ETL_OPT_LEVEL`, per-adapter mapping — and an explicit raw compiler flag with the same name always wins over the derived one, never both. **`Capabilities`** lets an adapter state what it can and cannot do (custom calls, blocks, native RNG algorithms, …), so callers read the limits instead of finding them by crashing. And **a backend that cannot do something raises an explicit `BackendError` naming the op** and suggesting the remedy — never a silent fallback. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`; `etl.devices()` enumerates what this host actually has.
+
+## Measured
+
+The 98-example matrix, best-of-20, on one AMD Instinct MI300X VF (gfx942, ROCm 7.1):
+
+| backend / device | numeric pass | deferrals (explicit errors) | numeric fails |
+|---|---|---|---|
+| numpy / cpu | 98 / 98 | 0 | 0 |
+| iree / llvm-cpu | 75 | 23 | 0 |
+| iree / rocm | 70 | 27 | 0 |
+| xla / rocm (`dot_precision="HIGHEST"`) | 59 | 39 | 0 |
+
+Where the compilers have something to work with the gap is large; where the graph is sub-millisecond it is not:
+
+| example | numpy/cpu | iree/llvm-cpu | iree/rocm |
+|---|---|---|---|
+| `matmul_1024` | 1.25 ms | 4.02e3 ms | 1.01 ms |
+| `transformer` | 25.6 ms | 1.05e4 ms | 3.76 ms |
+| `conv2d_large` | 40.7 ms | 1.12e3 ms | 1.02 ms |
+| `nbody` | 41.0 ms | 42.9 ms | 0.31 ms |
+| `vmap_elementwise` | 0.016 ms | 0.036 ms | 0.120 ms |
+
+Whole-model HuggingFace forward as one graph (`etl_hf`, device-resident loop, same GPU): **xla/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and **iree/rocm in 5/6 (0.73×–9.13×)**; both are 3.4×–33.5× faster than torch-cpu there. Three honest caveats:
+
+- **CPU numpy/OpenBLAS still wins large CPU matmuls.** `gpt2` at `seq_len=32`: 28.9 ms interpreted vs 403 ms on iree-llvm-cpu. A compiler's value here is the accelerator, not the CPU.
+- **Sub-millisecond steps are dispatch-bound.** The per-call host floor is ~0.13 ms on cuda and ~0.15–0.45 ms for small ROCm steps, so a 0.03 ms graph loses to torch eager regardless of codegen quality; the same cells narrow to 0.62–0.76× at larger sizes.
+- **XLA/ROCm lowers fp32 `dot` to a TF32-class path by default.** True fp32 is the opt-in `dot_precision="HIGHEST"` (bit-accurate legs, 3%–29% more latency).
+
+Raw data, probe scripts and full reports: [`etl/bench/`](etl/bench) and [`bench_logs/`](bench_logs).
+
+## Built on etl: `etl_hf`
+
+[`etl_hf`](etl_hf/CONTEXT.md) loads a real HuggingFace checkpoint and runs the **whole model forward as ONE etl graph** — a 124M-parameter transformer goes through the same `trace → lower → compile → load → run` pipeline as everything else. It is a separate top-level package, used from this checkout, **not part of the `etl` distribution**; `import etl` never imports it, `torch` or `transformers`.
+
+The API follows etl's value model in three layers that never blur: checkpoint IO produces **data** (`load_config` → frozen `ModelConfig`, `load_params` → `dict[str, np.ndarray]`, `load_hf` → a plain `LoadedModel` record); `forward_fn` is the pure **compute function** `(params, input_ids) -> logits` that captures no weights — every parameter is an ordinary graph input, never `etl.constant`; and `build`/`run` are the **staging** stages, `build` being `trace → lower → compile → load` via `build_cached`.
 
 ```python
 import numpy as np
 import etl, etl_hf
 
-ckpt = "/path/to/checkpoint"                     # a directory: config.json + weights
-
-# 1. checkpoint IO -> DATA (no graph exists yet; nothing traced or compiled)
+ckpt = "/path/to/checkpoint"                     # config.json + weights
 loaded = etl_hf.load_hf(ckpt)                    # LoadedModel: .config, .params, .family, .model_dir
-cfg, params = loaded.config, loaded.params       # (or load_config(ckpt) / load_params(ckpt, cfg))
+cfg, params = loaded.config, loaded.params
 
-# 2. the COMPUTE FUNCTION: one pure @etl.defn graph, weights are explicit INPUTS
-fwd = etl_hf.forward_fn(cfg, seq_len=32)         # (params, input_ids) -> logits, captures no weights
+fwd = etl_hf.forward_fn(cfg, seq_len=32)         # (params, input_ids) -> logits; captures no weights
 ids = np.zeros((1, 32), np.int32)                # static (batch, seq_len)
 
-# 3. STAGING: the explicit trace -> lower -> compile -> load -> run pipeline
-exe = etl_hf.build(fwd, cfg)                     # numpy interpreter (default)
-logits = etl_hf.run(exe, params, ids)            # -> etl.Tensor, on the executable's device
-exe = etl_hf.build(fwd, cfg, backend="iree")     # compiled once (StableHLO -> IREE)
-logits = etl_hf.run(exe, params, ids)
-host = etl_hf.predict(loaded, ids, backend="iree")          # host-facing shorthand -> np.ndarray
-oracle = etl_hf.reference_logits(cfg, params, ids)          # independent pure-numpy oracle
-
-# 4. device-resident recipe: place weights + ids ONCE, then run with zero host round-trips
-device = etl.core.Device("rocm", 0)              # or etl.core.Device("cuda", N)
-exe = etl_hf.build(fwd, cfg, backend="iree", device=device)
-out = etl_hf.run(exe, etl_hf.place_params(params, device), etl_hf.place_ids(ids, device))
+exe = etl_hf.build(fwd, cfg, backend="iree")     # numpy interpreter by default
+logits = etl_hf.run(exe, params, ids)            # -> etl.Tensor on the executable's device
+host = etl_hf.predict(loaded, ids, backend="iree")    # host-facing shorthand -> np.ndarray
+oracle = etl_hf.reference_logits(cfg, params, ids)    # independent pure-numpy oracle
 ```
 
-Outputs are `etl.Tensor`s on the executable's device — `logits.numpy()` for the
-cpu instance, and for a non-cpu one the explicit
-`out.to(etl.core.Device("cpu", 0)).numpy()`; nothing is copied to the host
-behind your back. Opt-in weight packing is `forward_fn(cfg, pack_weights=True)`
-+ `build(..., pack_weights=True)` + `pack_params(pack_plan(param_specs(cfg)), params)`.
+- **Families:** `llama` (also `mistral`/`qwen2` — RMSNorm, RoPE, GQA, SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
+- **Parity** against real `torch`/`transformers` logits on five checkpoints: ≤1.5e-4 max-abs on the 124M models (≈1e-6 relative) — fp32 accumulation order only.
+- **Device-resident on ROCm:** place weights and ids once (`place_params`/`place_ids`) and feed the device outputs back in; re-placing weights per call measured 10–56× slower.
+- **Opt-in weight packing** (`pack_weights=True`, `pack_params`) collapses the weight tree into ~4 graph inputs — bit-identical, and it works around IREE's llvm-cpu SIGSEGV above ~161 distinct inputs (an unpacked 124M model has 196).
+- **Deferred by design:** exact-`erf` GELU configs are numpy-only (`erf` is a StableHLO v1 deferral); dynamic shapes, kv-cache/incremental decode and generation loops are out of scope — this is the forward graph, not a serving stack.
 
-- **Install & optionality:** `etl_hf` uses **only** `numpy` + etl (plus the
-  standard library) and is a **separate top-level package used from the repo
-  checkout** — it is deliberately **not installed by `pip install etl`**
-  (`pyproject.toml`'s package find matches only `etl` / `etl.*`, so neither a
-  wheel nor an sdist of `etl` contains `etl_hf`). `pip install etl[hf]` pulls
-  only the optional `torch`/`transformers` reference oracles used to validate and
-  benchmark `etl_hf` against the real HuggingFace implementation — never a
-  runtime requirement. `pip install etl[iree]` (or `[tvm]` / a PJRT plugin `.so`
-  for `xla`) enables the compiled path. `import etl` never imports `etl_hf`,
-  `torch` or `transformers`.
-- **Families:** `llama` (also `mistral` / `qwen2` configs — RMSNorm, RoPE, GQA,
-  SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions,
-  `gelu_new`, tied head). Weights are always **explicit graph inputs** (never
-  `etl.constant`), one graph per static `(config, seq_len, batch)` — memoised
-  with `build_cached`.
-- **Parity:** validated against real HuggingFace (`torch`/`transformers`)
-  logits on five checkpoints (`tiny-random-llama`, `tiny-random-mistral`,
-  `tiny-gpt2`, `distilgpt2`, `gpt2`): ≤1.5e-4 max-abs on the 124M models
-  (≈1e-6 relative), fp32 accumulation-order only.
-- **Compiled, including on GPU:** a 12-layer/124M graph (870 IR ops, 171 KB
-  StableHLO) compiles on iree in a few seconds and runs **device-resident** on
-  an AMD MI300X (iree/rocm): outputs stay on the device, weights are placed
-  once with `place_params` and fed back input-to-output in a same-device loop
-  (re-placing per call measured 10–56× slower). Whole-forward latency:
-  `tiny_llama` 0.20 ms, `distilgpt2` 1.24 ms, `gpt2` (124M, packed) 7.07 ms —
-  4–14× faster than the numpy interpreter and up to ~200× faster than
-  iree/llvm-cpu. On CPU the numpy/OpenBLAS path is still the fast one (the
-  compiler's value here is the GPU).
-- **Compared to PyTorch** (measured; full tables in `./bench_logs/hf_bench_results.md`):
-  on an AMD Instinct MI300X VF (gfx942, ROCm 7.1) across five checkpoints
-  (`tiny_llama`, `tiny_mistral`, `tiny_gpt2`, `distilgpt2`, `gpt2` 124M; `seq_len` 32
-  for all of them, 128 for the two real ones), batch 1, the whole forward as ONE
-  graph in the device-resident same-device loop (zero `asdevicearray` per call):
-  **`xla`/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and is
-  21.6×–35.6× faster than torch-cpu on the real models; **`iree`/rocm beats
-  torch-rocm in 5/6 (0.73×–9.13×)**, its one loss being `gpt2` at `seq_len=128`.
-  XLA's default fp32 `dot` is TF32-class, so the opt-in `dot_precision="HIGHEST"`
-  leg is the bit-accurate one (rel-to-absmax 1.5e-6–2.9e-6, argmax agreement 1.0,
-  for 3%–29% more latency). On CPU the numpy/OpenBLAS interpreter still wins the
-  large matmuls (`gpt2` s32: 28.9 ms interpreted vs 403 ms on llvm-cpu) — the CPU
-  and GPU stories are never conflated. Legs that cannot run fail explicitly, never
-  silently: `tiny_mistral` on `iree`/`xla` (its `gelu` needs `etl.erf`, a StableHLO
-  export v1 deferral), and `distilgpt2`/`gpt2` at `seq_len=128` on iree-llvm-cpu
-  (upstream `iree-compile` stack-allocation limit). There is no XLA CPU plugin on
-  that host, so the xla legs are ROCm-only — and they are the first `etl_hf` runs
-  on the XLA backend anywhere.
-- **Opt-in weight packing (`pack_weights=True`)** collapses the whole weight
-  tree into ~4 graph inputs by host-side concatenation plus static in-graph
-  slices (bit-identical to unpacked). It also works around a real upstream
-  limit: IREE's Python runtime SIGSEGVs on llvm-cpu graphs that **consume**
-  more than ~161 distinct inputs, which an unpacked 124M model exceeds (196
-  weights) — packed, it runs compiled and stable (13/13 identical runs).
-- **Deferred by design (explicit errors):** exact-`erf` GELU configs
-  (`hidden_act: "gelu"`) are numpy-backend-only (`erf` is a StableHLO v1
-  deferral); dynamic shapes, kv-cache/incremental decode, and generation loops
-  are out of scope — this is the forward graph, not a serving stack.
+## How etl compares
 
-## etl vs torch, jax, nx
+**etl is a substrate, not a framework.** PyTorch and JAX are complete numerical ecosystems; Nx is the Elixir-native equivalent that etl deliberately mirrors semantically (explicit `defn` graphs, `block`, `vectorize`, pluggable backends). etl does not try to replace them and borrows freely: numpy ergonomics, Nx's graph semantics, JAX's key-based RNG and function transforms. What it offers is a smaller, sharper contract.
 
-etl is the only one of the four with **no eager mode and no implicit tracing**:
-the graph is the program, staging is explicit, and compilers are external — no
-compiler-owned optimization or resharding semantics. Torch traces implicitly
-(`torch.compile`/`export`), jax traces at every `jit` call, and nx pairs
-explicit `defn` graphs with eager execution. etl makes every stage an explicit
-step, and its sugar is documented shorthand only.
+**The one thing etl does differently: the program is a first-class object.** No eager mode, no implicit tracing, no mode switch, no compiler-owned semantics. `torch.compile` and `torch.export` capture graphs, `jax.jit` traces at every call, Nx executes `defn` eagerly through a backend — all three are reasonable designs that derive the program *inside* the framework. In etl the graph is what you wrote: an inspectable, diffable, saveable, transformable value, and every stage from `trace` to `run` is a public function with a public result type.
 
-| | PyTorch | JAX | Nx (Elixir) | etl |
+**What etl deliberately lacks:** nn modules, layers, optimizers, dataloaders, training loops, serving; a scheduler, allocator or autotuner; a kernel library; and an ecosystem. It is v0.1.0, with one author's worth of validation, CPU-only in CI, and it will not carry a product on breadth. It is meant to carry the *program*.
+
+| design axis | PyTorch | JAX | Nx (Elixir) | etl |
 |---|---|---|---|---|
-| Programming model | imperative eager + `torch.compile` | functional, transforms over JIT'd functions | explicit `defn` graph language, `block`/`vectorize` | explicit `@etl.defn` graphs, no eager mode at all |
-| Graph / staging | implicit tracing (`torch.fx`/`export`) | `jit` traces at call | `defn`/`trace` explicit | every stage explicit (`trace` → `lower` → `compile` → `load` → `run`), sugar is documented shorthand only |
-| Transforms | `torch.autograd`, `torch.func.vmap` | `grad`/`vmap`/`jit` as function transforms | `grad`/`vectorize` in-graph | graph→graph `vectorize`/`vmap`/`grad`/`jvp`/`vjp` (backends never see `vmap`) |
-| In-graph control flow | `torch.cond`/Python loops | `lax.cond`/`while_loop`/`scan` | `cond`/`while_loop`/`scan` | `etl.cond`/`while_loop`/`scan`; Python control flow over symbolic tensors fails clearly |
-| Compilation / backends | own kernels + Inductor/Triton | XLA | pluggable backends (EXLA…) | compiler-neutral — numpy reference backend + StableHLO export + pluggable adapters (IREE/XLA-PJRT/TVM), no optimization/kernel ownership |
-| Custom kernels | `torch.utils.cpp_extension`, `triton.jit` with torch tensors | `custom_call`/Pallas | `Nx.Defn.Kernel` | kernel-agnostic `etl.external_call` + name-keyed registry (numpy in/out, per-backend slots) and `etl.block` custom ops |
-| RNG | stateful `torch.Generator` | key-based functional | stateful backend RNG | key-based functional, deterministic, multi-algorithm (splitmix64 default, threefry, philox) |
-| Sparse | `torch.sparse` (separate layout world) | `jax.experimental.sparse` | none in core | first-class `etl.sparse` (COO/CSR/CSC) that flows through transforms and control flow |
+| program identity / staging | eager execution; graphs captured by `torch.compile` / `torch.export` | Python traced at each `jit`; StableHLO on demand (`jax.export`) | explicit `defn` graph language, executed eagerly via a backend (`Nx.Defn.compile/1` for compiled) | every stage an explicit public function; the `Graph` is an artifact you keep, save and ship |
+| where transforms run | autograd/`torch.func` over tensors, and inside the captured graph | function transforms (`jit`/`vmap`/`grad`) composed in Python | graph-level `grad`/`vectorize` inside `defn` | graph → graph on an already-traced `Graph`; backends never see `vmap` |
+| in-graph control flow | `torch.cond` / `torch.while_loop` (dynamo also captures Python control flow, with guards) | `lax.cond` / `while_loop` / `scan` | `cond` / `while_loop` / `scan` | `etl.cond` / `while_loop` / `scan`; a Python `if` on a symbolic value raises `TraceError` |
+| backend philosophy | owns kernels, Inductor + Triton codegen, hardware stack | XLA/PJRT is the compiler | pluggable backends (EXLA, Torchx, …) | owns no compiler: StableHLO out, adapters over IREE / XLA-PJRT / TVM |
+| custom kernel escape hatch | C++/CUDA extensions, `triton.jit` over torch tensors | `custom_call`, Pallas | custom `defn` ops / backend custom calls | `etl.external_call` + name-keyed registry (per-backend slots, host or device-resident boundaries), `etl.block` for graph ops |
+| RNG | stateful generators | key-based functional PRNG (multi-algorithm) | stateful backend RNG | key-based functional, 3 algorithms, bit-identical per key |
+| sparse | `torch.sparse` layouts (a separate world) | `jax.experimental.sparse` (BCOO/BCSR, experimental) | no first-class sparse type in core | `etl.sparse` COO/CSR/CSC, 16 ops, flows through transforms and control flow (numpy-only in v1) |
+| what it optimizes for | breadth, eager iteration speed, GPU kernel coverage | composable function transforms + XLA performance | Elixir/OTP numerical ecosystem | the program as an inspectable, persistable, transformable artifact with no vendor lock-in |
+
+**Choose etl when…** you want the program itself as an artifact (inspect, diff, save, transform, ship it to a device, hand it to another process); you need compiler neutrality — the same graph on a numpy interpreter, IREE, XLA or TVM, with no vendor IR in your source; you build meta-level or graph-generating workloads (NAS, genetic programming, algorithm synthesis) where a static program is data and `build_cached` is the compile boundary; or you want numpy-only deployment, a pure-Python dependency tree, and no compiler in the loop.
+
+**Reach for something else when…** you need an ecosystem (layers, optimizers, pretrained models, datasets, serving); you need fastest-possible eager iteration on dynamic Python control flow over tensors; you need the most mature GPU kernel coverage and vendor-specific performance work; or you want tens of thousands of users' worth of battle-testing on your critical path.
 
 ## Install
 
 ```bash
-pip install -e .          # numpy only — runs fully with the default numpy backend
-pip install -e ".[dev]"   # + pytest
-pip install -e ".[interop]"  # + torch (DLPack interop tests)
-pip install -e ".[bench]"    # + torch (etl.bench's PyTorch comparison column only)
-pip install -e ".[iree]"     # + IREE compiler/runtime adapters
-pip install -e ".[tvm]"      # + apache-tvm, jaxlib (its bundled MLIR bindings; `jax` itself is never imported)
-pip install -e ".[compilers]"  # + IREE and TVM adapters (xla: user-provided PJRT plugin .so, no pip dep)
-pip install -e ".[hf]"       # + torch, transformers — reference oracles for the etl_hf benchmarks only
+pip install -e .              # numpy only — a complete system with the default backend
+pip install -e ".[dev]"       # + pytest
+pytest                        # CPU-only suite
 ```
 
-Extras are additive and each enables only its own capability; `numpy` stays the only
-hard dependency (`xla` has no extra at all — it loads a user-provided PJRT C API
-plugin `.so`, configured with `ETL_PJRT_PLUGIN` or the backend's `plugin_path`
-option). None of them installs `etl_hf`: it is a separate top-level package used
-from the checkout (see the `etl_hf` section above).
+| extra | installs | enables |
+|---|---|---|
+| `dev` | `pytest` | the test suite |
+| `interop` | `torch` | DLPack interop tests |
+| `bench` | `torch` | `etl.bench`'s PyTorch comparison column |
+| `iree` | `iree-base-compiler` + `iree-base-runtime` (3.11.x) | the IREE adapter on llvm-cpu / cuda / rocm / vulkan |
+| `tvm` | `apache-tvm`, `jaxlib` | the TVM adapter (jaxlib only for its bundled MLIR bindings; `jax` is never imported) |
+| `compilers` | IREE + TVM | both adapters at once |
+| `hf` | `torch`, `transformers` | `etl_hf` reference oracles — never a runtime requirement |
+| *(xla)* | **no extra** | the XLA adapter loads a user-provided PJRT C API plugin `.so` (`ETL_PJRT_PLUGIN` or `plugin_path`) |
 
-## Test
-
-```bash
-pytest
 ```
+etl/            the package: core, ir, ops, trace, transforms, backends, dist, sparse,
+                random, io, pipeline, persist, build_cache, block, external, bench
+etl_hf/         HuggingFace integration — separate top-level package, used from the checkout
+tests/          pytest suite mirroring etl/ + spec-compliance tests
+bench_logs/     probe scripts, committed bench records and generated reports
+assets/         the diagrams in this README
+CONTEXT.md      architecture, contracts and status (root, the source of truth)
+```
+
+`python -m etl.bench` runs the harness. Docs map: [`./CONTEXT.md`](CONTEXT.md) (architecture, design principles, benchmark status) · [`./etl/CONTEXT.md`](etl/CONTEXT.md) (the binding public API contract) · [`./etl_hf/CONTEXT.md`](etl_hf/CONTEXT.md) · [`./tests/CONTEXT.md`](tests/CONTEXT.md) — every package directory carries its own `CONTEXT.md` describing its purpose, API surface and constraints.
+
+## Status & deferrals
+
+Implemented and tested end to end: the explicit pipeline plus `bind`/`build`/`evaluate`/`build_cached`, graph transforms, `etl.dist` collectives, `etl.block` custom ops, `etl.external_call` kernels (numpy + IREE host and device-resident dispatch), `etl.sparse`, `etl.random` (3 algorithms, bit-exact against numpy), `etl.io`, `etl.persist`/`Cache`, `etl.numpy`, the numpy interpreter, the StableHLO exporter and the IREE / XLA / TVM adapters, plus the `etl.bench` harness.
+
+Test suite: **6797 collected — 6716 passed, 81 skipped, 3 xfailed, 0 failed** with IREE installed and a Vulkan ICD configured; **6336 passed, 108 skipped, 3 xfailed** compiler-free. Every skip is a host or dependency guard (no CUDA/ROCm device, optional package absent, the packaging legs that build a distribution).
+
+<details>
+<summary><strong>v1 deferrals</strong> — each of them an explicit error naming the op</summary>
+
+- Vectorizing control-flow regions; `conv` VJP (there is no transposed-conv op); symbolic-length `scan`.
+- `linalg.inv`, `norm` beyond vector norms, `det`; non-constant `pad` modes; symbolic-bound `arange`/`linspace`.
+- StableHLO export deferrals: `cumsum`, `cumprod`, `diagonal`, `erf`/`gelu`, `tril`/`triu`, `flip`, `roll`, `nan_to_num`, `random_multinomial`, and the linalg factorizations `cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp` (`eigh` is v1 via a cyclic-Jacobi while-loop composition).
+- Sparse on compiler backends (densify with `etl.sparse.to_dense`), `sparse@sparse` matmul, sparse constants, whole-sparse `bind`.
+- Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
+- Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and reductions over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
+- `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`, never a Python-loop fallback.
+
+**The guarantee: a deferral is an explicit `BackendError` (or `TransformError`) naming the op and suggesting the remedy — never a silent fallback.**
+
+</details>
+
+## License
+
+Apache-2.0. etl is part of the **EvoX** ecosystem: the graph runtime underneath evolutionary computation workloads, deliberately small enough to read.
