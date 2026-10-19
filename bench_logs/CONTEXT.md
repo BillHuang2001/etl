@@ -381,10 +381,12 @@ amdgpu DRM device is stuck in a never-completing reset (`READ_MMR_REG 0x263e` �
 `close()` blocks; `hipErrorNoDevice`). Every Vulkan number here therefore comes from **lavapipe**.
 
 Device recipe (both files document it): Mesa **lavapipe** (software, device name
-`lavapipe (LLVM 20.1.2, 256 bits)`, apiVersion 1.4.318, Mesa 25.2.8, vendorID 0x10005) reached
-through a byte-patched `libvulkan_lvp.so` + ICD json — IREE 3.11 hard-denylists `llvmpipe*` names, so
-`VK_ICD_FILENAMES` must point at `$TMPDIR/vk-lvp/lavapipe_icd.json` (also prevents the loader from
-dlopening the wedged radeon ICD). Its `device_id` is a per-process UUID hash, never `index+1`.
+`lavapipe (LLVM 20.1.2, 256 bits)`, apiVersion 1.4.318, Mesa 25.2.8, vendorID 0x10005,
+`maxComputeSharedMemorySize` 32768, `maxComputeWorkGroupInvocations` 1024, `maxStorageBufferRange`
+128 MiB) reached through a byte-patched `libvulkan_lvp.so` + ICD json — IREE 3.11 hard-denylists
+`llvmpipe*` names in `vulkan_driver.cc` (`iree_hal_vulkan_is_device_visible`), so `VK_ICD_FILENAMES`
+must point at `$TMPDIR/vk-lvp/lavapipe_icd.json` (also prevents the loader from dlopening the wedged
+radeon ICD). Its `device_id` is a per-process UUID hash, never `index+1`.
 Throwaway venv `$TMPDIR/vk-venv` (iree-base-compiler/runtime 3.11 + numpy, CPython 3.14.8) with
 `etl`/`etl_hf` from the checkout via `PYTHONPATH`; `os._exit(0)` avoids the py3.14 nanobind exit dump.
 
