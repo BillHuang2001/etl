@@ -216,7 +216,7 @@ disk**, so leg order does not matter; a golden fixture whose `seq_len` differs f
 torch, no iree, no measurement) and reproduces byte-identically.
 
 **Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 58 JSON leg
-records, the env artifact and one small `parity_digest.json` (~29 KB: the parity numbers
+records, the env artifact and one small `parity_digest.json` (~26 KB: the parity numbers
 `--report` would recompute from the dumps, per cell and reference). The `*.logits.npz` dumps are
 **derived bulk** (one per ok cell, output-sized, ~460 MB for the current matrix) and are `.gitignore`d
 — a bench run re-creates them (the driver then
