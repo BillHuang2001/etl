@@ -1,7 +1,7 @@
 {
   "schema": "hf_bench.parity_digest/1",
-  "source": "parity of each leg's *.logits.npz dump against the golden fixture and the torch/numpy legs, as --report recomputes it; the dumps are derived bulk and are .gitignore'd, this digest is what --report reads without them. MERGED: the `dumps` count says how many dumps THIS write recomputed from; the 47 cell(s) listed under `merged_from_previous_digest` are pairs frozen by an earlier write whose dumps (derived, gitignored bulk) are no longer on disk \u2014 kept verbatim so a partial re-run never drops a committed parity number",
-  "dumps": 2,
+  "source": "parity of each leg's *.logits.npz dump against the golden fixture and the torch/numpy legs, as --report recomputes it; the dumps are derived bulk and are .gitignore'd, this digest is what --report reads without them. MERGED: the `dumps` count says how many dumps THIS write recomputed from; the 48 cell(s) listed under `merged_from_previous_digest` are pairs frozen by an earlier write whose dumps (derived, gitignored bulk) are no longer on disk \u2014 kept verbatim so a partial re-run never drops a committed parity number",
+  "dumps": 7,
   "cells": {
     "tiny_llama__s32__numpy-cpu": {
       "torch-cpu": {
@@ -888,7 +888,15 @@
         "rel_to_absmax": 2.1406974326509953e-07,
         "argmax_agreement": 1.0
       }
+    },
+    "tiny_gpt2__s32__iree-vulkan": {
+      "numpy-cpu": {
+        "comparable": true,
+        "max_abs": 2.2351741790771484e-08,
+        "rel_to_absmax": 1.7335290181108576e-07,
+        "argmax_agreement": 1.0
+      }
     }
   },
-  "merged_from_previous_digest": 47
+  "merged_from_previous_digest": 48
 }
