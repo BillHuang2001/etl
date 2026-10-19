@@ -62,6 +62,10 @@ VULKAN_ICD_ENV = "ETL_VULKAN_ICD"
 #: the key itself so every row stays machine-mappable to a record file.
 LEG_DISPLAY: dict[str, str] = {
     "iree-vulkan": "iree-vulkan (lavapipe, software Vulkan on CPU)",
+    "iree-vulkan-o1": (
+        "iree-vulkan-o1 (lavapipe, software Vulkan on CPU; hand-picked "
+        '`opt_level="O1"`)'
+    ),
 }
 
 #: Bumped whenever the record schema below changes in a way a reader cares about.
@@ -178,6 +182,30 @@ LEGS: dict[str, LegSpec] = {
         device_kind="vulkan",
         device_index=0,
     ),
+    # The SAME Vulkan device and path, with the ONE hand-picked compile option in this
+    # matrix: ``opt_level="O1"``.  The library default for a non-ROCm target set is
+    # ``O3``, and ``--iree-opt-level=O3`` cannot translate the 124M-class graphs for
+    # ``vulkan-spirv`` (IREE's default Vulkan target profile,
+    # ``vp_android_baseline_2022``, allows 16384 B of workgroup memory):
+    # ``distilgpt2``/``gpt2`` at ``seq_len`` 32 fail with ``function
+    # 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory;
+    # exceeded the limit of 16384 bytes`` (the fused LayerNorm-mean/variance
+    # reduction) and at ``seq_len`` 128 with ``failed to legalize operation
+    # 'vector.from_elements'`` (the packed in-graph gather).  ``O1`` (and ``O0``,
+    # whose vmfb is byte-identical) compiles all four cells and they run bit-plausibly
+    # on lavapipe — see ``bench_logs/vulkan_findings.md``.  This is therefore an
+    # explicitly PROBE-flavoured leg: it is NOT a library-defaults measurement and
+    # every record says so (``record["vulkan"]["compile_options_hand_picked"]``),
+    # which is exactly why it is a separate key from ``iree-vulkan`` (whose O3
+    # cells stay recorded as failures, unweakened).
+    "iree-vulkan-o1": LegSpec(
+        key="iree-vulkan-o1",
+        kind="etl",
+        backend="iree",
+        device_kind="vulkan",
+        device_index=0,
+        options={"opt_level": "O1"},
+    ),
     # Additive variant of ``xla-rocm``: the ONE place the harness passes a
     # precision option, because XLA/ROCm's default fp32 ``dot`` runs at
     # TF32-class precision (10-bit mantissa) while the explicit
@@ -208,6 +236,7 @@ LEG_ORDER: tuple[str, ...] = (
     "iree-llvmcpu",
     "iree-rocm",
     "iree-vulkan",
+    "iree-vulkan-o1",
     "xla-rocm",
     "xla-rocm-fp32",
     "torch-cpu",
@@ -223,7 +252,7 @@ LEG_ORDER: tuple[str, ...] = (
 PHASES: dict[str, tuple[str, ...]] = {
     "cpu": ("numpy-cpu", "iree-llvmcpu", "torch-cpu"),
     "gpu": ("iree-rocm", "xla-rocm", "torch-rocm"),
-    "vulkan": ("iree-vulkan",),
+    "vulkan": ("iree-vulkan", "iree-vulkan-o1"),
 }
 #: Legs that exist for a documented, additive *comparison* and are therefore never
 #: part of a phase or of the default leg set — they run only when named explicitly

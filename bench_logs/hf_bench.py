@@ -18,6 +18,10 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
                         i.e. SOFTWARE Vulkan on the CPU (not a GPU measurement),
                         device resident; needs the benchmark-only shim
                         ``bench_logs/hf_bench_vulkan.py`` and ``$ETL_VULKAN_ICD``
+    iree-vulkan-o1      the same Vulkan path with ONE hand-picked compile option,
+                        ``opt_level="O1"`` — the library default ``O3`` cannot compile
+                        the 124M-class graphs for ``vulkan-spirv``, so this leg is a
+                        Vulkan-EXECUTION probe and every record says so
     xla-rocm            PJRT/XLA on ROCm (needs ``ETL_PJRT_PLUGIN``), device resident
     xla-rocm-fp32       the same with ``dot_precision="HIGHEST"`` — opt-in variant
                         (``--legs`` only), isolates XLA/ROCm's default TF32-class
@@ -30,7 +34,7 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
 
 ``--phase`` expands to the default leg sets — ``cpu`` = ``numpy-cpu,iree-llvmcpu,
 torch-cpu``, ``gpu`` = ``iree-rocm,xla-rocm,torch-rocm`` and ``vulkan`` =
-``iree-vulkan``.  The phases are run **separately and sequentially, never
+``iree-vulkan,iree-vulkan-o1``.  The phases are run **separately and sequentially, never
 concurrently**, because the GPU is shared (and a software-Vulkan leg would steal the
 CPU cores the ``cpu`` phase assumes it has).
 
@@ -384,6 +388,25 @@ def measure_etl_leg(
                 "iree_device_id": enumerated.get("device_id"),
                 "iree_device_path": enumerated.get("path"),
                 "compile_target": hf_bench_vulkan.VULKAN_TARGET,
+                "compile_options_default": {
+                    "target_backends": [hf_bench_vulkan.VULKAN_TARGET],
+                    "opt_level": "O3 (library default for a non-ROCm target set)",
+                    "iree_vulkan_target": "IREE's default Vulkan profile "
+                    "vp_android_baseline_2022 (max_workgroup_memory_bytes = 16384)",
+                },
+                "compile_options_hand_picked": dict(spec.options),
+                "compile_options_note": (
+                    "NO hand-picked flag: library defaults apply, so this cell is a "
+                    "reproducible defaults measurement"
+                    if not spec.options
+                    else "HAND-PICKED compile option(s) "
+                    f"{dict(spec.options)} on top of the library defaults — this cell is "
+                    "a PROBE of what the Vulkan backend can execute, NOT a "
+                    "library-defaults measurement (the default "
+                    f"{'O3' if 'opt_level' in spec.options else 'options'} cannot compile "
+                    "the 124M-class graphs for vulkan-spirv; see "
+                    "bench_logs/vulkan_findings.md)"
+                ),
                 "note": (
                     "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD "
                     "GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) — see "
@@ -399,6 +422,15 @@ def measure_etl_leg(
                 f" type {properties.get('device_type')}) = SOFTWARE Vulkan on the CPU, so "
                 "its timings are a Vulkan-path datapoint, never a GPU number"
             )
+            if spec.options:
+                notes.append(
+                    "HAND-PICKED compile option(s) "
+                    f"{dict(spec.options)}: the library default "
+                    "opt_level=\"O3\" cannot translate this graph for vulkan-spirv "
+                    "(IREE's default Vulkan profile allows 16384 B of workgroup memory), "
+                    "so this cell is a Vulkan-EXECUTION probe, not a defaults measurement "
+                    "— see bench_logs/vulkan_findings.md"
+                )
         except Exception as exc:
             return fail("vulkan shim", exc)    # -- checkpoint + config + ids -----------------------------------------
     _progress("load checkpoint")
@@ -2188,7 +2220,26 @@ def _xla_lines(records, out_dirs, digest) -> list[str]:
 
 
 def _vulkan_lines(records, out_dirs, digest) -> list[str]:
-    """Section 5c: the ``iree-vulkan`` leg — IREE's Vulkan HAL on **lavapipe**.
+    """Section 5c: every leg that runs on IREE's Vulkan HAL on **lavapipe**.
+
+    There are two: ``iree-vulkan`` (library defaults — ``opt_level="O3"``) and
+    ``iree-vulkan-o1`` (the same path with one hand-picked compile option). Each leg
+    gets its own table, and every table says whether the compile configuration was
+    the library default or hand-picked, so the two are never mistaken for each other.
+    """
+    lines: list[str] = []
+    for leg_key in VULKAN_LEGS:
+        if any(key[2] == leg_key for key in records):
+            lines.extend(_vulkan_leg_lines(records, out_dirs, digest, leg_key))
+    return lines
+
+
+#: The legs that execute on IREE's Vulkan HAL (lavapipe) — section 5c renders each.
+VULKAN_LEGS: tuple[str, ...] = ("iree-vulkan", "iree-vulkan-o1")
+
+
+def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
+    """One Vulkan leg's table in section 5c (``leg_key`` is ``iree-vulkan[-o1]``).
 
     lavapipe is Mesa's **software** Vulkan implementation running on the CPU, so these
     are Vulkan-path correctness/perf datapoints and never GPU numbers. Every number is
@@ -2198,9 +2249,31 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
     """
     lines: list[str] = []
     add = lines.append
-    cells = [key for key in _cell_order(records) if key[2] == "iree-vulkan"]
+    cells = [key for key in _cell_order(records) if key[2] == leg_key]
+    hand_picked = next(
+        (
+            (_record_at(records, *key) or {}).get("vulkan", {}).get(
+                "compile_options_hand_picked"
+            )
+            for key in cells
+            if (_record_at(records, *key) or {}).get("vulkan", {}).get(
+                "compile_options_hand_picked"
+            )
+        ),
+        None,
+    )
     add(
-        f"`{lib.leg_display('iree-vulkan')}` — the whole forward as ONE `etl_hf` graph on "
+        f"### `{leg_key}` — "
+        + (
+            "hand-picked "
+            + ", ".join(f"`{key}={value!r}`" for key, value in sorted(hand_picked.items()))
+            if hand_picked
+            else "library defaults (no hand-picked compile option)"
+        )
+    )
+    add("")
+    add(
+        f"`{leg_key}` — the whole forward as ONE `etl_hf` graph on "
         "IREE's **Vulkan** HAL. The only Vulkan device this host exposes is **lavapipe** "
         "(Mesa's software Vulkan implementation, `deviceType = CPU`), reached through the "
         "benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (`install()` widens "
@@ -2211,6 +2284,30 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
         "interpreter on the large models."
     )
     add("")
+    if hand_picked:
+        add(
+            f"**Compile configuration: HAND-PICKED** — `{leg_key}` passes "
+            + ", ".join(f"`{k}={v!r}`" for k, v in sorted(hand_picked.items()))
+            + " to the build. Everything else is the library default "
+            "(`target_backends=['vulkan-spirv']`, i.e. IREE's default Vulkan profile "
+            "`vp_android_baseline_2022`, `max_workgroup_memory_bytes = 16384`). The "
+            "library default `opt_level=\"O3\"` **cannot compile** the 124M-class graphs "
+            "for `vulkan-spirv` — `seq_len` 32 fails with `function "
+            "'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; "
+            "exceeded the limit of 16384 bytes` and `seq_len` 128 with `failed to "
+            "legalize operation 'vector.from_elements'` — so these cells exist only "
+            "under the hand-picked level. They are therefore **not** comparable with the "
+            f"`iree-vulkan` (defaults, `O3`) cells as a compile-setting-free measurement; "
+            "the two legs are kept apart for exactly that reason."
+        )
+        add("")
+    else:
+        add(
+            "**Compile configuration: library defaults** — no hand-picked flag "
+            "(the `opt_level` is whatever `etl_hf.pipeline.resolve_build_options` "
+            "resolves, `O3` for a non-ROCm target set)."
+        )
+        add("")
     device = next(
         (
             (_record_at(records, *key) or {}).get("vulkan")
@@ -2235,7 +2332,7 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
         add("")
     rows = []
     for model, seq_len in _matrix_cells(records):
-        record = _record_at(records, model, seq_len, "iree-vulkan")
+        record = _record_at(records, model, seq_len, leg_key)
         run = (record or {}).get("run") or {}
         best = _best_ms(record)
         d2h = (run.get("d2h") or {}).get("best_ms")
@@ -2293,7 +2390,7 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
     add("")
     add(
         "The three `×` columns are the **CPU-vs-CPU** comparison — `that leg's best ms / "
-        "iree-vulkan's best ms`, so **>1 means iree-vulkan is faster**. The three `(reused)` "
+        f"{leg_key}'s best ms`, so **>1 means {leg_key} is faster**. The three `(reused)` "
         "columns carry the raw best ms of the **real-GPU** records (measured before the AMD "
         "GPU of this host stopped accepting Vulkan/ROCm work; that hardware cannot be "
         "re-measured) shown for reference only: they are a GPU's numbers next to a software "
@@ -2303,14 +2400,14 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
     add("")
     parity = []
     for model, seq_len in _matrix_cells(records):
-        record = _record_at(records, model, seq_len, "iree-vulkan")
+        record = _record_at(records, model, seq_len, leg_key)
         if record is None or record.get("status") != "ok":
             continue
         numpy_stats, numpy_note = _leg_parity(
-            records, out_dirs, digest, model, seq_len, "iree-vulkan", "numpy-cpu"
+            records, out_dirs, digest, model, seq_len, leg_key, "numpy-cpu"
         )
         golden_stats, _golden_note = _leg_parity(
-            records, out_dirs, digest, model, seq_len, "iree-vulkan", "golden"
+            records, out_dirs, digest, model, seq_len, leg_key, "golden"
         )
         parity.append((model, seq_len, numpy_stats, numpy_note, golden_stats))
     if parity:
@@ -2388,7 +2485,7 @@ def _reproduction_lines(records) -> list[str]:
     add("#    (--verify-only: checks only, no installs; --force: recreate the venv)")
     add("# 2. run the benchmark phases — etl + etl_hf come from the checkout")
     add("export PYTHONPATH=\"$(git rev-parse --show-toplevel)\"")
-    if any(key[2] == "iree-vulkan" for key in records):
+    if any(key[2] in VULKAN_LEGS for key in records):
         add(
             f"export {lib.VULKAN_ICD_ENV}=/path/to/renamed-lavapipe-icd.json"
             "   # required by --phase vulkan; forwarded to the leg as VK_ICD_FILENAMES"
@@ -2494,6 +2591,9 @@ def _reproduction_lines(records) -> list[str]:
         "**software** Vulkan on the CPU, device-resident; needs the benchmark-only shim "
         "`bench_logs/hf_bench_vulkan.py` and `ETL_VULKAN_ICD` (forwarded as "
         "`VK_ICD_FILENAMES`)",
+        "iree-vulkan-o1": "the same Vulkan path with ONE hand-picked compile option, "
+        "`opt_level=\"O1\"` — the library default `O3` cannot translate the 124M-class "
+        "graphs for `vulkan-spirv`; a Vulkan-EXECUTION probe, not a defaults measurement",
         "xla-rocm": "PJRT/XLA on ROCm (needs `ETL_PJRT_PLUGIN`), device-resident",
         "xla-rocm-fp32": "the same with `dot_precision=\"HIGHEST\"` (true fp32 dot) — "
         "opt-in, `--legs` only",
@@ -2584,7 +2684,7 @@ def render_report(records, out_dirs) -> str:
         f"Harness git commit: `{git or 'unknown'}`."
     )
     add("")
-    if "iree-vulkan" in legs:
+    if set(legs) & set(VULKAN_LEGS):
         add(
             f"**`iree-vulkan` is `{lib.leg_display('iree-vulkan')}`** — Mesa's *software* "
             "Vulkan implementation, i.e. work executed on the CPU through a Vulkan driver. "
@@ -3021,10 +3121,10 @@ def render_report(records, out_dirs) -> str:
         ))
         add("")
     # ---- the Vulkan HAL leg ----------------------------------------------
-    if any(key[2] == "iree-vulkan" for key in ordered):
+    if any(key[2] in VULKAN_LEGS for key in ordered):
         add(
-            "## 5c. `iree-vulkan` — IREE's Vulkan HAL on **lavapipe** "
-            "(software Vulkan on the CPU)"
+            "## 5c. `iree-vulkan` / `iree-vulkan-o1` — IREE's Vulkan HAL on "
+            "**lavapipe** (software Vulkan on the CPU)"
         )
         add("")
         lines.extend(_vulkan_lines(records, out_dirs, digest))
@@ -3183,7 +3283,7 @@ def render_report(records, out_dirs) -> str:
         "`opt_level=\"O1\"`, llvm-cpu → `opt_level=\"O3\"` + `--iree-llvmcpu-target-cpu=host` + "
         "`--iree-opt-data-tiling`); the resolved set is recorded in every leg JSON."
     )
-    if "iree-vulkan" in legs:
+    if set(legs) & set(VULKAN_LEGS):
         add(
             "* The `iree-vulkan` leg needs the benchmark-only runtime shim "
             "`bench_logs/hf_bench_vulkan.py` (installed by the measuring path, never by the "
@@ -3319,8 +3419,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--phase",
         default=None,
         help="phase leg set(s): cpu = numpy-cpu,iree-llvmcpu,torch-cpu; "
-        "gpu = iree-rocm,xla-rocm,torch-rocm; vulkan = iree-vulkan (lavapipe, software "
-        "Vulkan on the CPU; needs $ETL_VULKAN_ICD) — run the phases separately, never "
+        "gpu = iree-rocm,xla-rocm,torch-rocm; vulkan = iree-vulkan,iree-vulkan-o1 "
+        "(lavapipe, software Vulkan on the CPU; needs $ETL_VULKAN_ICD; the -o1 leg "
+        "hand-picks opt_level=O1 so the 124M-class graphs compile) — run the phases "
+        "separately, never "
         "concurrently (the GPU is shared and a software-Vulkan leg would steal the CPU "
         "cores the cpu phase assumes)",
     )
