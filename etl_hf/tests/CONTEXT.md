@@ -52,7 +52,7 @@ Skip groups: torch/transformers absent (3), `iree` absent (19), `ETL_HF_BIG` uns
 `pytest` is not in the base uv env: `uv run --with pytest python -m pytest etl_hf/tests -q` (add `--extra iree` for the compiled path; `uv run --isolated --extra iree …` for GPU work — the base env has no iree, so `etl.devices()` shows only cpu).
 Take authoritative counts from `--junit-xml`: iree's nanobind teardown can abort at exit and swallow the `-q` summary; also export `PYTHONUNBUFFERED=1` on a GPU host so buffered diagnostics survive a redirect.
 Never assert timings (the GPU is shared): measured numbers live in module-level `MEASURED` dicts or assertion messages.
-Use `$TMPDIR` (never `/tmp`) for downloads and scratch files, and never write into `./bench_logs/` or `./etl/`.
+Use `$TMPDIR` (never `/tmp`) for scratch files, and never write into `./bench_logs/` or `./etl/`.
 
 ## Network and environment gates
 
