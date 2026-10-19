@@ -215,10 +215,11 @@ disk**, so leg order does not matter; a golden fixture whose `seq_len` differs f
 `--report` is a pure function of the JSON records + `parity_digest.json` + `hf_bench_env.json` (no
 torch, no iree, no measurement) and reproduces byte-identically.
 
-**Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 51 JSON leg
-records, the env artifact and one small `parity_digest.json` (~26 KB: the parity numbers
-`--report` would recompute from the dumps, per cell and reference). The 46 `*.logits.npz` dumps are
-**derived bulk** (~393 MB) and are `.gitignore`d — a bench run re-creates them (the driver then
+**Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 58 JSON leg
+records, the env artifact and one small `parity_digest.json` (~29 KB: the parity numbers
+`--report` would recompute from the dumps, per cell and reference). The `*.logits.npz` dumps are
+**derived bulk** (one per ok cell, output-sized, ~460 MB for the current matrix) and are `.gitignore`d
+— a bench run re-creates them (the driver then
 refreshes the digest automatically; `--parity-digest` does it by hand). `--report` therefore
 resolves every parity pair from the first available source: the dumps (recomputed, exactly like a
 fresh run) → the parity block the leg's own record stored at measure time → the committed digest
