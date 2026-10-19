@@ -10,9 +10,10 @@ covers, and the four functions a family module must implement::
     reference(cfg, params, input_ids) -> np.ndarray
 
 Adding a family is **one module plus one entry in** :data:`FAMILIES` — nothing
-else in the package needs to change (:mod:`etl_hf.build` and the public API read
-the registry, they never hard-code a family). The two v1 families live in
-:mod:`etl_hf.models.llama` and :mod:`etl_hf.models.gpt2`.
+else in the package needs to change (:mod:`etl_hf.program` /
+:mod:`etl_hf.pipeline` and the public API read the registry, they never
+hard-code a family). The two v1 families live in :mod:`etl_hf.models.llama` and
+:mod:`etl_hf.models.gpt2`.
 
 Two invariants are enforced at *import* time, so a drifted registry fails loudly
 instead of silently mis-routing a checkpoint:
@@ -36,11 +37,18 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from etl_hf import config as _config
-from etl_hf.errors import HFUnsupportedError
+from etl_hf.config import ModelConfig
+from etl_hf.errors import HFConfigError, HFUnsupportedError
 from etl_hf.models import gpt2 as _gpt2
 from etl_hf.models import llama as _llama
 
-__all__ = ["FAMILIES", "FamilySpec", "family_for_model_type", "get_family"]
+__all__ = [
+    "FAMILIES",
+    "FamilySpec",
+    "family_for_model_type",
+    "get_family",
+    "resolve_family",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,9 +191,42 @@ def get_family(name: str) -> FamilySpec:
     return spec
 
 
+def resolve_family(config: ModelConfig, family: str | None = None) -> FamilySpec:
+    """Resolve the family implementation for ``config``, honouring an override.
+
+    The one place the package turns "a config plus an optional family key" into
+    a :class:`FamilySpec`; :mod:`etl_hf.load`, :mod:`etl_hf.program` and
+    :mod:`etl_hf.pipeline` all go through it so the disagreement rule can never
+    drift between the loading half and the compute half.
+
+    Args:
+        config: the parsed model config (its ``family`` attribute is the
+            default).
+        family: optional explicit family key; ``None`` means ``config.family``.
+
+    Returns:
+        FamilySpec: the family implementation for ``config``.
+
+    Raises:
+        HFConfigError: ``family`` disagrees with ``config.family`` (never
+            silently re-interpret one config with another family's weight map).
+        HFUnsupportedError: ``family`` (or ``config.family``) is not a
+            registered family.
+    """
+    if family is None:
+        return get_family(config.family)
+    spec = get_family(family)
+    if spec.name != config.family:
+        raise HFConfigError(
+            f"family={spec.name!r} was requested, but this config's model_type "
+            f"{config.model_type!r} belongs to family {config.family!r}; pass "
+            f"family={config.family!r} or load a config for {spec.name!r}"
+        )
+    return spec
+
+
 def family_for_model_type(model_type: str) -> FamilySpec:
     """Resolve an HF ``model_type`` string (e.g. ``"mistral"``) to its family.
-
     Delegates the mapping to :data:`etl_hf.config.FAMILY_BY_MODEL_TYPE` — the
     same table :meth:`ModelConfig.from_dict` uses — so registry lookups and
     config parsing can never disagree.
