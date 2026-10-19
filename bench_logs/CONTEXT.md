@@ -256,8 +256,8 @@ The throwaway venv (`$TMPDIR/hfbench-venv`) is mandatory: torch must NEVER enter
 `hf_bench_env.py` is idempotent (`--verify-only`, `--force`) and records every version, install
 command and the required env vars in `hf_bench_env.json`, which section 1 of the report renders.
 
-Measured state of the committed matrix (58 cells: 5 models × seq_len 32, `distilgpt2`/`gpt2` also at
-128, across the legs listed above — 48 ok, 10 not ok; best-of-5 warm, batch 1; full tables and every
+Measured state of the committed matrix (65 cells: 5 models × seq_len 32, `distilgpt2`/`gpt2` also at
+128, across the legs listed above — 54 ok, 11 not ok; best-of-5 warm, batch 1; full tables and every
 ratio in `./hf_bench_results.md`):
 - **xla/rocm is the fastest leg on every measured model** — 7.18×–9.99× torch-rocm (`gpt2` s128
   0.736 ms vs 5.286; `gpt2` s32 0.694 vs 5.277; `distilgpt2` s128 0.399 vs 3.074) and 21.6×–35.6×
