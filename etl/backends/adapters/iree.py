@@ -1732,7 +1732,7 @@ class IreeExecutable(CompilerExecutable):
     """IREE runtime executable (satisfies the backend ``Executable`` protocol).
 
     Runs the compiled VM module on the acquired IREE HAL device (``local-task``
-    CPU, ``cuda`` or ``rocm``/``hip`` GPU):
+    CPU, or a ``cuda`` / ``rocm``/``hip`` / ``vulkan`` GPU-class device):
 
     1. Validate flat inputs against the recorded ``Signature``: count
        (``core.BackendError``), per-input dtype (``core.BackendError``),
