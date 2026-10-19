@@ -327,6 +327,31 @@ Facts pinned by this matrix (all measured, nothing extrapolated):
    place_ids(...))`; `run.api` records it. No raw `etl.run` short-circuit is needed (the ids
    tensor reaches `run` as a metadata-validated `etl.Tensor`, never copied to the host).
 
+## `hf_bench_vulkan.py` + `vulkan_findings.md` — `etl_hf` public build/run on IREE Vulkan (lavapipe)
+
+`./hf_bench_vulkan.py` is a **benchmark-only runtime shim** (never a library change; nothing under
+`./etl/`, `./etl_hf/`, `./tests/` knows it exists). `install()` monkeypatch-widens exactly eight gates
+in the live etl modules — compile-target whitelist (`iree.py:1071`), artifact label (`:460`),
+`_GPU_DEVICE_KINDS` (`:486`), the vulkan device-id resolution (`:536`), the CUDA staging tier
+(`:1817`), the load device-kind whitelist + `expected_target` (`:1326`/`:1346`) and the transfer-provider
+registration (`:2907`), plus `pipeline.py:405` device→`["vulkan-spirv"]` inference — and exposes
+`patched_sites()` / `device_info()` / `--check` (self-check, no model). Deliberately not patched:
+`core/device.py devices()`, `iree.py:1417 _load_segments`, `etl_hf/pipeline.py:193`, `etl.io`.
+
+Device recipe (both files document it): Mesa **lavapipe** (software, device name
+`lavapipe (LLVM 20.1.2, 256 bits)`, apiVersion 1.4.318, Mesa 25.2.8, vendorID 0x10005) reached
+through a byte-patched `libvulkan_lvp.so` + ICD json — IREE 3.11 hard-denylists `llvmpipe*` names, so
+`VK_ICD_FILENAMES` must point at `$TMPDIR/vk-lvp/lavapipe_icd.json` (also prevents the loader from
+dlopening the wedged radeon ICD). Its `device_id` is a per-process UUID hash, never `index+1`.
+Throwaway venv `$TMPDIR/vk-venv` (iree-base-compiler/runtime 3.11 + numpy, CPython 3.14.8) with
+`etl`/`etl_hf` from the checkout via `PYTHONPATH`; `os._exit(0)` avoids the py3.14 nanobind exit dump.
+
+Measured (`tiny_llama` s32, packed, warmup 2 + best-of-5, two processes): build 954–994 ms, first call
+9.8 ms warm-process / 655 ms cold, **best warm 1.53–1.79 ms/call**, +d2h 3.29–3.49 ms,
+`asdevicearray` **0**; parity vs the numpy oracle and the torch golden max_abs **8.94e-08**
+(rel-to-absmax 2.1e-07 / 2.6e-07), argmax agreement **1.0**, bit-identical across runs. Lavapipe is
+CPU software — a Vulkan-path correctness/perf datapoint, never a GPU number.
+
 ## Known gotchas
 
 - MI300X/ROCm runs of anything touching a PJRT client abort at process exit
