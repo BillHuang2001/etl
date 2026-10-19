@@ -301,7 +301,7 @@ def _l2norm_numpy(x):
     return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
 ```
 
-The numpy backend keeps a registered impl as a `block_call` and dispatches it; other backends inline the portable. Compiler adapters declare `custom_blocks=False` in v1 and reject the graph with an explicit `BackendError` — never a silent reinterpretation.
+The numpy backend keeps a registered impl as a `block_call` and dispatches it, and inlines the portable when a block has no numpy impl. Compiler adapters declare `custom_blocks=False` in v1 and reject a block graph with an explicit `BackendError` — never a silent reinterpretation.
 
 ### Inspectable and persistable graphs
 
@@ -368,7 +368,7 @@ Where the compilers have something to work with the gap is large; where the grap
 | `nbody` | 41.0 ms | 42.9 ms | 0.31 ms |
 | `vmap_elementwise` | 0.016 ms | 0.036 ms | 0.120 ms |
 
-Whole-model HuggingFace forward as one graph (`etl_hf`, device-resident loop, same GPU): **xla/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and **iree/rocm in 5/6 (0.73×–9.13×)**; both are 3.4×–33.5× faster than torch-cpu there. Three honest caveats:
+Whole-model HuggingFace forward as one graph (`etl_hf`, device-resident loop, same GPU): **xla/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and **iree/rocm in 5/6 (0.73×–9.13×)**; both are 3.4×–35.6× faster than torch-cpu there. Three honest caveats:
 
 - **CPU numpy/OpenBLAS still wins large CPU matmuls.** `gpt2` at `seq_len=32`: 28.9 ms interpreted vs 403 ms on iree-llvm-cpu. A compiler's value here is the accelerator, not the CPU.
 - **Sub-millisecond steps are dispatch-bound.** The per-call host floor is ~0.13 ms on cuda and ~0.15–0.45 ms for small ROCm steps, so a 0.03 ms graph loses to torch eager regardless of codegen quality; the same cells narrow to 0.62–0.76× at larger sizes.
@@ -400,8 +400,8 @@ oracle = etl_hf.reference_logits(cfg, params, ids)    # independent pure-numpy o
 ```
 
 - **Families:** `llama` (also `mistral`/`qwen2` — RMSNorm, RoPE, GQA, SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions, `gelu_new`, tied head).
-- **Parity** against real `torch`/`transformers` logits on five checkpoints: ≤1.5e-4 max-abs on the 124M models (≈1e-6 relative) — fp32 accumulation order only.
-- **Device-resident on ROCm:** place weights and ids once (`place_params`/`place_ids`) and feed the device outputs back in; re-placing weights per call measured 10–56× slower.
+- **Parity** against real `torch`/`transformers` logits on five checkpoints: ≤4e-4 max-abs on the 124M models' fp32 legs (≈1e-6–3e-6 relative) — fp32 accumulation order only.
+- **Device-resident on ROCm:** place weights and ids once (`place_params`/`place_ids`) and feed the device outputs back in; re-placing weights per call measured 2.4×–11.7× slower.
 - **Opt-in weight packing** (`pack_weights=True`, `pack_params`) collapses the weight tree into ~4 graph inputs — bit-identical, and it works around IREE's llvm-cpu SIGSEGV above ~161 distinct inputs (an unpacked 124M model has 196).
 - **Deferred by design:** exact-`erf` GELU configs are numpy-only (`erf` is a StableHLO v1 deferral); dynamic shapes, kv-cache/incremental decode and generation loops are out of scope — this is the forward graph, not a serving stack.
 
@@ -470,10 +470,10 @@ Test suite: **6797 collected — 6716 passed, 81 skipped, 3 xfailed, 0 failed** 
 
 - Vectorizing control-flow regions; `conv` VJP (there is no transposed-conv op); symbolic-length `scan`.
 - `linalg.inv`, `norm` beyond vector norms, `det`; non-constant `pad` modes; symbolic-bound `arange`/`linspace`.
-- StableHLO export deferrals: `cumsum`, `cumprod`, `diagonal`, `erf`/`gelu`, `tril`/`triu`, `flip`, `roll`, `nan_to_num`, `random_multinomial`, and the linalg factorizations `cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp` (`eigh` is v1 via a cyclic-Jacobi while-loop composition).
+- StableHLO export deferrals: `cumsum`, `cumprod`, `diagonal`, `erf`/`gelu`, `tril`/`triu`, `flip`, `roll`, `nan_to_num`, `random_multinomial`, and the linalg `solve`/`cholesky`/`qr`/`matrix_rank`/`svd`/`matrix_exp` (`eigh` is v1 via a cyclic-Jacobi while-loop composition).
 - Sparse on compiler backends (densify with `etl.sparse.to_dense`), `sparse@sparse` matmul, sparse constants, whole-sparse `bind`.
 - Collectives and `runtime_call` are not compiled by any adapter in v1 (multi-rank runtime channels are not wired).
-- Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and reductions over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
+- Dynamic dims are supported per-op by the exporter, not universally: reshape/slice/pad/conv and `reduce_mean` over a dynamic reduced dim are rejected at `lower()` time with a clear `BackendError` (which is why vmap of softmax/layernorm/attention-style per-sample functions defers on compiler backends, while the numpy backend handles every symbolic shape).
 - `vmap`/`grad`/`jvp`/`vjp` have no rules for the random family and for ops without a registered rule → `TransformError`, never a Python-loop fallback.
 
 **The guarantee: a deferral is an explicit `BackendError` (or `TransformError`) naming the op and suggesting the remedy — never a silent fallback.**
