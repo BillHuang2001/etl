@@ -3,7 +3,7 @@
 ## Intent
 
 Colocated tests for `etl_hf`: a separate top-level distribution, so they live here rather than under `./tests/`, which mirrors `etl` only (`pyproject.toml` `testpaths = ["tests", "etl_hf/tests"]`, package list `include = ["etl*"]`, `etl_hf.tests` excluded).
-The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: a loading half (`etl_hf.load`), a compute-function half (`etl_hf.program`), a staging half (`etl_hf.pipeline`), joined only by ordinary values (`ModelConfig`, a host params dict, an `@etl.defn` forward, an `Executable`).
+The suite pins the **external** contracts — config parsing, checkpoint reading, canonicalisation, graph assembly, whole-graph export, compiled parity, parity against an independent oracle — plus the **functional shape** of the API: `etl_hf.load` (checkpoint → config + params), `etl_hf.program` (the memoised `@etl.defn` forward + specs + oracle), `etl_hf.pipeline` (build/run/predict/placement), joined only by ordinary values (`ModelConfig`, a host params dict, a forward, an `Executable`).
 Everything is offline and numpy-only by default (no torch, no compiler), so the contract verifies on a bare `uv run --with pytest` install; only the guarded checkpoint readers touch the network.
 
 ## Counts (default env: torch/transformers and iree absent, checkpoint + golden caches present)
