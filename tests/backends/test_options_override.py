@@ -203,7 +203,12 @@ def test_adapter_known_options_declarations():
             }
         ),
         "compile": frozenset(
-            {"target_backends", "iree_compile_args", "opt_level"}
+            {
+                "target_backends",
+                "iree_compile_args",
+                "opt_level",
+                "vulkan_target",
+            }
         ),
         "load": frozenset({"iree_runtime_args"}),
         "run": frozenset(),
