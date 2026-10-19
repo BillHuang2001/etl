@@ -88,7 +88,7 @@ Any non-empty `rope_scaling` (YaRN / linear / dynamic NTK) is rejected at **conf
 An unexpected (unconsumed) checkpoint key, a shape that disagrees with the config, a missing required key (with difflib near-miss suggestions) and a foreign-family `ModelConfig` are all `HFWeightError` / `HFConfigError`.
 
 **gpt2** (`FAMILY = "gpt2"`, registry `model_types` derived from `etl_hf.config.FAMILY_BY_MODEL_TYPE` = `("gpt2",)`, which is what `openai-community/gpt2` and `distilgpt2` both declare) covers LayerNorm + learned positions + `gelu_new` + tied head.
-Its compact HF keys are normalised in `etl_hf/config.py`: `n_embd` → `hidden_size`, `n_head` → `num_attention_heads`, `n_layer` → `num_hidden_layers`, `n_positions` → `max_position_embeddings`, `n_vocab` → `vocab_size`, `n_inner` → `intermediate_size` (`null` → `4·n_embd`), `layer_norm_epsilon` → `layer_norm_eps` (default `1e-5`), `activation_function` → `hidden_act` (default `gelu_new`), `tie_word_embeddings` default `True`.
+Its compact HF keys (`n_embd`/`n_head`/`n_layer`/`n_positions`/`n_vocab`/`n_inner`/`layer_norm_epsilon`/`activation_function`) are normalised in `etl_hf/config.py`, which owns that mapping and its defaults (`n_inner` `null` → `4·n_embd`, eps `1e-5`, `hidden_act` `gelu_new`, `tie_word_embeddings` `True`).
 GPT-2 has neither GQA nor MQA (`num_key_value_heads == num_attention_heads`), no RoPE (`rope_theta is None`) and no per-head override (`head_dim` always `hidden_size // num_attention_heads`).
 `canonicalize_weights` ends with a completeness assertion against its own shape table (`_assert_complete`), so an internal key-set drift fails loudly instead of handing the tracer a surprise.
 
