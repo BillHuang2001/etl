@@ -1310,12 +1310,582 @@ def _parity_table_lines(records, out_dirs) -> list[str]:
                     leg_key,
                     label,
                     lib.fmt(stats["max_abs"]),
-                    lib.fmt(stats["rel_to_absmax"]),
+                    _fmt_sci(stats["rel_to_absmax"]),
                     lib.fmt(stats["argmax_agreement"]),
                     "",
                 ]
             )
     return rows
+
+
+def _matrix_cells(records) -> list[tuple[str, int]]:
+    """Measured ``(model, seq_len)`` cells in deterministic order."""
+    cells: list[tuple[str, int]] = []
+    for model, seq_len, _leg_key in _cell_order(records):
+        if (model, seq_len) not in cells:
+            cells.append((model, seq_len))
+    return cells
+
+
+def _packed_cell(record) -> str:
+    """``packed`` / ``unpacked`` / ``—`` for one record."""
+    pack = ((record or {}).get("leg") or {}).get("pack") or {}
+    if not pack:
+        return "—"
+    return "packed" if pack.get("packed") else "unpacked"
+
+
+def _ratio(numerator, denominator) -> float | None:
+    """``numerator / denominator`` or ``None`` when either side is absent/zero."""
+    if not numerator or not denominator:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _fmt_sci(value) -> str:
+    """A relative error with three significant digits (``2.04e-03``), else ``—``."""
+    if value is None:
+        return "—"
+    return f"{float(value):.2e}"
+
+
+def _missing_reason(record) -> str:
+    """Why a leg has no number: the recorded error, else ``no record on disk``."""
+    if record is None:
+        return "no record on disk for this cell"
+    return _status_reason(record)
+
+
+def _leg_parity(out_dirs, model, seq_len, leg_key, reference_logits, reference_note=""):
+    """Parity stats of one leg's saved logits against one reference array.
+
+    Returns ``(stats_or_None, note)``; the note explains a ``—`` cell (missing
+    logits, a reference that was not run, or a shape mismatch) and is empty when
+    the stats are present.  Recomputed from the ``.npz`` files, exactly like the
+    parity table, so leg execution order never matters.
+    """
+    candidate, _candidate_path = _reference_from_disk(out_dirs, model, seq_len, leg_key)
+    if candidate is None:
+        return None, f"no saved logits for `{leg_key}`"
+    if reference_logits is None:
+        return None, reference_note or "no reference"
+    stats = lib.compare_logits(candidate, reference_logits)
+    if not stats.get("comparable"):
+        return None, str(stats.get("reason") or reference_note or "not comparable")
+    return stats, ""
+
+
+def _golden_logits(model, seq_len):
+    """The torch/transformers golden **when its ids shape matches** this cell."""
+    golden, reason = lib.golden_reference(model, seq_len)
+    if golden is None:
+        return None, reason
+    return golden["logits"], "golden fixture (torch/transformers oracle)"
+
+
+def _numpy_logits(out_dirs, model, seq_len):
+    """The numpy-interpreter leg's logits, or ``(None, reason)``."""
+    array, _path = _reference_from_disk(out_dirs, model, seq_len, "numpy-cpu")
+    if array is None:
+        return None, "no saved logits for the numpy-cpu leg"
+    return array, "numpy-cpu leg"
+
+
+def _headline_lines(records, out_dirs) -> list[str]:
+    """Headline: accelerator legs vs both PyTorch baselines, and vs the CPU legs.
+
+    Every number is read from a record and every ratio is computed here; a cell
+    whose leg was not measured renders ``—`` with the reason in the note column.
+    """
+    lines: list[str] = []
+    add = lines.append
+    add("**Accelerator legs vs the PyTorch baselines** (best warm ms; "
+        "`×torch-*` = `torch best ms / this leg's best ms`, so **>1 is faster**):")
+    add("")
+    rows = []
+    for model, seq_len in _matrix_cells(records):
+        torch_cpu = _best_ms(_record_at(records, model, seq_len, "torch-cpu"))
+        torch_rocm = _best_ms(_record_at(records, model, seq_len, "torch-rocm"))
+        row = [model, seq_len, lib.fmt(torch_cpu), lib.fmt(torch_rocm)]
+        notes = []
+        for leg_key in ("iree-rocm", "xla-rocm", "xla-rocm-fp32"):
+            record = _record_at(records, model, seq_len, leg_key)
+            best = _best_ms(record)
+            row.extend(
+                [lib.fmt(best), lib.fmt_ratio(_ratio(torch_rocm, best)),
+                 lib.fmt_ratio(_ratio(torch_cpu, best))]
+            )
+            if best is None:
+                notes.append(f"`{leg_key}`: {_missing_reason(record)}")
+        row.append("; ".join(notes))
+        rows.append(row)
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "torch-cpu ms",
+            "torch-rocm ms",
+            "iree-rocm ms",
+            "iree-rocm ×torch-rocm",
+            "iree-rocm ×torch-cpu",
+            "xla-rocm ms",
+            "xla-rocm ×torch-rocm",
+            "xla-rocm ×torch-cpu",
+            "xla-rocm-fp32 ms",
+            "fp32 ×torch-rocm",
+            "fp32 ×torch-cpu",
+            "note / reason",
+        ],
+        rows,
+    ))
+    add("")
+    add("**Accelerator vs CPU legs** (the same measured cells; the CPU columns are "
+        "host-resident paths, the last columns say how much the GPU buys):")
+    add("")
+    rows = []
+    for model, seq_len in _matrix_cells(records):
+        numpy_cpu = _best_ms(_record_at(records, model, seq_len, "numpy-cpu"))
+        llvm = _best_ms(_record_at(records, model, seq_len, "iree-llvmcpu"))
+        torch_cpu = _best_ms(_record_at(records, model, seq_len, "torch-cpu"))
+        accelerators = [
+            (leg_key, _best_ms(_record_at(records, model, seq_len, leg_key)))
+            for leg_key in ("iree-rocm", "xla-rocm", "xla-rocm-fp32")
+        ]
+        accelerators = [(key, value) for key, value in accelerators if value]
+        if accelerators:
+            fastest_key, fastest_ms = min(accelerators, key=lambda item: (item[1], item[0]))
+        else:
+            fastest_key, fastest_ms = "—", None
+        rows.append(
+            [
+                model,
+                seq_len,
+                lib.fmt(numpy_cpu),
+                lib.fmt(llvm),
+                lib.fmt(torch_cpu),
+                fastest_key,
+                lib.fmt(fastest_ms),
+                lib.fmt_ratio(_ratio(numpy_cpu, fastest_ms)),
+                lib.fmt_ratio(_ratio(llvm, fastest_ms)),
+                lib.fmt_ratio(_ratio(torch_cpu, fastest_ms)),
+            ]
+        )
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "numpy-cpu ms",
+            "iree-llvmcpu ms",
+            "torch-cpu ms",
+            "fastest accelerator leg",
+            "its best ms",
+            "it ×numpy-cpu",
+            "it ×iree-llvmcpu",
+            "it ×torch-cpu",
+        ],
+        rows,
+    ))
+    add("")
+    # ---- computed bullets -------------------------------------------------
+    for leg_key in ("iree-rocm", "xla-rocm"):
+        ratios = []
+        for model, seq_len in _matrix_cells(records):
+            base = _best_ms(_record_at(records, model, seq_len, "torch-rocm"))
+            best = _best_ms(_record_at(records, model, seq_len, leg_key))
+            ratio = _ratio(base, best)
+            if ratio is not None:
+                ratios.append((model, seq_len, ratio))
+        if not ratios:
+            continue
+        wins = sum(1 for _m, _s, ratio in ratios if ratio > 1)
+        fastest = max(ratios, key=lambda item: (item[2], item[0], item[1]))
+        slowest = min(ratios, key=lambda item: (item[2], item[0], item[1]))
+        add(
+            f"* `{leg_key}` vs `torch-rocm`: faster in **{wins}/{len(ratios)}** measured "
+            f"cells; range {lib.fmt_ratio(slowest[2])} (`{slowest[0]}` s{slowest[1]}) to "
+            f"{lib.fmt_ratio(fastest[2])} (`{fastest[0]}` s{fastest[1]})."
+        )
+    # xla default (TF32-class) vs the opt-in true-fp32 variant.
+    fp32_rows = []
+    for model, seq_len in _matrix_cells(records):
+        default_ms = _best_ms(_record_at(records, model, seq_len, "xla-rocm"))
+        fp32_ms = _best_ms(_record_at(records, model, seq_len, "xla-rocm-fp32"))
+        cost = _ratio(fp32_ms, default_ms)
+        if cost is None:
+            continue
+        golden, _note = _golden_logits(model, seq_len)
+        default_stats, _default_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm", golden
+        )
+        fp32_stats, _fp32_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm-fp32", golden
+        )
+        fp32_rows.append((model, seq_len, cost, default_stats, fp32_stats))
+    if fp32_rows:
+        costs = [row[2] for row in fp32_rows]
+        add(
+            f"* `xla-rocm-fp32` (`dot_precision=\"HIGHEST\"`) costs "
+            f"{lib.fmt_ratio(min(costs))}–{lib.fmt_ratio(max(costs))} of the default "
+            "`xla-rocm` latency across the "
+            f"{len(fp32_rows)} measured pair(s) — see section 6b for the precision it buys."
+        )
+    add("")
+    return lines
+
+
+def _xla_lines(records, out_dirs) -> list[str]:
+    """Section 6b: what the (first) xla/ROCm legs of ``etl_hf`` measured."""
+    lines: list[str] = []
+    add = lines.append
+    add(
+        "These are the **first `etl_hf` runs on the XLA backend**: the `etl` `xla` "
+        "adapter drives a user-provided PJRT plugin over the PJRT C API (ctypes, no "
+        "jax/jaxlib import), and the harness added purpose-built `xla-rocm` / "
+        "`xla-rocm-fp32` legs for them. Every `xla` cell below is **device-resident** on "
+        "`Device(\"rocm\", 0)` — weights and ids are placed once and the measured loop "
+        "feeds the same device tensors, so no per-call host staging happens (the "
+        "`asdevicearray` column of section 5 is `0` for each of them). The plugin "
+        "aborts at interpreter exit *after* the work succeeds, so the leg process "
+        "leaves through `os._exit(0)` once its record is on disk."
+    )
+    add("")
+    # ---- coverage --------------------------------------------------------
+    add("**Which models work on xla/ROCm, and which do not** "
+        "(one row per measured `(model, seq_len)` cell):")
+    add("")
+    rows = []
+    failures: list[tuple[str, int, str, str]] = []
+    for model, seq_len in _matrix_cells(records):
+        record = _record_at(records, model, seq_len, "xla-rocm")
+        build = (record or {}).get("build") or {}
+        run = (record or {}).get("run") or {}
+        status = lib.status_cell(record)
+        note = _missing_reason(record) if (record is None or record.get("status") != "ok") else "ok"
+        rows.append(
+            [
+                model,
+                seq_len,
+                _packed_cell(record),
+                status,
+                lib.fmt(build.get("build_total_ms")),
+                lib.fmt(run.get("first_call_ms")),
+                note,
+            ]
+        )
+        if record is not None and record.get("status") != "ok":
+            for message in record.get("errors") or ["no error message recorded"]:
+                failures.append((model, seq_len, "xla-rocm", str(message)))
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "weights",
+            "xla-rocm status",
+            "build total ms",
+            "first call ms",
+            "note / reason",
+        ],
+        rows,
+    ))
+    add("")
+    if failures:
+        add("The exact error(s), verbatim from the records:")
+        add("")
+        for model, seq_len, leg_key, message in failures:
+            add(f"**`{model}` s{seq_len} `{leg_key}`**")
+            add("")
+            add("```")
+            lines.extend(message.splitlines() or [""])
+            add("```")
+            add("")
+    # ---- build cost ------------------------------------------------------
+    add("**Build cost of the xla path** (`etl_hf.build` = trace → lower → compile → "
+        "load, library defaults; `iree-rocm` is the other device-resident compiled path "
+        "on the same cells):")
+    add("")
+    rows = []
+    for model, seq_len in _matrix_cells(records):
+        xla_record = _record_at(records, model, seq_len, "xla-rocm")
+        iree_record = _record_at(records, model, seq_len, "iree-rocm")
+        xla_build = ((xla_record or {}).get("build") or {}).get("build_total_ms")
+        iree_build = ((iree_record or {}).get("build") or {}).get("build_total_ms")
+        rows.append(
+            [
+                model,
+                seq_len,
+                _packed_cell(xla_record),
+                lib.fmt(xla_build),
+                lib.fmt(iree_build),
+                lib.fmt_ratio(_ratio(xla_build, iree_build)),
+                lib.fmt(((xla_record or {}).get("run") or {}).get("first_call_ms")),
+                lib.fmt(((iree_record or {}).get("run") or {}).get("first_call_ms")),
+            ]
+        )
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "weights",
+            "xla-rocm build total ms",
+            "iree-rocm build total ms",
+            "xla ÷ iree",
+            "xla first call ms",
+            "iree first call ms",
+        ],
+        rows,
+    ))
+    add("")
+    # ---- TF32 caveat -----------------------------------------------------
+    add("**TF32 caveat — the default `xla-rocm` leg vs the opt-in true-fp32 leg** "
+        "(`xla-rocm-fp32` is byte-identical apart from `dot_precision=\"HIGHEST\"`). "
+        "XLA/ROCm runs fp32 `dot` at TF32-class precision (10-bit mantissa) by default, "
+        "which visibly degrades parity; the opt-in leg restores true fp32 at a measured "
+        "latency cost. Both are presented as measured — neither is averaged away. "
+        "`rel_to_absmax`/`argmax` are vs the torch/transformers golden where its ids "
+        "shape matches the cell (otherwise `—` with the reason), and vs the numpy "
+        "interpreter leg always:")
+    add("")
+    rows = []
+    for model, seq_len in _matrix_cells(records):
+        default_record = _record_at(records, model, seq_len, "xla-rocm")
+        fp32_record = _record_at(records, model, seq_len, "xla-rocm-fp32")
+        default_ms = _best_ms(default_record)
+        fp32_ms = _best_ms(fp32_record)
+        golden, golden_note = _golden_logits(model, seq_len)
+        numpy_logits, _numpy_note = _numpy_logits(out_dirs, model, seq_len)
+        default_golden, _default_golden_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm", golden, golden_note
+        )
+        fp32_golden, _fp32_golden_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm-fp32", golden, golden_note
+        )
+        default_numpy, _default_numpy_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm", numpy_logits, "numpy-cpu leg"
+        )
+        fp32_numpy, _fp32_numpy_note = _leg_parity(
+            out_dirs, model, seq_len, "xla-rocm-fp32", numpy_logits, "numpy-cpu leg"
+        )
+        notes = [
+            f"golden: {golden_note}" if golden is None else "",
+            "" if fp32_record is not None else "`xla-rocm-fp32`: no record on disk",
+        ]
+        rows.append(
+            [
+                model,
+                seq_len,
+                _packed_cell(default_record),
+                lib.fmt(default_ms),
+                _fmt_sci(default_golden["rel_to_absmax"]) if default_golden else "—",
+                lib.fmt(default_golden["argmax_agreement"]) if default_golden else "—",
+                _fmt_sci(default_numpy["rel_to_absmax"]) if default_numpy else "—",
+                lib.fmt(fp32_ms),
+                _fmt_sci(fp32_golden["rel_to_absmax"]) if fp32_golden else "—",
+                lib.fmt(fp32_golden["argmax_agreement"]) if fp32_golden else "—",
+                _fmt_sci(fp32_numpy["rel_to_absmax"]) if fp32_numpy else "—",
+                lib.fmt_ratio(_ratio(fp32_ms, default_ms)),
+                " · ".join(note for note in notes if note),
+            ]
+        )
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "weights",
+            "xla-rocm ms",
+            "xla-rocm rel (golden)",
+            "xla-rocm argmax",
+            "xla-rocm rel (numpy)",
+            "xla-rocm-fp32 ms",
+            "fp32 rel (golden)",
+            "fp32 argmax",
+            "fp32 rel (numpy)",
+            "fp32 ÷ default ms",
+            "note",
+        ],
+        rows,
+    ))
+    add("")
+    add(
+        "A `—` in a golden column means the golden's `input_ids` shape does not match "
+        "that cell (the fixtures are `(1, 8)` for the tiny models and `(1, 32)` for "
+        "`distilgpt2`/`gpt2`), never that parity was good: the numpy-interpreter column "
+        "is then the reference."
+    )
+    add("")
+    return lines
+
+
+def _protocol_flags(records, leg_keys, models, seq_len) -> str:
+    """The recorded ``--warmup/--repeat`` flags of a group of cells, when uniform."""
+    seen = set()
+    for model in models:
+        for leg_key in leg_keys:
+            record = _record_at(records, model, seq_len, leg_key)
+            measurement = (record or {}).get("measurement") or {}
+            if measurement.get("warmup") is None or measurement.get("repeat") is None:
+                continue
+            seen.add((int(measurement["warmup"]), int(measurement["repeat"])))
+    if len(seen) != 1:
+        return ""
+    warmup, repeat = seen.pop()
+    return f" --warmup {warmup} --repeat {repeat}"
+
+
+def _reproduction_lines(records) -> list[str]:
+    """Section 8: env provisioning, the per-phase commands, leg definitions, protocol."""
+    lines: list[str] = []
+    add = lines.append
+    add("Re-provision the throwaway bench environment (idempotent; never the repo "
+        "`.venv`) and re-run the phases from it:")
+    add("")
+    add("```bash")
+    add("# 1. provision + verify the isolated venv ($TMPDIR/hfbench-venv) and write the")
+    add("#    environment/version table the report's section 1 reads")
+    add(f"python3 bench_logs/hf_bench_env.py --out bench_logs/{lib.ENV_JSON_NAME}")
+    add("#    (--verify-only: checks only, no installs; --force: recreate the venv)")
+    add("# 2. run the benchmark phases — etl + etl_hf come from the checkout")
+    add("export PYTHONPATH=\"$(git rev-parse --show-toplevel)\"")
+    phase_commands: list[str] = []
+    for phase in sorted(lib.PHASES):
+        phase_legs = set(lib.PHASES[phase])
+        cells = sorted({(key[0], key[1]) for key in records if key[2] in phase_legs})
+        by_seq: dict[int, list[str]] = {}
+        for model, seq_len in cells:
+            by_seq.setdefault(seq_len, []).append(model)
+        for seq_len in sorted(by_seq):
+            models = [model for model in lib.MODELS if model in by_seq[seq_len]]
+            models += sorted(set(by_seq[seq_len]) - set(models))
+            phase_commands.append(
+                f"$TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --phase {phase} "
+                f"--models {','.join(models)} --seq-lens {seq_len}"
+                + _protocol_flags(records, sorted(phase_legs), models, seq_len)
+            )
+    for command in phase_commands:
+        add(command)
+    # Extra (non-phase) legs, derived from the legs actually present on disk.
+    extra: list[str] = []
+    for leg_key in lib.LEG_ORDER:
+        if any(leg_key in legs for legs in lib.PHASES.values()):
+            continue
+        cells = sorted({(key[0], key[1]) for key in records if key[2] == leg_key})
+        if not cells:
+            continue
+        by_seq: dict[int, list[str]] = {}
+        for model, seq_len in cells:
+            by_seq.setdefault(seq_len, []).append(model)
+        for seq_len in sorted(by_seq):
+            models = [model for model in lib.MODELS if model in by_seq[seq_len]]
+            models += sorted(set(by_seq[seq_len]) - set(models))
+            extra.append(
+                f"$TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --legs {leg_key} "
+                f"--models {','.join(models)} --seq-lens {seq_len}"
+                + _protocol_flags(records, [leg_key], models, seq_len)
+            )
+    if extra:
+        add("# extra legs (not part of --phase): " + ", ".join(lib.sort_legs(
+            {key[2] for key in records
+             if key[2] not in {leg for legs in lib.PHASES.values() for leg in legs}}
+        )))
+        for command in extra:
+            add(command)
+    add("# 3. render this markdown from the records only (no torch, no iree, no measuring)")
+    add("$TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --report "
+        "--out bench_logs/hf_bench_data --report-out bench_logs/hf_bench_results.md")
+    add("```")
+    add("")
+    add("* `--report` is a pure function of the JSON/`.npz` records plus "
+        f"`bench_logs/{lib.ENV_JSON_NAME}`: no torch, no iree, no measurement and no "
+        "wall-clock content, so re-running it reproduces this file byte-identically.")
+    add("* The commands above are the leg sets the records on disk came from: one "
+        "subprocess per `(model, seq_len, leg)`, so a crash or an interpreter-exit "
+        "abort costs that cell only (its record/error record still lands).")
+    add("")
+    add("**Timing protocol.** `--warmup 2 --repeat 5` (two warmup calls, then five "
+        "measured calls; `best`/`median`/`mean`/`stdev` over those five, plus `first` "
+        "for the very first call). Per-leg values actually recorded:")
+    add("")
+    rows = []
+    for leg_key in lib.sort_legs([key[2] for key in records]):
+        seen = []
+        for key in _cell_order(records):
+            if key[2] != leg_key:
+                continue
+            measurement = (_record_at(records, *key) or {}).get("measurement") or {}
+            value = (
+                measurement.get("warmup"),
+                measurement.get("repeat"),
+                measurement.get("batch"),
+            )
+            if value not in seen:
+                seen.append(value)
+        rows.append(
+            [
+                leg_key,
+                ", ".join(
+                    f"{lib.fmt(warmup)}/{lib.fmt(repeat)}/b{lib.fmt(batch)}"
+                    for warmup, repeat, batch in seen
+                )
+                or "—",
+            ]
+        )
+    lines.extend(lib.md_table(["leg", "warmup / repeat / batch recorded"], rows))
+    add("")
+    add("**Leg definitions** (one leg = one execution path):")
+    add("")
+    descriptions = {
+        "numpy-cpu": "numpy interpreter backend, host arrays (no compilation)",
+        "iree-llvmcpu": "IREE compiled for llvm-cpu, host-resident inputs",
+        "iree-rocm": "IREE compiled for ROCm, device-resident same-device loop",
+        "xla-rocm": "PJRT/XLA on ROCm (needs `ETL_PJRT_PLUGIN`), device-resident",
+        "xla-rocm-fp32": "the same with `dot_precision=\"HIGHEST\"` (true fp32 dot) — "
+        "opt-in, `--legs` only",
+        "torch-cpu": "`transformers` fp32 eager on CPU (`.eval()` + `no_grad()`)",
+        "torch-rocm": "the same on `cuda:0` (torch maps ROCm onto its cuda API; "
+        "`torch.cuda.synchronize()` inside the timed region)",
+        "torchcompile-cpu": "`torch.compile(model)` on CPU — best-effort extra leg "
+        "(Inductor compiles lazily, so the first call includes it)",
+        "torchcompile-rocm": "`torch.compile(model)` on `cuda:0` — best-effort extra leg",
+    }
+    rows = []
+    for leg_key in lib.sort_legs([key[2] for key in records]):
+        spec = lib.LEGS[leg_key]
+        options = (
+            ", ".join(f"`{name}={value!r}`" for name, value in sorted(spec.options.items()))
+            or "—"
+        )
+        rows.append(
+            [
+                leg_key,
+                spec.kind,
+                spec.backend or "—",
+                spec.device_string,
+                lib.fmt(spec.device_resident),
+                options,
+                descriptions.get(leg_key, "—"),
+            ]
+        )
+    lines.extend(lib.md_table(
+        ["leg", "kind", "backend", "device", "device-resident", "requested options", "what it is"],
+        rows,
+    ))
+    add("")
+    add("* **Device-resident same-device loop** (the measured pattern): place the "
+        "weights + ids on the device ONCE and feed the same device `Tensor`s to every "
+        "call; the output stays on the device. **Per-call restaging** "
+        "(`place_params(host_params, device)` inside the loop) is the documented "
+        "anti-pattern — measured once for reference in section 5b, never as the leg's "
+        "number. The `+d2h` column is the same loop plus one explicit "
+        "`Tensor.to(Device('cpu', 0))` per call, i.e. the cost a host-facing caller "
+        "pays.")
+    add("* PyTorch baselines are fp32 eager forward passes under `.eval()` and "
+        "`torch.no_grad()` (`dtype=torch.float32`, `attn_implementation=\"eager\"`, "
+        "recorded in each torch record's `model.from_pretrained_kwargs`). The "
+        "`torch.compile`/Inductor columns are best-effort extra legs, not part of a "
+        "`--phase` run.")
+    add("* Numbers never come from this text: each table row is rendered from the leg "
+        "record, and a leg that did not run renders `—` with the recorded reason.")
+    add("")
+    return lines
 
 
 def render_report(records, out_dirs) -> str:
@@ -1351,6 +1921,10 @@ def render_report(records, out_dirs) -> str:
         f"Harness git commit: `{git or 'unknown'}`."
     )
     add("")
+    # ---- headline --------------------------------------------------------
+    add("## Headline (every ratio computed from the records)")
+    add("")
+    lines.extend(_headline_lines(records, out_dirs))
     add("## Method (what a number means)")
     add("")
     add("| aspect | how it is measured |")
@@ -1475,6 +2049,17 @@ def render_report(records, out_dirs) -> str:
         )
     )
     add("")
+    xla_flags = sorted(flags.get("XLA_FLAGS") or [])
+    if any("xla_gpu_enable_command_buffer" in value for value in xla_flags):
+        add(
+            "**Required XLA/ROCm caveat:** the `xla` legs run with "
+            "`XLA_FLAGS=--xla_gpu_enable_command_buffer=` (recorded value: "
+            + ", ".join(f"`{value}`" for value in xla_flags)
+            + ") — HIP-graph command buffers SIGSEGV inside `PJRT_Executable_Execute` "
+            "on this plugin/stack, so they must be disabled. The value is recorded in "
+            "`provenance.env.XLA_FLAGS` of every `xla` leg record."
+        )
+        add("")
 
     # ---- leg status ------------------------------------------------------
     add("## 2. Legs measured")
@@ -1552,8 +2137,11 @@ def render_report(records, out_dirs) -> str:
     add("")
     add(
         "Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced graph "
-        "(`etl.trace` → `graph.verify()` → op walk), never from a constant. Packed graph input "
-        "counts are `len(pack_plan(...).specs)`."
+        "(`etl.trace` → `graph.verify()` → op walk), never from a constant. `weight inputs` is "
+        "the number of canonical weight keys (one graph input per `etl_hf.param_specs` leaf). "
+        "Packed graph input counts are `len(pack_plan(...).specs)`. The counts are the ones the "
+        "**unpacked** graph has: a packed leg traces the same program with the weight tree "
+        "collapsed, so its in-graph static slices add IR ops and its input count drops."
     )
     add("")
 
@@ -1740,7 +2328,7 @@ def render_report(records, out_dirs) -> str:
                 "restage best ms",
                 "restage median ms",
                 "same-device loop best ms",
-                "slowdown",
+                "loop ÷ restage",
                 "what the anti-pattern is",
             ],
             rows,
@@ -1770,6 +2358,10 @@ def render_report(records, out_dirs) -> str:
         "reported as measured — nothing here is tuned away."
     )
     add("")
+    # ---- xla specifics ---------------------------------------------------
+    add("## 6b. `xla`/ROCm — the first `etl_hf` runs on the XLA backend (TF32 caveat)")
+    add("")
+    lines.extend(_xla_lines(records, out_dirs))
 
     # ---- failures --------------------------------------------------------
     add("## 7. Legs that could not run, and why")
@@ -1820,6 +2412,25 @@ def render_report(records, out_dirs) -> str:
             rows,
         ))
         add("")
+        # Verbatim error blocks only for LEGS THAT ACTUALLY RAN and failed; the
+        # synthetic "missing" rows above are a coverage statement, not a record.
+        quoted = [
+            (model, seq_len, leg_key, str((record.get("errors") or record.get("notes") or [""])[0]))
+            for (model, seq_len, leg_key), record in entries
+            if record is not None
+            and record.get("status") != "missing"
+            and (record.get("errors") or record.get("notes"))
+        ]
+        if quoted:
+            add("The exact error(s), verbatim from the records:")
+            add("")
+            for model, seq_len, leg_key, message in quoted:
+                add(f"**`{model}` s{seq_len} `{leg_key}`**")
+                add("")
+                add("```")
+                lines.extend(message.splitlines() or [""])
+                add("```")
+                add("")
         details = []
         for (model, seq_len, leg_key), record in entries:
             process = record.get("process") or {}
@@ -1837,9 +2448,12 @@ def render_report(records, out_dirs) -> str:
             add("")
             lines.extend(details)
     add("")
-
+    # ---- reproduction ----------------------------------------------------
+    add("## 8. Reproduction (environment, commands, leg definitions, protocol)")
+    add("")
+    lines.extend(_reproduction_lines(records))
     # ---- notes -----------------------------------------------------------
-    add("## 8. Notes")
+    add("## 9. Notes")
     add("")
     add(
         "* One subprocess per `(model, seq_len, leg)`. A leg that segfaults, times out or "

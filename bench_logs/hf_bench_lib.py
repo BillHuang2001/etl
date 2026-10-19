@@ -787,9 +787,12 @@ def first_diagnostic(exc: BaseException) -> str:
 
 
 def md_table(headers, rows) -> list[str]:
-    """Render a markdown table (pipe-escaped, deterministic)."""
+    """Render a markdown table (pipe-escaped, newline-collapsed, deterministic)."""
     def cell(value) -> str:
-        return str(value).replace("|", "\\|")
+        # A newline inside a cell would end the table row and corrupt the table,
+        # so multi-line text (e.g. a compiler diagnostic) is collapsed to one line.
+        text = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        return text.replace("|", "\\|")
 
     lines = [
         "| " + " | ".join(cell(header) for header in headers) + " |",
