@@ -487,10 +487,10 @@ def _install_load(adapter: Any) -> None:
         return _load_vulkan(adapter, core, self, artifact, device, options, original)
 
     load.__doc__ = (
-        "shim wrapper over IreeBackend.load (etl/backends/adapters/iree.py:1211): "
-        "a vulkan device takes an equivalent load path with the device-kind "
-        "whitelist (:1326) and the expected-target map (:1346) widened; every "
-        "other device delegates to the library method unchanged."
+        "shim wrapper over IreeBackend.load (etl/backends/adapters/iree.py:1211, "
+        "gates at :1326/:1346): a vulkan device takes an equivalent load path "
+        "with the device-kind whitelist and the expected-target map widened; "
+        "every other device delegates to the library method unchanged."
     )
     adapter.IreeBackend.load = load
     _PATCHED["etl/backends/adapters/iree.py:1326/1346 IreeBackend.load"] = (
