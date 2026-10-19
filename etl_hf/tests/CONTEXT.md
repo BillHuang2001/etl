@@ -13,21 +13,21 @@ Skip groups: torch/transformers absent (3), `iree` absent (19), `ETL_HF_BIG` uns
 
 | Module | Collected | Area |
 |---|---|---|
-| `test_build.py` | 94 | `pipeline` + `program`: build/run/predict, options, memoisation, placement, `load_hf` |
-| `test_config.py` | 70 | HF `config.json` normalisation + explicit errors |
-| `test_export.py` | 11 | whole-graph StableHLO export (numpy only) |
-| `test_families.py` | 33 | `FAMILIES` registry, `resolve_family`, routing |
-| `test_gpt2.py` | 67 | GPT-2 parity + canonicalisation |
-| `test_iree_llvm_cpu.py` | 7 | compiled parity on iree/llvm-cpu (1 ungated) |
-| `test_iree_rocm.py` | 11 | device-resident forward on iree/ROCm (1 ungated, 8 GPU, 2 also big) |
-| `test_llama.py` | 43 | Llama/Mistral parity + canonicalisation |
-| `test_ops.py` | 83 | `ops` / `models._common` graph idioms vs numpy |
-| `test_pack.py` | 38 | packed weights: plans, bit-exact equivalence, export |
-| `test_public_api.py` | 88 | public surface, functional invariants, import hygiene |
-| `test_real_checkpoints.py` | 10 | real downloaded checkpoints (7 run, 3 big) |
-| `test_reference.py` | 59 | the pure-numpy oracle primitives |
-| `test_weights.py` | 50 | checkpoint readers + `load_checkpoint` |
-| `test_torch_oracle.py` | 11 | optional torch/transformers oracle (8 torch-free) |
+| `test_build.py` | 94 | `pipeline` + `program` staging |
+| `test_config.py` | 70 | `ModelConfig` parsing |
+| `test_export.py` | 11 | whole-graph StableHLO export |
+| `test_families.py` | 33 | family registry |
+| `test_gpt2.py` | 67 | GPT-2 parity/canonicalisation |
+| `test_iree_llvm_cpu.py` | 7 | iree/llvm-cpu parity |
+| `test_iree_rocm.py` | 11 | iree/ROCm device-resident |
+| `test_llama.py` | 43 | Llama/Mistral parity/canonicalisation |
+| `test_ops.py` | 83 | `ops` graph idioms |
+| `test_pack.py` | 38 | packed weights |
+| `test_public_api.py` | 88 | public surface + functional invariants |
+| `test_real_checkpoints.py` | 10 | real checkpoints end-to-end |
+| `test_reference.py` | 59 | the numpy oracle |
+| `test_weights.py` | 50 | checkpoint readers |
+| `test_torch_oracle.py` | 11 | optional torch oracle |
 
 ## What each module pins
 
