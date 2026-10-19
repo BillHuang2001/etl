@@ -138,20 +138,69 @@ numpy-only: the checkpoint readers are pure numpy (`safetensors`, sharded
 indexes and both `pytorch_model.bin` encodings), and `torch`/`transformers`/
 `iree` are never imported at module scope.
 
+The API is **functional** and follows etl's own value model — three layers that
+never blur:
+
+- **checkpoint IO produces DATA.** `load_config(ckpt)` returns a frozen static
+  `ModelConfig` (one config = one graph), `load_params(ckpt, cfg)` the canonical
+  `dict[str, np.ndarray]` of host weights, and `load_hf(ckpt)` both at once as a
+  plain `LoadedModel(config, params, family, model_dir)` record with no methods.
+  Nothing here is traced, compiled or cached.
+- **`forward_fn` is the COMPUTE FUNCTION.** A pure `@etl.defn`
+  `(params, input_ids) -> logits` that captures **no** weights: every parameter
+  is an ordinary graph **input** (never `etl.constant`, so nothing is silently
+  inlined into the program), and the static specialisation
+  `(family, config, seq_len, batch_size, pack_weights)` is all the graph depends
+  on (`build`'s cache key adds the resolved backend, device and options).
+- **`build` / `run` are the explicit staging stages.** `build` *is*
+  `trace → lower → compile → load` (via `build_cached`, memoised, so an
+  identical specialisation returns the identical `Executable`); `run` is
+  validation + `etl.run`; `predict` is the one documented host-facing shorthand.
+
 ```python
+import numpy as np
 import etl, etl_hf
 
-model = etl_hf.load_hf("/path/to/checkpoint", seq_len=32)  # config + canonical weights, nothing compiled
-logits = model.forward(input_ids=ids)                      # whole forward as ONE graph (numpy interpreter)
+ckpt = "/path/to/checkpoint"                     # a directory: config.json + weights
 
-exe = model.build(backend="iree")                          # trace → lower → compile → load, once
-logits_iree = model.forward(input_ids=ids, backend="iree")
+# 1. checkpoint IO -> DATA (no graph exists yet; nothing traced or compiled)
+loaded = etl_hf.load_hf(ckpt)                    # LoadedModel: .config, .params, .family, .model_dir
+cfg, params = loaded.config, loaded.params       # (or load_config(ckpt) / load_params(ckpt, cfg))
 
-ref = model.reference(input_ids=ids)                       # independent pure-numpy oracle
-tensors = etl_hf.place_params(model.params(), etl.core.Device("cuda", 0))  # one explicit .to per leaf
-out = etl.run(model.build(backend="iree", device=etl.core.Device("cuda", 0)), tensors, ids)
+# 2. the COMPUTE FUNCTION: one pure @etl.defn graph, weights are explicit INPUTS
+fwd = etl_hf.forward_fn(cfg, seq_len=32)         # (params, input_ids) -> logits, captures no weights
+ids = np.zeros((1, 32), np.int32)                # static (batch, seq_len)
+
+# 3. STAGING: the explicit trace -> lower -> compile -> load -> run pipeline
+exe = etl_hf.build(fwd, cfg)                     # numpy interpreter (default)
+logits = etl_hf.run(exe, params, ids)            # -> etl.Tensor, on the executable's device
+exe = etl_hf.build(fwd, cfg, backend="iree")     # compiled once (StableHLO -> IREE)
+logits = etl_hf.run(exe, params, ids)
+host = etl_hf.predict(loaded, ids, backend="iree")          # host-facing shorthand -> np.ndarray
+oracle = etl_hf.reference_logits(cfg, params, ids)          # independent pure-numpy oracle
+
+# 4. device-resident recipe: place weights + ids ONCE, then run with zero host round-trips
+device = etl.core.Device("rocm", 0)              # or etl.core.Device("cuda", N)
+exe = etl_hf.build(fwd, cfg, backend="iree", device=device)
+out = etl_hf.run(exe, etl_hf.place_params(params, device), etl_hf.place_ids(ids, device))
 ```
 
+Outputs are `etl.Tensor`s on the executable's device — `logits.numpy()` for the
+cpu instance, and for a non-cpu one the explicit
+`out.to(etl.core.Device("cpu", 0)).numpy()`; nothing is copied to the host
+behind your back. Opt-in weight packing is `forward_fn(cfg, pack_weights=True)`
++ `build(..., pack_weights=True)` + `pack_params(pack_plan(param_specs(cfg)), params)`.
+
+- **Install & optionality:** `etl_hf` uses **only** `numpy` + etl (plus the
+  standard library) and is a **separate top-level package used from the repo
+  checkout** — it is deliberately **not installed by `pip install etl`**
+  (`pyproject.toml`'s package find matches only `etl` / `etl.*`, so neither a
+  wheel nor an sdist of `etl` contains `etl_hf`). `pip install etl[hf]` pulls
+  only the optional `torch`/`transformers` reference oracles used to validate and
+  benchmark `etl_hf` against the real HuggingFace implementation — never a
+  runtime requirement. `pip install etl[iree]` (or `[tvm]` / a PJRT plugin `.so`
+  for `xla`) enables the compiled path. `import etl` never imports `etl_hf`,
+  `torch` or `transformers`.
 - **Families:** `llama` (also `mistral` / `qwen2` configs — RMSNorm, RoPE, GQA,
   SwiGLU) and `gpt2` (also `distilgpt2` — LayerNorm, learned positions,
   `gelu_new`, tied head). Weights are always **explicit graph inputs** (never
@@ -175,7 +224,8 @@ out = etl.run(model.build(backend="iree", device=etl.core.Device("cuda", 0)), te
   slices (bit-identical to unpacked). It also works around a real upstream
   limit: IREE's Python runtime SIGSEGVs on llvm-cpu graphs that **consume**
   more than ~161 distinct inputs, which an unpacked 124M model exceeds (196
-  weights) — packed, it runs compiled and stable (13/13 identical runs).- **Deferred by design (explicit errors):** exact-`erf` GELU configs
+  weights) — packed, it runs compiled and stable (13/13 identical runs).
+- **Deferred by design (explicit errors):** exact-`erf` GELU configs
   (`hidden_act: "gelu"`) are numpy-backend-only (`erf` is a StableHLO v1
   deferral); dynamic shapes, kv-cache/incremental decode, and generation loops
   are out of scope — this is the forward graph, not a serving stack.
