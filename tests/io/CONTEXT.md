@@ -46,12 +46,16 @@ order, and worker-thread re-entry raises `RuntimeError`.
   queue-put in one critical section ⇒ issue order == execution order). `atexit`
   best-effort drain joins FINITE in-flight copies at normal interpreter exit
   (os._exit skips atexit → daemon dies with the process, instant — never hangs).
-  First non-cpu-kind copy triggers a one-time lazy best-effort CUDA/ROCm
-  primary-context bootstrap (`import iree.runtime`, `get_driver(kind).create_device(device_id=index
-  + 1)` — the etl kind maps to the iree HAL driver name (`"rocm"`/`"hip"` →
-  `"hip"`, else the kind verbatim) and iree's 1-based mapping; all failures
-  swallowed, devices kept alive process-globally, at most once per
-  `(kind, index)`). v1 wording: copies are "async relative to the caller, no strict
+  First non-cpu-kind copy triggers a one-time lazy best-effort CUDA/ROCm/Vulkan
+  primary-context bootstrap (`import iree.runtime`, then
+  `get_driver(driver_name).create_device(...)` — the etl kind maps to the iree HAL
+  driver name (`"rocm"`/`"hip"` → `"hip"`, else the kind verbatim, so `"vulkan"` stays
+  `"vulkan"`); cuda/rocm pass iree's 1-based `device_id = index + 1` KEYWORD, while
+  vulkan passes the QUERIED `query_available_devices()[index]` info dict
+  POSITIONALLY — Vulkan HAL ids are UUID hashes, not ordinals, and an out-of-range
+  index is a silent no-op; all failures swallowed, devices kept alive
+  process-globally, at most once per `(kind, index)`). v1 wording: copies are "async
+  relative to the caller, no strict
   same-device overlap guarantee" (the single worker serializes everything). Buffer
   lifetime is user-controlled: the worker holds only a bound-method thunk
   (`tensor.to(device)` / `.to(cpu:0)`) — the caller must keep source buffers alive
