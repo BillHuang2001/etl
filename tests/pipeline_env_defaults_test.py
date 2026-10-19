@@ -7,7 +7,7 @@ unset ``backend``/``device`` resolve from ``ETL_BACKEND`` / ``ETL_DEVICE``
 (read lazily at call time); unset ``target_backends`` resolves from
 ``ETL_TARGET_BACKENDS`` or, for an iree-family backend, is inferred from the
 resolved device (``cuda`` -> ``["cuda"]``, ``rocm``/``hip`` -> ``["rocm"]``,
-``cpu`` -> ``["llvm-cpu"]``).
+``vulkan`` -> ``["vulkan-spirv"]``, ``cpu`` -> ``["llvm-cpu"]``).
 
 The env variables are read lazily at call time, so every test drives them
 with ``monkeypatch`` after ``import etl`` — no module-level env snapshot.
@@ -263,15 +263,20 @@ def test_env_backend_empty_treated_as_unset(monkeypatch):
         ("rocm:3", "rocm", 3),
         ("rocm", "rocm", 0),
         ("hip:2", "hip", 2),
+        ("vulkan", "vulkan", 0),
+        ("vulkan:0", "vulkan", 0),
+        ("vulkan:2", "vulkan", 2),
     ],
 )
 def test_env_device_parsing(monkeypatch, value, kind, index):
     """ETL_DEVICE parses ``kind[:index]`` into a core.Device.
 
     Any kind string is accepted, so the ROCm spellings ``"rocm"`` and the
-    equivalent ``"hip"`` alias parse too — the kind is preserved verbatim
+    equivalent ``"hip"`` alias parse too, as do the Vulkan spellings
+    ``"vulkan"`` / ``"vulkan:N"`` — the kind is preserved verbatim
     (``Device.kind`` is never normalized; only the target-backends inference
-    below maps both to the IREE ``"rocm"`` target)."""
+    below maps ``rocm``/``hip`` to the IREE ``"rocm"`` target and ``vulkan``
+    to the IREE ``"vulkan-spirv"`` target)."""
     monkeypatch.setenv("ETL_DEVICE", value)
     backend, device, options = _resolve_backend_device(None, None, {})
     assert device == core.Device(kind, index)
@@ -318,6 +323,20 @@ def test_env_device_parse_rocm_directly():
     assert _parse_env_device("ETL_DEVICE", "hip:2") != core.Device("rocm", 2)
 
 
+def test_env_device_parse_vulkan_directly():
+    """``_parse_env_device`` parses the Vulkan spellings ``"vulkan"`` /
+    ``"vulkan:N"`` into a ``core.Device`` with kind ``"vulkan"`` PRESERVED and
+    the index parsed (bare ``"vulkan"`` -> index 0). The parser only parses:
+    the compile-target spelling (``vulkan-spirv``) is derived later, by the
+    iree-family target-backends inference."""
+    assert _parse_env_device("ETL_DEVICE", "vulkan") == core.Device("vulkan", 0)
+    assert _parse_env_device("ETL_DEVICE", "vulkan:0") == core.Device("vulkan", 0)
+    assert _parse_env_device("ETL_DEVICE", "vulkan:2") == core.Device("vulkan", 2)
+    # Index really parsed (not defaulted) and kind really "vulkan".
+    assert _parse_env_device("ETL_DEVICE", "vulkan:2").index == 2
+    assert _parse_env_device("ETL_DEVICE", "vulkan:2").kind == "vulkan"
+
+
 def test_env_device_empty_treated_as_unset(monkeypatch):
     """An empty ETL_DEVICE is treated as unset (cpu default)."""
     monkeypatch.setenv("ETL_DEVICE", "")
@@ -342,6 +361,16 @@ def test_env_device_cuda_numpy_backend_fails_explicitly(monkeypatch):
     """Full path: ETL_DEVICE=cuda with the (cpu-only) numpy backend raises the
     backend's explicit BackendError — never a silent fallback."""
     monkeypatch.setenv("ETL_DEVICE", "cuda:0")
+    with pytest.raises(etl.BackendError, match="CPU devices only"):
+        etl.build(_linear, *_LINEAR_SPECS)
+    _assert_no_new_iree_import()
+
+
+def test_env_device_vulkan_numpy_backend_fails_explicitly(monkeypatch):
+    """Full path: ETL_DEVICE=vulkan:0 with the (cpu-only) numpy backend raises
+    the backend's explicit BackendError — a vulkan device never silently falls
+    back to the host interpreter."""
+    monkeypatch.setenv("ETL_DEVICE", "vulkan:0")
     with pytest.raises(etl.BackendError, match="CPU devices only"):
         etl.build(_linear, *_LINEAR_SPECS)
     _assert_no_new_iree_import()
@@ -452,6 +481,121 @@ def test_rocm_inference_only_for_iree_family():
             None, core.Device(kind, 0), {}
         )
         assert options == {}
+    _assert_no_new_iree_import()
+
+
+def test_iree_inference_vulkan():
+    """iree-family backend + vulkan device -> target_backends ==
+    ["vulkan-spirv"], the IREE Vulkan/SPIR-V compile-target spelling.
+
+    Pinned exactly: NOT ``["vulkan"]`` (the device kind is not a target name)
+    and NOT the ``--iree-hal-vulkan-target``/``--iree-vulkan-target`` flag
+    form — ``vulkan_target`` is a separate compile-option knob applied by the
+    adapter (see the ``vulkan_target`` tests below)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("vulkan", 0), {}
+    )
+    assert options == {"target_backends": ["vulkan-spirv"]}
+    # Exact shape pin: a plain list of one exact lowercase string.
+    assert isinstance(options["target_backends"], list)
+    assert options["target_backends"] == ["vulkan-spirv"]
+    assert options["target_backends"] != ["vulkan"]
+    (target,) = options["target_backends"]
+    assert target == "vulkan-spirv" and not target.startswith("--")
+    _assert_no_new_iree_import()
+
+
+def test_iree_inference_vulkan_index_irrelevant():
+    """The inference depends only on the device KIND: a nonzero vulkan index
+    still yields target_backends == ["vulkan-spirv"], and the resolved device
+    keeps the index (the inference does not rewrite the device)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("vulkan", 4), {}
+    )
+    assert options == {"target_backends": ["vulkan-spirv"]}
+    assert device == core.Device("vulkan", 4)
+    _assert_no_new_iree_import()
+
+
+def test_vulkan_inference_only_for_iree_family():
+    """Non-iree backend (the numpy interpreter) + vulkan device -> no
+    target_backends key: the device-derived compile target is iree-family
+    only, exactly like the cuda/rocm/cpu cases."""
+    backend, device, options = _resolve_backend_device(
+        None, core.Device("vulkan", 0), {}
+    )
+    assert backend is etl.backends.numpy_backend
+    assert device == core.Device("vulkan", 0)
+    assert options == {}
+    _assert_no_new_iree_import()
+
+
+def test_iree_inference_vulkan_from_env_device(monkeypatch, iree_stub_registered):
+    """ETL_BACKEND=iree + ETL_DEVICE=vulkan:0 -> the whole resolution infers
+    target_backends == ["vulkan-spirv"] for the env-selected iree backend
+    (the registered stub keeps the real adapter unimported)."""
+    monkeypatch.setenv("ETL_BACKEND", "iree")
+    monkeypatch.setenv("ETL_DEVICE", "vulkan:0")
+    backend, device, options = _resolve_backend_device(None, None, {})
+    assert backend.name == "iree"
+    assert device == core.Device("vulkan", 0)
+    assert options == {"target_backends": ["vulkan-spirv"]}
+    _assert_no_new_iree_import()
+
+
+def test_explicit_target_backends_wins_over_vulkan_inference():
+    """An explicit target_backends is preserved on a vulkan device (no
+    inference)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(),
+        core.Device("vulkan", 0),
+        {"target_backends": ["llvm-cpu"]},
+    )
+    assert options == {"target_backends": ["llvm-cpu"]}
+    _assert_no_new_iree_import()
+
+
+def test_env_target_backends_wins_over_vulkan_inference(monkeypatch):
+    """ETL_TARGET_BACKENDS beats the vulkan device inference."""
+    monkeypatch.setenv("ETL_TARGET_BACKENDS", "llvm-cpu,vulkan-spirv")
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("vulkan", 0), {}
+    )
+    assert options == {"target_backends": ["llvm-cpu", "vulkan-spirv"]}
+    _assert_no_new_iree_import()
+
+
+def test_vulkan_device_does_not_inject_vulkan_target():
+    """``vulkan_target`` is a SEPARATE knob from ``target_backends``: a vulkan
+    device makes the pipeline infer ONLY the compile target — it never injects
+    a ``vulkan_target`` SPIR-V profile (that option is applied at the compile
+    stage by the adapter, from an explicit kwarg or ``ETL_IREE_VULKAN_TARGET``)."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("vulkan", 0), {}
+    )
+    assert "vulkan_target" not in options
+    assert options == {"target_backends": ["vulkan-spirv"]}
+    _assert_no_new_iree_import()
+
+
+def test_explicit_vulkan_target_passes_through_untouched():
+    """An explicitly-passed ``vulkan_target`` is never touched by the
+    resolution (no rewriting, no dropping) — alongside the inferred compile
+    target — and a vulkan_target on a NON-vulkan device is left alone too."""
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("vulkan", 0), {"vulkan_target": "gfx1100"}
+    )
+    assert options == {
+        "target_backends": ["vulkan-spirv"],
+        "vulkan_target": "gfx1100",
+    }
+    backend, device, options = _resolve_backend_device(
+        _IreeStub(), core.Device("cpu", 0), {"vulkan_target": "gfx1100"}
+    )
+    assert options == {
+        "target_backends": ["llvm-cpu"],
+        "vulkan_target": "gfx1100",
+    }
     _assert_no_new_iree_import()
 
 
@@ -575,6 +719,23 @@ def test_full_path_env_iree_cpu(monkeypatch, iree_stub_registered):
     ]
     x, w, b = _linear_inputs()
     np.testing.assert_allclose(etl.run(exe, x, w, b).numpy(), _ref(x, w, b))
+    _assert_no_new_iree_import()
+
+
+def test_full_path_env_iree_vulkan(monkeypatch, iree_stub_registered):
+    """ETL_BACKEND=iree + ETL_DEVICE=vulkan:0 routes the whole build: the
+    device is honored (kind "vulkan", index preserved) and
+    target_backends=["vulkan-spirv"] reaches the compile stage (no real
+    adapter import, no Vulkan device needed)."""
+    monkeypatch.setenv("ETL_BACKEND", "iree")
+    monkeypatch.setenv("ETL_DEVICE", "vulkan:0")
+    exe = etl.build(_linear, *_LINEAR_SPECS)
+    assert exe.device == core.Device("vulkan", 0)
+    assert iree_stub_registered.recorded_compile_options[-1]["target_backends"] == [
+        "vulkan-spirv"
+    ]
+    # The separate vulkan_target knob stays uninjected.
+    assert "vulkan_target" not in iree_stub_registered.recorded_compile_options[-1]
     _assert_no_new_iree_import()
 
 
