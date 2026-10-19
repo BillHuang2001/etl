@@ -585,13 +585,15 @@ These are the **first `etl_hf` runs on the XLA backend**: the `etl` `xla` adapte
 | gpt2 | 32 | packed | ok | 20,339.91 | 34.713 | ok |
 | gpt2 | 128 | packed | ok | 16,531.97 | 35.252 | ok |
 
-The exact error(s), verbatim from the records:
+The exact error(s) — the first 3 lines only, each cut at 200 characters, with a pointer to the record that holds the full text:
 
 **`tiny_mistral` s32 `xla-rocm`**
 
 ```
-build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'xla'. Two remedies: build with backend='numpy' (the exact-erf host path — same numbers, no compilation), or use a tanh-approximate config (hidden_act='gelu_new'), which differs from exact erf GELU by at most ~5e-4 per activation value (measured max |gelu_tanh - gelu_erf| = 4.7e-4, peaking near |x| ~ 2.7).
+build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'xla'. Two remedies: build with backend='numpy' (the exact-erf host…
 ```
+
+Full text (1 line): `bench_logs/hf_bench_data/tiny_mistral__s32__xla-rocm.json` → `errors[0]`.
 
 **Build cost of the xla path** (`etl_hf.build` = trace → lower → compile → load, library defaults; `iree-rocm` is the other device-resident compiled path on the same cells):
 
@@ -668,25 +670,31 @@ A `—` in a golden column means the golden's `input_ids` shape does not match t
 | gpt2 | 128 | torchcompile-cpu | missing | — | — | — | no record on disk for this cell |
 | gpt2 | 128 | torchcompile-rocm | missing | — | — | — | no record on disk for this cell |
 
-The exact error(s), verbatim from the records:
+Each failing leg's error text — the first 3 lines only, each cut at 200 characters, followed by a pointer to the record that holds it in full:
 
 **`tiny_mistral` s32 `iree-llvmcpu`**
 
 ```
-build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'iree'. Two remedies: build with backend='numpy' (the exact-erf host path — same numbers, no compilation), or use a tanh-approximate config (hidden_act='gelu_new'), which differs from exact erf GELU by at most ~5e-4 per activation value (measured max |gelu_tanh - gelu_erf| = 4.7e-4, peaking near |x| ~ 2.7).
+build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'iree'. Two remedies: build with backend='numpy' (the exact-erf host…
 ```
+
+Full text (1 line): `bench_logs/hf_bench_data/tiny_mistral__s32__iree-llvmcpu.json` → `errors[0]`.
 
 **`tiny_mistral` s32 `iree-rocm`**
 
 ```
-build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'iree'. Two remedies: build with backend='numpy' (the exact-erf host path — same numbers, no compilation), or use a tanh-approximate config (hidden_act='gelu_new'), which differs from exact erf GELU by at most ~5e-4 per activation value (measured max |gelu_tanh - gelu_erf| = 4.7e-4, peaking near |x| ~ 2.7).
+build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'iree'. Two remedies: build with backend='numpy' (the exact-erf host…
 ```
+
+Full text (1 line): `bench_logs/hf_bench_data/tiny_mistral__s32__iree-rocm.json` → `errors[0]`.
 
 **`tiny_mistral` s32 `xla-rocm`**
 
 ```
-build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'xla'. Two remedies: build with backend='numpy' (the exact-erf host path — same numbers, no compilation), or use a tanh-approximate config (hidden_act='gelu_new'), which differs from exact erf GELU by at most ~5e-4 per activation value (measured max |gelu_tanh - gelu_erf| = 4.7e-4, peaking near |x| ~ 2.7).
+build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it cannot run on backend 'xla'. Two remedies: build with backend='numpy' (the exact-erf host…
 ```
+
+Full text (1 line): `bench_logs/hf_bench_data/tiny_mistral__s32__xla-rocm.json` → `errors[0]`.
 
 **`distilgpt2` s128 `iree-llvmcpu`**
 
@@ -694,38 +702,10 @@ build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO 
 build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm-cpu):
 Error invoking IREE compiler tool iree-compile
 Error code: 1
-Diagnostics:
-<stdin>:55:11: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %54 = "stablehlo.reduce"(%49, %50) ({
-          ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<50257x768xf32>, %arg1: tensor<768xf32>, %arg2: tensor<768xf32>, %arg3: tensor<768xf32>, %arg4: tensor<768x768xf32>, %arg5: tensor<768xf32>, %arg6: tensor<768x768xf32>, %arg7: tensor<768xf32>, %arg8: tensor<768x768xf32>, %arg9: tensor<768xf32>, %arg10: tensor<768x768xf32>, %arg11: tensor<768xf32>, %arg12: tensor<768xf32>, %arg13: tensor<3072xf32>, %arg14: tensor<768x3072xf32>, %arg15: tensor<768xf32>, %arg16: tensor<3072x768xf32>, %arg17: tensor<768xf32>, %arg18: tensor<768xf32>, %arg19: tensor<768xf32>, %arg20: tensor<768x768xf32>, %arg21: tensor<768xf32>, %arg22: tensor<768x768xf32>, %arg23: tensor<768xf32>, %arg24: tensor<768x768xf32>, %arg25: tensor<768xf32>, %arg26: tensor<768x768xf32>, %arg27: tensor<768xf32>, %arg28: tensor<768xf32>, %arg29: tensor<3072xf32>, %arg30: tensor<768x3072xf32>, %arg31: tensor<768xf32>, %arg32: tensor<3072x768xf32>, %arg33: tensor<768xf32>, %arg34: tensor<768xf32>, %arg35: tensor<768xf32>, %arg36: tensor<768x768xf32>, %arg37: tensor<768xf32>, %arg38: tensor<768x768xf32>, %arg39: tensor<768xf32>, %arg40: tensor<768x768xf32>, %arg41: tensor<768xf32>, %arg42: tensor<768x768xf32>, %arg43: tensor<768xf32>, %arg44: tensor<768xf32>, %arg45: tensor<3072xf32>, %arg46: tensor<768x3072xf32>, %arg47: tensor<768xf32>, %arg48: tensor<3072x768xf32>, %arg49: tensor<768xf32>, %arg50: tensor<768xf32>, %arg51: tensor<768xf32>, %arg52: tensor<768x768xf32>, %arg53: tensor<768xf32>, %arg54: tensor<768x768xf32>, %arg55: tensor<768xf32>, %arg56: tensor<768x768xf32>, %arg57: tensor<768xf32>, %arg58: tensor<768x768xf32>, %arg59: tensor<768xf32>, %arg60: tensor<768xf32>, %arg61: tensor<3072xf32>, %arg62: tensor<768x3072xf32>, %arg63: tensor<768xf32>, %arg64: tensor<3072x768xf32>, %arg65: tensor<768xf32>, %arg66: tensor<768xf32>, %arg67: tensor<768xf32>, %arg68: tensor<768x768xf32>, %arg69: tensor<768xf32>, %arg70: tensor<768x768xf32>, %arg71: tensor<768xf32>, %arg72: tensor<768x768xf32>, %arg73: tensor<768xf32>, %arg74: tensor<768x768xf32>, %arg75: tensor<768xf32>, %arg76: tensor<768xf32>, %arg77: tensor<3072xf32>, %arg78: tensor<768x3072xf32>, %arg79: tensor<768xf32>, %arg80: tensor<3072x768xf32>, %arg81: tensor<768xf32>, %arg82: tensor<768xf32>, %arg83: tensor<768xf32>, %arg84: tensor<768x768xf32>, %arg85: tensor<768xf32>, %arg86: tensor<768x768xf32>, %arg87: tensor<768xf32>, %arg88: tensor<768x768xf32>, %arg89: tensor<768xf32>, %arg90: tensor<768x768xf32>, %arg91: tensor<768xf32>, %arg92: tensor<768xf32>, %arg93: tensor<3072xf32>, %arg94: tensor<768x3072xf32>, %arg95: tensor<768xf32>, %arg96: tensor<3072x768xf32>, %arg97: tensor<768xf32>, %arg98: tensor<768xf32>, %arg99: tensor<1024x768xf32>, %arg100: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:55:11: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %54 = "stablehlo.reduce"(%49, %50) ({
-          ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<50257x768xf32>, %arg1: tensor<768xf32>, %arg2: tensor<768xf32>, %arg3: tensor<768xf32>, %arg4: tensor<768x768xf32>, %arg5: tensor<768xf32>, %arg6: tensor<768x768xf32>, %arg7: tensor<768xf32>, %arg8: tensor<768x768xf32>, %arg9: tensor<768xf32>, %arg10: tensor<768x768xf32>, %arg11: tensor<768xf32>, %arg12: tensor<768xf32>, %arg13: tensor<3072xf32>, %arg14: tensor<768x3072xf32>, %arg15: tensor<768xf32>, %arg16: tensor<3072x768xf32>, %arg17: tensor<768xf32>, %arg18: tensor<768xf32>, %arg19: tensor<768xf32>, %arg20: tensor<768x768xf32>, %arg21: tensor<768xf32>, %arg22: tensor<768x768xf32>, %arg23: tensor<768xf32>, %arg24: tensor<768x768xf32>, %arg25: tensor<768xf32>, %arg26: tensor<768x768xf32>, %arg27: tensor<768xf32>, %arg28: tensor<768xf32>, %arg29: tensor<3072xf32>, %arg30: tensor<768x3072xf32>, %arg31: tensor<768xf32>, %arg32: tensor<3072x768xf32>, %arg33: tensor<768xf32>, %arg34: tensor<768xf32>, %arg35: tensor<768xf32>, %arg36: tensor<768x768xf32>, %arg37: tensor<768xf32>, %arg38: tensor<768x768xf32>, %arg39: tensor<768xf32>, %arg40: tensor<768x768xf32>, %arg41: tensor<768xf32>, %arg42: tensor<768x768xf32>, %arg43: tensor<768xf32>, %arg44: tensor<768xf32>, %arg45: tensor<3072xf32>, %arg46: tensor<768x3072xf32>, %arg47: tensor<768xf32>, %arg48: tensor<3072x768xf32>, %arg49: tensor<768xf32>, %arg50: tensor<768xf32>, %arg51: tensor<768xf32>, %arg52: tensor<768x768xf32>, %arg53: tensor<768xf32>, %arg54: tensor<768x768xf32>, %arg55: tensor<768xf32>, %arg56: tensor<768x768xf32>, %arg57: tensor<768xf32>, %arg58: tensor<768x768xf32>, %arg59: tensor<768xf32>, %arg60: tensor<768xf32>, %arg61: tensor<3072xf32>, %arg62: tensor<768x3072xf32>, %arg63: tensor<768xf32>, %arg64: tensor<3072x768xf32>, %arg65: tensor<768xf32>, %arg66: tensor<768xf32>, %arg67: tensor<768xf32>, %arg68: tensor<768x768xf32>, %arg69: tensor<768xf32>, %arg70: tensor<768x768xf32>, %arg71: tensor<768xf32>, %arg72: tensor<768x768xf32>, %arg73: tensor<768xf32>, %arg74: tensor<768x768xf32>, %arg75: tensor<768xf32>, %arg76: tensor<768xf32>, %arg77: tensor<3072xf32>, %arg78: tensor<768x3072xf32>, %arg79: tensor<768xf32>, %arg80: tensor<3072x768xf32>, %arg81: tensor<768xf32>, %arg82: tensor<768xf32>, %arg83: tensor<768xf32>, %arg84: tensor<768x768xf32>, %arg85: tensor<768xf32>, %arg86: tensor<768x768xf32>, %arg87: tensor<768xf32>, %arg88: tensor<768x768xf32>, %arg89: tensor<768xf32>, %arg90: tensor<768x768xf32>, %arg91: tensor<768xf32>, %arg92: tensor<768xf32>, %arg93: tensor<3072xf32>, %arg94: tensor<768x3072xf32>, %arg95: tensor<768xf32>, %arg96: tensor<3072x768xf32>, %arg97: tensor<768xf32>, %arg98: tensor<768xf32>, %arg99: tensor<1024x768xf32>, %arg100: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:203:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %196 = "stablehlo.reduce"(%191, %192) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<50257x768xf32>, %arg1: tensor<768xf32>, %arg2: tensor<768xf32>, %arg3: tensor<768xf32>, %arg4: tensor<768x768xf32>, %arg5: tensor<768xf32>, %arg6: tensor<768x768xf32>, %arg7: tensor<768xf32>, %arg8: tensor<768x768xf32>, %arg9: tensor<768xf32>, %arg10: tensor<768x768xf32>, %arg11: tensor<768xf32>, %arg12: tensor<768xf32>, %arg13: tensor<3072xf32>, %arg14: tensor<768x3072xf32>, %arg15: tensor<768xf32>, %arg16: tensor<3072x768xf32>, %arg17: tensor<768xf32>, %arg18: tensor<768xf32>, %arg19: tensor<768xf32>, %arg20: tensor<768x768xf32>, %arg21: tensor<768xf32>, %arg22: tensor<768x768xf32>, %arg23: tensor<768xf32>, %arg24: tensor<768x768xf32>, %arg25: tensor<768xf32>, %arg26: tensor<768x768xf32>, %arg27: tensor<768xf32>, %arg28: tensor<768xf32>, %arg29: tensor<3072xf32>, %arg30: tensor<768x3072xf32>, %arg31: tensor<768xf32>, %arg32: tensor<3072x768xf32>, %arg33: tensor<768xf32>, %arg34: tensor<768xf32>, %arg35: tensor<768xf32>, %arg36: tensor<768x768xf32>, %arg37: tensor<768xf32>, %arg38: tensor<768x768xf32>, %arg39: tensor<768xf32>, %arg40: tensor<768x768xf32>, %arg41: tensor<768xf32>, %arg42: tensor<768x768xf32>, %arg43: tensor<768xf32>, %arg44: tensor<768xf32>, %arg45: tensor<3072xf32>, %arg46: tensor<768x3072xf32>, %arg47: tensor<768xf32>, %arg48: tensor<3072x768xf32>, %arg49: tensor<768xf32>, %arg50: tensor<768xf32>, %arg51: tensor<768xf32>, %arg52: tensor<768x768xf32>, %arg53: tensor<768xf32>, %arg54: tensor<768x768xf32>, %arg55: tensor<768xf32>, %arg56: tensor<768x768xf32>, %arg57: tensor<768xf32>, %arg58: tensor<768x768xf32>, %arg59: tensor<768xf32>, %arg60: tensor<768xf32>, %arg61: tensor<3072xf32>, %arg62: tensor<768x3072xf32>, %arg63: tensor<768xf32>, %arg64: tensor<3072x768xf32>, %arg65: tensor<768xf32>, %arg66: tensor<768xf32>, %arg67: tensor<768xf32>, %arg68: tensor<768x768xf32>, %arg69: tensor<768xf32>, %arg70: tensor<768x768xf32>, %arg71: tensor<768xf32>, %arg72: tensor<768x768xf32>, %arg73: tensor<768xf32>, %arg74: tensor<768x768xf32>, %arg75: tensor<768xf32>, %arg76: tensor<768xf32>, %arg77: tensor<3072xf32>, %arg78: tensor<768x3072xf32>, %arg79: tensor<768xf32>, %arg80: tensor<3072x768xf32>, %arg81: tensor<768xf32>, %arg82: tensor<768xf32>, %arg83: tensor<768xf32>, %arg84: tensor<768x768xf32>, %arg85: tensor<768xf32>, %arg86: tensor<768x768xf32>, %arg87: tensor<768xf32>, %arg88: tensor<768x768xf32>, %arg89: tensor<768xf32>, %arg90: tensor<768x768xf32>, %arg91: tensor<768xf32>, %arg92: tensor<768xf32>, %arg93: tensor<3072xf32>, %arg94: tensor<768x3072xf32>, %arg95: tensor<768xf32>, %arg96: tensor<3072x768xf32>, %arg97: tensor<768xf32>, %arg98: tensor<768xf32>, %arg99: tensor<1024x768xf32>, %arg100: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:203:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %196 = "stablehlo.reduce"(%191, %192) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<50257x768xf32>, %arg1: tensor<768xf32>, %arg2: tensor<768xf32>, %arg3: tensor<768xf32>, %arg4: tensor<768x768xf32>, %arg5: tensor<768xf32>, %arg6: tensor<768x768xf32>, %arg7: tensor<768xf32>, %arg8: tensor<768x768xf32>, %arg9: tensor<768xf32>, %arg10: tensor<768x768xf32>, %arg11: tensor<768xf32>, %arg12: tensor<768xf32>, %arg13: tensor<3072xf32>, %arg14: tensor<768x3072xf32>, %arg15: tensor<768xf32>, %arg16: tensor<3072x768xf32>, %arg17: tensor<768xf32>, %arg18: tensor<768xf32>, %arg19: tensor<768xf32>, %arg20: tensor<768x768xf32>, %arg21: tensor<768xf32>, %arg22: tensor<768x768xf32>, %arg23: tensor<768xf32>, %arg24: tensor<768x768xf32>, %arg25: tensor<768xf32>, %arg26: tensor<768x768xf32>, %arg27: tensor<768xf32>, %arg28: tensor<768xf32>, %arg29: tensor<3072xf32>, %arg30: tensor<768x3072xf32>, %arg31: tensor<768xf32>, %arg32: tensor<3072x768xf32>, %arg33: tensor<768xf32>, %arg34: tensor<768xf32>, %arg35: tensor<768xf32>, %arg36: tensor<768x768xf32>, %arg37: tensor<768xf32>, %arg38: tensor<768x768xf32>, %arg39: tensor<768xf32>, %arg40: tensor<768x768xf32>, %arg41: tensor<768xf32>, %arg42: tensor<768x768xf32>, %arg43: tensor<768xf32>, %arg44: tensor<768xf32>, %arg45: tensor<3072xf32>, %arg46: tensor<768x3072xf32>, %arg47: tensor<768xf32>, %arg48: tensor<3072x768xf32>, %arg49: tensor<768xf32>, %arg50: tensor<768xf32>, %arg51: tensor<768xf32>, %arg52: tensor<768x768xf32>, %arg53: tensor<768xf32>, %arg54: tensor<768x768xf32>, %arg55: tensor<768xf32>, %arg56: tensor<768x768xf32>, %arg57: tensor<768xf32>, %arg58: tensor<768x768xf32>, %arg59: tensor<768xf32>, %arg60: tensor<768xf32>, %arg61: tensor<3072xf32>, %arg62: tensor<768x3072xf32>, %arg63: tensor<768xf32>, %arg64: tensor<3072x768xf32>, %arg65: tensor<768xf32>, %arg66: tensor<768xf32>, %arg67: tensor<768xf32>, %arg68: tensor<768x768xf32>, %arg69: tensor<768xf32>, %arg70: tensor<768x768xf32>, %arg71: tensor<768xf32>, %arg72: tensor<768x768xf32>, %arg73: tensor<768xf32>, %arg74: tensor<768x768xf32>, %arg75: tensor<768xf32>, %arg76: tensor<768xf32>, %arg77: tensor<3072xf32>, %arg78: tensor<768x3072xf32>, %arg79: tensor<768xf32>, %arg80: tensor<3072x768xf32>, %arg81: tensor<768xf32>, %arg82: tensor<768xf32>, %arg83: tensor<768xf32>, %arg84: tensor<768x768xf32>, %arg85: tensor<768xf32>, %arg86: tensor<768x768xf32>, %arg87: tensor<768xf32>, %arg88: tensor<768x768xf32>, %arg89: tensor<768xf32>, %arg90: tensor<768x768xf32>, %arg91: tensor<768xf32>, %arg92: tensor<768xf32>, %arg93: tensor<3072xf32>, %arg94: tensor<768x3072xf32>, %arg95: tensor<768xf32>, %arg96: tensor<3072x768xf32>, %arg97: tensor<768xf32>, %arg98: tensor<768xf32>, %arg99: tensor<1024x768xf32>, %arg100: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-
-
-Invoked with:
- iree-compile /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/iree/compiler/tools/../_mlir_libs/iree-compile - --iree-input-type=stablehlo --iree-vm-bytecode-module-output-format=flatbuffer-binary --iree-hal-target-backends=llvm-cpu --iree-llvmcpu-embedded-linker-path=/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/iree/compiler/tools/../_mlir_libs/iree-lld --mlir-print-debuginfo --mlir-print-op-on-diagnostic=false --iree-input-demote-f64-to-f32=false --iree-opt-level=O3 --iree-llvmcpu-link-embedded=false --iree-llvmcpu-target-cpu=host --iree-opt-data-tiling
-
-Need more information? Set IREE_SAVE_TEMPS=/some/dir in your environment to save all artifacts and reproducers.
+…
 ```
+
+Full text (31 lines): `bench_logs/hf_bench_data/distilgpt2__s128__iree-llvmcpu.json` → `errors[0]`.
 
 **`gpt2` s128 `iree-llvmcpu`**
 
@@ -733,158 +713,10 @@ Need more information? Set IREE_SAVE_TEMPS=/some/dir in your environment to save
 build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm-cpu):
 Error invoking IREE compiler tool iree-compile
 Error code: 1
-Diagnostics:
-<stdin>:251:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %250 = "stablehlo.reduce"(%245, %246) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:251:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %250 = "stablehlo.reduce"(%245, %246) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:399:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %392 = "stablehlo.reduce"(%387, %388) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:399:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %392 = "stablehlo.reduce"(%387, %388) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:547:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %534 = "stablehlo.reduce"(%529, %530) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:547:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %534 = "stablehlo.reduce"(%529, %530) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:695:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %676 = "stablehlo.reduce"(%671, %672) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:695:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %676 = "stablehlo.reduce"(%671, %672) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:843:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %818 = "stablehlo.reduce"(%813, %814) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:843:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %818 = "stablehlo.reduce"(%813, %814) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:991:12: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %960 = "stablehlo.reduce"(%955, %956) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:991:12: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %960 = "stablehlo.reduce"(%955, %956) ({
-           ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1139:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1102 = "stablehlo.reduce"(%1097, %1098) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1139:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1102 = "stablehlo.reduce"(%1097, %1098) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1287:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1244 = "stablehlo.reduce"(%1239, %1240) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1287:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1244 = "stablehlo.reduce"(%1239, %1240) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1435:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1386 = "stablehlo.reduce"(%1381, %1382) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1435:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1386 = "stablehlo.reduce"(%1381, %1382) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1583:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1528 = "stablehlo.reduce"(%1523, %1524) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1583:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1528 = "stablehlo.reduce"(%1523, %1524) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1731:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1670 = "stablehlo.reduce"(%1665, %1666) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1731:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1670 = "stablehlo.reduce"(%1665, %1666) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1879:13: error: 'func.func' op exceeded stack allocation limit of 32768 bytes for function. Got 73920 bytes
-    %1812 = "stablehlo.reduce"(%1807, %1808) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-<stdin>:1879:13: error: failed to run translation of source executable to target executable for backend #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu = "emeraldrapids", cpu_features = "+64bit,+adx,+aes,-amx-avx512,-amx-bf16,-amx-complex,-amx-fp16,-amx-fp8,-amx-int8,-amx-movrs,-amx-tf32,-amx-tile,+avx,-avx10.1,-avx10.2,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512fp16,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,-avx512vp2intersect,+avx512vpopcntdq,-avxifma,-avxneconvert,+avxvnni,-avxvnniint16,-avxvnniint8,+bmi,+bmi2,-ccmp,-cf,+cldemote,+clflushopt,+clwb,-clzero,+cmov,-cmpccxadd,+crc32,+cx16,+cx8,-egpr,-enqcmd,+f16c,+fma,-fma4,+fsgsbase,+fxsr,+gfni,-hreset,+invpcid,-kl,-lwp,+lzcnt,+mmx,+movbe,+movdir64b,+movdiri,-movrs,-mwaitx,-ndd,-nf,+pclmul,-pconfig,+pku,+popcnt,-ppx,-prefetchi,+prfchw,-ptwrite,-push2pop2,-raoint,+rdpid,-rdpru,+rdrnd,+rdseed,-rtm,+sahf,+serialize,-sgx,+sha,-sha512,-shstk,-sm3,-sm4,+sse,+sse2,+sse3,+sse4.1,+sse4.2,-sse4a,+ssse3,-tbm,+tsxldtrk,-uintr,-usermsr,+vaes,+vpclmulqdq,+waitpkg,+wbnoinvd,-widekl,-xop,+xsave,+xsavec,+xsaveopt,+xsaves,-zu", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", iree.encoding.resolver = #iree_cpu.cpu_encoding_resolver<>, link_embedded = false, max_stack_allocation_size = 32768 : i64, native_vector_size = 64 : i64, target_triple = "x86_64-unknown-linux-gnu"}>
-    %1812 = "stablehlo.reduce"(%1807, %1808) ({
-            ^
-<stdin>:2:3: note: called from
-  func.func @main(%arg0: tensor<125009x768xf32>, %arg1: tensor<121344xf32>, %arg2: tensor<9216x3072xf32>, %arg3: tensor<1x128xi32>) -> tensor<1x128x50257xf32> {
-  ^
-
-
-Invoked with:
- iree-compile /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/iree/compiler/tools/../_mlir_libs/iree-compile - --iree-input-type=stablehlo --iree-vm-bytecode-module-output-format=flatbuffer-binary --iree-hal-target-backends=llvm-cpu --iree-llvmcpu-embedded-linker-path=/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/iree/compiler/tools/../_mlir_libs/iree-lld --mlir-print-debuginfo --mlir-print-op-on-diagnostic=false --iree-input-demote-f64-to-f32=false --iree-opt-level=O3 --iree-llvmcpu-link-embedded=false --iree-llvmcpu-target-cpu=host --iree-opt-data-tiling
-
-Need more information? Set IREE_SAVE_TEMPS=/some/dir in your environment to save all artifacts and reproducers.
+…
 ```
+
+Full text (151 lines): `bench_logs/hf_bench_data/gpt2__s128__iree-llvmcpu.json` → `errors[0]`.
 
 
 ## 8. Reproduction (environment, commands, leg definitions, protocol)

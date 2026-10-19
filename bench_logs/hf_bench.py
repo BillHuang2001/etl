@@ -1292,6 +1292,67 @@ def _record_at(records, model, seq_len, leg_key):
     return entry[0] if entry else None
 
 
+def _record_path_at(records, model, seq_len, leg_key):
+    """Record file backing one cell (``None`` when the cell has no record)."""
+    entry = records.get((model, seq_len, leg_key))
+    return entry[1] if entry else None
+
+
+#: How much of a failing leg's error text the report inlines. A compiler
+#: diagnostic is tens of KB of repeated target-triple / CPU-feature flags, so the
+#: report quotes its leading lines and points at the cell's JSON record, which
+#: carries the message in full (``errors[0]`` / ``notes[0]``).
+ERROR_EXCERPT_LINES = 3
+ERROR_EXCERPT_WIDTH = 200
+
+
+def _error_field(record) -> str:
+    """Which record field the reported error text came from."""
+    return "errors[0]" if record.get("errors") else "notes[0]"
+
+
+def _error_lines(message) -> list[str]:
+    """The non-empty lines of an error text, stripped at both ends."""
+    return [line.strip() for line in str(message).splitlines() if line.strip()]
+
+
+def _error_excerpt(message) -> list[str]:
+    """The leading lines of an error text, each hard-truncated with ``…``.
+
+    A trailing ``…`` on its own line marks an error text that has more lines than
+    the excerpt keeps; the full text is in the cell's record.
+    """
+    text = _error_lines(message)
+    excerpt = []
+    for line in text[:ERROR_EXCERPT_LINES]:
+        if len(line) > ERROR_EXCERPT_WIDTH:
+            line = line[: ERROR_EXCERPT_WIDTH - 1].rstrip() + "…"
+        excerpt.append(line)
+    if len(text) > ERROR_EXCERPT_LINES:
+        excerpt.append("…")
+    return excerpt or ["(the record carries no error text)"]
+
+
+def _display_path(path) -> str:
+    """A path as the report should quote it: repo-relative when inside the repo."""
+    path = Path(path)
+    try:
+        return str(path.resolve().relative_to(lib.REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _error_pointer(records, model, seq_len, leg_key, record, message) -> str:
+    """One line naming the record file that holds an error text in full."""
+    total = len(_error_lines(message))
+    count = "" if not total else f" ({total} line{'' if total == 1 else 's'})"
+    path = _record_path_at(records, model, seq_len, leg_key)
+    field = _error_field(record)
+    if path is None:
+        return f"Full text{count} is in the cell's record, field `{field}`."
+    return f"Full text{count}: `{_display_path(path)}` → `{field}`."
+
+
 def _best_ms(record) -> float | None:
     if not record or record.get("status") != "ok":
         return None
@@ -1834,7 +1895,7 @@ def _xla_lines(records, out_dirs, digest) -> list[str]:
         "(one row per measured `(model, seq_len)` cell):")
     add("")
     rows = []
-    failures: list[tuple[str, int, str, str]] = []
+    failures: list[tuple[str, int, str, dict, str]] = []
     for model, seq_len in _matrix_cells(records):
         record = _record_at(records, model, seq_len, "xla-rocm")
         build = (record or {}).get("build") or {}
@@ -1854,7 +1915,7 @@ def _xla_lines(records, out_dirs, digest) -> list[str]:
         )
         if record is not None and record.get("status") != "ok":
             for message in record.get("errors") or ["no error message recorded"]:
-                failures.append((model, seq_len, "xla-rocm", str(message)))
+                failures.append((model, seq_len, "xla-rocm", record, str(message)))
     lines.extend(lib.md_table(
         [
             "model",
@@ -1869,14 +1930,20 @@ def _xla_lines(records, out_dirs, digest) -> list[str]:
     ))
     add("")
     if failures:
-        add("The exact error(s), verbatim from the records:")
+        add(
+            f"The exact error(s) — the first {ERROR_EXCERPT_LINES} lines only, each cut at "
+            f"{ERROR_EXCERPT_WIDTH} characters, with a pointer to the record that holds the "
+            "full text:"
+        )
         add("")
-        for model, seq_len, leg_key, message in failures:
+        for model, seq_len, leg_key, record, message in failures:
             add(f"**`{model}` s{seq_len} `{leg_key}`**")
             add("")
             add("```")
-            lines.extend(message.splitlines() or [""])
+            lines.extend(_error_excerpt(message))
             add("```")
+            add("")
+            add(_error_pointer(records, model, seq_len, leg_key, record, message))
             add("")
     # ---- build cost ------------------------------------------------------
     add("**Build cost of the xla path** (`etl_hf.build` = trace → lower → compile → "
@@ -2716,24 +2783,34 @@ def render_report(records, out_dirs) -> str:
             rows,
         ))
         add("")
-        # Verbatim error blocks only for LEGS THAT ACTUALLY RAN and failed; the
-        # synthetic "missing" rows above are a coverage statement, not a record.
+        # Error blocks only for LEGS THAT ACTUALLY RAN and failed; the synthetic
+        # "missing" rows above are a coverage statement, not a record. The record
+        # (not the report) holds the full text: a compiler diagnostic is tens of KB
+        # of repeated target-triple / CPU-feature flags, so the report quotes its
+        # leading lines and names the record file the rest lives in.
         quoted = [
-            (model, seq_len, leg_key, str((record.get("errors") or record.get("notes") or [""])[0]))
+            (model, seq_len, leg_key, record)
             for (model, seq_len, leg_key), record in entries
             if record is not None
             and record.get("status") != "missing"
             and (record.get("errors") or record.get("notes"))
         ]
         if quoted:
-            add("The exact error(s), verbatim from the records:")
+            add(
+                f"Each failing leg's error text — the first {ERROR_EXCERPT_LINES} lines "
+                f"only, each cut at {ERROR_EXCERPT_WIDTH} characters, followed by a pointer "
+                "to the record that holds it in full:"
+            )
             add("")
-            for model, seq_len, leg_key, message in quoted:
+            for model, seq_len, leg_key, record in quoted:
+                message = str((record.get("errors") or record.get("notes") or [""])[0])
                 add(f"**`{model}` s{seq_len} `{leg_key}`**")
                 add("")
                 add("```")
-                lines.extend(message.splitlines() or [""])
+                lines.extend(_error_excerpt(message))
                 add("```")
+                add("")
+                add(_error_pointer(records, model, seq_len, leg_key, record, message))
                 add("")
         details = []
         for (model, seq_len, leg_key), record in entries:
