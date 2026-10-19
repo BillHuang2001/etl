@@ -291,8 +291,8 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | tiny_llama | 32 | numpy-cpu | unpacked | build_total | — | — | — | — | 75.389 | 0.437 | — |
 | tiny_llama | 32 | iree-llvmcpu | unpacked | build_total | — | — | — | — | 1,365.81 | 0.583 | — |
 | tiny_llama | 32 | iree-rocm | unpacked | build_total | — | — | — | — | 1,178.35 | 0.524 | — |
-| tiny_llama | 32 | iree-vulkan | unpacked | build_total | — | — | — | — | 852.968 | 0.574 | — |
-| tiny_llama | 32 | iree-vulkan-o1 | unpacked | build_total | — | — | — | — | 860.342 | 0.578 | — |
+| tiny_llama | 32 | iree-vulkan | unpacked | build_total | — | — | — | — | 913.74 | 0.55 | — |
+| tiny_llama | 32 | iree-vulkan-o1 | unpacked | build_total | — | — | — | — | 910.607 | 0.557 | — |
 | tiny_llama | 32 | xla-rocm | unpacked | build_total | — | — | — | — | 8,717.95 | 0.588 | — |
 | tiny_llama | 32 | xla-rocm-fp32 | unpacked | build_total | — | — | — | — | 8,695.73 | 0.582 | — |
 | tiny_llama | 32 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
@@ -310,8 +310,8 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | tiny_gpt2 | 32 | numpy-cpu | unpacked | build_total | — | — | — | — | 75.244 | 0.641 | — |
 | tiny_gpt2 | 32 | iree-llvmcpu | unpacked | build_total | — | — | — | — | 1,078.97 | 3.621 | — |
 | tiny_gpt2 | 32 | iree-rocm | unpacked | build_total | — | — | — | — | 1,106.83 | 3.647 | — |
-| tiny_gpt2 | 32 | iree-vulkan | unpacked | build_total | — | — | — | — | 678.659 | 3.465 | — |
-| tiny_gpt2 | 32 | iree-vulkan-o1 | unpacked | build_total | — | — | — | — | 677.233 | 3.257 | — |
+| tiny_gpt2 | 32 | iree-vulkan | unpacked | build_total | — | — | — | — | 695.009 | 0.767 | — |
+| tiny_gpt2 | 32 | iree-vulkan-o1 | unpacked | build_total | — | — | — | — | 695.1 | 0.761 | — |
 | tiny_gpt2 | 32 | xla-rocm | unpacked | build_total | — | — | — | — | 8,427.51 | 0.834 | — |
 | tiny_gpt2 | 32 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
 | tiny_gpt2 | 32 | torch-rocm | — | — | — | — | — | — | — | — | no build measured |
@@ -321,7 +321,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | distilgpt2 | 32 | iree-llvmcpu | unpacked | build_total | — | — | — | — | 2,252.13 | 1.688 | — |
 | distilgpt2 | 32 | iree-rocm | packed | build_total | — | — | — | — | 3,759.00 | 0.268 | — |
 | distilgpt2 | 32 | iree-vulkan | packed | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulkan-spirv):  |
-| distilgpt2 | 32 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 1,789.39 | 0.249 | — |
+| distilgpt2 | 32 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 1,842.97 | 0.307 | — |
 | distilgpt2 | 32 | xla-rocm | packed | build_total | — | — | — | — | 12,853.26 | 0.307 | — |
 | distilgpt2 | 32 | xla-rocm-fp32 | packed | build_total | — | — | — | — | 16,222.07 | 0.328 | — |
 | distilgpt2 | 32 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
@@ -330,7 +330,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | distilgpt2 | 128 | iree-llvmcpu | unpacked | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm-cpu): Erro |
 | distilgpt2 | 128 | iree-rocm | packed | build_total | — | — | — | — | 7,363.54 | 0.319 | — |
 | distilgpt2 | 128 | iree-vulkan | packed | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulkan-spirv):  |
-| distilgpt2 | 128 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 1,809.80 | 0.254 | — |
+| distilgpt2 | 128 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 1,806.63 | 0.24 | — |
 | distilgpt2 | 128 | xla-rocm | packed | build_total | — | — | — | — | 12,014.28 | 0.287 | — |
 | distilgpt2 | 128 | xla-rocm-fp32 | packed | build_total | — | — | — | — | 11,612.66 | 0.303 | — |
 | distilgpt2 | 128 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
@@ -339,7 +339,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | gpt2 | 32 | iree-llvmcpu | packed | build_total | — | — | — | — | 3,457.35 | 0.319 | — |
 | gpt2 | 32 | iree-rocm | packed | build_total | — | — | — | — | 6,592.87 | 0.319 | — |
 | gpt2 | 32 | iree-vulkan | packed | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulkan-spirv):  |
-| gpt2 | 32 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 3,116.54 | 0.271 | — |
+| gpt2 | 32 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 3,179.42 | 0.285 | — |
 | gpt2 | 32 | xla-rocm | packed | build_total | — | — | — | — | 20,339.91 | 0.298 | — |
 | gpt2 | 32 | xla-rocm-fp32 | packed | build_total | — | — | — | — | 22,383.89 | 0.305 | — |
 | gpt2 | 32 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
@@ -348,7 +348,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | gpt2 | 128 | iree-llvmcpu | packed | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm-cpu): Erro |
 | gpt2 | 128 | iree-rocm | packed | build_total | — | — | — | — | 13,659.27 | 0.29 | — |
 | gpt2 | 128 | iree-vulkan | packed | — | — | — | — | — | — | — | build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulkan-spirv):  |
-| gpt2 | 128 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 3,091.35 | 0.267 | — |
+| gpt2 | 128 | iree-vulkan-o1 | packed | build_total | — | — | — | — | 3,110.12 | 0.258 | — |
 | gpt2 | 128 | xla-rocm | packed | build_total | — | — | — | — | 16,531.97 | 0.335 | — |
 | gpt2 | 128 | xla-rocm-fp32 | packed | build_total | — | — | — | — | 17,955.46 | 0.318 | — |
 | gpt2 | 128 | torch-cpu | — | — | — | — | — | — | — | — | no build measured |
@@ -363,8 +363,8 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | tiny_llama | 32 | numpy-cpu | unpacked | 2.129 | 1.529 | 1.594 | 1.598 ± 0.048 | 20,932.82 | 0.60× | 1.18× | n/a | 0 (host inputs, not asserted) | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_llama | 32 | iree-llvmcpu | unpacked | 5.465 | 2.131 | 2.386 | 2.346 ± 0.129 | 15,019.24 | 0.43× | 0.85× | n/a | 110 (host inputs, not asserted) | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_llama | 32 | iree-rocm | unpacked | 0.778 | 0.198 | 0.211 | 0.216 ± 0.017 | 162,025.32 | 4.61× | 9.13× | 1.508 | 0 | auto: unpacked (below the input limit, no staging benefit) |
-| tiny_llama | 32 | iree-vulkan | unpacked | 7.022 | 1.577 | 1.619 | 1.615 ± 0.023 | 20,298.13 | 0.58× | 1.14× | 1.393 | 0 | auto: unpacked (below the input limit, no staging benefit) |
-| tiny_llama | 32 | iree-vulkan-o1 | unpacked | 429.711 | 1.65 | 1.718 | 1.704 ± 0.044 | 19,398.64 | 0.55× | 1.09× | 1.525 | 0 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_llama | 32 | iree-vulkan | unpacked | 7.72 | 1.617 | 1.637 | 1.642 ± 0.019 | 19,787.29 | 0.56× | 1.11× | 1.555 | 0 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_llama | 32 | iree-vulkan-o1 | unpacked | 7.225 | 1.698 | 1.712 | 1.718 ± 0.017 | 18,843.48 | 0.54× | 1.06× | 1.52 | 0 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_llama | 32 | xla-rocm | unpacked | 8.799 | 0.18 | 0.192 | 0.192 ± 0.01 | 177,285.32 | 5.04× | 9.99× | 0.555 | 0 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_llama | 32 | xla-rocm-fp32 | unpacked | 8.749 | 0.186 | 0.196 | 0.196 ± 0.008 | 172,135.56 | 4.89× | 9.70× | 0.676 | 0 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_llama | 32 | torch-cpu | — | 30.883 | 0.91 | 0.95 | 0.939 ± 0.022 | 35,180.30 | 1.00× | 1.98× | n/a | n/a | CPU wall time per forward call |
@@ -382,8 +382,8 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | tiny_gpt2 | 32 | numpy-cpu | unpacked | 2.113 | 1.211 | 1.229 | 1.244 ± 0.036 | 26,433.17 | 0.69× | 1.21× | n/a | 0 (host inputs, not asserted) | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_gpt2 | 32 | iree-llvmcpu | unpacked | 3.756 | 1.812 | 1.881 | 1.866 ± 0.046 | 17,660.04 | 0.46× | 0.81× | n/a | 185 (host inputs, not asserted) | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_gpt2 | 32 | iree-rocm | unpacked | 0.708 | 0.216 | 0.238 | 0.238 ± 0.016 | 148,148.15 | 3.86× | 6.80× | 5.451 | 0 | auto: unpacked (below the input limit, no staging benefit) |
-| tiny_gpt2 | 32 | iree-vulkan | unpacked | 5.552 | 1.728 | 1.747 | 1.753 ± 0.025 | 18,513.16 | 0.48× | 0.85× | 2.158 | 0 | auto: unpacked (below the input limit, no staging benefit) |
-| tiny_gpt2 | 32 | iree-vulkan-o1 | unpacked | 105.534 | 1.923 | 1.967 | 2.025 ± 0.151 | 16,637.20 | 0.43× | 0.76× | 2.41 | 0 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_gpt2 | 32 | iree-vulkan | unpacked | 5.609 | 1.744 | 1.767 | 1.762 ± 0.014 | 18,349.68 | 0.48× | 0.84× | 2.292 | 0 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_gpt2 | 32 | iree-vulkan-o1 | unpacked | 6.073 | 1.9 | 1.936 | 1.953 ± 0.05 | 16,841.22 | 0.44× | 0.77× | 2.274 | 0 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_gpt2 | 32 | xla-rocm | unpacked | 8.825 | 0.153 | 0.165 | 0.163 ± 0.011 | 208,877.28 | 5.44× | 9.58× | 1.147 | 0 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_gpt2 | 32 | torch-cpu | — | 103.363 | 0.833 | 0.909 | 0.914 ± 0.056 | 38,406.14 | 1.00× | 1.76× | n/a | n/a | CPU wall time per forward call |
 | tiny_gpt2 | 32 | torch-rocm | — | 6,097.36 | 1.468 | 1.571 | 1.55 ± 0.053 | 21,792.43 | 0.57× | 1.00× | n/a | n/a | timed region includes torch.cuda.synchronize() before and after each call (GPU) — a forward-pass wall time, no |
@@ -393,7 +393,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | distilgpt2 | 32 | iree-llvmcpu | unpacked | 296.55 | 253.233 | 256.807 | 257.735 ± 3.527 | 126.37 | 0.03× | 0.01× | n/a | 505 (host inputs, not asserted) | auto: unpacked (below the input limit, no staging benefit) |
 | distilgpt2 | 32 | iree-rocm | packed | 10.484 | 1.101 | 1.107 | 1.223 ± 0.264 | 29,053.93 | 8.01× | 2.71× | 2.309 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 32 | iree-vulkan | packed | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
-| distilgpt2 | 32 | iree-vulkan-o1 | packed | 188.214 | 141.851 | 142.237 | 144.805 ± 4.402 | 225.59 | 0.06× | 0.02× | 1.977 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
+| distilgpt2 | 32 | iree-vulkan-o1 | packed | 189.931 | 139.455 | 142.725 | 143.581 ± 4.528 | 229.46 | 0.06× | 0.02× | 1.905 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 32 | xla-rocm | packed | 19.08 | 0.378 | 0.388 | 0.431 ± 0.086 | 84,768.21 | 23.38× | 7.92× | 1.011 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 32 | xla-rocm-fp32 | packed | 19.569 | 0.414 | 0.44 | 0.442 ± 0.025 | 77,238.72 | 21.30× | 7.21× | 1.106 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 32 | torch-cpu | — | 60.326 | 8.824 | 8.857 | 9.193 ± 0.478 | 3,626.31 | 1.00× | 0.34× | n/a | n/a | CPU wall time per forward call |
@@ -402,7 +402,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | distilgpt2 | 128 | iree-llvmcpu | unpacked | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm- |
 | distilgpt2 | 128 | iree-rocm | packed | 12.973 | 2.553 | 2.561 | 2.559 ± 0.004 | 50,129.24 | 5.56× | 1.20× | 7.746 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 128 | iree-vulkan | packed | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
-| distilgpt2 | 128 | iree-vulkan-o1 | packed | 11,631.33 | 11,453.44 | 11,480.67 | 11,475.64 ± 16.536 | 11.18 | 0.00× | 0.00× | 7.063 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
+| distilgpt2 | 128 | iree-vulkan-o1 | packed | 11,528.31 | 11,477.25 | 11,495.23 | 11,494.14 ± 16.607 | 11.15 | 0.00× | 0.00× | 7.221 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 128 | xla-rocm | packed | 19.268 | 0.399 | 0.42 | 0.426 ± 0.029 | 320,882.43 | 35.58× | 7.71× | 2.574 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 128 | xla-rocm-fp32 | packed | 18.303 | 0.443 | 0.477 | 0.47 ± 0.026 | 289,134.85 | 32.06× | 6.94× | 2.544 | 0 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
 | distilgpt2 | 128 | torch-cpu | — | 80.354 | 14.194 | 14.54 | 14.479 ± 0.161 | 9,017.70 | 1.00× | 0.22× | n/a | n/a | CPU wall time per forward call |
@@ -411,7 +411,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | gpt2 | 32 | iree-llvmcpu | packed | 432.497 | 402.984 | 407.735 | 406.172 ± 2.909 | 79.41 | 0.04× | 0.01× | n/a | 20 (host inputs, not asserted) | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 32 | iree-rocm | packed | 19.502 | 2.045 | 2.05 | 2.055 ± 0.012 | 15,644.86 | 7.33× | 2.58× | 2.314 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 32 | iree-vulkan | packed | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
-| gpt2 | 32 | iree-vulkan-o1 | packed | 238.381 | 174.589 | 191.694 | 188.754 ± 10.333 | 183.29 | 0.09× | 0.03× | 2.003 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
+| gpt2 | 32 | iree-vulkan-o1 | packed | 249.409 | 194.588 | 206.498 | 208.462 ± 11.083 | 164.45 | 0.08× | 0.03× | 2.013 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 32 | xla-rocm | packed | 34.713 | 0.694 | 0.738 | 0.76 ± 0.073 | 46,142.75 | 21.61× | 7.61× | 0.716 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 32 | xla-rocm-fp32 | packed | 33.203 | 0.823 | 0.833 | 0.875 ± 0.102 | 38,872.69 | 18.21× | 6.41× | 0.741 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 32 | torch-cpu | — | 74.579 | 14.99 | 15.272 | 15.496 ± 0.724 | 2,134.76 | 1.00× | 0.35× | n/a | n/a | CPU wall time per forward call |
@@ -420,7 +420,7 @@ Counts come from `etl_hf.param_specs` / `etl_hf.pack_plan` and from the traced g
 | gpt2 | 128 | iree-llvmcpu | packed | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: llvm- |
 | gpt2 | 128 | iree-rocm | packed | 24.748 | 7.276 | 7.284 | 7.284 ± 0.006 | 17,591.36 | 3.39× | 0.73× | 8.137 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 128 | iree-vulkan | packed | — | — | — | — ± — | — | — | — | — | n/a | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
-| gpt2 | 128 | iree-vulkan-o1 | packed | 11,673.43 | 11,626.02 | 11,634.66 | 11,653.45 ± 46.967 | 11.01 | 0.00× | 0.00× | 6.761 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
+| gpt2 | 128 | iree-vulkan-o1 | packed | 11,617.58 | 11,559.80 | 11,594.93 | 11,605.90 ± 37.608 | 11.07 | 0.00× | 0.00× | 6.93 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 128 | xla-rocm | packed | 35.252 | 0.736 | 0.764 | 0.777 ± 0.048 | 173,913.04 | 33.52× | 7.18× | 2.486 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 128 | xla-rocm-fp32 | packed | 31.342 | 0.949 | 0.994 | 1.02 ± 0.084 | 134,864.61 | 26.00× | 5.57× | 2.845 | 0 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 | gpt2 | 128 | torch-cpu | — | 114.599 | 24.672 | 26.04 | 27.083 ± 2.618 | 5,188.05 | 1.00× | 0.21× | n/a | n/a | CPU wall time per forward call |
@@ -433,8 +433,8 @@ A `—` cell means the number was **not measured** (the reason is in the last co
 | model | seq | leg | restage best ms | restage median ms | same-device loop best ms | loop ÷ restage | what the anti-pattern is |
 |---|---|---|---|---|---|---|---|
 | tiny_llama | 32 | iree-rocm | 1.764 | 1.873 | 0.198 | 0.11× | etl_hf.place_params(host params, device) + etl_hf.run per call |
-| tiny_llama | 32 | iree-vulkan | 3.904 | 3.968 | 1.577 | 0.40× | etl_hf.place_params(host params, device) + etl_hf.run per call |
-| tiny_llama | 32 | iree-vulkan-o1 | 3.936 | 4.024 | 1.65 | 0.42× | etl_hf.place_params(host params, device) + etl_hf.run per call |
+| tiny_llama | 32 | iree-vulkan | 3.869 | 3.927 | 1.617 | 0.42× | etl_hf.place_params(host params, device) + etl_hf.run per call |
+| tiny_llama | 32 | iree-vulkan-o1 | 4.072 | 4.138 | 1.698 | 0.42× | etl_hf.place_params(host params, device) + etl_hf.run per call |
 | tiny_llama | 32 | xla-rocm | 2.013 | 2.054 | 0.18 | 0.09× | etl_hf.place_params(host params, device) + etl_hf.run per call |
 | tiny_llama | 32 | xla-rocm-fp32 | 2.183 | 2.28 | 0.186 | 0.09× | etl_hf.place_params(host params, device) + etl_hf.run per call |
 
@@ -442,17 +442,17 @@ A `—` cell means the number was **not measured** (the reason is in the last co
 
 ### `iree-vulkan` — library defaults (no hand-picked compile option)
 
-`iree-vulkan` — the whole forward as ONE `etl_hf` graph on IREE's **Vulkan** HAL. The only Vulkan device this host exposes is **lavapipe** (Mesa's software Vulkan implementation, `deviceType = CPU`), reached through the benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (`install()` widens eight string/dialect gates of the live iree adapter; nothing under `etl/` or `etl_hf/` is modified) with the Vulkan loader pinned to a renamed lavapipe ICD by `VK_ICD_FILENAMES`, forwarded from `$ETL_VULKAN_ICD`. **These are not GPU numbers** — the same work runs on the CPU, slower than the interpreter on the large models.
+`iree-vulkan` — the whole forward as ONE `etl_hf` graph on IREE's **Vulkan** HAL. `vulkan` is a first-class `etl` device kind, so the leg runs the **unmodified public API** — `etl_hf.build(...)` / `etl_hf.run(...)` on `Device("vulkan", 0)`, with `target_backends=["vulkan-spirv"]` inferred from the device by `etl.pipeline`; nothing beyond the library's own public API is involved. The only Vulkan device this host exposes is **lavapipe** (Mesa's software Vulkan implementation, `deviceType = CPU`), reached through a renamed ICD pinned by the Vulkan loader with `VK_ICD_FILENAMES`, forwarded from `$ETL_VULKAN_ICD`. **These are not GPU numbers** — the same work runs on the CPU, slower than the interpreter on the large models.
 
-**Compile configuration: library defaults** — no hand-picked flag (the `opt_level` is whatever `etl_hf.pipeline.resolve_build_options` resolves, `O3` for a non-ROCm target set).
+**Compile configuration: library defaults** — no hand-picked flag (the `opt_level` is whatever `etl_hf.pipeline.resolve_build_options` resolves, `O3` for a non-ROCm target set; the compile target `vulkan-spirv` is inferred from the device, and the SPIR-V profile is IREE's default `vp_android_baseline_2022`).
 
-Device the leg actually enumerated (recorded per cell under `vulkan`): **lavapipe (LLVM 20.1.2, 256 bits)** — apiVersion `1.4.318`, driverVersion `25.2.8` (VK_MAKE_VERSION (Mesa/lavapipe spelling)), vendorID `0x10005`, `deviceType = CPU`; IREE compile target `vulkan-spirv`; shim `bench_logs/hf_bench_vulkan.py install()` (8 patched site(s)); ICD from `$ETL_VULKAN_ICD`.
+Device the leg actually ran on (recorded per cell under `vulkan`): **lavapipe (LLVM 20.1.2, 256 bits)** — apiVersion `1.4.318`, driverVersion `25.2.8` (VK_MAKE_VERSION (Mesa/lavapipe spelling)), vendorID `0x10005`, `deviceType = CPU`; etl device `Device(kind='vulkan', index=0)`, compile target `vulkan-spirv` — inferred from the device by etl.pipeline (['vulkan-spirv']), public API `yes`; ICD from `$ETL_VULKAN_ICD`.
 
 | model | seq | weights | first ms | best ms | median ms | +d2h best ms | asdevicearray | ×numpy-cpu | ×iree-llvmcpu | ×torch-cpu | iree-rocm ms (reused) | xla-rocm ms (reused) | torch-rocm ms (reused) | note / reason |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| tiny_llama | 32 | unpacked | 7.022 | 1.577 | 1.619 | 1.393 | 0 | 0.97× | 1.35× | 0.58× | 0.198 | 0.18 | 1.803 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_llama | 32 | unpacked | 7.72 | 1.617 | 1.637 | 1.555 | 0 | 0.95× | 1.32× | 0.56× | 0.198 | 0.18 | 1.803 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_mistral | 32 | unpacked | — | — | — | — | n/a | — | — | — | — | — | 1.98 | error: build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it c |
-| tiny_gpt2 | 32 | unpacked | 5.552 | 1.728 | 1.747 | 2.158 | 0 | 0.70× | 1.05× | 0.48× | 0.216 | 0.153 | 1.468 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_gpt2 | 32 | unpacked | 5.609 | 1.744 | 1.767 | 2.292 | 0 | 0.69× | 1.04× | 0.48× | 0.216 | 0.153 | 1.468 | auto: unpacked (below the input limit, no staging benefit) |
 | distilgpt2 | 32 | packed | — | — | — | — | n/a | — | — | — | 1.101 | 0.378 | 2.988 | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
 | distilgpt2 | 128 | packed | — | — | — | — | n/a | — | — | — | 2.553 | 0.399 | 3.074 | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
 | gpt2 | 32 | packed | — | — | — | — | n/a | — | — | — | 2.045 | 0.694 | 5.277 | error: build: BackendError: iree-compile failed to compile the StableHLO program for the iree backend (targets: vulka |
@@ -471,21 +471,21 @@ The numpy reference is the `numpy-cpu` leg's own logits: its `*.logits.npz` dump
 
 ### `iree-vulkan-o1` — hand-picked `opt_level='O1'`
 
-`iree-vulkan-o1` — the whole forward as ONE `etl_hf` graph on IREE's **Vulkan** HAL. The only Vulkan device this host exposes is **lavapipe** (Mesa's software Vulkan implementation, `deviceType = CPU`), reached through the benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (`install()` widens eight string/dialect gates of the live iree adapter; nothing under `etl/` or `etl_hf/` is modified) with the Vulkan loader pinned to a renamed lavapipe ICD by `VK_ICD_FILENAMES`, forwarded from `$ETL_VULKAN_ICD`. **These are not GPU numbers** — the same work runs on the CPU, slower than the interpreter on the large models.
+`iree-vulkan-o1` — the whole forward as ONE `etl_hf` graph on IREE's **Vulkan** HAL. `vulkan` is a first-class `etl` device kind, so the leg runs the **unmodified public API** — `etl_hf.build(...)` / `etl_hf.run(...)` on `Device("vulkan", 0)`, with `target_backends=["vulkan-spirv"]` inferred from the device by `etl.pipeline`; nothing beyond the library's own public API is involved. The only Vulkan device this host exposes is **lavapipe** (Mesa's software Vulkan implementation, `deviceType = CPU`), reached through a renamed ICD pinned by the Vulkan loader with `VK_ICD_FILENAMES`, forwarded from `$ETL_VULKAN_ICD`. **These are not GPU numbers** — the same work runs on the CPU, slower than the interpreter on the large models.
 
-**Compile configuration: HAND-PICKED** — `iree-vulkan-o1` passes `opt_level='O1'` to the build. Everything else is the library default (`target_backends=['vulkan-spirv']`, i.e. IREE's default Vulkan profile `vp_android_baseline_2022`, `max_workgroup_memory_bytes = 16384`). The library default `opt_level="O3"` **cannot compile** the 124M-class graphs for `vulkan-spirv` — `seq_len` 32 fails with `function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; exceeded the limit of 16384 bytes` and `seq_len` 128 with `failed to legalize operation 'vector.from_elements'` — so these cells exist only under the hand-picked level. They are therefore **not** comparable with the `iree-vulkan` (defaults, `O3`) cells as a compile-setting-free measurement; the two legs are kept apart for exactly that reason.
+**Compile configuration: HAND-PICKED** — `iree-vulkan-o1` passes `opt_level='O1'` to the build. Everything else is the library default (the compile **target** is inferred from `Device("vulkan", 0)` by `etl.pipeline` — `vulkan-spirv` — and the SPIR-V **profile** is left at IREE's default, `vp_android_baseline_2022` (`max_workgroup_memory_bytes = 16384`). The library default `opt_level="O3"` **cannot compile** the 124M-class graphs for `vulkan-spirv` — `seq_len` 32 fails with `function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of shared memory; exceeded the limit of 16384 bytes` and `seq_len` 128 with `failed to legalize operation 'vector.from_elements'` — so these cells exist only under the hand-picked level. They are therefore **not** comparable with the `iree-vulkan` (defaults, `O3`) cells as a compile-setting-free measurement; the two legs are kept apart for exactly that reason.
 
-Device the leg actually enumerated (recorded per cell under `vulkan`): **lavapipe (LLVM 20.1.2, 256 bits)** — apiVersion `1.4.318`, driverVersion `25.2.8` (VK_MAKE_VERSION (Mesa/lavapipe spelling)), vendorID `0x10005`, `deviceType = CPU`; IREE compile target `vulkan-spirv`; shim `bench_logs/hf_bench_vulkan.py install()` (8 patched site(s)); ICD from `$ETL_VULKAN_ICD`.
+Device the leg actually ran on (recorded per cell under `vulkan`): **lavapipe (LLVM 20.1.2, 256 bits)** — apiVersion `1.4.318`, driverVersion `25.2.8` (VK_MAKE_VERSION (Mesa/lavapipe spelling)), vendorID `0x10005`, `deviceType = CPU`; etl device `Device(kind='vulkan', index=0)`, compile target `vulkan-spirv` — inferred from the device by etl.pipeline (['vulkan-spirv']), public API `yes`; ICD from `$ETL_VULKAN_ICD`.
 
 | model | seq | weights | first ms | best ms | median ms | +d2h best ms | asdevicearray | ×numpy-cpu | ×iree-llvmcpu | ×torch-cpu | iree-rocm ms (reused) | xla-rocm ms (reused) | torch-rocm ms (reused) | note / reason |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| tiny_llama | 32 | unpacked | 429.711 | 1.65 | 1.718 | 1.525 | 0 | 0.93× | 1.29× | 0.55× | 0.198 | 0.18 | 1.803 | auto: unpacked (below the input limit, no staging benefit) |
+| tiny_llama | 32 | unpacked | 7.225 | 1.698 | 1.712 | 1.52 | 0 | 0.90× | 1.25× | 0.54× | 0.198 | 0.18 | 1.803 | auto: unpacked (below the input limit, no staging benefit) |
 | tiny_mistral | 32 | unpacked | — | — | — | — | n/a | — | — | — | — | — | 1.98 | error: build: HFUnsupportedError: hidden_act='gelu' needs etl.erf, which the StableHLO exporter defers in v1, so it c |
-| tiny_gpt2 | 32 | unpacked | 105.534 | 1.923 | 1.967 | 2.41 | 0 | 0.63× | 0.94× | 0.43× | 0.216 | 0.153 | 1.468 | auto: unpacked (below the input limit, no staging benefit) |
-| distilgpt2 | 32 | packed | 188.214 | 141.851 | 142.237 | 1.977 | 0 | 0.10× | 1.79× | 0.06× | 1.101 | 0.378 | 2.988 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
-| distilgpt2 | 128 | packed | 11,631.33 | 11,453.44 | 11,480.67 | 7.063 | 0 | 0.01× | — | 0.00× | 2.553 | 0.399 | 3.074 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
-| gpt2 | 32 | packed | 238.381 | 174.589 | 191.694 | 2.003 | 0 | 0.17× | 2.31× | 0.09× | 2.045 | 0.694 | 5.277 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
-| gpt2 | 128 | packed | 11,673.43 | 11,626.02 | 11,634.66 | 6.761 | 0 | 0.01× | — | 0.00× | 7.276 | 0.736 | 5.286 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
+| tiny_gpt2 | 32 | unpacked | 6.073 | 1.9 | 1.936 | 2.274 | 0 | 0.64× | 0.95× | 0.44× | 0.216 | 0.153 | 1.468 | auto: unpacked (below the input limit, no staging benefit) |
+| distilgpt2 | 32 | packed | 189.931 | 139.455 | 142.725 | 1.905 | 0 | 0.11× | 1.82× | 0.06× | 1.101 | 0.378 | 2.988 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
+| distilgpt2 | 128 | packed | 11,528.31 | 11,477.25 | 11,495.23 | 7.221 | 0 | 0.01× | — | 0.00× | 2.553 | 0.399 | 3.074 | auto: device-resident leg would stage 100 weight leaves; packing collapses them to a handful of host->device transfers |
+| gpt2 | 32 | packed | 249.409 | 194.588 | 206.498 | 2.013 | 0 | 0.15× | 2.07× | 0.08× | 2.045 | 0.694 | 5.277 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
+| gpt2 | 128 | packed | 11,617.58 | 11,559.80 | 11,594.93 | 6.93 | 0 | 0.01× | — | 0.00× | 7.276 | 0.736 | 5.286 | auto: 197 unpacked graph inputs exceed the ~161-input IREE runtime limit (SIGSEGV at invoke) |
 
 The three `×` columns are the **CPU-vs-CPU** comparison — `that leg's best ms / iree-vulkan-o1's best ms`, so **>1 means iree-vulkan-o1 is faster**. The three `(reused)` columns carry the raw best ms of the **real-GPU** records (measured before the AMD GPU of this host stopped accepting Vulkan/ROCm work; that hardware cannot be re-measured) shown for reference only: they are a GPU's numbers next to a software rasterizer's, so no ratio is formed from them here (e.g. `torch-rocm` on a *tiny* model is launch-overhead-bound and says nothing about GPU throughput).
 
@@ -494,7 +494,7 @@ Parity of the Vulkan logits — against the **numpy interpreter** (the reference
 | model | seq | max_abs (numpy) | rel_to_absmax (numpy) | argmax (numpy) | max_abs (golden) | argmax (golden) | note / reason |
 |---|---|---|---|---|---|---|---|
 | tiny_llama | 32 | 8.94e-08 | 2.14e-07 | 1 | — | — |  |
-| tiny_gpt2 | 32 | 6.26e-07 | 4.85e-06 | 1 | — | — |  |
+| tiny_gpt2 | 32 | 3.30e-04 | 2.56e-03 | 1 | — | — |  |
 | distilgpt2 | 32 | 2.44e-04 | 2.97e-06 | 1 | 2.44e-04 | 1 |  |
 | distilgpt2 | 128 | 2.59e-04 | 3.16e-06 | 1 | — | — |  |
 | gpt2 | 32 | 3.66e-04 | 2.64e-06 | 1 | 4.27e-04 | 1 |  |
@@ -579,7 +579,7 @@ The numpy reference is the `numpy-cpu` leg's own logits: its `*.logits.npz` dump
 | tiny_gpt2 | 32 | iree-vulkan-o1 | golden (torch/transformers) | — | — | — | golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 — compare against the torch / numpy legs |
 | tiny_gpt2 | 32 | iree-vulkan-o1 | torch-cpu | — | — | — | no logits dump on disk for this leg and no recorded parity for the torch-cpu reference (parity_digest.json has no entry either) |
 | tiny_gpt2 | 32 | iree-vulkan-o1 | torch-rocm | — | — | — | no logits dump on disk for this leg and no recorded parity for the torch-rocm reference (parity_digest.json has no entry either) |
-| tiny_gpt2 | 32 | iree-vulkan-o1 | numpy-cpu | 6.26e-07 | 4.85e-06 | 1 |  |
+| tiny_gpt2 | 32 | iree-vulkan-o1 | numpy-cpu | 3.30e-04 | 2.56e-03 | 1 |  |
 | tiny_gpt2 | 32 | xla-rocm | golden (torch/transformers) | — | — | — | golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 — compare against the torch / numpy legs |
 | tiny_gpt2 | 32 | xla-rocm | torch-cpu | 1.34e-04 | 1.04e-03 | 1 |  |
 | tiny_gpt2 | 32 | xla-rocm | torch-rocm | 1.34e-04 | 1.04e-03 | 1 |  |
@@ -993,7 +993,7 @@ $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --report --out bench_logs
 | numpy-cpu | etl | numpy | cpu (host) | no | — | numpy interpreter backend, host arrays (no compilation) |
 | iree-llvmcpu | etl | iree | cpu (host) | no | `target_backends=['llvm-cpu']` | IREE compiled for llvm-cpu, host-resident inputs |
 | iree-rocm | etl | iree | rocm:0 | yes | `target_backends=['rocm']` | IREE compiled for ROCm, device-resident same-device loop |
-| iree-vulkan | etl | iree | vulkan:0 | yes | — | IREE compiled for Vulkan (`vulkan-spirv`) on lavapipe — **software** Vulkan on the CPU, device-resident; needs the benchmark-only shim `bench_logs/hf_bench_vulkan.py` and `ETL_VULKAN_ICD` (forwarded as `VK_ICD_FILENAMES`) |
+| iree-vulkan | etl | iree | vulkan:0 | yes | — | IREE compiled for Vulkan (`vulkan-spirv`) on lavapipe — **software** Vulkan on the CPU, device-resident; `vulkan` is a first-class etl device kind (the target is inferred from it), so the leg runs the unmodified public API and needs `ETL_VULKAN_ICD` (forwarded as `VK_ICD_FILENAMES`) |
 | iree-vulkan-o1 | etl | iree | vulkan:0 | yes | `opt_level='O1'` | the same Vulkan path with ONE hand-picked compile option, `opt_level="O1"` — the library default `O3` cannot translate the 124M-class graphs for `vulkan-spirv`; a Vulkan-EXECUTION probe, not a defaults measurement |
 | xla-rocm | etl | xla | rocm:0 | yes | — | PJRT/XLA on ROCm (needs `ETL_PJRT_PLUGIN`), device-resident |
 | xla-rocm-fp32 | etl | xla | rocm:0 | yes | `dot_precision='HIGHEST'` | the same with `dot_precision="HIGHEST"` (true fp32 dot) — opt-in, `--legs` only |
@@ -1011,7 +1011,7 @@ $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --report --out bench_logs
 * One subprocess per `(model, seq_len, leg)`. A leg that segfaults, times out or writes no record is still reported (section 7 quotes its returncode, signal, last `[stage]` marker and stderr tail). The xla/ROCm PJRT plugin aborts at interpreter exit **after** the work succeeds, so legs end with `os._exit(0)` once their record is on disk.
 * `--pack auto` packs only when it is needed (a compiled leg above the ~161-consumed-input IREE runtime limit — the 124M `gpt2`) or measured-beneficial (a device leg staging many weight leaves). The per-row reason is in section 2.
 * Compile options are the `etl_hf.pipeline.resolve_build_options` defaults (all-ROCm → `opt_level="O1"`, llvm-cpu → `opt_level="O3"` + `--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling`); the resolved set is recorded in every leg JSON.
-* The `iree-vulkan` leg needs the benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (installed by the measuring path, never by the library: `etl` has no `vulkan` device kind) and a Vulkan ICD pinned by `VK_ICD_FILENAMES`, which the driver forwards from `$ETL_VULKAN_ICD` — a vulkan leg requested without it fails as a record naming that variable. The device is lavapipe (**software** Vulkan on the CPU), so no row in this report moves work to an accelerator for that leg; the shim's patched sites and the device's apiVersion/driverVersion are recorded per cell under `vulkan`.
+* The `iree-vulkan` leg runs the **unmodified public API**: `vulkan` is a first-class `etl` device kind, so `etl_hf.build(...)` / `etl_hf.run(...)` on `Device("vulkan", 0)` work as they do on any other device — `etl.pipeline` infers the `vulkan-spirv` compile target from the device and nothing beyond the library's own public API is involved. It does need a Vulkan ICD pinned by `VK_ICD_FILENAMES`, which the driver forwards from `$ETL_VULKAN_ICD` — a vulkan leg requested without it fails as a record naming that variable. The device is lavapipe (**software** Vulkan on the CPU), so no row in this report moves work to an accelerator for that leg; the device's name/apiVersion/driverVersion are recorded per cell under `vulkan`.
 * The GPU columns of this report (`iree-rocm`, `xla-rocm`, `torch-rocm`, …) are **reused records** measured before the AMD GPU of this host stopped accepting work; they were not re-measured, and no number here was extrapolated from the Vulkan leg.
 * The torch legs are the baseline, not the reference: parity versus the stored torch/transformers golden is the absolute check (only where the golden's ids shape matches the cell).
 * Graph sizes missing for: `tiny_llama` s128: no leg traced this graph; `tiny_mistral` s128: no leg traced this graph; `tiny_gpt2` s128: no leg traced this graph.
