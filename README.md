@@ -5,8 +5,6 @@
 
 <p><strong>EvoX Tensor Library</strong> — a minimal, explicit, compiler-neutral tensor graph runtime.</p>
 
-<p>etl = <strong>EvoX Tensor Library</strong>. It is a Python tensor <em>language</em> whose program is an explicit SSA graph: you build the graph, etl owns the frontend (trace → transform → IR → StableHLO), and external ML compilers do the optimization, scheduling, memory planning and codegen. With no compiler installed it still runs — on a reference numpy interpreter.</p>
-
 <p>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
   <a href="#install"><img src="https://img.shields.io/badge/deps-numpy%20only-7c5cff?style=flat-square" alt="deps: numpy only"></a>
@@ -17,6 +15,8 @@
 
 <p><a href="#why-etl-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#backends">Backends</a> · <a href="#measured">Measured</a> · <a href="#how-etl-compares">vs others</a> · <a href="#install">Install</a></p>
 </div>
+
+etl is a Python tensor <em>language</em> whose program is an explicit SSA graph. You build the graph; etl owns the frontend (trace → transform → IR → StableHLO); external ML compilers own the optimization, scheduling, memory planning and code generation. With no compiler installed it still runs — on a reference numpy interpreter.
 
 ---
 
