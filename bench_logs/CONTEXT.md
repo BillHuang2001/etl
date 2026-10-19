@@ -155,8 +155,91 @@ fails with `RuntimeError: ROCm runtime is not linked into this build; cannot
 launch kernels.` (`rocm_fallback_module.cc:59`); etl's tvm adapter is
 additionally CPU-only by design (`adapters/tvm.py:304`).
 
-## `probe_hf_perf.py` + `hf_perf_results.md` + `hf_perf_data/` — whole-forward perf/parity matrix (numpy / iree-llvm-cpu / iree-rocm × unpacked / packed)
+## `hf_bench.py` — the current benchmark: `etl_hf` vs PyTorch on iree / xla / numpy
 
+`./hf_bench.py` + `./hf_bench_lib.py` measure a real HuggingFace checkpoint's whole-model forward
+through `etl_hf` (ONE etl graph, every weight a graph input) on the compiler backends and against
+PyTorch baselines. Environment provisioning is `./hf_bench_env.py`; raw records live in
+`./hf_bench_data/`; the rendered report is `./hf_bench_results.md` (generated, never hand-edited).
+`./probe_hf_perf.py` below is the older narrower matrix — new measurements belong here.
+
+Legs: `numpy-cpu` (interpreter reference), `iree-llvmcpu`, `iree-rocm`, `xla-rocm`, `torch-cpu`,
+`torch-rocm` (fp32 eager `.eval()`/`no_grad()`, `torch.cuda.synchronize()` around each call), plus
+the opt-in `xla-rocm-fp32` (`dot_precision="HIGHEST"`), `torchcompile-cpu`, `torchcompile-rocm`.
+`--phase cpu` = `numpy-cpu,iree-llvmcpu,torch-cpu`; `--phase gpu` = `iree-rocm,xla-rocm,torch-rocm`.
+The phases are run SEQUENTIALLY — the MI300X is shared, so never two GPU legs at once.
+One subprocess per `(model, seq_len, leg)`, with `--leg-timeout`; the child writes its own JSON and
+`.logits.npz` then `os._exit(0)`, so the xla/ROCm teardown abort cannot lose a record.
+A leg that cannot run is a RECORD (`*.error.json`) with its verbatim error/returncode/signal, never
+an omission: a `—` cell in the report always carries a reason.
+
+Device legs use the documented **device-resident same-device loop** (params + ids placed once,
+each run's device outputs fed back) and record `checks.asdevicearray_calls`, which must be `0` after
+warmup; `+d2h` is a separate column (one explicit `Tensor.to(Device('cpu',0))` per call) and the
+per-call restage anti-pattern is measured once under `--anti-pattern` for reference only.
+Compiled legs always use the library defaults from `etl_hf.pipeline.resolve_build_options`
+(`opt_level="O1"` for an all-ROCm target set; `"O3"` + `--iree-llvmcpu-target-cpu=host` /
+`--iree-opt-data-tiling` for llvm-cpu) — the harness never hand-picks compiler flags.
+`--pack auto` packs only where required or beneficial (`gpt2`'s 197 unpacked inputs exceed the
+~161-input IREE runtime limit, and packing collapses ~100 device staging leaves for the 124M
+models); the counts are read from `pack_plan(...).specs`, never hard-coded.
+Parity is recomputed by `--report` from every leg's saved `.logits.npz`, so leg order does not
+matter; a golden fixture whose `seq_len` differs from the cell renders `—` with the reason (the tiny
+goldens are S=8, `distilgpt2`/`gpt2` S=32), never a number.
+`--report` is a pure function of the JSON/npz + `hf_bench_env.json` (no torch, no iree, no
+measurement) and reproduces byte-identically.
+
+Run it (etl/etl_hf come from the checkout via `PYTHONPATH`, never installed into the bench venv):
+
+```
+$TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench_env.py          # provision + 17 capability checks → hf_bench_env.json
+PYTHONPATH=$PWD ETL_HF_MODELS_DIR=$TMPDIR/etl_hf_models HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --phase cpu --seq-lens 32 \
+  --out bench_logs/hf_bench_data --warmup 2 --repeat 5
+PYTHONPATH=$PWD ETL_HF_MODELS_DIR=$TMPDIR/etl_hf_models ETL_PJRT_PLUGIN=$TMPDIR/pjrt/xla_rocm_plugin.so \
+  XLA_FLAGS=--xla_gpu_enable_command_buffer= \
+  $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --phase gpu --seq-lens 32 \
+  --out bench_logs/hf_bench_data --warmup 2 --repeat 5 --anti-pattern
+$TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --report --out bench_logs/hf_bench_data
+```
+
+The throwaway venv (`$TMPDIR/hfbench-venv`) is mandatory: torch must NEVER enter the repo `.venv`
+(it flips the etl suite's `importorskip("torch")` guards), and the ROCm torch wheel comes only from
+`--index-url https://download.pytorch.org/whl/rocm7.1` **with** `--index-strategy unsafe-best-match`
+(without it uv reports "No solution found" for `torch==2.13.0+rocm7.1`).
+`hf_bench_env.py` is idempotent (`--verify-only`, `--force`) and records every version, install
+command and the required env vars in `hf_bench_env.json`, which section 1 of the report renders.
+
+Measured state of the committed matrix (51 cells: 5 models × seq_len 32, `distilgpt2`/`gpt2` also at
+128; best-of-5 warm, batch 1; full tables and every ratio in `./hf_bench_results.md`):
+- **xla/rocm is the fastest leg on every measured model** — 7.18×–9.99× torch-rocm (`gpt2` s128
+  0.736 ms vs 5.286; `gpt2` s32 0.694 vs 5.277; `distilgpt2` s128 0.399 vs 3.074) and 21.6×–35.6×
+  torch-cpu on the real checkpoints.
+- **iree/rocm beats torch-rocm in 5 of 6 cells** (9.13× `tiny_llama`, 6.80× `tiny_gpt2`, 2.58×
+  `gpt2` s32) and loses exactly one: `gpt2` s128 (7.276 ms vs 5.286 = 0.73×).
+- On CPU the numpy interpreter (OpenBLAS) beats the compiled llvm-cpu path on large matmuls
+  (`gpt2` 28.9 ms vs 403 ms) and torch-cpu beats both on the real models (14.99 / 8.824 ms).
+- **xla/rocm's default fp32 dots are TF32-class** — rel-to-absmax 1.5e-3–2.6e-3 and argmax agreement
+  0.9688 on real `gpt2`, vs 1.5e-6–2.9e-6 and argmax 1.0 from the opt-in `xla-rocm-fp32` leg
+  (`dot_precision="HIGHEST"`) at +3–29% latency. Always report the pair, never conflate them.
+- xla builds cost 8.4–22.4 s (1.2–7.6× iree) plus a one-time ~6 s first `place_params`.
+
+Facts about the current matrix worth knowing before re-running it:
+- `tiny_mistral` is exact-erf GELU, so every COMPILED leg of it fails with an explicit
+  `HFUnsupportedError` from the activation gate — the numpy and torch legs run normally.
+- `iree/llvm-cpu` cannot compile `distilgpt2`/`gpt2` at `seq_len=128` (works at 32):
+  `'func.func' op exceeded stack allocation limit of 32768 bytes for function` — an upstream
+  iree-compile limit, independent of packing and of any harness option.
+- Inductor/Triton caches must not live under `$HOME` (a read-only mount here): the harness points
+  `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
+  `torchcompile-*` legs.
+- `./hf_bench_data/` carries one `.logits.npz` per ok leg (output-sized, ~250 MB total) — that is
+  what makes order-independent parity recomputation possible, and `.npz` benchmark data is already
+  tracked in this directory (`hf_goldens/`, `hf_perf_data/`).
+- The environment record's `host.repo_root`/`host.tmpdir` are the worktree/scratch paths at
+  measurement time, recorded as provenance only.
+
+## `probe_hf_perf.py` + `hf_perf_results.md` + `hf_perf_data/` — whole-forward perf/parity matrix (numpy / iree-llvm-cpu / iree-rocm × unpacked / packed)
 Measures the `etl_hf` full-model forward as ONE graph across **six legs per checkpoint** — three
 backend paths each measured **unpacked** (one graph input per weight) and **packed**
 (`etl_hf.build(forward_fn(cfg, pack_weights=True), cfg)` + `etl_hf.pack_params(pack_plan(...))`,
