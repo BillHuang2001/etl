@@ -145,6 +145,20 @@ LEGS: dict[str, LegSpec] = {
         backend="xla",
         device_kind="rocm",
     ),
+    # Additive variant of ``xla-rocm``: the ONE place the harness passes a
+    # precision option, because XLA/ROCm's default fp32 ``dot`` runs at
+    # TF32-class precision (10-bit mantissa) while the explicit
+    # ``dot_precision="HIGHEST"`` restores true fp32.  It flows through the
+    # ordinary options plumbing (``resolve_build_options`` copies it, the xla
+    # adapter declares it a reserved lower option) — nothing else differs from
+    # ``xla-rocm``, so the pair isolates the precision decision.
+    "xla-rocm-fp32": LegSpec(
+        key="xla-rocm-fp32",
+        kind="etl",
+        backend="xla",
+        device_kind="rocm",
+        options={"dot_precision": "HIGHEST"},
+    ),
     "torch-cpu": LegSpec(key="torch-cpu", kind="torch", torch_device="cpu"),
     "torch-rocm": LegSpec(key="torch-rocm", kind="torch", torch_device="cuda:0"),
     "torchcompile-cpu": LegSpec(
@@ -161,6 +175,7 @@ LEG_ORDER: tuple[str, ...] = (
     "iree-llvmcpu",
     "iree-rocm",
     "xla-rocm",
+    "xla-rocm-fp32",
     "torch-cpu",
     "torch-rocm",
     "torchcompile-cpu",
@@ -172,6 +187,11 @@ PHASES: dict[str, tuple[str, ...]] = {
     "cpu": ("numpy-cpu", "iree-llvmcpu", "torch-cpu"),
     "gpu": ("iree-rocm", "xla-rocm", "torch-rocm"),
 }
+#: Legs that exist for a documented, additive *comparison* and are therefore never
+#: part of a phase or of the default leg set — they run only when named explicitly
+#: with ``--legs`` (``xla-rocm-fp32`` isolates the TF32-vs-true-fp32 ``dot_precision``
+#: decision against ``xla-rocm``; nothing else about it differs).
+OPT_IN_LEGS: frozenset[str] = frozenset({"xla-rocm-fp32"})
 
 
 def leg_spec(key: str) -> LegSpec:

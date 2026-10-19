@@ -1,0 +1,400 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "etl",
+  "provenance": {
+    "model": "tiny_llama",
+    "golden_slug": "tiny_random_llama",
+    "seq_len": 32,
+    "leg": "xla-rocm",
+    "timestamp": "2026-10-19T11:06:56Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "38a379a21b1eebb61223749c2da8dd0e0a07c343",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "xla-rocm",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "xla-rocm",
+    "kind": "etl",
+    "backend": "xla",
+    "device": "rocm:0",
+    "device_resident": true,
+    "options_requested": {},
+    "pack": {
+      "mode": "auto",
+      "packed": false,
+      "reason": "auto: unpacked (below the input limit, no staging benefit)"
+    },
+    "resolved_backend": "xla",
+    "options_resolved": {
+      "opt_level": "O3"
+    }
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "pack: auto: unpacked (below the input limit, no staging benefit)",
+    "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)",
+    "device-resident: weights and ids are placed ONCE; the measured loop is a same-device loop (nothing is restaged, the output never auto-copies to the host)"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_llama",
+    "batch": 1,
+    "family": "llama",
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "config_digest": "2d3a50f18a1a185a",
+    "vocab_size": 32000,
+    "hidden_size": 16,
+    "num_hidden_layers": 2,
+    "tie_word_embeddings": false,
+    "param_count": 1032272,
+    "param_bytes": 4129088,
+    "weight_keys": [
+      "embed.weight",
+      "final_norm.weight",
+      "layers.0.attn.k.weight",
+      "layers.0.attn.o.weight",
+      "layers.0.attn.q.weight",
+      "layers.0.attn.v.weight",
+      "layers.0.attn_norm.weight",
+      "layers.0.mlp.down.weight",
+      "layers.0.mlp.gate.weight",
+      "layers.0.mlp.up.weight",
+      "layers.0.mlp_norm.weight",
+      "layers.1.attn.k.weight",
+      "layers.1.attn.o.weight",
+      "layers.1.attn.q.weight",
+      "layers.1.attn.v.weight",
+      "layers.1.attn_norm.weight",
+      "layers.1.mlp.down.weight",
+      "layers.1.mlp.gate.weight",
+      "layers.1.mlp.up.weight",
+      "layers.1.mlp_norm.weight",
+      "lm_head.weight"
+    ]
+  },
+  "graph": {
+    "load_hf_ms": 8.2852,
+    "unpacked_graph_inputs": 22,
+    "packed_graph_inputs": 5,
+    "pack_plan_inputs": 4,
+    "param_specs_ms": 0.0343,
+    "weight_inputs": 21,
+    "graph_inputs": 22,
+    "packed_input_names": [
+      "packed.0",
+      "packed.1",
+      "packed.2",
+      "packed.3"
+    ],
+    "trace_ms": 53.7405,
+    "ir_ops": 170,
+    "ir_distinct_ops": 24,
+    "ir_histogram": {
+      "multiply": 32,
+      "reshape": 21,
+      "constant": 19,
+      "dot": 19,
+      "add": 15,
+      "transpose": 10,
+      "slice": 8,
+      "divide": 7,
+      "concatenate": 5,
+      "reduce_mean": 5,
+      "sqrt": 5,
+      "negate": 4,
+      "cast": 3,
+      "subtract": 3,
+      "exp": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "sigmoid": 2,
+      "cos": 1,
+      "gather": 1,
+      "less_equal": 1,
+      "power": 1,
+      "return": 1,
+      "sin": 1
+    },
+    "stablehlo_bytes": 29482,
+    "stablehlo_export_ms": 5.2179
+  },
+  "parity": {
+    "ids_source": "synthesized (i*7+3) % vocab_size=32000 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": false,
+      "reason": "golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 0.0001301625743508339,
+      "mean_abs": 6.146076430013636e-06,
+      "rel_to_absmax": 0.00031165211112238467,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.417667031288147,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 0.0001301574520766735,
+      "mean_abs": 6.146281066321535e-06,
+      "rel_to_absmax": 0.0003116398293059319,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.417667031288147,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__torch-cpu.logits.npz",
+      "reference_leg": "torch-cpu"
+    },
+    "vs_torch_rocm": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 0.00013015791773796082,
+      "mean_abs": 6.146444320620503e-06,
+      "rel_to_absmax": 0.00031164096435531974,
+      "ref_absmax": 0.4176534116268158,
+      "cand_absmax": 0.417667031288147,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__torch-rocm.logits.npz",
+      "reference_leg": "torch-rocm"
+    }
+  },
+  "build": {
+    "stage_timing": "build_total",
+    "build_total_ms": 8717.9536,
+    "executable_device": "Device(kind='rocm', index=0)",
+    "resolved_options": {
+      "opt_level": "O3"
+    },
+    "build_total_cached_ms": 0.5875
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "etl_hf.run(exe, place_params(params, device), place_ids(ids, device))",
+    "first_call_ms": 8.7987,
+    "logits_device": "Device(kind='rocm', index=0)",
+    "n": 5,
+    "best_ms": 0.1805,
+    "median_ms": 0.1917,
+    "mean_ms": 0.1916,
+    "stdev_ms": 0.0104,
+    "warmup": 2,
+    "tokens_per_s": 177285.32,
+    "peak_rss_mb": 9820.8,
+    "d2h": {
+      "n": 3,
+      "best_ms": 0.5548,
+      "median_ms": 1.6882,
+      "mean_ms": 1.3604,
+      "stdev_ms": 0.7017
+    },
+    "warm_with_d2h": {
+      "n": 5,
+      "best_ms": 0.7281,
+      "median_ms": 0.7432,
+      "mean_ms": 0.7487,
+      "stdev_ms": 0.0205
+    }
+  },
+  "staging": {
+    "place_params_ms": 6077.5965,
+    "place_params_leaves": 21,
+    "place_ids_ms": 0.1192,
+    "place_params_steady": {
+      "n": 3,
+      "best_ms": 1.6154,
+      "median_ms": 1.639,
+      "mean_ms": 1.6656,
+      "stdev_ms": 0.0676
+    }
+  },
+  "checks": {
+    "checked": true,
+    "asdevicearray_calls": 0,
+    "reason": null,
+    "zero_asdevicearray_after_warmup": true
+  },
+  "anti_pattern": {
+    "label": "ANTI-PATTERN: per-call host->device restage of the params tree",
+    "detail": "etl_hf.place_params(host params, device) + etl_hf.run per call",
+    "n": 5,
+    "best_ms": 2.0126,
+    "median_ms": 2.054,
+    "mean_ms": 2.113,
+    "stdev_ms": 0.1053
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      32000
+    ],
+    "absmax": 0.417667031288147,
+    "mean": 6.766414298908785e-05,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/tiny_llama__s32__xla-rocm.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 15.59,
+    "timed_out": false,
+    "stderr_tail": [
+      "I1019 11:06:57.905521 1526449 amdgpu_backend.cc:163] TF_XLA_HSACO_CACHE_DIR is not set: HSACO file cache is disabled!",
+      "I1019 11:07:05.388939 1526377 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+      "I1019 11:07:05.388984 1526377 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator.",
+      "I1019 11:07:05.392835 1526377 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+      "I1019 11:07:05.392878 1526377 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator."
+    ],
+    "stdout_tail": [
+      "[stage] warm loop",
+      "[stage] d2h",
+      "[stage] anti-pattern restage",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/tiny_llama__s32__xla-rocm.json",
+      "[leg] tiny_llama/s32/xla-rocm: ok -> bench_logs/hf_bench_data/tiny_llama__s32__xla-rocm.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "xla-rocm",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}

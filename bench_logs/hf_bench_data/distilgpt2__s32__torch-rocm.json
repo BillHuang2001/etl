@@ -1,0 +1,274 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "torch",
+  "provenance": {
+    "model": "distilgpt2",
+    "golden_slug": "distilgpt2",
+    "seq_len": 32,
+    "leg": "torch-rocm",
+    "timestamp": "2026-10-19T11:06:24Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "38a379a21b1eebb61223749c2da8dd0e0a07c343",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "torch-rocm",
+      "--models",
+      "distilgpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "torch-rocm",
+    "kind": "torch",
+    "backend": null,
+    "device": "cuda:0",
+    "device_resident": true,
+    "torch_compile": false
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "timed region includes torch.cuda.synchronize() before and after each call (GPU) \u2014 a forward-pass wall time, no decode loop"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/distilgpt2",
+    "batch": 1,
+    "torch_device_name": "AMD Instinct MI300X VF",
+    "from_pretrained_kwargs": {
+      "local_files_only": "True",
+      "dtype": "torch.float32",
+      "attn_implementation": "eager"
+    },
+    "family": "torch",
+    "model_class": "GPT2LMHeadModel",
+    "config_model_type": "gpt2",
+    "param_count": 81912576,
+    "param_bytes": 327650304,
+    "dtype": "torch.float32"
+  },
+  "parity": {
+    "ids_source": "hf_goldens input_ids",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 0.00022125244140625,
+      "mean_abs": 2.2040932890377007e-05,
+      "rel_to_absmax": 2.6944260298478184e-06,
+      "ref_absmax": 82.1148681640625,
+      "cand_absmax": 82.11480712890625,
+      "argmax_agreement": 1.0,
+      "reference": "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_goldens/distilgpt2.npz",
+      "reference_note": "golden fixture (torch/transformers oracle)"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 0.000213623046875,
+      "mean_abs": 2.102920552715659e-05,
+      "rel_to_absmax": 2.6015152343461523e-06,
+      "ref_absmax": 82.11485290527344,
+      "cand_absmax": 82.11480712890625,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/distilgpt2__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 0.00022125244140625,
+      "mean_abs": 2.2040932890377007e-05,
+      "rel_to_absmax": 2.6944260298478184e-06,
+      "ref_absmax": 82.1148681640625,
+      "cand_absmax": 82.11480712890625,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/distilgpt2__s32__torch-cpu.logits.npz",
+      "reference_leg": "torch-cpu"
+    },
+    "vs_torch_rocm": {
+      "comparable": false,
+      "reason": "same leg"
+    }
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "model(input_ids=ids).logits",
+    "first_call_ms": 5231.4675,
+    "n": 5,
+    "best_ms": 2.988,
+    "median_ms": 3.0445,
+    "mean_ms": 3.0401,
+    "stdev_ms": 0.0383,
+    "warmup": 2,
+    "tokens_per_s": 10709.5,
+    "peak_rss_mb": 4225.8,
+    "d2h": {
+      "applicable": false,
+      "reason": "the logits are moved to the host once per call inside the timed region"
+    }
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      50257
+    ],
+    "absmax": 82.11480712890625,
+    "mean": -58.538047790527344,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/distilgpt2__s32__torch-rocm.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 13.58,
+    "timed_out": false,
+    "stderr_tail": [
+      "Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]",
+      "Loading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 76/76 [00:00<00:00, 11697.45it/s]",
+      "/root/.local/share/uv/python/cpython-3.14.8-linux-x86_64-gnu/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-v0hqxfm0'}",
+      "  warnings.warn("
+    ],
+    "stdout_tail": [
+      "[stage] load checkpoint (transformers)",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/distilgpt2__s32__torch-rocm.json",
+      "[leg] distilgpt2/s32/torch-rocm: ok -> bench_logs/hf_bench_data/distilgpt2__s32__torch-rocm.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "torch-rocm",
+      "--models",
+      "distilgpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}

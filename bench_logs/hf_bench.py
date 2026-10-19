@@ -15,6 +15,9 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
     iree-llvmcpu        IREE compiled for llvm-cpu, host-resident inputs
     iree-rocm           IREE compiled for ROCm (the MI300X), **device resident**
     xla-rocm            PJRT/XLA on ROCm (needs ``ETL_PJRT_PLUGIN``), device resident
+    xla-rocm-fp32       the same with ``dot_precision="HIGHEST"`` — opt-in variant
+                        (``--legs`` only), isolates XLA/ROCm's default TF32-class
+                        ``dot`` from true fp32; nothing else differs
     torch-cpu           ``transformers.AutoModelForCausalLM`` on CPU, fp32, no_grad
     torch-rocm          the same on ``cuda:0`` (the ROCm torch wheel says "cuda")
     torchcompile-cpu    ``torch.compile(model)`` on CPU
@@ -1101,8 +1104,15 @@ def resolve_legs(args) -> list[str]:
                 )
             legs.extend(lib.PHASES[phase])
         return lib.sort_legs(legs)
-    # default: the six primary legs (no torch.compile variants)
-    return lib.sort_legs([key for key in lib.LEG_ORDER if not key.startswith("torchcompile")])
+    # default: the six primary legs (no torch.compile variants, no opt-in variants —
+    # ``xla-rocm-fp32`` is additive and runs only when named with ``--legs``)
+    return lib.sort_legs(
+        [
+            key
+            for key in lib.LEG_ORDER
+            if not key.startswith("torchcompile") and key not in lib.OPT_IN_LEGS
+        ]
+    )
 
 
 def plan_cells(args) -> list[tuple[str, int, str]]:
