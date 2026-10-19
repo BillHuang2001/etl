@@ -8,8 +8,8 @@ optional `hf` extra.
 
 These tests are numeric-free, network-free and fast: they read `pyproject.toml`
 with `tomllib`, walk the checkout for real importable packages, and inspect the
-installed distribution's metadata. The one optional extra leg (a real wheel
-build) skips cleanly when no build backend is available.
+installed distribution's metadata. The optional extra legs (a real wheel build
+and a real sdist build) skip cleanly when no build backend is available.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
@@ -246,7 +247,7 @@ def test_installed_distribution_metadata_lists_only_etl():
 
 
 # --------------------------------------------------------------------------
-# 4. optional: build a real wheel and pin its RECORD (skips without tooling)
+# 4. optional: build real distributions and pin their contents (skips w/o tooling)
 # --------------------------------------------------------------------------
 
 
@@ -261,28 +262,22 @@ def _importable(module: str) -> bool:
     return spec is not None and spec.origin is not None
 
 
-def _wheel_build_command(out_dir: Path) -> list[str] | None:
-    """Best-effort non-isolated wheel build command, or None.
+def _build_command(dist: str, out_dir: Path) -> list[str] | None:
+    """Best-effort non-isolated `sdist`/`wheel` build command, or None.
 
-    Non-isolation keeps the leg network-free (no build requirements to fetch):
-    it needs the `setuptools.build_meta` backend importable in THIS environment.
+    Non-isolation keeps the legs network-free (no build requirements to fetch):
+    they need the `setuptools.build_meta` backend importable in THIS environment.
     """
     if not _importable("setuptools"):
         return None
     if _importable("build"):
         return [
-            sys.executable,
-            "-m",
-            "build",
-            "--wheel",
-            "--no-isolation",
-            "--outdir",
-            str(out_dir),
+            sys.executable, "-m", "build", f"--{dist}", "--no-isolation", "--outdir", str(out_dir)
         ]
     uv = shutil.which("uv")
-    if uv is not None:
-        return [uv, "build", "--wheel", "--no-build-isolation", "--out-dir", str(out_dir)]
-    return None
+    if uv is None:
+        return None
+    return [uv, "build", f"--{dist}", "--no-build-isolation", "--out-dir", str(out_dir)]
 
 
 # Copied into a throwaway source tree so the build never writes `build/` or
@@ -302,31 +297,166 @@ _COPY_IGNORE = shutil.ignore_patterns(
     "bench_logs",  # large scratch area, never a build input
 )
 
+_STALE_EGG_INFO = "etl.egg-info"
+
+
+def _sanitize_source_tree(src: Path) -> list[str]:
+    """Delete stale build artifacts from a copied tree (`rm -rf etl.egg-info build`).
+
+    MEASURED TRAP (setuptools 68.1.2 and 84.0.0): `sdist` *reads* an existing
+    `etl.egg-info/SOURCES.txt` and keeps every entry that still exists on disk,
+    so an artifact left by an earlier build can silently re-ship a broken,
+    partial `etl_hf/`. `_COPY_IGNORE` already drops these when copying; this
+    removes any that survive or that a test deliberately planted.
+    """
+    removed: list[str] = []
+    for candidate in (*src.glob("*.egg-info"), src / "build", src / "dist", src / ".eggs"):
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+        elif candidate.exists():
+            candidate.unlink()
+        else:
+            continue
+        removed.append(candidate.name)
+    return sorted(set(removed))
+
+
+def _copy_checkout(dest: Path) -> Path:
+    """Copy the checkout into `dest` (no VCS dirs, build artifacts or scratch)."""
+    shutil.copytree(REPO_ROOT, dest, ignore=_COPY_IGNORE)
+    _sanitize_source_tree(dest)  # defensive: a plant may predate the copy
+    return dest
+
+
+def _build_distribution(dist: str, src: Path, out_dir: Path) -> tuple[Path | None, str]:
+    """Build `dist` from `src`; `(artifact, "")` or `(None, skip-reason)`."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    command = _build_command(dist, out_dir)
+    if command is None:
+        return None, f"no build backend available (setuptools/build/uv) — {dist} leg skipped"
+
+    proc = subprocess.run(command, cwd=str(src), capture_output=True, text=True, timeout=900)
+    artifacts = sorted(out_dir.glob("etl-*.whl" if dist == "wheel" else "etl-*.tar.gz"))
+    if proc.returncode != 0 or not artifacts:
+        detail = (proc.stderr or proc.stdout or "no output")[-500:]
+        return None, f"{dist} build unavailable: {detail}"
+    return artifacts[0], ""
+
+
+def _hf_entries(entries: Iterable[str]) -> list[str]:
+    """Paths whose first component is `etl_hf` (a file OR a bare directory)."""
+    return [e for e in entries if e == HF_TOP_LEVEL or e.startswith(HF_TOP_LEVEL + "/")]
+
+
+def _relative_entries(archive: Path) -> list[str]:
+    """Member paths of an sdist tarball, relative to the `etl-<version>/` root."""
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+    root = names[0].split("/", 1)[0] if names else ""
+    return [n.split("/", 1)[1] if n.startswith(root + "/") else n for n in names]
+
+
+_STALE_HINT = (
+    "Cause and fix: setuptools' sdist READS an existing etl.egg-info/SOURCES.txt and keeps "
+    "every listed path that still exists on disk, so a STALE etl.egg-info/ from an earlier "
+    "build silently re-ships a broken partial etl_hf. `rm -rf etl.egg-info build dist` and "
+    "rebuild — etl_hf must only ever be reachable from the checkout."
+)
+
+
+def _assert_distribution_ships_no_etl_hf(entries: Sequence[str], kind: str) -> None:
+    """Anti-vacuity (`etl/` + `pyproject.toml` are shipped) + zero `etl_hf` entries."""
+    assert any(e.startswith("etl/") for e in entries), (
+        f"{kind} does not ship the etl package (the etl_hf pin would be vacuous): {entries[:5]}"
+    )
+    assert "pyproject.toml" in entries, f"{kind} does not ship pyproject.toml: {entries[:5]}"
+    hf_entries = _hf_entries(entries)
+    assert not hf_entries, f"{kind} ships etl_hf source entries: {hf_entries[:5]}\n{_STALE_HINT}"
+
 
 def test_wheel_contains_no_etl_hf(tmp_path):
     """A real `etl` wheel must contain no `etl_hf` module (skips without tooling)."""
-    out_dir = tmp_path / "wheel"
-    out_dir.mkdir()
-    command = _wheel_build_command(out_dir)
-    if command is None:
-        pytest.skip("no build backend available (setuptools/build/uv) — wheel leg skipped")
+    src = _copy_checkout(tmp_path / "src")
+    wheel, reason = _build_distribution("wheel", src, tmp_path / "wheel")
+    if wheel is None:
+        pytest.skip(reason)
 
-    src = tmp_path / "src"
-    shutil.copytree(REPO_ROOT, src, ignore=_COPY_IGNORE)
-
-    proc = subprocess.run(command, cwd=str(src), capture_output=True, text=True, timeout=600)
-    wheels = sorted(out_dir.glob("etl-*.whl"))
-    if proc.returncode != 0 or not wheels:
-        pytest.skip(f"wheel build unavailable: {(proc.stderr or proc.stdout)[-500:]}")
-
-    with zipfile.ZipFile(wheels[0]) as wheel:
-        names = wheel.namelist()
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
         record_name = next((n for n in names if n.endswith(".dist-info/RECORD")), None)
         assert record_name is not None, "wheel has no RECORD"
-        record = wheel.read(record_name).decode().splitlines()
+        record = archive.read(record_name).decode().splitlines()
 
     shipped = [line.split(",", 1)[0] for line in record if line.split(",", 1)[0]]
     assert shipped, "empty RECORD"
     assert any(n.startswith("etl/") for n in shipped), "wheel does not ship the etl package"
-    hf_entries = [n for n in shipped if n.startswith(HF_TOP_LEVEL + "/")]
-    assert not hf_entries, f"wheel ships etl_hf files: {hf_entries[:5]}"
+    hf_entries = _hf_entries(shipped)
+    assert not hf_entries, f"wheel ships etl_hf files: {hf_entries[:5]}\n{_STALE_HINT}"
+
+
+def test_sdist_contains_no_etl_hf(tmp_path):
+    """A real `etl` sdist must contain no `etl_hf` source (skips without tooling).
+
+    The sdist is the distribution that ships `pyproject.toml` + the sources, so
+    it is the one a stale build artifact can corrupt: it is built from an
+    isolated temp COPY of the checkout with `*.egg-info`, `build/` and `dist/`
+    removed, so nothing from the working tree can leak in.
+    """
+    src = _copy_checkout(tmp_path / "src")
+    archive, reason = _build_distribution("sdist", src, tmp_path / "sdist")
+    if archive is None:
+        pytest.skip(reason)
+
+    _assert_distribution_ships_no_etl_hf(_relative_entries(archive), "sdist")
+
+# The exact stale artifact that can poison an sdist: a leftover `SOURCES.txt`
+# from an earlier build listing `etl_hf/` modules. One entry points at a file
+# that no longer exists, to pin setuptools' pruning of dead manifest entries.
+_STALE_SOURCES = (
+    "etl_hf/__init__.py\n"
+    "etl_hf/config.py\n"
+    "etl_hf/stale_module_that_no_longer_exists.py\n"
+    "etl/__init__.py\n"
+    "pyproject.toml\n"
+)
+
+
+def test_sdist_built_from_a_stale_egg_info_tree_ships_no_etl_hf(tmp_path):
+    """The stale-`etl.egg-info` regression pin: sanitizing the tree is what saves us.
+
+    MEASURED (setuptools 68.1.2 and 84.0.0): the trap is real — an sdist built
+    from a tree carrying a stale `etl.egg-info/SOURCES.txt` DOES ship the listed
+    `etl_hf/` paths that still exist on disk (3 of the 5 planted entries:
+    `etl_hf/`, `etl_hf/__init__.py`, `etl_hf/config.py`; the entry naming a file
+    that no longer exists is silently pruned), even though `packages.find`
+    excludes `etl_hf`. So this test asserts the documented-safe path rather than
+    the impossible one: plant the artifact, prove the trap manifests (when it
+    does), sanitize the SAME tree, assert the rebuild is clean.
+    """
+    src = _copy_checkout(tmp_path / "src")
+
+    # Plant the stale artifact exactly as an earlier build would have left it.
+    egg_info = src / _STALE_EGG_INFO
+    egg_info.mkdir(parents=True, exist_ok=True)
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\nName: etl\nVersion: 0.1.0\n")
+    (egg_info / "SOURCES.txt").write_text(_STALE_SOURCES)
+
+    stale_archive, reason = _build_distribution("sdist", src, tmp_path / "stale")
+    if stale_archive is None:
+        pytest.skip(reason)
+    stale_hf = _hf_entries(_relative_entries(stale_archive))
+    if stale_hf:  # trap live (measured): existing entries ship, the dead one is pruned
+        assert "etl_hf/__init__.py" in stale_hf, stale_hf
+        assert "etl_hf/config.py" in stale_hf, stale_hf
+        assert not [e for e in stale_hf if "stale_module_that_no_longer_exists" in e], stale_hf
+    # The documented-safe path: drop the stale artifacts, rebuild the SAME tree.
+    # (The first build also wrote a fresh `etl.egg-info/` + `build/`.)
+    removed = _sanitize_source_tree(src)
+    assert _STALE_EGG_INFO in removed, (removed, sorted(p.name for p in src.iterdir()))
+
+    clean_archive, reason = _build_distribution("sdist", src, tmp_path / "clean")
+    if clean_archive is None:  # pragma: no cover - tooling vanished mid-test
+        pytest.skip(reason)
+
+    entries = _relative_entries(clean_archive)
+    _assert_distribution_ships_no_etl_hf(entries, f"sdist rebuilt after removing {removed}")
