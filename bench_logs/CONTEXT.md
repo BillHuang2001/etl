@@ -367,11 +367,30 @@ dlopening the wedged radeon ICD). Its `device_id` is a per-process UUID hash, ne
 Throwaway venv `$TMPDIR/vk-venv` (iree-base-compiler/runtime 3.11 + numpy, CPython 3.14.8) with
 `etl`/`etl_hf` from the checkout via `PYTHONPATH`; `os._exit(0)` avoids the py3.14 nanobind exit dump.
 
-Measured (`tiny_llama` s32, packed, warmup 2 + best-of-5, two processes): build 954–994 ms, first call
-9.8 ms warm-process / 655 ms cold, **best warm 1.53–1.79 ms/call**, +d2h 3.29–3.49 ms,
-`asdevicearray` **0**; parity vs the numpy oracle and the torch golden max_abs **8.94e-08**
-(rel-to-absmax 2.1e-07 / 2.6e-07), argmax agreement **1.0**, bit-identical across runs. Lavapipe is
-CPU software — a Vulkan-path correctness/perf datapoint, never a GPU number.
+Measured — all seven `iree-vulkan` cells of the matrix, warmup 2 + best-of-5, batch 1, `--pack auto`
+(record per cell in `./hf_bench_data/*__iree-vulkan.json`, table in section 5c of the report):
+- **ok, unpacked: `tiny_llama` s32** (first 7.02 ms, best **1.577**, median 1.619, +d2h 1.393,
+  `asdevicearray` **0**; parity vs `numpy-cpu` max_abs **8.94e-08**, rel-to-absmax 2.14e-07, argmax
+  1.0) and **`tiny_gpt2` s32** (first 5.55, best **1.728**, median 1.747, +d2h 2.158,
+  `asdevicearray` 0; max_abs **2.24e-08**, rel-to-absmax 1.73e-07, argmax 1.0). Both build in
+  ~0.7–0.95 s. On the CPU-vs-CPU comparison lavapipe sits at numpy-interpreter level (`tiny_llama`
+  0.97× numpy, `tiny_gpt2` 0.70× numpy = numpy faster) and within 5–35% of `iree-llvmcpu` — a
+  software rasterizer, so this is a Vulkan-path datapoint only.
+- **`tiny_mistral` s32: `HFUnsupportedError`** — the same exact-`erf`-GELU activation gate that
+  blocks every compiled leg of that checkpoint, verbatim in the record's `errors[0]`.
+- **the 124M-class cells do not compile for this target** (explicit `BackendError` from
+  `iree-compile`, full text in `errors[0]`): `distilgpt2` s32 and `gpt2` s32 fail in the
+  LayerNorm-shaped reduction — `function 'main_dispatch_N_reduction_32x768_f32' uses 196864 bytes of
+  shared memory; exceeded the limit of 16384 bytes` — because no `--iree-vulkan-target` is passed,
+  so iree targets its `vp_android_baseline_2022` default with
+  `max_workgroup_memory_bytes = 16384`; `distilgpt2` s128 and `gpt2` s128 (packed) instead fail
+  later with `failed to legalize operation 'vector.from_elements'` (an i64 4-lane vector out of the
+  packed in-graph gather). The harness never hand-picks compiler flags, so these stay recorded
+  failures rather than tuned runs.
+A cell's `parity.vs_numpy` is only computed at measure time when that cell's `numpy-cpu`
+`*.logits.npz` dump is on disk: the run recipe is to write the numpy leg's dump (`--legs numpy-cpu
+--out $TMPDIR/vk-ref`) and copy back only the `.npz` — the committed `numpy-cpu` **record** is never
+re-measured. Lavapipe is CPU software — a Vulkan-path correctness/perf datapoint, never a GPU number.
 
 ## Known gotchas
 
