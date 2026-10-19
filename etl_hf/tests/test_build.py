@@ -20,7 +20,8 @@ What is pinned here:
   rule, and the llvm-cpu-only ``iree_compile_args`` that must reach the
   *compile* stage), including "explicit wins", "``ETL_OPT_LEVEL`` wins", "the
   caller's dict is not mutated" and the ``ETL_BACKEND``/``ETL_TARGET_BACKENDS``
-  env defaults;
+  env defaults — plus the device→IREE-target map itself, including
+  ``vulkan`` → ``vulkan-spirv``;
 * **memoisation** — identical ``build`` calls return the identical
   ``Executable``; a different ``seq_len``/``batch_size``/option/private cache does
   not;
@@ -585,6 +586,63 @@ def test_resolve_never_injects_llvm_cpu_flags_for_cuda_or_rocm():
         "iree", None, {"target_backends": ["cuda", "rocm"]}
     )
     assert "iree_compile_args" not in resolved
+
+
+def test_targets_from_device_maps_every_known_kind():
+    """The device→IREE-target map: each kind has its own target spelling.
+
+    ``vulkan`` is a device *kind*, while IREE's target backend is spelled
+    ``vulkan-spirv`` — passing the bare kind through would be an unknown-target
+    error at compile time.
+    """
+    device = etl.core.Device
+    assert pipeline_module._targets_from_device(None) == ["llvm-cpu"]
+    assert pipeline_module._targets_from_device(device("cpu", 0)) == ["llvm-cpu"]
+    assert pipeline_module._targets_from_device(device("cuda", 0)) == ["cuda"]
+    assert pipeline_module._targets_from_device(device("rocm", 0)) == ["rocm"]
+    # ``hip`` is an accepted spelling of the rocm kind (canonicalised here)
+    assert pipeline_module._targets_from_device(device("hip", 1)) == ["rocm"]
+    # vulkan → vulkan-spirv (the only kind whose target is not its kind name)
+    for index in (0, 1):
+        assert pipeline_module._targets_from_device(device("vulkan", index)) == [
+            "vulkan-spirv"
+        ]
+    # an unknown kind is still passed through verbatim — never guessed
+    assert pipeline_module._targets_from_device(device("metal", 2)) == ["metal"]
+
+
+def test_resolve_maps_a_vulkan_device_to_iree_and_vulkan_spirv():
+    """``device=Device('vulkan', 0)`` → the compiled path, Vulkan target, no cpu flags.
+
+    The derived target list is what decides the injected defaults, so this pins
+    the observable consequence of the mapping: Vulkan keeps the ``O3`` default
+    (it is not an all-ROCm target set) and never receives the llvm-cpu-only
+    ``iree_compile_args``. The device-level Vulkan compile caveats (the default
+    target profile's 16384-byte workgroup-memory budget, and the explicit
+    ``opt_level="O1"`` the 124M-class graphs need) are the *user's* options —
+    etl_hf injects nothing for them (see ``bench_logs/vulkan_findings.md``).
+    """
+    vulkan = etl.core.Device("vulkan", 0)
+    name, resolved = resolve_build_options(None, vulkan, {})
+    assert name == "iree", "a vulkan device is a non-cpu device ⇒ the compiled path"
+    assert resolved == {"opt_level": "O3"}, resolved
+    assert "iree_compile_args" not in resolved
+    # an explicitly named iree backend behaves identically ...
+    assert resolve_build_options("iree", vulkan, {})[1] == {"opt_level": "O3"}
+    # ... and an explicit target/opt_level still wins (the documented remedy).
+    _, explicit = resolve_build_options(
+        "iree",
+        vulkan,
+        {"target_backends": ["vulkan-spirv"], "opt_level": "O1"},
+    )
+    assert explicit["opt_level"] == "O1"
+    assert explicit["target_backends"] == ["vulkan-spirv"]
+    # an explicit vulkan-spirv target set is not llvm-cpu ⇒ nothing injected
+    # (the caller's own target_backends is of course passed through untouched)
+    _, by_target = resolve_build_options("iree", None, {"target_backends": ["vulkan-spirv"]})
+    assert by_target == {"target_backends": ["vulkan-spirv"], "opt_level": "O3"}, by_target
+    # numpy stays option-untouched even on a vulkan device
+    assert resolve_build_options("numpy", vulkan, {}) == ("numpy", {})
 
 
 def test_default_rocm_opt_level_is_the_codegen_safe_one():

@@ -5,18 +5,17 @@ This module takes a compute function (a ``@etl.defn`` forward from
 explicit etl pipeline, and it is where the *measured* backend-default matrix
 lives (once):
 
-===============================  =============================================
-situation                        resolution
-===============================  =============================================
-``backend`` explicit             used verbatim (explicit > env > default)
-``backend=None``, ``ETL_BACKEND`` set  that value is used
-``backend=None``, device cpu/None      ``"numpy"`` (the numpy interpreter)
-``backend=None``, device cuda/rocm…    ``"iree"`` (the compiled path)
-any compiled backend             ``opt_level="O3"`` injected unless passed
-``"iree"`` + all-ROCm targets   ``opt_level="O1"`` injected instead
-``"iree"`` + ``["llvm-cpu"]``    ``iree_compile_args`` injected unless passed
-===============================  =============================================
-
+==========================================  ==================================
+situation                                   resolution
+==========================================  ==================================
+``backend`` explicit                        used verbatim (explicit > env > default)
+``backend=None``, ``ETL_BACKEND`` set       that value is used
+``backend=None``, device cpu/None           ``"numpy"`` (the numpy interpreter)
+``backend=None``, device cuda/rocm/vulkan…  ``"iree"`` (the compiled path)
+any compiled backend                        ``opt_level="O3"`` injected unless passed
+``"iree"`` + all-ROCm targets               ``opt_level="O1"`` injected instead
+``"iree"`` + ``["llvm-cpu"]``               ``iree_compile_args`` injected unless passed
+==========================================  ==================================
 Every injected default is a *measured* pitfall rather than taste — each one is
 documented beside its constant (see :data:`DEFAULT_LLVM_CPU_COMPILE_ARGS`,
 :data:`DEFAULT_ROCM_OPT_LEVEL`, and the compile-stage note on
@@ -186,7 +185,9 @@ def _targets_from_device(device: _core.Device | None) -> list[str]:
 
     Returns:
         list[str]: ``["llvm-cpu"]`` (cpu/absent), ``["cuda"]``, ``["rocm"]``
-        (rocm/hip — ``hip`` is an accepted spelling), else ``[device.kind]``.
+        (rocm/hip — ``hip`` is an accepted spelling), ``["vulkan-spirv"]``
+        (``vulkan`` — a device *kind*, whose IREE target backend is spelled
+        ``vulkan-spirv``), else ``[device.kind]`` passed through verbatim.
     """
     if device is None:
         return ["llvm-cpu"]
@@ -196,6 +197,11 @@ def _targets_from_device(device: _core.Device | None) -> list[str]:
         return ["cuda"]
     if device.kind in ("rocm", "hip"):
         return ["rocm"]
+    if device.kind == "vulkan":
+        # A device kind is not a target-backend name: IREE spells Vulkan
+        # ``vulkan-spirv`` (``--iree-hal-target-backends=vulkan-spirv``), so
+        # the bare kind would be an unknown-target error at compile time.
+        return ["vulkan-spirv"]
     return [device.kind]
 
 
@@ -244,8 +250,8 @@ def _default_opt_level(targets: list[str] | None) -> str:
     Returns:
         str: :data:`DEFAULT_ROCM_OPT_LEVEL` (``"O1"``) when every target is
         rocm/hip (the codegen-safe level for that HAL), else
-        :data:`DEFAULT_OPT_LEVEL` (``"O3"``) — llvm-cpu, cuda, xla, tvm and any
-        mixed/unknown target set are unchanged.
+        :data:`DEFAULT_OPT_LEVEL` (``"O3"``) — llvm-cpu, cuda, vulkan-spirv,
+        xla, tvm and any mixed/unknown target set are unchanged.
     """
     if targets and all(kind in ("rocm", "hip") for kind in targets):
         return DEFAULT_ROCM_OPT_LEVEL
@@ -279,15 +285,16 @@ def resolve_build_options(
       ``"O1"`` (:data:`DEFAULT_ROCM_OPT_LEVEL`) when they are **all** rocm/hip —
       IREE's ROCm translation fails at O2/O3 on transformer-shaped graphs — and
       ``"O3"`` (:data:`DEFAULT_OPT_LEVEL`) for every other target (llvm-cpu,
-      cuda, a mixed set, or a backend without targets such as xla/tvm).
+      cuda, vulkan-spirv, a mixed set, or a backend without targets such as
+      xla/tvm).
     * backend ``"iree"`` whose *effective* target set is exactly
       ``["llvm-cpu"]`` → ``iree_compile_args=list(DEFAULT_LLVM_CPU_COMPILE_ARGS)``
       injected unless the caller passed ``iree_compile_args``. The effective
       targets are ``options["target_backends"]``, else the
       ``ETL_TARGET_BACKENDS`` environment variable, else derived from the device
       (cpu/``None`` → ``["llvm-cpu"]``, cuda → ``["cuda"]``, rocm/hip →
-      ``["rocm"]``). Nothing is ever injected for cuda/rocm (those flags are
-      llvm-cpu-specific).
+      ``["rocm"]``, vulkan → ``["vulkan-spirv"]``). Nothing is ever injected for
+      cuda/rocm/vulkan (those flags are llvm-cpu-specific).
 
     Args:
         backend: ``None``, a backend name, or a backend object with ``.name``.
