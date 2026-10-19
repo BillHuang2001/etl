@@ -1,0 +1,10 @@
+# Derived measurement output — do NOT commit.
+#
+# Every bench run re-creates these: one `*.logits.npz` per leg cell (that cell's logits
+# + input_ids, up to ~20 MB each — hundreds of MB for the full matrix). They are
+# regenerable from the checkpoints alone, so the repository keeps the small JSON leg
+# records and `parity_digest.json` instead; `hf_bench.py --report` renders the same
+# numbers from those (see bench_logs/CONTEXT.md, section "hf_bench.py").
+*.logits.npz
+*.npy
+*.bin

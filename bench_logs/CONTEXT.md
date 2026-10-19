@@ -183,11 +183,24 @@ Compiled legs always use the library defaults from `etl_hf.pipeline.resolve_buil
 `--pack auto` packs only where required or beneficial (`gpt2`'s 197 unpacked inputs exceed the
 ~161-input IREE runtime limit, and packing collapses ~100 device staging leaves for the 124M
 models); the counts are read from `pack_plan(...).specs`, never hard-coded.
-Parity is recomputed by `--report` from every leg's saved `.logits.npz`, so leg order does not
-matter; a golden fixture whose `seq_len` differs from the cell renders `—` with the reason (the tiny
-goldens are S=8, `distilgpt2`/`gpt2` S=32), never a number.
-`--report` is a pure function of the JSON/npz + `hf_bench_env.json` (no torch, no iree, no
-measurement) and reproduces byte-identically.
+Parity is recomputed by `--report` from every leg's saved `.logits.npz` **while those dumps are on
+disk**, so leg order does not matter; a golden fixture whose `seq_len` differs from the cell renders
+`—` with the reason (the tiny goldens are S=8, `distilgpt2`/`gpt2` S=32), never a number.
+`--report` is a pure function of the JSON records + `parity_digest.json` + `hf_bench_env.json` (no
+torch, no iree, no measurement) and reproduces byte-identically.
+
+**Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 51 JSON leg
+records, the env artifact and one small `parity_digest.json` (~26 KB: the parity numbers
+`--report` would recompute from the dumps, per cell and reference). The 46 `*.logits.npz` dumps are
+**derived bulk** (~393 MB) and are `.gitignore`d — a bench run re-creates them (the driver then
+refreshes the digest automatically; `--parity-digest` does it by hand). `--report` therefore
+resolves every parity pair from the first available source: the dumps (recomputed, exactly like a
+fresh run) → the parity block the leg's own record stored at measure time → the committed digest
+(only needed for the 31 pairs whose reference leg was measured *after* that cell, where the
+measure-time block legitimately says "no logits on disk") → `—` with the reason. The report header
+states which sources were used, and the rendered parity table is identical either way (verified by
+diffing the dumps-present and dumps-absent renders) — so the directory is ~700 KB instead of ~393 MB
+without losing a number.
 
 Run it (etl/etl_hf come from the checkout via `PYTHONPATH`, never installed into the bench venv):
 
@@ -233,9 +246,10 @@ Facts about the current matrix worth knowing before re-running it:
 - Inductor/Triton caches must not live under `$HOME` (a read-only mount here): the harness points
   `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
   `torchcompile-*` legs.
-- `./hf_bench_data/` carries one `.logits.npz` per ok leg (output-sized, ~250 MB total) — that is
-  what makes order-independent parity recomputation possible, and `.npz` benchmark data is already
-  tracked in this directory (`hf_goldens/`, `hf_perf_data/`).
+- `./hf_bench_data/` commits the JSON records + `parity_digest.json` only: a bench run may write one
+  `.logits.npz` per ok leg (output-sized, ~393 MB total) but that derived bulk is gitignored and
+  regenerated on demand — order-independent parity recomputation comes from the dumps when a run
+  left them, else from the records' own parity blocks plus the digest.
 - The environment record's `host.repo_root`/`host.tmpdir` are the worktree/scratch paths at
   measurement time, recorded as provenance only.
 
