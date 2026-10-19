@@ -18,7 +18,8 @@ Pinned here:
   never mutated.
 * ``ETL_TVM_TARGET`` / ``ETL_TVM_PASS_CONFIGS`` (JSON object) /
   ``ETL_XLA_COMPILE_OPTIONS`` (base64 -> bytes) parse into the documented
-  option keys.
+  option keys; ``ETL_IREE_VULKAN_TARGET`` -> ``vulkan_target`` (the SPIR-V
+  target profile, whitespace-stripped only — the compiler validates it).
 * malformed env values raise ``core.BackendError`` naming the variable and
   the value — never a raw shlex/base64/json exception.
 * the ``lower``-stage rows ``ETL_EIGH_ALGORITHM`` -> ``eigh_algorithm``
@@ -70,6 +71,7 @@ from etl.pipeline_options import ENV_OPTION_TABLE, apply_env_options
 OPTION_ENV_VARS = (
     # compile stage
     "ETL_IREE_COMPILE_ARGS",
+    "ETL_IREE_VULKAN_TARGET",
     "ETL_XLA_COMPILE_OPTIONS",
     "ETL_TVM_TARGET",
     "ETL_TVM_PASS_CONFIGS",
@@ -161,16 +163,24 @@ def test_env_option_table_entries():
 def test_env_option_table_keys_and_parsers():
     """The documented env var -> option key mapping (parsers are functions)."""
     iree_compile = ENV_OPTION_TABLE[("iree", "compile")]
-    assert len(iree_compile) == 2
+    assert len(iree_compile) == 3
     assert {entry[1] for entry in iree_compile} == {
         "iree_compile_args",
         "opt_level",
+        "vulkan_target",
     }
     args_entry = next(
         entry for entry in iree_compile if entry[1] == "iree_compile_args"
     )
     assert args_entry[:2] == ("ETL_IREE_COMPILE_ARGS", "iree_compile_args")
     assert callable(args_entry[2])
+    vulkan_entry = next(
+        entry for entry in iree_compile if entry[1] == "vulkan_target"
+    )
+    assert vulkan_entry[:2] == ("ETL_IREE_VULKAN_TARGET", "vulkan_target")
+    assert callable(vulkan_entry[2])
+    # The parser only strips whitespace — the compiler validates the profile.
+    assert vulkan_entry[2]("ETL_IREE_VULKAN_TARGET", "  rtx4090  ") == "rtx4090"
     opt_level_entry = next(
         entry for entry in iree_compile if entry[1] == "opt_level"
     )
@@ -469,6 +479,66 @@ def test_caller_dict_never_mutated(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ETL_IREE_VULKAN_TARGET — the SPIR-V target profile (compile stage)
+# ---------------------------------------------------------------------------
+
+
+def test_vulkan_target_env_parsed(monkeypatch):
+    """ETL_IREE_VULKAN_TARGET maps to the iree compile ``vulkan_target``
+    option with only the whitespace stripped — the VALUE (the SPIR-V target
+    profile, e.g. ``rtx4090``) is validated by the compiler, never by etl."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "rtx4090")
+    assert apply_env_options("iree", {}, "compile") == {
+        "vulkan_target": "rtx4090"
+    }
+    # A padded value is stripped, never passed through with the whitespace.
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "  rtx4090  ")
+    assert apply_env_options("iree", {}, "compile") == {
+        "vulkan_target": "rtx4090"
+    }
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t \n"])
+def test_vulkan_target_blank_env_is_unset(monkeypatch, value):
+    """An empty/whitespace ETL_IREE_VULKAN_TARGET is treated as unset (no key,
+    never an empty-string target profile)."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", value)
+    assert apply_env_options("iree", {}, "compile") == {}
+
+
+def test_vulkan_target_explicit_wins_env(monkeypatch):
+    """An explicit vulkan_target key always wins over the env var; other keys
+    are still env-supplied."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "rtx4090")
+    assert apply_env_options(
+        "iree", {"vulkan_target": "rx7900xtx"}, "compile"
+    ) == {"vulkan_target": "rx7900xtx"}
+    # Mixed: explicit target_backends + env-supplied vulkan_target.
+    monkeypatch.setenv("ETL_IREE_COMPILE_ARGS", "--flag-from-env")
+    assert apply_env_options(
+        "iree", {"target_backends": ["vulkan-spirv"]}, "compile"
+    ) == {
+        "target_backends": ["vulkan-spirv"],
+        "vulkan_target": "rtx4090",
+        "iree_compile_args": ["--flag-from-env"],
+    }
+
+
+def test_vulkan_target_env_stage_scoped(monkeypatch):
+    """ETL_IREE_VULKAN_TARGET applies at the iree compile stage only — never
+    at lower, load or run, and never for the numpy backend, an absent backend
+    name or another compiler backend."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "rtx4090")
+    assert apply_env_options("iree", {}, "compile") == {
+        "vulkan_target": "rtx4090"
+    }
+    for stage in ("lower", "load", "run"):
+        assert apply_env_options("iree", {}, stage) == {}
+    for backend in ("numpy", "xla", "tvm", None):
+        assert apply_env_options(backend, {}, "compile") == {}
+
+
+# ---------------------------------------------------------------------------
 # The lower-stage rows (reserved exporter options)
 # ---------------------------------------------------------------------------
 
@@ -721,6 +791,52 @@ def test_full_path_explicit_opt_level_beats_env(monkeypatch, iree_stub_registere
     assert _RecordingIreeStub.recorded_compile_options[-1][
         "opt_level"
     ] == "O0"
+    assert exe.device == core.Device("cpu", 0)
+    _assert_no_new_iree_import()
+
+
+def test_full_path_env_vulkan_target_reaches_compile(
+    monkeypatch, iree_stub_registered
+):
+    """ETL_IREE_VULKAN_TARGET reaches the compile stage through ``etl.build``
+    with the padding stripped (the adapter derives
+    ``--iree-vulkan-target=<profile>`` from it)."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "  rtx4090  ")
+    exe = etl.build(_linear, *_LINEAR_SPECS, backend="iree")
+    compile_recorded = _RecordingIreeStub.recorded_compile_options[-1]
+    assert compile_recorded["vulkan_target"] == "rtx4090"
+    assert compile_recorded["target_backends"] == ["llvm-cpu"]
+    # Compile-scoped: the load stage never sees the target profile.
+    assert "vulkan_target" not in _RecordingIreeStub.recorded_load_options[-1]
+    assert exe.device == core.Device("cpu", 0)
+    _assert_no_new_iree_import()
+
+
+def test_full_path_vulkan_target_blank_env_sends_no_key(
+    monkeypatch, iree_stub_registered
+):
+    """A blank ETL_IREE_VULKAN_TARGET never reaches the compile stage."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "   ")
+    exe = etl.build(_linear, *_LINEAR_SPECS, backend="iree")
+    compile_recorded = _RecordingIreeStub.recorded_compile_options[-1]
+    assert "vulkan_target" not in compile_recorded
+    assert compile_recorded == {"target_backends": ["llvm-cpu"]}
+    assert exe.device == core.Device("cpu", 0)
+    _assert_no_new_iree_import()
+
+
+def test_full_path_explicit_vulkan_target_beats_env(
+    monkeypatch, iree_stub_registered
+):
+    """An explicit vulkan_target kwarg beats ETL_IREE_VULKAN_TARGET end to end
+    (passed through unnormalized — the adapter validates it)."""
+    monkeypatch.setenv("ETL_IREE_VULKAN_TARGET", "rtx4090")
+    exe = etl.build(
+        _linear, *_LINEAR_SPECS, backend="iree",
+        vulkan_target="rx7900xtx",
+    )
+    compile_recorded = _RecordingIreeStub.recorded_compile_options[-1]
+    assert compile_recorded["vulkan_target"] == "rx7900xtx"
     assert exe.device == core.Device("cpu", 0)
     _assert_no_new_iree_import()
 
