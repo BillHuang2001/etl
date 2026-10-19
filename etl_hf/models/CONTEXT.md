@@ -79,7 +79,7 @@ The `reference` functions compose **only** `etl_hf.reference` primitives (no `et
 ## Per-family notes
 
 **llama** (`FAMILY = "llama"`, `MODEL_TYPES = ("llama", "mistral", "qwen2")`) covers every Llama-shaped checkpoint: RMSNorm, RoPE, GQA/MQA and a SwiGLU MLP.
-Config fields it consumes: `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` (defaults to `num_attention_heads`), `intermediate_size`, `hidden_act`, `layer_norm_eps` (from HF `rms_norm_eps`), `max_position_embeddings`, `rope_theta` (default `10000.0`), `tie_word_embeddings` (default `False`) and an optional explicit `head_dim` override, honoured verbatim — q/k/v/o shapes derive from `num_attention_heads · head_dim` / `num_key_value_heads · head_dim`, never from an assumed `hidden_size // num_attention_heads`, and RoPE requires `head_dim` to be even.
+The config fields that matter here: `num_key_value_heads` (defaults to `num_attention_heads`), `rope_theta` (default `10000.0`), `tie_word_embeddings` (default `False`), `layer_norm_eps` (HF `rms_norm_eps`) and an optional explicit `head_dim` override, honoured verbatim — q/k/v/o shapes derive from `num_attention_heads · head_dim` / `num_key_value_heads · head_dim`, never from an assumed `hidden_size // num_attention_heads`, and RoPE requires `head_dim` to be even.
 Any non-empty `rope_scaling` (YaRN / linear / dynamic NTK) is rejected at **config parse** time (`etl_hf/config.py`, `HFUnsupportedError`) because a scaled-RoPE model would silently diverge from HF.
 An unexpected (unconsumed) checkpoint key, a shape that disagrees with the config, a missing required key (with difflib near-miss suggestions) and a foreign-family `ModelConfig` are all `HFWeightError` / `HFConfigError`.
 
