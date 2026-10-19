@@ -271,6 +271,11 @@ Facts about the current matrix worth knowing before re-running it:
 - `iree/llvm-cpu` cannot compile `distilgpt2`/`gpt2` at `seq_len=128` (works at 32):
   `'func.func' op exceeded stack allocation limit of 32768 bytes for function` — an upstream
   iree-compile limit, independent of packing and of any harness option.
+- `iree-vulkan` (lavapipe) runs the two tiny checkpoints and fails the rest by construction of the
+  target: the 124M models exceed the default Vulkan target's 16 KiB workgroup-memory budget in the
+  LayerNorm-shaped reduction (or fail `vector.from_elements` legalization at `seq_len=128`), and
+  `tiny_mistral` hits the exact-`erf`-GELU activation gate. Details in the `hf_bench_vulkan.py`
+  section below.
 - Inductor/Triton caches must not live under `$HOME` (a read-only mount here): the harness points
   `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
   `torchcompile-*` legs.
