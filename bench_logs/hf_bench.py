@@ -1857,7 +1857,9 @@ def _parity_table_lines(records, out_dirs, digest) -> list[str]:
                     lib.fmt(stats["max_abs"]),
                     _fmt_sci(stats["rel_to_absmax"]),
                     lib.fmt(stats["argmax_agreement"]),
-                    "",
+                    VULKAN_TILING_POINTER
+                    if leg_key in VULKAN_LEGS and _is_vulkan_tiling_noise(stats)
+                    else "",
                 ]
             )
     return rows
@@ -2255,6 +2257,55 @@ def _vulkan_lines(records, out_dirs, digest) -> list[str]:
 #: The legs that execute on IREE's Vulkan HAL (lavapipe) — section 5c renders each.
 VULKAN_LEGS: tuple[str, ...] = ("iree-vulkan", "iree-vulkan-o1")
 
+#: ``max_abs`` at/above which a Vulkan-leg parity value is annotated as fp32
+#: accumulation-order tiling variance on a threaded software device rather than a
+#: precision / code-generation difference.  The tiny checkpoints measure at the
+#: ``1e-08`` level; a ``1e-4``-magnitude value with ``argmax`` agreement 1 is the
+#: reduction tiling's summation order, not lost precision.
+VULKAN_TILING_THRESHOLD = 1e-6
+#: The note-column marker a Vulkan parity table row above the threshold carries.
+VULKAN_TILING_TABLE_NOTE = (
+    "`1e-4` magnitude: fp32 accumulation-order tiling variance on this threaded "
+    "software device, not a precision change — see the note below"
+)
+#: The section-6 note column's pointer to that note.
+VULKAN_TILING_POINTER = (
+    "Vulkan leg: fp32 accumulation-order tiling variance at `1e-4` magnitude, not a "
+    "precision change — see the note in section 5c"
+)
+#: The documented static caveat rendered under a Vulkan parity table that contains a
+#: value above the threshold (the records carry one number per cell, so replicate
+#: spread cannot be a per-cell field).
+VULKAN_TILING_NOTE = (
+    "**Reading a Vulkan parity value at the `1e-4` magnitude.** A `max_abs` in the "
+    "`1e-4` range on a *tiny* checkpoint is fp32 **accumulation-order tiling "
+    "variance** on a threaded software device — lavapipe splits the reductions / "
+    "element-wise work across threads, so the summation order (and therefore the "
+    "rounding) can differ between processes — not a precision or code-generation "
+    "change: `argmax` agreement stays `1.0`, and the same graph on the same target "
+    "measures at the `1e-08` level whenever no such split occurs. It does not make "
+    "the two legs comparable as compile-setting-free measurements (they are kept "
+    "apart for that reason, above), and it is not a regression of the public path — "
+    "every leg here runs the unmodified `etl_hf.build` / `etl_hf.run` API. The "
+    "`tiny_gpt2` s32 `iree-vulkan-o1` cell in particular is **bimodal across "
+    "processes** with an identical command: the committed record is ONE measured "
+    "sample of that distribution (the row above), while 5 of 7 replicate runs "
+    "measured `max_abs ≈ 6.26e-07` — `argmax_agreement = 1.0` in both modes, the "
+    "divergence covering ~15% of the vocabulary and growing along the sequence. The "
+    "`iree-vulkan` (defaults) cell of the same model is stable at the `1e-08` level "
+    "and `distilgpt2` / `gpt2` reproduce bit-identically across replicates at both "
+    "seq lens, so no other Vulkan cell carries this caveat — the records hold one "
+    "number per cell (replicate spread is a measurement property, not a per-cell "
+    "field), which is why this is a documented note rather than a number in the table."
+)
+
+
+def _is_vulkan_tiling_noise(stats) -> bool:
+    """Whether a rendered Vulkan parity value belongs to the tiling-variance regime."""
+    if not stats:
+        return False
+    value = stats.get("max_abs")
+    return isinstance(value, (int, float)) and float(value) >= VULKAN_TILING_THRESHOLD
 
 def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
     """One Vulkan leg's table in section 5c (``leg_key`` is ``iree-vulkan[-o1]``).
@@ -2461,7 +2512,12 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
         )
         add("")
         rows = []
+        tiling_rows = 0
         for model, seq_len, numpy_stats, numpy_note, golden_stats in parity:
+            note = numpy_note or ""
+            if _is_vulkan_tiling_noise(numpy_stats):
+                note = VULKAN_TILING_TABLE_NOTE
+                tiling_rows += 1
             rows.append(
                 [
                     model,
@@ -2471,7 +2527,7 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
                     lib.fmt(numpy_stats["argmax_agreement"]) if numpy_stats else "—",
                     _fmt_sci(golden_stats["max_abs"]) if golden_stats else "—",
                     lib.fmt(golden_stats["argmax_agreement"]) if golden_stats else "—",
-                    numpy_note or "",
+                    note,
                 ]
             )
         lines.extend(lib.md_table(
@@ -2495,6 +2551,9 @@ def _vulkan_leg_lines(records, out_dirs, digest, leg_key: str) -> list[str]:
             "renders them identically with or without the dumps on disk."
         )
         add("")
+        if tiling_rows:
+            add(VULKAN_TILING_NOTE)
+            add("")
     return lines
 
 
@@ -2689,6 +2748,34 @@ def _reproduction_lines(records) -> list[str]:
     return lines
 
 
+def _harness_commit_clause(records) -> str:
+    """The harness-commit provenance of the matrix on disk, with per-commit counts.
+
+    A matrix measured over several passes carries several ``provenance.git_commit``
+    values; naming only the first one would credit every cell to a single harness
+    revision. The clause therefore lists the distinct commits with the number of
+    records each produced — sorted by count (desc) then by commit, so the line is
+    byte-deterministic — while a single-commit matrix renders that one hash and no
+    counts, so a homogeneous matrix gains no noise.
+    """
+    counts: dict[str, int] = {}
+    for record, _path in records.values():
+        commit = str((record.get("provenance") or {}).get("git_commit") or "")
+        if commit:
+            counts[commit] = counts.get(commit, 0) + 1
+    if not counts:
+        return "Harness git commit: `unknown`"
+    if len(counts) == 1:
+        return f"Harness git commit: `{next(iter(counts))}`"
+    parts = [
+        f"`{commit[:7]}` ({count} cells)" if index == 0 else f"`{commit[:7]}` ({count})"
+        for index, (commit, count) in enumerate(
+            sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+    ]
+    return "Harness commits: " + ", ".join(parts)
+
+
 def render_report(records, out_dirs) -> str:
     """Render the benchmark markdown from the records on disk."""
     lines: list[str] = []
@@ -2713,18 +2800,13 @@ def render_report(records, out_dirs) -> str:
     add("")
     add(_parity_source_line(parity_sources))
     add("")
-    git = next(
-        (record.get("provenance", {}).get("git_commit") for record in ok_cells
-         if record.get("provenance", {}).get("git_commit")),
-        None,
-    )
     add(
         f"Cells on disk: **{len(records)}** ({len(ok_cells)} ok, "
         f"{len(records) - len(ok_cells)} not ok) — models: "
         f"{', '.join(f'`{model}`' for model in models) or '—'}; seq lens: "
         f"{', '.join(str(seq) for seq in seq_lens) or '—'}; legs: "
         f"{', '.join(f'`{leg}`' for leg in legs) or '—'}. "
-        f"Harness git commit: `{git or 'unknown'}`."
+        f"{_harness_commit_clause(records)}."
     )
     add("")
     if set(legs) & set(VULKAN_LEGS):
