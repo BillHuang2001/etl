@@ -1,14 +1,12 @@
 # IREE Vulkan on this host: no AMD-GPU Vulkan path exists; lavapipe (software) runs, and `etl_hf` runs on it
 
-> **Status note (superseding):** the library work this document asked for landed — `vulkan` is now a
-> **first-class `etl` device kind** (`etl.core.Device("vulkan", N)`, `etl.pipeline` inferring
-> `target_backends=["vulkan-spirv"]`, the adapter's device-id/load/staging/transfer beds and the
-> `vulkan_target` compile option), so the benchmark legs run the **unmodified public API** and the
-> `install()` runtime shim described below has been **retired**. Every `hf_bench_vulkan.install()` /
-> `patched_sites()` recipe in this file is history, not a runnable instruction; the surviving module
-> holds harness-side `device_info()` / `physical_device_properties()` helpers and a `--check`
-> environment self-test. The host verdict, the device recipe (renamed lavapipe ICD, throwaway venv) and
-> the measurements below are unaffected and remain the record.
+> **Status.** `vulkan` is a **first-class `etl` device kind**, so the library work this document
+> originally asked for (§3) is implemented and the benchmark legs run the **unmodified public API**.
+> There is no runtime shim: [`./hf_bench_vulkan.py`](./hf_bench_vulkan.py) holds device/provenance
+> helpers (`VULKAN_KIND`/`VULKAN_TARGET`, `device_info`, `physical_device_properties`) plus a `--check`
+> environment self-test, and nothing patches etl. The host verdict (§1), the device recipe (renamed
+> lavapipe ICD, throwaway venv) and the measurements (§2, §4) are the record; §3 keeps the shim-era
+> patch list as history.
 
 ## Verdict
 
@@ -21,14 +19,17 @@ patched to accept it (§1). This is a host/driver fact, not an etl or IREE limit
 (`deviceType = CPU`).** The whole `etl_hf` pipeline (trace → lower → `iree-compile
 --iree-hal-target-backends=vulkan-spirv` → load → device-resident run) executes a real checkpoint's
 forward pass as ONE graph with **zero** `asdevicearray` calls in the warm loop, bit-comparable to the
-numpy interpreter (§2). IREE 3.11 hides lavapipe behind a hard-coded device-name denylist, so a
-**benchmark-only runtime shim** ([`./hf_bench_vulkan.py`](./hf_bench_vulkan.py)) widens the eight
-etl string/dialect gates and the loader is pinned to a renamed lavapipe ICD; nothing under `./etl/`,
-`./etl_hf/` or `./tests/` is modified (§3).
+numpy interpreter (§2). IREE 3.11 hides lavapipe behind a hard-coded device-name denylist, so the only
+host-side setup is a **renamed lavapipe ICD** pinned through `VK_ICD_FILENAMES` (§1d); `Device("vulkan",
+0)` itself is an ordinary etl device — `etl.pipeline` infers `target_backends=["vulkan-spirv"]`, the
+iree adapter maps the etl index onto IREE's own enumeration and load/run/staging/transfer treat it as
+a device-resident kind, and `Tensor.to(Device("vulkan", N))` has a registered transfer provider (§3).
 
-**All seven HF benchmark cells are measured on the Vulkan path, and all seven ran** — two under the
-library's default `opt_level="O3"`, all seven under a hand-picked `opt_level="O1"` (§4, and section 5c
-of [`./hf_bench_results.md`](./hf_bench_results.md)). Every number is a **software-Vulkan / CPU**
+**Seven HF benchmark cells are measured on the Vulkan path under two legs** — two cells run on the
+library defaults (`opt_level="O3"`, `vulkan_target` unset), six on the one hand-picked option
+`opt_level="O1"` (`tiny_mistral` fails the exact-`erf`-GELU activation gate in both, so 14 Vulkan
+cells in total: **8 ok, 6 not ok**) (§4, and section 5c of
+[`./hf_bench_results.md`](./hf_bench_results.md)). Every number is a **software-Vulkan / CPU**
 number: the same work runs on the CPU through a Vulkan driver, and on the 124M-class models it is far
 slower than the numpy interpreter. No cell moves work to the GPU.
 
@@ -189,7 +190,7 @@ The workaround is a **copy** of `libvulkan_lvp.so` whose name string reads `lava
 via `VK_ICD_FILENAMES`. A side benefit: pinning the ICD also stops the loader from `dlopen`ing the
 **radeon** ICD, whose wedged device makes creation attempts hang.
 
-### 1e. The IREE compiler side works (no shim needed)
+### 1e. The IREE compiler side works
 
 `iree-compile --iree-hal-target-backends=vulkan-spirv` compiles both a trivial StableHLO module and
 real etl exports (including a two-512×512-matmul + tanh + reduce graph) for this target, and the
@@ -235,27 +236,27 @@ mandate is the software device, which is what the committed `iree-vulkan` legs m
 
 `etl_hf`'s unmodified public API — `load_hf` → `forward_fn` → `pack_plan`/`pack_params` →
 `build(backend="iree", device=Device("vulkan", 0))` → `place_params`/`place_ids` → `run` in a warm
-same-device loop — runs a real checkpoint's whole forward as ONE graph on IREE's Vulkan HAL, with
-[`./hf_bench_vulkan.py`](./hf_bench_vulkan.py) installed. Measured on `tiny_llama`
-(`hf-internal-testing/tiny-random-LlamaForCausalLM`), `seq_len=32`, batch 1, packed weights,
-warmup 2 + best-of-5, in two independent processes:
+same-device loop — runs a real checkpoint's whole forward as ONE graph on IREE's Vulkan HAL, with no
+option, monkeypatch or harness helper involved. The committed `iree-vulkan` record for `tiny_llama`
+(`hf-internal-testing/tiny-random-LlamaForCausalLM`), `seq_len=32`, batch 1, unpacked weights,
+warmup 2 + best-of-5, one subprocess per cell:
 
-| metric | run 1 | run 2 |
-|---|---|---|
-| build (trace → lower → compile → load, incl. `iree-compile`) | **993.7 ms** | **954.3 ms** |
-| first call | **655.1 ms** (cold process: SPIR-V module instantiation + lavapipe cold pages) | **9.8 ms** |
-| **best warm ms/call** | **1.530 ms** (median 1.567, mean 1.572, stdev 0.040) | **1.791 ms** (median 1.804, mean 1.829, stdev 0.054) |
-| +d2h (one explicit `Tensor.to(Device("cpu",0))` per call) | 3.289 ms best (median 3.922) | 3.485 ms best (median 3.953) |
-| `asdevicearray` calls in the warm loop | **0** | **0** |
-| host→device placement of the 4 packed leaves (once) | 2.218 ms (`place_ids` 0.040 ms) | 2.301 ms |
-| parity vs the pure-numpy oracle (`etl_hf.reference_logits`) | max_abs **8.94e-08**, rel-to-absmax 2.14e-07, argmax **1.0000** | identical |
-| parity vs the committed torch/transformers golden (`hf_goldens/tiny_random_llama.npz`, 1×8) | max_abs **8.94e-08**, rel-to-absmax 2.56e-07, argmax **1.0000** | identical |
+| metric | value |
+|---|---|
+| build (trace → lower → compile → load, incl. `iree-compile`) | **913.7 ms** |
+| first call | **7.720 ms** |
+| **best warm ms/call** | **1.617 ms** (median 1.637, stdev 0.019) |
+| throughput | 19 787 tok/s |
+| +d2h (one explicit `Tensor.to(Device("cpu",0))` per call) | 1.555 ms best |
+| `asdevicearray` calls in the warm loop | **0** (`zero_asdevicearray_after_warmup: true`) |
+| host→device placement of the unpacked weight leaves (once) | 2.819 ms for 21 leaves (`place_ids` 0.059 ms) |
+| parity vs the `numpy-cpu` leg's logits (the committed reference) | max_abs **8.94e-08**, rel-to-absmax 2.14e-07, argmax **1.0000** |
 
-The two runs' logits are **bit-identical**, so the Vulkan path is deterministic; the first-call number
-varies with process warmth while the steady-state cost is ~1.5–1.8 ms/call. fp32 accumulation order
-differs from numpy's ⇒ **not** bit-exact; ~1e-7 absolute at absmax 0.42 with full argmax agreement is
-the expected fp32 result and matches what every other etl backend shows on this checkpoint. (The
-golden fixture is `seq_len=8`, so that comparison used a second build at `seq_len=8` — 930.2 ms.)
+fp32 accumulation order differs from numpy's ⇒ **not** bit-exact; ~1e-7 absolute at absmax 0.42 with
+full argmax agreement is the expected fp32 result and matches what every other etl backend shows on
+this checkpoint. (The torch/transformers golden fixture is `seq_len=8`, so this `seq_len=32` cell has
+no golden comparison — the report renders `—` with that reason and points at the `numpy-cpu`/torch
+legs instead.)
 
 Logits stay on the device in an `IreeDevicePayload` (`out.device` = `Device(kind='vulkan', index=0)`,
 shape `[1, 32, 32000]`, float32); exactly one explicit `.to(cpu)` produced the host array used for
@@ -263,19 +264,27 @@ parity. Device-resident semantics hold unchanged: host inputs are rejected at th
 results are never auto-copied, and the documented same-device loop costs **0** `asdevicearray` calls
 (measured with `hf_bench_lib.AsDeviceArrayCounter`).
 
-One Vulkan-specific behaviour a first-class etl device kind would have to model: the IREE `vulkan`
-`device_id` is a **queried per-process UUID hash** (observed 941009984, 588459008, 1052880608, … in
-different processes), never `index + 1` as on CUDA/ROCm — so `Device(kind, index)` must map through
-`query_available_devices()[index]`, and one HAL device must be cached per `(index, runtime args)` so
-uploads and the module load share it.
+The one Vulkan-specific device behaviour the kind models: the IREE `vulkan` `device_id` is a
+**queried per-process UUID hash** (observed 941009984, 588459008, 1052880608, 998819584, … in
+different processes), never `index + 1` as on CUDA/ROCm — so `Device(kind, index)` maps through
+`query_available_devices()[index]` (the adapter's `_acquire_vulkan_device`) and one HAL device is
+cached per `(index, runtime args)` so uploads and the module load share it.
 
 ---
 
-## 3. The etl-core gaps (what the shim does, and what remains)
+## 3. The `vulkan` device kind: what it needed, and where the library provides it
 
-### 3a. What the library raises today, without the shim (verbatim)
+`vulkan` is a first-class `etl` device kind; §3a/§3b are the **history** of what a benchmark-only
+shim had to widen before the kind existed, and §3c maps each of those capabilities onto the library
+code that owns it now. Library-level documentation: [`../etl/backends/adapters/CONTEXT.md`](../etl/backends/adapters/CONTEXT.md)
+(the iree adapter's Vulkan section: device acquisition, load gate, staging tier, transfer slots, the
+`vulkan_target` compile option) and the skills
+[`.agents/skills/etl-vulkan-device-recipe.md`](../.agents/skills/etl-vulkan-device-recipe.md) /
+[`.agents/skills/etl-compiler-adapter-recipes.md`](../.agents/skills/etl-compiler-adapter-recipes.md).
 
-Reproduced in this tree with `etl_hf.load_hf` → `forward_fn`:
+### 3a. What the library raised before the kind existed (historical, verbatim)
+
+Reproduced at the time with `etl_hf.load_hf` → `forward_fn`:
 
 ```
 Device ctor OK: Device(kind='vulkan', index=0)
@@ -301,85 +310,92 @@ etl.from_numpy(zeros).to(Device('vulkan',0))
 ```
 
 Four independent *string* whitelists (compile targets, load device kinds, transfer providers, device
-enumeration) plus a device→target inference gap and a device-id convention block the path. No public
-flag or env var reaches them; `target_backends` is the only entry point, and the raw
-`--iree-hal-target-backends` escape hatch is explicitly denied by the adapter
-(`BackendError: the iree backend denies the iree-compile flag '--iree-hal-target-backends=llvm-cpu':
-use the 'target_backends' compile option instead`).
+enumeration) plus a device→target inference gap and a device-id convention blocked the path. Each is
+now part of the kind (§3c); the raw `--iree-hal-target-backends` escape hatch remains deliberately
+denied by the adapter (`BackendError: the iree backend denies the iree-compile flag
+'--iree-hal-target-backends=llvm-cpu': use the 'target_backends' compile option instead`), because the
+target is derived from the device.
 
-### 3b. The eight sites the shim patches
+### 3b. What the retired shim patched (historical)
 
-`install()` is idempotent, must run after `etl` is importable and before the executable is built,
-and returns `{site: "what changed"}` (also `patched_sites()`); `device_info()` reports the enumerated
-device as evidence.
+The retired shim ran `install()` (idempotent, after `etl` was importable and before the executable was
+built) and returned `{site: "what changed"}` (also `patched_sites()`), with `device_info()` as
+enumerated-device evidence. None of that exists in the current module, which holds the two
+device/provenance helpers and `--check` only. The sites the shim had to widen, kept as the historical
+record:
 
 `etl/backends/adapters/iree.py`
 
-| site | library behaviour | shim |
+| site (at shim time) | library behaviour then | shim |
 |---|---|---|
-| `:1071` `IreeBackend._resolve_compile_options` | `supported_targets = {"llvm-cpu","cuda","rocm"}` rejects `vulkan-spirv` (`:1074-1079` message) | **wrapped** — a vulkan-only target list is resolved by the shim (the library's own `opt_level` → `--iree-opt-level=O{N}` + `iree_compile_args` resolution), a mixed list re-attaches `vulkan-spirv`, unknown targets delegate |
-| `:460` `_artifact_target` | target→label map; `vulkan-spirv` falls through to a `"+".join` label | **wrapped** → label `"vulkan"` |
-| `:486` `_GPU_DEVICE_KINDS` | `frozenset({"cuda","rocm"})` selects the `rt.Config(device=…)` load path and the non-host input branch (also used at `:532`, `:607`, `:2231`, `:2820`) | module global **widened** with `"vulkan"` |
-| `:536` `_acquire_runtime_device` | `device_id = device.index + 1` (CUDA/ROCm 1-based ordinal) | **wrapped** — vulkan creates the device from the **queried** `query_available_devices()[index]` info dict and caches one HAL device per `(index, runtime args)` |
-| `:1817` `_staged_input` | non-ROCm branch is the CUDA pinned/DMA staging tier | **wrapped** → `None` for vulkan (plain `rt.asdevicearray`; the CUDA ordering guarantee is unverified on lavapipe) |
-| `:1326` / `:1346` `IreeBackend.load` | device-kind whitelist `("cpu","cuda","rocm","hip")`; `expected_target = {…}[device_kind]` raises `KeyError` | **wrapped** — for a vulkan device the wrapper replays the adapter's own load steps (`check_available` / `validate_options` / `_apply_iree_runtime_args` / `base64.b64decode` / `_acquire_runtime_device` / `_load_vm_module` / `IreeExecutable`) with those two gates widened; every other device delegates unchanged |
+| `:1071` `IreeBackend._resolve_compile_options` | `supported_targets = {"llvm-cpu","cuda","rocm"}` rejected `vulkan-spirv` (`:1074-1079` message) | **wrapped** — a vulkan-only target list was resolved by the shim (the library's own `opt_level` → `--iree-opt-level=O{N}` + `iree_compile_args` resolution), a mixed list re-attached `vulkan-spirv`, unknown targets delegated |
+| `:460` `_artifact_target` | target→label map; `vulkan-spirv` fell through to a `"+".join` label | **wrapped** → label `"vulkan"` |
+| `:486` `_GPU_DEVICE_KINDS` | `frozenset({"cuda","rocm"})` selected the `rt.Config(device=…)` load path and the non-host input branch (also used at `:532`, `:607`, `:2231`, `:2820`) | module global **widened** with `"vulkan"` |
+| `:536` `_acquire_runtime_device` | `device_id = device.index + 1` (CUDA/ROCm 1-based ordinal) | **wrapped** — vulkan created the device from the **queried** `query_available_devices()[index]` info dict and cached one HAL device per `(index, runtime args)` |
+| `:1817` `_staged_input` | non-ROCm branch was the CUDA pinned/DMA staging tier | **wrapped** → `None` for vulkan (plain `rt.asdevicearray`; the CUDA ordering guarantee is unverified on lavapipe) |
+| `:1326` / `:1346` `IreeBackend.load` | device-kind whitelist `("cpu","cuda","rocm","hip")`; `expected_target = {…}[device_kind]` raised `KeyError` | **wrapped** — for a vulkan device the wrapper replayed the adapter's own load steps (`check_available` / `validate_options` / `_apply_iree_runtime_args` / `base64.b64decode` / `_acquire_runtime_device` / `_load_vm_module` / `IreeExecutable`) with those two gates widened; every other device delegated unchanged |
 | `:2759` `upload_tensor` (with the `:2818-2820` kind gate) | placement provider for CUDA/ROCm/HIP only | the adapter's own `upload_tensor` **registered** for `"vulkan"` in both the per-backend `("vulkan","iree")` slot and the flat default slot |
-| `:2907-2908` `register()` | `for kind in ("cuda","rocm","hip")` | same as above — the shim performs the registration for `"vulkan"` |
+| `:2907-2908` `register()` | `for kind in ("cuda","rocm","hip")` | same as above — the shim performed the registration for `"vulkan"` |
 
 `etl/pipeline.py`
 
-| site | library behaviour | shim |
+| site (at shim time) | library behaviour then | shim |
 |---|---|---|
-| `:360-412` `_resolve_backend_device` | device→`target_backends` inference covers `cuda`/`rocm`/`hip`/`cpu` (`:405-411`); a vulkan device compiles `llvm-cpu` and then fails the load-time target check | **wrapped** — an iree backend on a vulkan device infers `target_backends=["vulkan-spirv"]` when neither the option nor `ETL_TARGET_BACKENDS` is set |
+| `:360-412` `_resolve_backend_device` | device→`target_backends` inference covered `cuda`/`rocm`/`hip`/`cpu` (`:405-411`); a vulkan device compiled `llvm-cpu` and then failed the load-time target check | **wrapped** — an iree backend on a vulkan device inferred `target_backends=["vulkan-spirv"]` when neither the option nor `ETL_TARGET_BACKENDS` was set |
 
-### 3c. The remaining gap list (report-only, not shimmed)
+### 3c. Where each capability lives in the library now
 
-These are touched by `Device("vulkan", 0)` users outside the HF benchmark path; each is a place a
-first-class `vulkan` device kind would have to be added. None of them blocks the HF path today:
+Every item below is library behaviour, exercised by the HF legs through the public API only:
 
-| file:line | behaviour | why it matters |
-|---|---|---|
-| `etl/core/device.py:122-159` `devices()` | no `vulkan` branch; the fallthrough raises `DeviceError: Unknown device kind 'vulkan'` | `etl.devices("vulkan")` cannot enumerate even a working HAL device; an iree-HAL query (lazy import) is the natural implementation |
-| `etl/backends/adapters/iree.py:1417-1429` `_load_segments` | same `("cpu","cuda","rocm","hip")` whitelist, external-kernel split path | an HF forward has no `external_call`, so unreachable there; a graph with an external kernel on vulkan would fail |
-| `etl/io.py:304` | `create_device(device_id=device.index + 1)` and the `"cuda"`/`"hip"` driver-name map | `etl.io.prefetch`/`sink` to a vulkan device would address the wrong device id and lack a driver name |
-| `etl/bench/_util.py:58-59` (used at `:77`, `:109`) | `_SUPPORTED_DEVICE_KINDS = ("cpu","cuda","rocm","hip")` + its text | `python -m etl.bench --device vulkan:0` is rejected up front |
-| `etl_hf/pipeline.py:181-199` `_targets_from_device` | falls through to `[device.kind]` → `["vulkan"]`, not `["vulkan-spirv"]` | only feeds etl_hf's `opt_level` default today (compile targets come from `target_backends`), so harmless here — but wrong if used as the target source |
-| `etl/backends/adapters/iree.py:486` semantic (beyond the whitelist) | the CUDA staging tier is selected for every non-ROCm GPU kind | a vulkan kind must not inherit the CUDA pinned/DMA ordering assumptions without validation |
+| capability | library owner |
+|---|---|
+| device→`target_backends` inference (`vulkan` → `["vulkan-spirv"]`), and NO target flag unless the `vulkan_target` option is set | `etl/pipeline.py` `_resolve_backend_device`; the etl_hf-side twin is `etl_hf/pipeline.py::_targets_from_device` |
+| compile-target whitelist (`{"llvm-cpu","cuda","rocm","vulkan-spirv"}`), artifact label `"vulkan"`, and the `vulkan_target` → `--iree-vulkan-target=<profile>` option | `etl/backends/adapters/iree.py` `IreeBackend._resolve_compile_options` / `_artifact_target` / the options table |
+| device-resident semantics: `_GPU_DEVICE_KINDS` includes `vulkan`, the load gate accepts it, the artifact↔device table maps `vulkan-spirv` ↔ `vulkan`, and `_staged_input` returns `None` (no CUDA pinned/DMA tier on lavapipe) | `etl/backends/adapters/iree.py` (`_GPU_DEVICE_KINDS`, `IreeBackend.load`, `_expected_target_for_kind`, `_staged_input`), shared with `_load_segments` (external-kernel split path) |
+| device acquisition by **queried device info** (`query_available_devices()[index]`, one cached HAL device per `(index, runtime args)`), not the CUDA/ROCm `index + 1` ordinal | `etl/backends/adapters/iree.py` `_acquire_vulkan_device` / `_acquire_runtime_device` |
+| `Tensor.to(Device("vulkan", N))` — the adapter's `upload_tensor` in the per-backend `("vulkan","iree")` slot AND the flat DEFAULT slot (the one documented exception: nothing else serves a vulkan device) | `etl/backends/adapters/iree.py` `register()`, `etl/core/device.py` provider resolution |
+| `etl.devices("vulkan")` enumeration through `iree.runtime.get_driver("vulkan")` (lazy iree import) | `etl/core/device.py` `devices()` / `_vulkan_devices()` |
+| `etl.io.prefetch`/`sink` on a vulkan device (driver name `vulkan`, device-id mapping, the worker-thread context bootstrap) | `etl/io.py` |
+| `python -m etl.bench --device vulkan:0` accepted, treated as a device-residency kind and never labelled GPU hardware | `etl/bench/_util.py` `_SUPPORTED_DEVICE_KINDS` |
 
-Deliberately **not** patched (verified unnecessary for this path): `core/tensor.py` (provider
-resolution is kind-agnostic), `etl/backends/compiler.py`, and the StableHLO exporter — the exported
-StableHLO compiles for `vulkan-spirv` unchanged.
+Unchanged and deliberately so: `core/tensor.py` (provider resolution is kind-agnostic),
+`etl/backends/compiler.py`, and the StableHLO exporter — the exported StableHLO compiles for
+`vulkan-spirv` as-is.
 
-### 3d. What a first-class `vulkan` kind minimally needs
+### 3d. The two constraints that are host/compiler side, not etl side
 
-1. `vulkan` in the compile-target whitelist (`vulkan-spirv`) with an artifact label, and in the
-   `_GPU_DEVICE_KINDS` device-resident set.
-2. Device acquisition by **queried device info** (`query_available_devices()[index]`), not
-   `index + 1`, with per-`(index, args)` HAL-device caching shared by uploads and module loads.
-3. The load-time device-kind whitelist and `expected_target` map widened (ideally derived, not a
-   literal dict).
-4. A transfer-provider registration for the kind so `Tensor.to(Device("vulkan", 0))` works.
-5. Device→`target_backends` inference in `pipeline._resolve_backend_device`
-   (`vulkan` → `["vulkan-spirv"]`), plus `core.devices("vulkan")`, `etl.io`, and `etl.bench._util`.
-6. A documented default target profile decision: `vulkan-spirv` without `--iree-vulkan-target` uses
-   `vp_android_baseline_2022` (16 KiB workgroup memory, 128 threads), which **cannot** compile the
-   124M-class HF graphs — a real-GPU or larger profile must be passed (and then `opt_level` O2/O3
-   still fails on those graphs today, see §4c).
-
-IREE's Vulkan runtime also needs the `llvmpipe` name denylist lifted (or a config) for software
-devices to be usable at all — a runtime-side request, not an etl one.
+1. **The default SPIR-V profile is the binding constraint for large graphs.** `vulkan-spirv` without
+   `--iree-vulkan-target` uses `vp_android_baseline_2022` (16 KiB workgroup memory, 128 threads),
+   which cannot compile the 124M-class HF graphs at `opt_level="O3"` (§4c). The `vulkan_target` compile
+   option exists for that (a real-GPU / larger profile); the benchmark legs deliberately do not set it.
+2. **IREE 3.11's `llvmpipe` name denylist** (`iree_hal_vulkan_is_device_visible()` in
+   `vulkan_driver.cc`) hides software devices, so lavapipe is only enumerable through the renamed ICD
+   (§1d) — a runtime-side request, not an etl one.
 
 ---
 
 ## 4. Benchmark: `iree-vulkan` and `iree-vulkan-o1` (lavapipe, software Vulkan on the CPU)
 
+Both legs run the **unmodified public API** — `etl_hf.build(fwd, cfg, backend="iree", device=Device("vulkan", 0))`
+and then `etl_hf.place_params`/`place_ids` + `etl_hf.run` in the device-resident same-device loop. A
+leg passes **no** `target_backends` option: `etl.pipeline` infers `target_backends=["vulkan-spirv"]`
+from the device. The `vulkan_target` compile option is **not** set, so codegen keeps IREE's default
+SPIR-V profile `vp_android_baseline_2022` (`max_workgroup_memory_bytes = 16384`). The two legs are
+separate on purpose: `iree-vulkan` uses the library defaults (`opt_level` as resolved by
+`etl_hf.pipeline.resolve_build_options` — `O3` for a non-ROCm target set), `iree-vulkan-o1` passes
+the one hand-picked option `opt_level="O1"`, and each record marks which
+(`compile_options_hand_picked` / `compile_options_default` / `compile_options_note`).
+
 Both legs are integrated in the harness ([`./hf_bench.py`](./hf_bench.py), [`./hf_bench_lib.py`](./hf_bench_lib.py)),
 one subprocess per `(model, seq_len, leg)`, records in [`./hf_bench_data/`](./hf_bench_data/)
 (`*__iree-vulkan.json`, `*__iree-vulkan-o1.json`), rendered in **section 5c** of
-[`./hf_bench_results.md`](./hf_bench_results.md). They are separate legs on purpose: `iree-vulkan`
-uses the library defaults (`opt_level` → `O3`), `iree-vulkan-o1` passes a hand-picked
-`opt_level="O1"`, and each record marks which (`compile_options_hand_picked` /
-`compile_options_default` / `compile_options_note`).
+[`./hf_bench_results.md`](./hf_bench_results.md).
+
+The committed matrix is **65 cells (54 ok, 11 not ok) over 11 legs**; the Vulkan subset is **14 cells
+(8 ok, 6 not ok)** — 7 model/seq cells × 2 legs, with `tiny_mistral` failing on both. Every ok cell
+records `asdevicearray_calls == 0` / `zero_asdevicearray_after_warmup: true`, logits on
+`Device(kind='vulkan', index=0)`, `vulkan.public_api: true`, the inferred target backend and the
+`compile_options_*` pair.
 
 Run them with `--phase vulkan`, which requires the environment to name the ICD:
 
@@ -392,28 +408,32 @@ PYTHONPATH=$PWD $TMPDIR/vk-venv/bin/python bench_logs/hf_bench.py \
 
 `child_env` forwards `ETL_VULKAN_ICD` to the leg process as `VK_ICD_FILENAMES`; a vulkan leg
 requested without it writes a record naming the variable instead of a silently empty device list.
-Each record carries a `vulkan` provenance block (device name/apiVersion/driverVersion/vendorID/
-deviceType, IREE device id/path, the ICD used, the shim and its patched sites, the compile target,
-the hand-picked-vs-default options, and `"note": "lavapipe = software Vulkan on CPU; not a GPU
-measurement"`). The report's GPU columns are **reused records** measured on the real GPU before it
+Each record carries a `vulkan` provenance block — device name / apiVersion / driverVersion (read from
+`VkPhysicalDeviceProperties` via `hf_bench_vulkan.physical_device_properties()`), vendorID,
+`deviceType`, IREE device id/path, the ICD used, `public_api: true`, `etl_device`
+(`Device(kind='vulkan', index=0)`), the inferred `target_backends`, `compile_options_default`
+(`opt_level` default + the default SPIR-V profile) and `compile_options_hand_picked` (plus whether
+`vulkan_target` was used), and an explicit `"note": "lavapipe = software Vulkan on CPU; not a GPU
+measurement"`. The report's GPU columns are **reused records** measured on the real GPU before it
 stopped accepting work — reference data, never a comparison with the software leg.
 
-### 4a. `iree-vulkan` (library defaults, `opt_level="O3"`): 2 of 7 cells run
+### 4a. `iree-vulkan` (library defaults, `opt_level="O3"`, `vulkan_target` unset): 2 of 7 cells run
 
 | model | seq | weights | first ms | best ms | median ms | +d2h best | `asdevicearray` | ×numpy-cpu | ×iree-llvmcpu | ×torch-cpu |
 |---|---|---|---|---|---|---|---|---|---|---|
-| tiny_llama | 32 | unpacked | 7.022 | **1.577** | 1.619 | 1.393 | 0 | 0.97× | 1.35× | 0.58× |
-| tiny_gpt2 | 32 | unpacked | 5.552 | **1.728** | 1.747 | 2.158 | 0 | 0.70× | 1.05× | 0.48× |
+| tiny_llama | 32 | unpacked | 7.720 | **1.617** | 1.637 | 1.555 | 0 | 0.95× | 1.32× | 0.56× |
+| tiny_gpt2 | 32 | unpacked | 5.609 | **1.744** | 1.767 | 2.292 | 0 | 0.69× | 1.04× | 0.48× |
 | tiny_mistral | 32 | unpacked | — | — | — | — | n/a | — | — | — |
 | distilgpt2 | 32 | packed | — | — | — | — | n/a | — | — | — |
 | distilgpt2 | 128 | packed | — | — | — | — | n/a | — | — | — |
 | gpt2 | 32 | packed | — | — | — | — | n/a | — | — | — |
 | gpt2 | 128 | packed | — | — | — | — | n/a | — | — | — |
 
-Build totals 852.97 ms (`tiny_llama`) and 678.66 ms (`tiny_gpt2`). The `×` columns are CPU-vs-CPU
-(that leg's best ÷ this leg's best, so >1 means Vulkan is faster): lavapipe sits at
-numpy-interpreter level and within 5–35 % of `iree-llvmcpu` — on a software rasterizer that is the
-expected outcome, and it means these cells carry no GPU information.
+Build totals 913.74 ms (`tiny_llama`) and 695.01 ms (`tiny_gpt2`); throughput 19 787.29 and
+18 349.68 tok/s. The `×` columns are CPU-vs-CPU (that leg's best ÷ this leg's best, so >1 means
+Vulkan is faster): lavapipe sits at numpy-interpreter level (0.95× / 0.69× numpy — the interpreter is
+the faster of the two on `tiny_gpt2`) and 4–32 % faster than `iree-llvmcpu` (1.32× / 1.04×), which on
+a software rasterizer is the expected outcome and means these cells carry no GPU information.
 
 The five non-running cells are recorded verbatim, never omitted:
 
@@ -425,47 +445,61 @@ The five non-running cells are recorded verbatim, never omitted:
 Parity vs the numpy interpreter: `tiny_llama` s32 max_abs **8.94e-08** / rel-to-absmax 2.14e-07 /
 argmax 1.0; `tiny_gpt2` s32 max_abs **2.24e-08** / rel 1.73e-07 / argmax 1.0.
 
-### 4b. `iree-vulkan-o1` (hand-picked `opt_level="O1"`): 7 of 7 cells run
+### 4b. `iree-vulkan-o1` (hand-picked `opt_level="O1"`): 6 of 7 cells run
 
 | model | seq | weights | first ms | best ms | median ms | +d2h best | `asdevicearray` | ×numpy-cpu | ×iree-llvmcpu | ×torch-cpu |
 |---|---|---|---|---|---|---|---|---|---|---|
-| tiny_llama | 32 | unpacked | 429.711 | **1.650** | 1.718 | 1.525 | 0 | 0.93× | 1.29× | 0.55× |
-| tiny_gpt2 | 32 | unpacked | 105.534 | **1.923** | 1.967 | 2.410 | 0 | 0.63× | 0.94× | 0.43× |
+| tiny_llama | 32 | unpacked | 7.225 | **1.698** | 1.712 | 1.520 | 0 | 0.90× | 1.25× | 0.54× |
+| tiny_gpt2 | 32 | unpacked | 6.073 | **1.900** | 1.936 | 2.274 | 0 | 0.64× | 0.95× | 0.44× |
 | tiny_mistral | 32 | unpacked | — | — | — | — | n/a | — | — | — |
-| distilgpt2 | 32 | packed | 188.214 | **141.851** | 142.237 | 1.977 | 0 | 0.10× | 1.79× | 0.06× |
-| distilgpt2 | 128 | packed | 11 631.33 | **11 453.44** | 11 480.67 | 7.063 | 0 | 0.01× | — | 0.00× |
-| gpt2 | 32 | packed | 238.381 | **174.589** | 191.694 | 2.003 | 0 | 0.17× | 2.31× | 0.09× |
-| gpt2 | 128 | packed | 11 673.43 | **11 626.02** | 11 634.66 | 6.761 | 0 | 0.01× | — | 0.00× |
+| distilgpt2 | 32 | packed | 189.931 | **139.455** | 142.725 | 1.905 | 0 | 0.11× | 1.82× | 0.06× |
+| distilgpt2 | 128 | packed | 11 528.31 | **11 477.25** | 11 495.23 | 7.221 | 0 | 0.01× | — | 0.00× |
+| gpt2 | 32 | packed | 249.409 | **194.588** | 206.498 | 2.013 | 0 | 0.15× | 2.07× | 0.08× |
+| gpt2 | 128 | packed | 11 617.58 | **11 559.80** | 11 594.93 | 6.930 | 0 | 0.01× | — | 0.00× |
 
-Build totals: 860.34 / 677.23 / 1 789.39 / 1 809.80 / 3 116.54 / 3 091.35 ms for the six built cells.
-`tiny_mistral` still fails on the erf-GELU activation gate.
+Build totals: 910.61 / 695.10 / 1 842.97 / 1 806.63 / 3 179.42 / 3 110.12 ms for the six built cells;
+throughput 18 843.48 / 16 841.22 / 229.46 / 11.15 / 164.45 / 11.07 tok/s in the same order.
+`tiny_mistral` fails on the erf-GELU activation gate in this leg too, so the leg runs 6 of the 7 cells.
 
-Parity vs the numpy interpreter (all with **argmax agreement 1.0**):
+Parity vs the numpy interpreter (all with **argmax agreement 1.0**), plus the torch/transformers
+golden where a fixture of the cell's `seq_len` exists:
 
-| model | seq | max_abs | rel-to-absmax |
-|---|---|---|---|
-| tiny_llama | 32 | 8.94e-08 | 2.14e-07 |
-| tiny_gpt2 | 32 | 6.26e-07 | 4.85e-06 |
-| distilgpt2 | 32 | 2.441e-04 | 2.97e-06 |
-| distilgpt2 | 128 | 2.594e-04 | 3.16e-06 |
-| gpt2 | 32 | 3.662e-04 | 2.64e-06 |
-| gpt2 | 128 | 4.196e-04 | 3.02e-06 |
+| model | seq | max_abs | rel-to-absmax | max_abs vs golden |
+|---|---|---|---|---|
+| tiny_llama | 32 | 8.94e-08 | 2.14e-07 | — (golden fixture is `1x8`) |
+| tiny_gpt2 | 32 | 3.30e-04 | 2.56e-03 | — (no `seq_len=32` golden) |
+| distilgpt2 | 32 | 2.441e-04 | 2.97e-06 | 2.44e-04 |
+| distilgpt2 | 128 | 2.594e-04 | 3.16e-06 | — |
+| gpt2 | 32 | 3.662e-04 | 2.64e-06 | 4.27e-04 |
+| gpt2 | 128 | 4.196e-04 | 3.02e-06 | — |
 
 The real models' absolute deviation grows with logit magnitude (absmax ~139 for `gpt2`), while
 relative-to-absmax stays at the fp32 accumulation-order floor (~3e-06) — the same order every other
 etl backend shows, with **no** SPIR-V fast-math divergence and no argmax disagreement.
 
-Reading the numbers honestly: under `O1` the 124M-class graphs *run* but are slow — 141–175 ms at
-`seq_len=32` (0.10–0.17× the numpy interpreter, 1.8–2.3× `iree-llvmcpu`) and ~11.5 s at `seq_len=128`
+**A `1e-4`-magnitude Vulkan parity value is fp32 accumulation-order tiling variance**, not a precision
+or code-generation change: lavapipe splits reductions and element-wise work across threads, so the
+summation order — and therefore the rounding — can differ, while `argmax` agreement stays 1.0. The
+`tiny_gpt2` s32 `iree-vulkan-o1` cell is **bimodal across processes**: 7 replicate processes with an
+identical command give 5 runs at `max_abs = 6.258e-07` and 2 runs at `3.304e-04` (bit-stable within a
+run, `argmax_agreement = 1.0` in both modes, the divergence covering ~15 % of the vocabulary and
+growing along the sequence). The committed record is one sample of that distribution. The same model's
+`iree-vulkan` (defaults) cell is stable at 2.234e-08, and `distilgpt2`/`gpt2` reproduce bit-identically
+across replicates at both seq lens — the records hold one number per cell, so the replicate spread is
+documented here rather than in a table.
+
+Reading the numbers honestly: under `O1` the 124M-class graphs *run* but are slow — 139–195 ms at
+`seq_len=32` (0.11–0.15× the numpy interpreter, 1.82–2.07× `iree-llvmcpu`) and ~11.5 s at `seq_len=128`
 (~0.01× numpy). The `seq_len=128` cliff is a codegen-quality problem, not a device limit: `O1` leaves
 the 50257-wide vocabulary matmul and the packed gather/copy loops unoptimized, so a software rasterizer
 executes them as scalar SPIR-V work. These are recorded as measured, with the hand-picked level
 labelled in every record and in the report; they are **not** comparable with the `iree-vulkan`
 defaults cells as a compile-setting-free measurement.
 
-### 4c. Why the four 124M-class cells fail under the default `opt_level="O3"` (verbatim)
+### 4c. Why the four 124M-class cells fail under the library-default compile level (verbatim)
 
-`distilgpt2`/`gpt2` at `seq_len=32` — the default target profile's 16 KiB workgroup-memory budget:
+`distilgpt2`/`gpt2` at `seq_len=32` (locations `<stdin>:155:12` and `<stdin>:251:12`) — the default
+target profile's 16 KiB workgroup-memory budget:
 
 ```
 <stdin>:155:12: error: function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of
@@ -477,8 +511,8 @@ shared memory; exceeded the limit of 16384 bytes
 Passing a larger-profile `--iree-vulkan-target` (e.g. `gfx942`, 64 KiB) moves the wall: the reduction
 then legalizes and compilation stops later in vector-dialect lowering.
 
-`distilgpt2`/`gpt2` at `seq_len=128` — the same graphs instead die in legalization, before the memory
-budget matters:
+`distilgpt2`/`gpt2` at `seq_len=128` (locations `<stdin>:124:12` and `<stdin>:220:12`) — the same
+graphs instead die in legalization, before the memory budget matters:
 
 ```
 <stdin>:220:12: error: failed to legalize operation 'vector.from_elements' that was explicitly
@@ -492,7 +526,7 @@ marked illegal: %1201 = "vector.from_elements"(%562, %564, %566, %568) : (i64,i6
 above `O1`); `O2`/`O3` both fail identically. So the leg split is a compiler limitation of
 `vulkan-spirv` codegen on this graph shape, not a lavapipe constraint.
 
-### 4d. Low-level shim probe (512×512 matmul + tanh + variance)
+### 4d. Low-level runtime probe (512×512 matmul + tanh + variance; historical, before the public-API proof)
 
 Before the public-API proof, the same Vulkan path was driven through `iree.runtime` directly on an
 etl-exported graph (`etl.backends.stablehlo.export` → `iree-compile --iree-hal-target-backends=vulkan-spirv`
@@ -511,20 +545,26 @@ etl-exported graph (`etl.backends.stablehlo.export` → `iree-compile --iree-hal
 ## 5. Notes and caveats
 
 * **lavapipe is a software Vulkan device on the CPU.** Every `iree-vulkan`/`iree-vulkan-o1` number is
-  a Vulkan-path correctness/performance datapoint, never a GPU number: ~1.6 ms/call for a tiny model
-  is a plausible software-rasterizer cost, and 141 ms – 11.6 s for the 124M checkpoints shows the
-  cost of unoptimized scalar SPIR-V. The interesting result is architectural: the whole **public**
-  staging pipeline is device-kind-generic apart from the string/dialect gates listed in §3.
+  a Vulkan-path correctness/performance datapoint, never a GPU number: ~1.6–1.9 ms/call for a tiny
+  model is a plausible software-rasterizer cost, and 139 ms – 11.6 s for the 124M checkpoints shows
+  the cost of unoptimized scalar SPIR-V. The architectural result is that the whole **public** staging
+  pipeline is device-kind-generic: `vulkan` is a first-class device kind serviced entirely by the
+  library (§3c), with no benchmark-side patch involved.
 * **The GPU columns in the report are reused, not re-measured** — `iree-rocm`, `xla-rocm`,
   `xla-rocm-fp32`, `torch-rocm` (and the CPU legs `numpy-cpu`/`iree-llvmcpu`/`torch-cpu`) are the
   committed records from before the AMD GPU stopped accepting work. No ratio is formed between a GPU
   column and a software-Vulkan column.
-* **Determinism**: repeat runs of a cell produce bit-identical logits; only the cold first call and
-  build time vary.
+* **ROCm/HIP has not recovered** — `iree.runtime.get_driver("hip").query_available_devices()` still
+  fails with `hip_driver.c:66 FAILED_PRECONDITION; HIP driver error 'hipErrorNoDevice' (100): no
+  ROCm-capable device is detected`, i.e. the same wedged device as §1c, so no GPU column can be
+  re-measured. No DRM/kernel recovery is attempted.
+* **Determinism**: within one process a cell's logits are bit-stable across warm iterations; across
+  processes the fp32 accumulation order can differ on this threaded software device — `tiny_gpt2` s32
+  `iree-vulkan-o1` is bimodal (§4b), every other cell reproduces bit-identically.
 * **`iree-base-compiler` and `iree-base-runtime` must be the same 3.11 series** (validated pair
   `3.11.0`); compiled artifacts are version-specific, so clear stale build caches after an upgrade.
 * **Python 3.14 + nanobind**: `iree.runtime` can emit a teardown dump at interpreter exit; anything
-  that must exit cleanly flushes and calls `os._exit(0)` (the shim's `--check` does).
+  that must exit cleanly flushes and calls `os._exit(0)` (`hf_bench_vulkan.py --check` does).
 * **Never touch `/dev/dri`, ROCm or HIP on this host** — the wedged device makes `close()` and
   HIP init hang; wrap any DRM probe in `timeout`. Pinning `VK_ICD_FILENAMES` to the lavapipe ICD is
   also what keeps the loader away from the radeon ICD.
@@ -537,28 +577,35 @@ etl-exported graph (`etl.backends.stablehlo.export` → `iree-compile --iree-hal
 export VK_ICD_FILENAMES=$TMPDIR/vk-lvp/lavapipe_icd.json
 export ETL_HF_MODELS_DIR=$TMPDIR/etl_hf_models HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export PYTHONPATH=$PWD                       # etl and etl_hf from the checkout, never installed
-$TMPDIR/vk-venv/bin/python bench_logs/hf_bench_vulkan.py --check      # shim + device evidence, no model
+$TMPDIR/vk-venv/bin/python bench_logs/hf_bench_vulkan.py --check      # device + public-path evidence, no model
 ```
+
+`$TMPDIR/vk-venv` is a throwaway venv holding only `iree-base-compiler` + `iree-base-runtime` 3.11 +
+numpy (CPython 3.14.8); `etl`/`etl_hf` come from the checkout via `PYTHONPATH`.
 
 The end-to-end proof (also the shape of the harness's etl legs):
 
 ```python
-import sys; sys.path[:0] = [".", "bench_logs"]
-import hf_bench_vulkan; hf_bench_vulkan.install()
 import etl, etl_hf
 
 loaded = etl_hf.load_hf("$ETL_HF_MODELS_DIR/tiny_llama")
 cfg, params = loaded.config, loaded.params
 fwd = etl_hf.forward_fn(cfg, seq_len=32, pack_weights=True)
 dev = etl.Device("vulkan", 0)
-exe = etl_hf.build(fwd, cfg, backend="iree", device=dev)           # ~0.85-1.0 s
+exe = etl_hf.build(fwd, cfg, backend="iree", device=dev)             # ~0.91 s
 plan = etl_hf.pack_plan(etl_hf.param_specs(cfg))
-placed = etl_hf.place_params(etl_hf.pack_params(plan, params), dev)  # ~2.2 ms, once
+placed = etl_hf.place_params(etl_hf.pack_params(plan, params), dev)  # ~1.3-2.8 ms, once
 ids = etl_hf.place_ids(input_ids, dev)
-out = etl_hf.run(exe, placed, ids)    # 9.8-655 ms first call, then ~1.5-1.8 ms/call,
-                                      # 0 uploads in the warm loop
+out = etl_hf.run(exe, placed, ids)    # 7.7 ms first call, then ~1.6-1.7 ms/call,
+                                      # 0 asdevicearray calls in the warm loop
 host = out.to(etl.Device("cpu", 0)).numpy()        # the one explicit D2H copy
 ```
 
-`$TMPDIR/vk-venv` is a throwaway venv holding only `iree-base-compiler` + `iree-base-runtime` 3.11 +
-numpy (CPython 3.14.8); `etl`/`etl_hf` come from the checkout via `PYTHONPATH`.
+**The in-package conformance harness accepts the kind too.** `PYTHONPATH=$PWD
+VK_ICD_FILENAMES=$TMPDIR/vk-lvp/lavapipe_icd.json python -m etl.bench --backend iree --device vulkan:0
+--examples matmul,op_gather_scatter,elementwise_fusion --repeats 3` prints `overall: PASS (3/3 checked)`
+and exits 0 — `matmul` max_abs 3.81e-06 / max_rel 1.61e-04, `op_gather_scatter` and
+`elementwise_fusion` bit-exact (0 / 0); benchmark best-of-3 0.201 / 0.238 / 0.212 ms vs numpy
+0.004 / 0.003 / 0.005 ms (lavapipe launch/overhead on a software device — not a GPU number). No
+deferral and no harness flag: `etl.bench` lists `vulkan` in its supported device kinds. The full
+98-example matrix was not run on it.

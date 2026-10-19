@@ -8,13 +8,15 @@ probe.
 `./hf_bench_vulkan.py` (+ `./vulkan_findings.md`) is the **IREE Vulkan / lavapipe** datapoint:
 `vulkan` is a **first-class `etl` device kind**, so the two harness legs — `iree-vulkan` (library
 defaults) and `iree-vulkan-o1` (hand-picked `opt_level="O1"`) — run `etl_hf`'s public
-`build`/`run` path on `Device("vulkan", 0)` with no library change. `./hf_bench_vulkan.py` is now
-only harness-side device/provenance helpers (`device_info`, `physical_device_properties`) plus a
-`--check` environment self-test; see its own section below.
+`build`/`run` path on `Device("vulkan", 0)` with no library change. `./hf_bench_vulkan.py` holds
+only harness-side device/provenance helpers (`VULKAN_KIND`/`VULKAN_TARGET`, `device_info`,
+`physical_device_properties`) plus a `--check` environment self-test; it patches nothing. See its
+own section below.
 `./vulkan_findings.md` records the host verdict: **this AMD GPU cannot run Vulkan at all**
 (RADV CDNA3 policy gate, AMDVLK has no CDNA PAL path, and the amdgpu DRM device is stuck in a
 never-completing reset) — so every Vulkan number comes from lavapipe — plus the historical probe
-evidence (and the now-closed etl-core gap list that a first-class `vulkan` kind needed).
+evidence and the retired shim's per-site patch list, kept as the history of what the `vulkan` kind
+had to cover.
 Historical artifacts remain committed here: the 763a415-era xla-vs-iree fused
 4096×50 probes (`probe_xla_gpu.py`, `probe_iree_same_mlir.py`, `probe_parity.py`,
 `de_4096x50_fused_key1.mlir`/`.vmfb`, `clocks_*.log`, `_common.py`) — their
@@ -187,7 +189,9 @@ host exposes: **lavapipe**, Mesa's *software* Vulkan implementation (`deviceType
 correctness/perf datapoint, never a GPU number (the AMD GPU cannot run Vulkan: Mesa RADV refuses CDNA3;
 see `./vulkan_findings.md`). `vulkan` is a first-class `etl` device kind, so the leg runs the
 **unmodified public API** on `Device("vulkan", 0)` — `etl.pipeline` infers
-`target_backends=["vulkan-spirv"]` from the device, so the leg declares no target; the loader is pinned
+`target_backends=["vulkan-spirv"]` from the device, so a vulkan leg passes **no** `target_backends`
+option and never sets the `vulkan_target` compile option (the SPIR-V profile stays IREE's default
+`vp_android_baseline_2022`, `max_workgroup_memory_bytes = 16384`); the loader is pinned
 to a renamed lavapipe ICD. The ICD is a **machine-local path and is never hard-coded**: the runner
 exports `ETL_VULKAN_ICD`, `child_env` forwards it to the leg as `VK_ICD_FILENAMES`, and a vulkan leg
 requested without it writes a record naming that variable (never a silently empty device list). Each
@@ -200,7 +204,11 @@ record carries a `vulkan` provenance block — device name / apiVersion / driver
 measurement"`. Compile options stay library defaults (`opt_level="O3"` for a non-rocm target set,
 `vulkan_target` unset ⇒ IREE's `vp_android_baseline_2022`); `--pack auto` applies unchanged (tiny
 models unpacked, the 124M models packed). The GPU columns of the report are **reused records**
-measured before the GPU wedged — they are reference data, not a comparison with the software leg.
+measured before the GPU wedged — they are reference data, not a comparison with the software leg,
+and they cannot be re-measured: ROCm/HIP has not recovered
+(`iree.runtime.get_driver("hip").query_available_devices()` still fails with
+`HIP driver error 'hipErrorNoDevice' (100): no ROCm-capable device is detected`), so no DRM/kernel
+recovery is attempted.
 One subprocess per `(model, seq_len, leg)`, with `--leg-timeout`; the child writes its own JSON and
 `.logits.npz` then `os._exit(0)`, so the xla/ROCm teardown abort cannot lose a record.
 A leg that cannot run is a RECORD (`*.error.json`) with its verbatim error/returncode/signal, never
@@ -225,8 +233,8 @@ disk**, so leg order does not matter; a golden fixture whose `seq_len` differs f
 `--report` is a pure function of the JSON records + `parity_digest.json` + `hf_bench_env.json` (no
 torch, no iree, no measurement) and reproduces byte-identically.
 
-**Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 58 JSON leg
-records, the env artifact and one small `parity_digest.json` (~26 KB: the parity numbers
+**Data policy — records committed, logits dumps not.** `./hf_bench_data/` commits the 65 JSON leg
+records, the env artifact and one small `parity_digest.json` (~28 KB: the parity numbers
 `--report` would recompute from the dumps, per cell and reference). The `*.logits.npz` dumps are
 **derived bulk** (one per ok cell, output-sized, ~460 MB for the current matrix) and are `.gitignore`d
 — a bench run re-creates them (the driver then
@@ -236,7 +244,7 @@ fresh run) → the parity block the leg's own record stored at measure time → 
 (only needed for the 31 pairs whose reference leg was measured *after* that cell, where the
 measure-time block legitimately says "no logits on disk") → `—` with the reason. The report header
 states which sources were used, and the rendered parity table is identical either way (verified by
-diffing the dumps-present and dumps-absent renders) — so the directory is ~700 KB instead of ~393 MB
+diffing the dumps-present and dumps-absent renders) — so the directory is ~830 KB instead of ~393 MB
 without losing a number.
 
 Run it (etl/etl_hf come from the checkout via `PYTHONPATH`, never installed into the bench venv):
@@ -281,15 +289,33 @@ Facts about the current matrix worth knowing before re-running it:
 - `iree/llvm-cpu` cannot compile `distilgpt2`/`gpt2` at `seq_len=128` (works at 32):
   `'func.func' op exceeded stack allocation limit of 32768 bytes for function` — an upstream
   iree-compile limit, independent of packing and of any harness option.
-- `iree-vulkan` (lavapipe, library defaults → `opt_level="O3"`) runs the two tiny checkpoints and
-  fails the other five by construction of the target: the 124M models exceed the default Vulkan
-  target's 16 KiB workgroup-memory budget in the LayerNorm-shaped reduction (`uses 196864 bytes of
-  shared memory; exceeded the limit of 16384 bytes`) or fail `vector.from_elements` legalization at
-  `seq_len=128`, and `tiny_mistral` hits the exact-`erf`-GELU activation gate.
-- `iree-vulkan-o1` (hand-picked `opt_level="O1"`) runs **all seven** cells, including the four
-  124M-class graphs the default level cannot compile; `O2`/`O3` both fail identically, so the two
-  levels are separate legs and their numbers are not comparable. Details in the `hf_bench_vulkan.py`
-  section below; the compile diagnosis is in `./vulkan_findings.md`.
+- `iree-vulkan` (lavapipe, library defaults → `opt_level="O3"`, `vulkan_target` unset) — **2 of 7
+  cells run**: `tiny_llama` s32 best 1.6172 ms, `tiny_gpt2` s32 1.7439 ms. `tiny_mistral` fails on
+  the exact-`erf`-GELU activation gate, and the four 124M-class cells fail in `iree-compile` against
+  the default Vulkan profile — at `seq_len=32` the LayerNorm-shaped reduction exceeds its 16 KiB
+  workgroup-memory budget (`function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of
+  shared memory; exceeded the limit of 16384 bytes`), at `seq_len=128` the packed in-graph gather
+  fails `vector.from_elements` legalization.
+- `iree-vulkan-o1` (the one hand-picked option, `opt_level="O1"`) runs **6 of those same 7 cells**,
+  including the four 124M-class graphs the default level cannot compile — all except `tiny_mistral`,
+  which hits the activation gate under every compile level; `O2`/`O3` both fail identically, so the
+  two levels are separate legs and their numbers are not comparable. Details in the
+  `hf_bench_vulkan.py` section below; the compile diagnosis is in `./vulkan_findings.md`.
+- The 14 Vulkan cells are **8 ok / 6 not ok**. Parity vs the numpy interpreter sits at the `1e-08`
+  level on the two default-leg cells (`tiny_llama` 8.94e-08, `tiny_gpt2` 2.24e-08) and at the `1e-04`
+  level on the o1 cells with **argmax agreement 1.0 everywhere** — fp32 accumulation-order tiling
+  variance on a threaded software device, not a precision change (`distilgpt2` s32 2.44e-04 /
+  2.97e-06, `gpt2` s32 3.66e-04 / 2.64e-06, `distilgpt2` s128 2.59e-04 / 3.16e-06, `gpt2` s128
+  4.20e-04 / 3.02e-06, `tiny_gpt2` an accumulation-order variant at 3.30e-04 / 2.56e-03).
+  The `tiny_gpt2` s32 `iree-vulkan-o1` parity is **bimodal across processes**: 7 replicate
+  processes with an identical command give 5 runs at `max_abs = 6.258e-07` and 2 runs at
+  `3.304e-04` (bit-stable within a run, `argmax` 1.0 in both, the divergence over ~15 % of the vocab
+  growing along the sequence); the committed record is one sample. The same cell on the default leg
+  is stable at 2.234e-08, and `distilgpt2`/`gpt2` reproduce bit-identically across replicates.
+- **ROCm/HIP has not recovered** — `iree.runtime.get_driver("hip").query_available_devices()` still
+  fails with `HIP driver error 'hipErrorNoDevice' (100): no ROCm-capable device is detected`, so
+  every GPU column (`iree-rocm`, `xla-rocm`, `xla-rocm-fp32`, `torch-rocm`) stays a reused
+  pre-wedge record; no DRM/kernel recovery is attempted.
 - Inductor/Triton caches must not live under `$HOME` (a read-only mount here): the harness points
   `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
   `torchcompile-*` legs.
@@ -373,15 +399,14 @@ Facts pinned by this matrix (all measured, nothing extrapolated):
 `./etl_hf/`, `./tests/` imports it and it patches nothing. `vulkan` is a **first-class `etl` device
 kind**, so the legs run the unmodified public API (`etl_hf.build` / `etl_hf.run` on
 `Device("vulkan", 0)`; `etl.pipeline` infers `target_backends=["vulkan-spirv"]` from the device). What
-the module still provides: `VULKAN_KIND`/`VULKAN_TARGET`, `device_info()` (what IREE's Vulkan driver
+the module provides: `VULKAN_KIND`/`VULKAN_TARGET`, `device_info()` (what IREE's Vulkan driver
 enumerates), `physical_device_properties()` (`VkPhysicalDeviceProperties` via the loader: name /
 apiVersion / driverVersion / vendorID / deviceType) and `--check`, the environment self-test — it
 enumerates the device **and** proves the public path end to end (`etl.build`/`etl.run` of a tiny
 `@etl.defn` matmul on `Device("vulkan", 0)`, device-resident, max-abs vs numpy; exit 0 = environment
-OK). `./vulkan_findings.md` is the historical record: feasibility/root cause (§1), the execution proof
-(§2), the once-reported gap list for a first-class `vulkan` kind (§3 — since implemented in the
-library) and the benchmark tables (§4); its `install()`-shim recipes describe the retired shim and are
-kept as history only.
+OK). `./vulkan_findings.md` is the record: feasibility/root cause (§1), the execution proof (§2), the
+capabilities a first-class `vulkan` kind covers and the library code owning each (§3, with the retired
+shim's per-site table kept as history) and the benchmark tables (§4).
 
 **No AMD-GPU Vulkan path exists on this host** (§1 of the findings): RADV rejects CDNA3 by policy
 (`radv_physical_device.c:2122`, `radv: info: device 'GFX940' is not supported by RADV.`), AMDVLK
@@ -399,22 +424,36 @@ radeon ICD). Its `device_id` is a per-process UUID hash, never `index+1`.
 Throwaway venv `$TMPDIR/vk-venv` (iree-base-compiler/runtime 3.11 + numpy, CPython 3.14.8) with
 `etl`/`etl_hf` from the checkout via `PYTHONPATH`; `os._exit(0)` avoids the py3.14 nanobind exit dump.
 
+**The in-package conformance harness accepts the kind too.** `PYTHONPATH=$PWD
+VK_ICD_FILENAMES=$TMPDIR/vk-lvp/lavapipe_icd.json python -m etl.bench --backend iree --device
+vulkan:0 --examples matmul,op_gather_scatter,elementwise_fusion --repeats 3` prints
+`overall: PASS (3/3 checked)` and exits 0 — `matmul` max_abs 3.81e-06 / max_rel 1.61e-04,
+`op_gather_scatter` and `elementwise_fusion` bit-exact (0 / 0); benchmark best-of-3 0.201 / 0.238 /
+0.212 ms vs numpy 0.004 / 0.003 / 0.005 ms (lavapipe launch/overhead on a software device — not a
+GPU number). No deferral and no harness flag: `etl.bench` lists `vulkan` in its supported device kinds.
+The full 98-example matrix was not run on it.
+
 Measured — the matrix holds **65 cells (54 ok, 11 not ok)** over 11 legs, of which 7 are `iree-vulkan`
-and 7 `iree-vulkan-o1` (warmup 2 + best-of-5, batch 1, `--pack auto`; record per cell in
-`./hf_bench_data/*__iree-vulkan*.json`, tables in section 5c of the report).
-`iree-vulkan` — library defaults (`opt_level="O3"`): **2 of 7 cells run**.
-- **ok, unpacked: `tiny_llama` s32** (first 7.02 ms, best **1.577**, median 1.619, +d2h 1.393,
-  `asdevicearray` **0**; parity vs `numpy-cpu` max_abs **8.94e-08**, rel-to-absmax 2.14e-07, argmax
-  1.0) and **`tiny_gpt2` s32** (first 5.55, best **1.728**, median 1.747, +d2h 2.158,
-  `asdevicearray` 0; max_abs **2.24e-08**, rel-to-absmax 1.73e-07, argmax 1.0). Both build in
-  0.68–0.85 s. On the CPU-vs-CPU comparison lavapipe sits at numpy-interpreter level (`tiny_llama`
-  0.97× numpy, `tiny_gpt2` 0.70× numpy = numpy faster) and within 5–35% of `iree-llvmcpu` — a
-  software rasterizer, so this is a Vulkan-path datapoint only.
+and 7 `iree-vulkan-o1`, i.e. a **14-cell Vulkan subset: 8 ok / 6 not ok** (warmup 2 + best-of-5,
+batch 1, `--pack auto`; record per cell in `./hf_bench_data/*__iree-vulkan*.json`, tables in section 5c
+of the report). Both legs drive the unmodified public API — `etl_hf.build(fwd, cfg, backend="iree",
+device=Device("vulkan", 0))` with `target_backends` inferred from the device and `vulkan_target`
+unused — and every ok cell records `asdevicearray_calls == 0` /
+`zero_asdevicearray_after_warmup: true`, logits on `Device(kind='vulkan', index=0)`, and
+`vulkan.public_api: true`.
+`iree-vulkan` — library defaults (`opt_level="O3"`, no `vulkan_target`): **2 of 7 cells run**.
+- **ok, unpacked: `tiny_llama` s32** (first 7.720 ms, best **1.6172**, median 1.6373, 19 787 tok/s,
+  +d2h 1.5548, `asdevicearray` **0**; parity vs `numpy-cpu` max_abs **8.94e-08**, rel-to-absmax
+  2.14e-07, argmax 1.0) and **`tiny_gpt2` s32** (first 5.610, best **1.7439**, median 1.7672,
+  18 350 tok/s, +d2h 2.2917, `asdevicearray` 0; max_abs **2.24e-08**, rel-to-absmax 1.73e-07, argmax
+  1.0). Builds 913.7 / 695.0 ms. On the CPU-vs-CPU comparison lavapipe sits at numpy-interpreter
+  level (`tiny_llama` 0.95× numpy, `tiny_gpt2` 0.69× numpy = numpy faster) and 1.04–1.32×
+  `iree-llvmcpu` — a software rasterizer, so this is a Vulkan-path datapoint only.
 - **`tiny_mistral` s32: `HFUnsupportedError`** — the same exact-`erf`-GELU activation gate that
   blocks every compiled leg of that checkpoint, verbatim in the record's `errors[0]`.
 - **the 124M-class cells do not compile for this target** (explicit `BackendError` from
   `iree-compile`, full text in `errors[0]`): `distilgpt2` s32 and `gpt2` s32 fail in the
-  LayerNorm-shaped reduction — `function 'main_dispatch_N_reduction_32x768_f32' uses 196864 bytes of
+  LayerNorm-shaped reduction — `function 'main_dispatch_0_reduction_32x768_f32' uses 196864 bytes of
   shared memory; exceeded the limit of 16384 bytes` — because no `--iree-vulkan-target` is passed,
   so iree targets its `vp_android_baseline_2022` default with
   `max_workgroup_memory_bytes = 16384`; `distilgpt2` s128 and `gpt2` s128 (packed) instead fail
@@ -422,19 +461,26 @@ and 7 `iree-vulkan-o1` (warmup 2 + best-of-5, batch 1, `--pack auto`; record per
   packed in-graph gather). The harness never hand-picks compiler flags, so these stay recorded
   failures rather than tuned runs.
 
-`iree-vulkan-o1` — the SAME graph/target with a hand-picked `opt_level="O1"`: **7 of 7 cells run**,
-so the four 124M-class cells exist only under this leg (`O2`/`O3` fail exactly as above). Each record
-marks the configuration (`compile_options_hand_picked`/`_default`/`_note`) and the report renders a
-"Compile configuration: HAND-PICKED" paragraph; the two legs are therefore never conflated.
-- `tiny_llama` s32 best **1.650** (median 1.718, +d2h 1.525), `tiny_gpt2` s32 best **1.923**
-  (1.967, +d2h 2.410), `tiny_mistral` still `HFUnsupportedError`.
-- `distilgpt2` s32 **141.851** (first 188.2, 0.10× numpy, 1.79× `iree-llvmcpu`, 0.06× torch-cpu),
-  `gpt2` s32 **174.589** (0.17× numpy, 2.31× `iree-llvmcpu`), `distilgpt2` s128 **11,453.44** and
-  `gpt2` s128 **11,626.02** (~0.01× numpy — `O1` leaves the 50257-wide packed gather unoptimized, so
-  the s128 cells are ~100× slower than the interpreter). `asdevicearray` is **0** in every cell.
+`iree-vulkan-o1` — the SAME graph/target with the one hand-picked option `opt_level="O1"`: **6 of
+those same 7 cells run** (`tiny_mistral` still `HFUnsupportedError`), so the four 124M-class cells
+exist only under this leg (`O2`/`O3` fail exactly as above). Each record marks the configuration
+(`compile_options_hand_picked: {"opt_level": "O1"}` vs `{}` on the default leg, plus `_default`/`_note`)
+and the report renders a "Compile configuration: HAND-PICKED" paragraph; the two legs are therefore
+never conflated.
+- `tiny_llama` s32 best **1.6982** (median 1.7117, 18 843 tok/s, +d2h 1.5197) and `tiny_gpt2` s32
+  best **1.9001** (median 1.9358, 16 841 tok/s, +d2h 2.2738) — first calls 7.225 / 6.073 ms.
+- `distilgpt2` s32 **139.46** (first 189.93, median 142.72, 0.11× numpy, 1.82× `iree-llvmcpu`,
+  0.06× torch-cpu), `gpt2` s32 **194.59** (first 249.41, median 206.50, 0.15× numpy, 2.07×
+  `iree-llvmcpu`, 0.08× torch-cpu), `distilgpt2` s128 **11 477.25** and `gpt2` s128 **11 559.80**
+  (both ~0.01× numpy — `O1` leaves the 50257-wide packed gather unoptimized, so the s128 cells are
+  ~100× slower than the interpreter). Builds 910.6 / 695.1 / 1 843.0 / 1 806.6 / 3 179.4 / 3 110.1 ms
+  for the six built cells. `asdevicearray` is **0** in every cell.
 - parity vs the numpy interpreter: max_abs 8.94e-08–4.20e-04 with rel-to-absmax **~3e-06** on the real
-  models and **argmax agreement 1.0 everywhere** — the fp32 accumulation-order floor, no SPIR-V
-  fast-math divergence.
+  models and **argmax agreement 1.0 everywhere** (`tiny_gpt2` an accumulation-order variant at
+  3.30e-04 / 2.56e-03) — the fp32 accumulation-order floor, no SPIR-V fast-math divergence. The
+  `tiny_gpt2` s32 o1 cell is **bimodal across processes** (5 of 7 replicates at
+  `max_abs = 6.258e-07`, 2 at `3.304e-04`, argmax 1.0 in both): the committed record is one sample,
+  and the report documents the caveat rather than a spread, since records hold one number per cell.
 
 A cell's `parity.vs_numpy` is only computed at measure time when that cell's `numpy-cpu`
 `*.logits.npz` dump is on disk: the run recipe is to write the numpy leg's dump (`--legs numpy-cpu
@@ -454,9 +500,10 @@ and never ratioed against a software-Vulkan cell.
   backend, and `Tensor.to` resolves the preferred slot first, then the flat
   DEFAULT slot (`etl.backends`' lazy iree thunk), then `DeviceError`.
 - The run boundary enforces device-resident inputs for non-cpu executables
-  (cuda/rocm/hip — `core.DeviceError`, no implicit staging) — the same-device
+  (cuda/rocm/hip/vulkan — `core.DeviceError`, no implicit staging) — the same-device
   loop (feed each run's device `Tensor` outputs back as next inputs) is the
   required fast iteration pattern; host restaging costs ~0.8 ms per MB of state
-  round trip.
+  round trip (lavapipe: ~3.9 ms/call restaged vs ~1.6 ms in the loop, from the
+  records' `--anti-pattern` measurement).
 - Bash `for` loops + `set --` argument passing silently produced misnamed
   outputs in probe runs — use explicit per-invocation args or a Python driver.
