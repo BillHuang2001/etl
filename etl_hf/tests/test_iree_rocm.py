@@ -7,14 +7,14 @@ recipe end to end on the real GPU of this host (AMD Instinct MI300X VF, gfx942,
 ROCm 7.1)::
 
     device = etl.core.Device("rocm", 0)                   # HAL device_id = index+1
-    model  = load_hf(dir, seq_len=…)                      # checkpoint → host tree
-    exe    = model.build(backend="iree", device=device)   # ONE compiled program
-    out    = etl_hf.run_model(
+    loaded = load_hf(dir)                                 # config + host params
+    fwd    = forward_fn(loaded.config, seq_len=…)         # the pure @etl.defn
+    exe    = build(fwd, loaded.config, backend="iree", device=device)   # ONE program
+    out    = etl_hf.run(
                  exe,
-                 etl_hf.place_params(model.params(), device),   # explicit H2D/leaf
+                 etl_hf.place_params(loaded.params, device),    # explicit H2D/leaf
                  etl_hf.place_ids(input_ids, device))           # explicit H2D
     logits = out.to(etl.core.Device("cpu", 0)).numpy()    # exactly ONE explicit D2H
-
 Pinned here (nowhere else — it needs the hardware): the **ROCm opt-level default**
 (``"O1"`` for an all-ROCm IREE target set; O2/O3 hit an upstream ``iree-compile``
 ``'func.func' op failed to distribute`` on transformer LayerNorm-reduce shapes,
@@ -52,19 +52,20 @@ import numpy as np
 import pytest
 
 import etl
-from etl_hf.build import (
+from etl_hf import run
+from etl_hf.pipeline import (
     DEFAULT_LLVM_CPU_COMPILE_ARGS,
     DEFAULT_OPT_LEVEL,
     DEFAULT_ROCM_OPT_LEVEL,
-    HFModel,
-    load_hf,
+    build,
     place_ids,
     place_params,
     resolve_build_options,
-    run_model,
 )
+from etl_hf.load import LoadedModel, load_hf
+from etl_hf.pack import pack_params, pack_plan
+from etl_hf.program import forward_fn, param_specs
 from etl_hf.tests import hf_download
-
 # --- module guards: clean skips, never errors (no iree / no GPU / not opted in) ---
 def _iree_available() -> bool:
     """Probe for the IREE bindings **without importing them** (metadata lookup)."""
@@ -242,27 +243,51 @@ def _require_memory(slug: str) -> None:
         )
 
 
-# --- memoised models / executables / placements (one placement reused by several
-# --- tests IS the documented pattern, so it is shared on purpose)
-_MODELS: dict[tuple[str, int], HFModel] = {}
+# --- memoised loaded checkpoints / forwards / executables / placements (one
+# --- placement reused by several tests IS the documented pattern, so it is
+# --- shared on purpose)
+_LOADED: dict[str, LoadedModel] = {}
+_FORWARDS: dict[tuple[str, int, bool], object] = {}
 _EXECUTABLES: dict[tuple, tuple[etl.Executable, float]] = {}
 _CACHES: dict[tuple, etl.CompileCache] = {}
 _PLACED: dict[tuple[str, int, bool], dict[str, "etl.Tensor"]] = {}
 _PLACED_IDS: dict[tuple[str, int], "etl.Tensor"] = {}
 
 
-def model_for(slug: str, seq_len: int) -> HFModel:
-    """``load_hf`` the (cached) checkpoint for ``slug`` once per process."""
-    key = (slug, seq_len)
-    model = _MODELS.get(key)
-    if model is not None:
-        return model
+def loaded_for(slug: str) -> LoadedModel:
+    """``load_hf`` the (cached) checkpoint for ``slug`` once per process.
+
+    Loading answers only *what is this checkpoint?* — a static config plus the
+    canonical host params — so the sequence length is **not** part of the key:
+    the length specialises the *graph*, not the checkpoint (see
+    :func:`forward_for`)."""
+    loaded = _LOADED.get(slug)
+    if loaded is not None:
+        return loaded
     directory = hf_download.require_model(slug)  # pytest.skip when unavailable
     start = time.perf_counter()
-    model = load_hf(directory, seq_len=seq_len)
-    _MODELS[key] = model
-    _record(f"{slug}/host", load_s=time.perf_counter() - start, canonical_keys=len(model.params()))
-    return model
+    loaded = load_hf(directory)
+    _LOADED[slug] = loaded
+    _record(f"{slug}/host", load_s=time.perf_counter() - start,
+            canonical_keys=len(loaded.params))
+    return loaded
+
+
+def forward_for(slug: str, seq_len: int, *, pack: bool = False) -> object:
+    """The memoised ``@etl.defn`` forward for ``(slug, seq_len, packed?)``.
+
+    ``(config, seq_len, batch_size, pack_weights)`` is the static specialisation
+    one graph corresponds to, and :func:`etl_hf.forward_fn` returns the *same*
+    object for the same specialisation — which is what makes two identical
+    :func:`etl_hf.build` calls return the identical executable. ``build`` reads
+    the length/packing back off the forward."""
+    key = (slug, seq_len, bool(pack))
+    fwd = _FORWARDS.get(key)
+    if fwd is None:
+        loaded = loaded_for(slug)
+        fwd = forward_fn(loaded.config, seq_len=seq_len, pack_weights=bool(pack))
+        _FORWARDS[key] = fwd
+    return fwd
 
 
 def executable_for(
@@ -279,8 +304,14 @@ def executable_for(
         return cached
     cache = _CACHES.setdefault(key, etl.CompileCache())
     start = time.perf_counter()
-    exe = model_for(slug, seq_len).build(
-        backend="iree", device=DEVICE, cache=cache, pack_weights=pack, **options
+    exe = build(
+        forward_for(slug, seq_len, pack=pack),
+        loaded_for(slug).config,
+        backend="iree",
+        device=DEVICE,
+        cache=cache,
+        pack_weights=pack,
+        **options,
     )
     build_s = time.perf_counter() - start
     _EXECUTABLES[key] = (exe, build_s)
@@ -293,8 +324,12 @@ def numpy_executable_for(slug: str, seq_len: int, *, pack: bool = False) -> etl.
     cached = _EXECUTABLES.get(key)
     if cached is not None:
         return cached[0]
-    exe = model_for(slug, seq_len).build(
-        backend="numpy", cache=etl.CompileCache(), pack_weights=pack
+    exe = build(
+        forward_for(slug, seq_len, pack=pack),
+        loaded_for(slug).config,
+        backend="numpy",
+        cache=etl.CompileCache(),
+        pack_weights=pack,
     )
     _EXECUTABLES[key] = (exe, 0.0)
     return exe
@@ -305,8 +340,10 @@ def host_tree(slug: str, seq_len: int, *, pack: bool = False) -> dict[str, np.nd
 
     ``pack=True`` packs **on the host first** (the supported order), so the
     explicit H2D step transfers 3–5 leaves instead of one per weight."""
-    model = model_for(slug, seq_len)
-    return model.pack_params() if pack else model.params()
+    loaded = loaded_for(slug)
+    if not pack:
+        return loaded.params
+    return pack_params(pack_plan(param_specs(loaded.config)), loaded.params)
 
 
 def placed_tree(slug: str, seq_len: int, *, pack: bool = False) -> dict[str, "etl.Tensor"]:
@@ -330,10 +367,9 @@ def placed_tree(slug: str, seq_len: int, *, pack: bool = False) -> dict[str, "et
     )
     _PLACED[key] = placed
     _record(_label(slug, pack), staged_leaves=len(placed), place_total_s=total,
-            canonical_leaves=len(model_for(slug, seq_len).params()),
+            canonical_leaves=len(loaded_for(slug).params),
             place_first_leaf_s=per_leaf[0], place_median_leaf_s=statistics.median(per_leaf))
     return placed
-
 
 def placed_ids_for(slug: str, seq_len: int) -> "etl.Tensor":
     """Place (once) the fixture's ``(1, seq_len)`` ids on :data:`DEVICE`.
@@ -356,10 +392,9 @@ def placed_ids_for(slug: str, seq_len: int) -> "etl.Tensor":
 
 
 def device_run(slug: str, seq_len: int, *, pack: bool = False) -> "etl.Tensor":
-    """One device-resident ``run_model`` on the placed ``(params, ids)`` trees."""
+    """One device-resident :func:`etl_hf.run` on the placed ``(params, ids)`` trees."""
     exe, _ = executable_for(slug, seq_len, pack=pack)
-    return run_model(exe, placed_tree(slug, seq_len, pack=pack), placed_ids_for(slug, seq_len))
-
+    return run(exe, placed_tree(slug, seq_len, pack=pack), placed_ids_for(slug, seq_len))
 
 def assert_device_resident(out: "etl.Tensor", slug: str) -> None:
     """Assert an output stays on :data:`DEVICE` and refuses an implicit readback."""
@@ -379,10 +414,9 @@ def assert_device_resident(out: "etl.Tensor", slug: str) -> None:
 def _numpy_logits(slug: str, seq_len: int, *, pack: bool = False) -> np.ndarray:
     """Run the numpy interpreter on the SAME params/ids (the parity reference)."""
     ids = placed_ids_for(slug, seq_len).to(CPU).numpy()
-    return run_model(
+    return run(
         numpy_executable_for(slug, seq_len, pack=pack), host_tree(slug, seq_len, pack=pack), ids
     ).numpy()
-
 
 def assert_oracle_parity(
     slug: str, seq_len: int, logits: np.ndarray, *, pack: bool = False
@@ -501,17 +535,17 @@ def test_rocm_device_is_visible_and_hip_ids_are_one_based() -> None:
 def test_device_resident_forward_matches_numpy_and_golden(slug: str) -> None:
     """The whole forward runs ON the GPU and its logits survive both oracles."""
     label = _label(slug, False)
-    model = model_for(slug, SEQ_LEN)
+    loaded = loaded_for(slug)
     exe, build_s = executable_for(slug, SEQ_LEN)
-    assert len(exe.signature.input_specs) == len(model.params()) + 1, (
-        f"{slug}: the unpacked graph declares {len(model.params())} weight inputs + "
+    assert len(exe.signature.input_specs) == len(loaded.params) + 1, (
+        f"{slug}: the unpacked graph declares {len(loaded.params)} weight inputs + "
         f"ids, got {len(exe.signature.input_specs)}"
     )
 
     out = device_run(slug, SEQ_LEN)
     assert_device_resident(out, slug)
     logits = _readback(out)
-    expected_shape = (model.batch_size, model.seq_len, model.config.vocab_size)
+    expected_shape = (1, SEQ_LEN, loaded.config.vocab_size)
     assert logits.shape == expected_shape, f"{slug}: logits shape {logits.shape} != {expected_shape}"
     assert logits.dtype == np.float32, f"{slug}: logits must be float32, got {logits.dtype}"
     assert np.isfinite(logits).all(), f"{slug}: device logits must be finite"
@@ -541,14 +575,14 @@ def test_host_inputs_are_rejected_by_a_rocm_executable() -> None:
     device_ids = placed_ids_for("tiny_llama", SEQ_LEN)
 
     with pytest.raises(etl.DeviceError) as params_exc:
-        run_model(exe, host, device_ids)
+        run(exe, host, device_ids)
     params_message = str(params_exc.value)
     assert "no implicit" in params_message and "t.to(" in params_message, (
         f"a host params tree must be rejected with a DeviceError naming the explicit "
         f"transfer; got {params_message!r}"
     )
     with pytest.raises(etl.DeviceError) as ids_exc:
-        run_model(exe, placed, np.zeros((1, SEQ_LEN), dtype=np.int32))
+        run(exe, placed, np.zeros((1, SEQ_LEN), dtype=np.int32))
     ids_message = str(ids_exc.value)
     assert "no implicit" in ids_message and "t.to(" in ids_message, (
         f"host ids must be rejected the same way (both sides need placing); got "
@@ -579,7 +613,7 @@ def test_same_device_loop_stages_nothing_and_is_bit_identical() -> None:
 
     rt.asdevicearray = spy  # type: ignore[assignment]
     try:
-        outputs = [run_model(exe, placed, device_ids) for _ in range(6)]
+        outputs = [run(exe, placed, device_ids) for _ in range(6)]
         staged = len(calls)
     finally:
         rt.asdevicearray = original  # type: ignore[assignment]
@@ -605,13 +639,14 @@ def test_same_device_loop_stages_nothing_and_is_bit_identical() -> None:
 def test_packed_device_resident_matches_unpacked(slug: str) -> None:
     """Packing changes the SIGNATURE, not the numbers — on the GPU too.
 
-    The packed tree is built on the host (``model.pack_params()``) and *then*
-    placed, so ``place_params`` stages 3–5 leaves instead of one per weight; the
-    device logits are bit-identical (≤ ``PACKED_REL_TOL``) to the unpacked device
-    run and within ``REL_TOL`` of the numpy interpreter."""
+    The packed tree is built on the host (``pack_params(pack_plan(
+    param_specs(config)), params)``) and *then* placed, so ``place_params``
+    stages 3–5 leaves instead of one per weight; the device logits are
+    bit-identical (≤ ``PACKED_REL_TOL``) to the unpacked device run and within
+    ``REL_TOL`` of the numpy interpreter."""
     label = _label(slug, True)
-    model = model_for(slug, SEQ_LEN)
-    plan = model.pack_plan()
+    loaded = loaded_for(slug)
+    plan = pack_plan(param_specs(loaded.config))
     exe, build_s = executable_for(slug, SEQ_LEN, pack=True)
     assert len(exe.signature.input_specs) == len(plan.specs) + 1, (
         f"{slug}: the packed graph declares {len(plan.specs)} packed inputs + ids, "
@@ -622,7 +657,7 @@ def test_packed_device_resident_matches_unpacked(slug: str) -> None:
     )
 
     packed_device = placed_tree(slug, SEQ_LEN, pack=True)
-    canonical = len(model.params())
+    canonical = len(loaded.params)
     assert 3 <= len(packed_device) <= 5 < canonical, (
         f"{slug}: the packed placement must stage 3–5 leaves (the measured count), "
         f"fewer than the {canonical} canonical weights; got {len(packed_device)}"
@@ -657,8 +692,8 @@ def test_rocm_dot_is_true_fp32_without_dot_precision() -> None:
         "tiny_llama", SEQ_LEN, label="dot_precision=HIGHEST", dot_precision="HIGHEST"
     )
     highest_logits = _readback(
-        run_model(highest_exe, placed_tree("tiny_llama", SEQ_LEN),
-                  placed_ids_for("tiny_llama", SEQ_LEN))
+        run(highest_exe, placed_tree("tiny_llama", SEQ_LEN),
+            placed_ids_for("tiny_llama", SEQ_LEN))
     )
     delta, relative = _parity(highest_logits, default_logits)
     _record("tiny_llama/dot_precision", build_s=highest_build_s, max_abs_vs_default=delta,
@@ -681,11 +716,10 @@ def _assert_real_checkpoint_device_resident(slug: str, runs: int) -> None:
     and parity against the numpy interpreter and the stored golden."""
     _require_memory(slug)
     label = _label(slug, True)
-    model = model_for(slug, BIG_SEQ_LEN)
-    params = model.params()
-    plan = model.pack_plan()
+    loaded = loaded_for(slug)
+    params = loaded.params
+    plan = pack_plan(param_specs(loaded.config))
     assert len(plan.specs) == 3, f"{slug} must pack to 3 inputs, got {len(plan.specs)}"
-
     exe, build_s = executable_for(slug, BIG_SEQ_LEN, pack=True)
     declared = len(exe.signature.input_specs)
     assert declared == 4, (
@@ -702,7 +736,7 @@ def _assert_real_checkpoint_device_resident(slug: str, runs: int) -> None:
     out = device_run(slug, BIG_SEQ_LEN, pack=True)
     assert_device_resident(out, slug)
     logits = _readback(out)
-    expected_shape = (model.batch_size, model.seq_len, model.config.vocab_size)
+    expected_shape = (1, BIG_SEQ_LEN, loaded.config.vocab_size)
     assert logits.shape == expected_shape, f"{slug}: logits shape {logits.shape} != {expected_shape}"
     assert np.isfinite(logits).all(), f"{slug}: device logits must be finite"
 

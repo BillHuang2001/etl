@@ -22,7 +22,7 @@ The property this suite pins is *equivalence*, not a new numerics claim:
 * unpacked stays the DEFAULT (no silent behaviour change), and mixing the two
   tree shapes gets an actionable ``pack_weights`` error rather than a bare etl
   pytree message (``test_unpacked_is_the_default``,
-  ``test_run_model_reports_the_packing_mismatch``);
+  ``test_run_reports_the_packing_mismatch``);
 * nothing is baked: the packed graph is still all graph inputs, so the
   StableHLO export keeps the same ``stablehlo.constant`` ceiling
   (``test_packed_graph_bakes_no_weights``);
@@ -48,11 +48,14 @@ import pytest
 import etl
 from etl.backends import stablehlo
 from etl_hf import pack as pack_module
-from etl_hf.build import HFModel, build_model, load_hf, place_params, run_model
+from etl_hf import program as program_module
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFUnsupportedError, HFWeightError
+from etl_hf.load import LoadedModel, load_hf, validate_params
 from etl_hf.models import gpt2 as gpt2_module
 from etl_hf.models import llama as llama_module
+from etl_hf.pipeline import build, place_params, predict, run
+from etl_hf.program import forward_fn, param_specs, reference_logits
 from etl_hf.tests import hf_download
 
 # ---------------------------------------------------------------------------
@@ -229,14 +232,17 @@ def _max_abs(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _built(cfg: ModelConfig, pack_weights: bool, seq: int = _SEQ, batch: int = _BATCH):
-    """Build a numpy-backend executable (a private cache keeps builds isolated)."""
-    return build_model(
+    """Build a numpy-backend executable (a private cache keeps builds isolated).
+
+    The static specialisation lives on the forward (:func:`etl_hf.forward_fn`),
+    so ``seq``/``batch``/packing are chosen there and :func:`etl_hf.build` reads
+    them back off it.
+    """
+    return build(
+        forward_fn(cfg, seq_len=seq, batch_size=batch, pack_weights=pack_weights),
         cfg,
-        seq,
-        batch_size=batch,
         backend="numpy",
         cache=etl.CompileCache(),
-        pack_weights=pack_weights,
     )
 
 
@@ -562,14 +568,14 @@ def test_numpy_backend_packed_matches_unpacked_bit_identically(
     params = _params(_specs(cfg))
     packed = _plan(cfg).pack(params)
     ids = _ids(cfg)
-    unpacked_logits = run_model(_built(cfg, pack_weights=False), params, ids).numpy()
-    packed_logits = run_model(_built(cfg, pack_weights=True), packed, ids).numpy()
+    unpacked_logits = run(_built(cfg, pack_weights=False), params, ids).numpy()
+    packed_logits = run(_built(cfg, pack_weights=True), packed, ids).numpy()
     assert packed_logits.shape == unpacked_logits.shape
     assert np.array_equal(packed_logits, unpacked_logits), (
         f"{label}: packed logits must be bit-identical to unpacked on the numpy "
         f"backend (max-abs {_max_abs(packed_logits, unpacked_logits):g})"
     )
-    reference = _FAMILIES[cfg.family].reference(cfg, params, ids)
+    reference = reference_logits(cfg, params, ids)
     assert _max_abs(packed_logits, reference) <= 1e-4, (
         f"{label}: packed forward drifted from the pure-numpy oracle "
         f"({_max_abs(packed_logits, reference):g})"
@@ -583,10 +589,10 @@ def test_packed_matches_unpacked_across_shapes() -> None:
     packed = _plan(cfg).pack(params)
     for seq, batch in ((4, 1), (8, 2)):
         ids = _ids(cfg, batch=batch, seq=seq)
-        unpacked = run_model(
+        unpacked = run(
             _built(cfg, pack_weights=False, seq=seq, batch=batch), params, ids
         ).numpy()
-        packed_logits = run_model(
+        packed_logits = run(
             _built(cfg, pack_weights=True, seq=seq, batch=batch), packed, ids
         ).numpy()
         assert packed_logits.shape == (batch, seq, cfg.vocab_size)
@@ -597,19 +603,19 @@ def test_packed_matches_unpacked_across_shapes() -> None:
 
 
 def test_unpacked_is_the_default() -> None:
-    """``build_model`` without the flag keeps one graph input per canonical weight."""
+    """``forward_fn``/``build`` without the flag keep one input per canonical weight."""
     cfg = _config(LLAMA_UNTIED)
     specs = _specs(cfg)
     params = _params(specs)
     ids = _ids(cfg)
-    default = build_model(cfg, _SEQ, backend="numpy", cache=etl.CompileCache())
+    default = build(forward_fn(cfg, seq_len=_SEQ), cfg, backend="numpy", cache=etl.CompileCache())
     explicit = _built(cfg, pack_weights=False)
     assert len(default.signature.input_specs) == len(specs) + 1, (
         f"the default must declare {len(specs)} weight inputs + ids, got "
         f"{len(default.signature.input_specs)}"
     )
     assert np.array_equal(
-        run_model(default, params, ids).numpy(), run_model(explicit, params, ids).numpy()
+        run(default, params, ids).numpy(), run(explicit, params, ids).numpy()
     ), "pack_weights=False must be byte-identical to the default build"
     # And a packed build really is a different graph (its own cache entry).
     packed_exe = _built(cfg, pack_weights=True)
@@ -617,7 +623,7 @@ def test_unpacked_is_the_default() -> None:
     assert len(packed_exe.signature.input_specs) == len(_plan(cfg).specs) + 1
 
 
-def test_run_model_reports_the_packing_mismatch() -> None:
+def test_run_reports_the_packing_mismatch() -> None:
     """Mixing the two tree shapes names ``pack_weights`` and the remedy."""
     cfg = _config(GPT2_TIED)
     params = _params(_specs(cfg))
@@ -627,20 +633,20 @@ def test_run_model_reports_the_packing_mismatch() -> None:
     unpacked_exe = _built(cfg, pack_weights=False)
 
     with pytest.raises(HFWeightError) as excinfo:
-        run_model(packed_exe, params, ids)
+        run(packed_exe, params, ids)
     message = str(excinfo.value)
     assert "pack_weights=True" in message and "packed.0" in message, message
     assert "pack_params" in message and "pack_weights=False" in message, message
 
     with pytest.raises(HFWeightError) as excinfo:
-        run_model(unpacked_exe, packed, ids)
+        run(unpacked_exe, packed, ids)
     message = str(excinfo.value)
     assert "pack_weights=False" in message and "packed.0" in message, message
     assert "pack_weights=True" in message, message
 
     # The legitimate combinations still run.
-    assert run_model(packed_exe, packed, ids).shape == (1, _SEQ, cfg.vocab_size)
-    assert run_model(unpacked_exe, params, ids).shape == (1, _SEQ, cfg.vocab_size)
+    assert run(packed_exe, packed, ids).shape == (1, _SEQ, cfg.vocab_size)
+    assert run(unpacked_exe, params, ids).shape == (1, _SEQ, cfg.vocab_size)
 
 
 # ---------------------------------------------------------------------------
@@ -704,99 +710,135 @@ def test_packed_graph_bakes_no_weights() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. HFModel: pack_params + build/forward with pack_weights
+# 6. predict: pack_params + build/predict with pack_weights
 # ---------------------------------------------------------------------------
-def _model(raw: dict, seq: int = _SEQ, batch: int = _BATCH) -> HFModel:
-    """An in-memory :class:`HFModel` with synthetic canonical weights."""
+def _loaded(raw: dict) -> LoadedModel:
+    """An in-memory :class:`LoadedModel` with synthetic canonical weights.
+
+    The functional replacement for the removed ``HFModel`` constructor: plain
+    ``(config, params)`` data plus the explicit pre-flight tree check
+    (:func:`etl_hf.validate_params`), which is the validation that constructor
+    performed. A ``LoadedModel`` deliberately carries **no** ``seq_len`` — that
+    is a graph specialisation value, passed to ``forward_fn``/``predict``.
+    """
     cfg = _config(raw)
-    return HFModel(cfg, _params(_specs(cfg)), seq_len=seq, batch_size=batch)
+    return LoadedModel(
+        config=cfg,
+        params=validate_params(cfg, _params(_specs(cfg))),
+        family=cfg.family,
+        model_dir=None,
+    )
 
 
-def test_hfmodel_pack_weights_end_to_end() -> None:
-    """``HFModel`` packs once and forwards through the packed executable."""
-    model = _model(GPT2_TIED)
-    canonical_specs = model.param_specs()
-    packed_specs = model.param_specs(pack_weights=True)
-    plan = model.pack_plan()
+def test_predict_pack_weights_end_to_end() -> None:
+    """``pack_params`` once, then predict through the packed executable."""
+    loaded = _loaded(GPT2_TIED)
+    cfg, params = loaded.config, loaded.params
+    canonical_specs = param_specs(cfg)
+    packed_specs = param_specs(cfg, pack_weights=True)
+    plan = _plan(cfg)
     assert set(packed_specs) == set(plan.specs) and len(packed_specs) < len(canonical_specs)
-    assert model.pack_plan() is plan, "the plan must be memoised per model"
+    # The plan is memoised per config (one plan per digest), so repeated
+    # build/predict calls never rebuild it.
+    assert packed_specs == plan.specs, (
+        "param_specs(pack_weights=True) must be exactly the packed plan's specs"
+    )
+    plan_memo = program_module._pack_plan_for(cfg)
+    assert program_module._pack_plan_for(cfg) is plan_memo, (
+        "the packed plan must be memoised per config"
+    )
 
-    packed = model.pack_params()
+    packed = pack_module.pack_params(plan, params)
     assert set(packed) == set(plan.specs)
     for name, array in packed.items():
-        assert np.array_equal(array, plan.pack(model.params())[name])
+        assert np.array_equal(array, plan.pack(params)[name])
 
-    ids = _ids(model.config)
-    logits = model.forward(input_ids=ids, pack_weights=True)
-    reference = model.reference(input_ids=ids)
-    assert logits.shape == (model.batch_size, model.seq_len, model.config.vocab_size)
+    ids = _ids(cfg)
+    logits = predict(loaded, ids, seq_len=_SEQ, pack_weights=True)
+    reference = reference_logits(cfg, params, ids)
+    assert logits.shape == (_BATCH, _SEQ, cfg.vocab_size)
     assert _max_abs(logits, reference) <= 1e-4, (
-        f"packed HFModel forward drifted from the oracle "
+        f"packed predict drifted from the oracle "
         f"({_max_abs(logits, reference):g})"
     )
     # Passing the already-packed tree skips the host re-pack and agrees exactly.
     assert np.array_equal(
-        model.forward(params=packed, input_ids=ids, pack_weights=True), logits
+        predict(loaded, ids, params=packed, seq_len=_SEQ, pack_weights=True), logits
     ), "a pre-packed tree must produce the same logits as the implicit pack"
     # ... and the unpacked default still works and agrees bit-for-bit on numpy.
-    assert np.array_equal(model.forward(input_ids=ids), logits), (
-        "packed and unpacked HFModel forwards must be bit-identical on the numpy "
+    assert np.array_equal(predict(loaded, ids, seq_len=_SEQ), logits), (
+        "packed and unpacked predicts must be bit-identical on the numpy "
         "interpreter"
     )
 
 
-def test_hfmodel_pack_params_error_paths() -> None:
+def test_pack_params_error_paths() -> None:
     """``pack_params`` names the offending key for every kind of mismatch."""
-    model = _model(LLAMA_TIED)
-    params = model.params()
+    loaded = _loaded(LLAMA_TIED)
+    cfg, params = loaded.config, loaded.params
+    plan = _plan(cfg)
     first = min(params)
 
     with pytest.raises(HFWeightError) as excinfo:
-        model.pack_params({k: v for k, v in params.items() if k != first})
+        pack_module.pack_params(plan, {k: v for k, v in params.items() if k != first})
     assert first in str(excinfo.value), str(excinfo.value)
 
     with pytest.raises(HFWeightError) as excinfo:
-        model.pack_params(dict(params, **{"layer.0.bogus": np.zeros(3, np.float32)}))
+        pack_module.pack_params(
+            plan, dict(params, **{"layer.0.bogus": np.zeros(3, np.float32)})
+        )
     assert "layer.0.bogus" in str(excinfo.value)
 
     with pytest.raises(HFWeightError) as excinfo:
-        model.pack_params(dict(params, **{first: np.zeros(3, np.float32)}))
+        pack_module.pack_params(plan, dict(params, **{first: np.zeros(3, np.float32)}))
     assert first in str(excinfo.value) and "shape" in str(excinfo.value)
 
     with pytest.raises(HFWeightError) as excinfo:
-        model.pack_params(dict(params, **{first: np.zeros_like(params[first], np.float16)}))
+        pack_module.pack_params(
+            plan, dict(params, **{first: np.zeros_like(params[first], np.float16)})
+        )
     assert first in str(excinfo.value) and "dtype" in str(excinfo.value)
 
     with pytest.raises(TypeError):
-        model.pack_params([1, 2])  # type: ignore[arg-type]
+        pack_module.pack_params(plan, [1, 2])  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        model.param_specs(pack_weights=1)  # type: ignore[arg-type]
+        pack_module.pack_params([1, 2], params)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
-        model.forward(pack_weights="yes")  # type: ignore[arg-type]
+        param_specs(cfg, pack_weights=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        predict(loaded, pack_weights="yes", seq_len=_SEQ)  # type: ignore[arg-type]
 
     # A device tensor is host-only data for packing: explicit, actionable error.
     placed = place_params({first: params[first]}, etl.core.Device("cpu", 0))[first]
     with pytest.raises(HFWeightError) as excinfo:
-        model.pack_params(dict(params, **{first: placed}))
+        pack_module.pack_params(plan, dict(params, **{first: placed}))
     message = str(excinfo.value)
     assert first in message and "host" in message, message
 
 
 def test_packed_params_place_into_fewer_leaves() -> None:
     """``pack → place`` is the supported order and transfers far fewer leaves."""
-    model = _model(GPT2_UNTIED, seq=4)
+    loaded = _loaded(GPT2_UNTIED)
+    cfg, params = loaded.config, loaded.params
+    seq = 4
     device = etl.core.Device("cpu", 0)
-    packed = model.pack_params()
+    packed = pack_module.pack_params(_plan(cfg), params)
     placed_packed = place_params(packed, device)
-    placed_canonical = place_params(model.params(), device)
+    placed_canonical = place_params(params, device)
     assert set(placed_packed) == set(packed)
     assert len(placed_packed) < len(placed_canonical), (
         "packed placement must stage fewer leaves than the canonical tree"
     )
-    ids = _ids(model.config, seq=4)
+    ids = _ids(cfg, seq=seq)
+    packed_exe = build(
+        forward_fn(cfg, seq_len=seq, pack_weights=True), cfg, backend="numpy"
+    )
+    unpacked_exe = build(
+        forward_fn(cfg, seq_len=seq, pack_weights=False), cfg, backend="numpy"
+    )
     assert np.array_equal(
-        run_model(model.build(pack_weights=True), placed_packed, ids).numpy(),
-        run_model(model.build(pack_weights=False), placed_canonical, ids).numpy(),
+        run(packed_exe, placed_packed, ids).numpy(),
+        run(unpacked_exe, placed_canonical, ids).numpy(),
     ), "placed packed params must run the same graph to the same logits"
 
 
@@ -811,19 +853,18 @@ def test_iree_llvm_cpu_runs_the_packed_graph(label: str, raw: dict, want: int) -
     params = _params(_specs(cfg))
     packed = _plan(cfg).pack(params)
     ids = _ids(cfg)
-    numpy_logits = run_model(_built(cfg, pack_weights=True), packed, ids).numpy()
-    iree_exe = build_model(
+    numpy_logits = run(_built(cfg, pack_weights=True), packed, ids).numpy()
+    iree_exe = build(
+        forward_fn(cfg, seq_len=_SEQ, pack_weights=True),
         cfg,
-        _SEQ,
         backend="iree",
         cache=etl.CompileCache(),
-        pack_weights=True,
     )
     assert len(iree_exe.signature.input_specs) == len(_plan(cfg).specs) + 1, (
         f"{label}: the compiled executable must declare the packed inputs only, got "
         f"{len(iree_exe.signature.input_specs)}"
     )
-    iree_logits = run_model(iree_exe, packed, ids).numpy()
+    iree_logits = run(iree_exe, packed, ids).numpy()
     assert iree_logits.shape == numpy_logits.shape
     assert np.isfinite(iree_logits).all(), f"{label}: iree logits must be finite"
     delta = _max_abs(iree_logits, numpy_logits)
@@ -864,26 +905,28 @@ def test_real_size_gpt2_packed_matches_golden() -> None:
     if ids.shape != (1, 32):
         pytest.skip(f"golden gpt2 ids shape {ids.shape} is not (1, 32)")
     directory = hf_download.require_model("gpt2")
-    model = load_hf(directory, seq_len=32)
-    params = model.params()
+    loaded = load_hf(directory)
+    cfg, params = loaded.config, loaded.params
     assert len(params) == 196, f"expected 196 canonical keys, got {len(params)}"
 
-    plan = model.pack_plan()
+    plan = pack_module.pack_plan(param_specs(cfg))
     assert len(plan.specs) == 3, (
         f"the 124M gpt2 must pack to 3 inputs, got {len(plan.specs)}: "
         f"{ {name: tuple(spec.shape) for name, spec in plan.specs.items()} }"
     )
-    packed = model.pack_params(params)
+    packed = pack_module.pack_params(plan, params)
     assert set(packed) == set(plan.specs)
 
-    executable = model.build(backend="numpy", pack_weights=True)
+    executable = build(
+        forward_fn(cfg, seq_len=32, pack_weights=True), cfg, backend="numpy"
+    )
     assert len(executable.signature.input_specs) == len(plan.specs) + 1, (
         f"the packed executable must declare {len(plan.specs)} weight inputs + ids, "
         f"got {len(executable.signature.input_specs)} (the unpacked graph declares "
         f"{len(params) + 1}, over the IREE runtime cliff of "
         f"{IREE_CONSUMED_INPUT_CLIFF})"
     )
-    got = run_model(executable, packed, ids).numpy()
+    got = run(executable, packed, ids).numpy()
     assert got.shape == want.shape == (1, 32, 50257)
     delta = _max_abs(got, want)
     scale = max(1e-45, float(np.max(np.abs(want.astype(np.float64)))))
@@ -893,7 +936,9 @@ def test_real_size_gpt2_packed_matches_golden() -> None:
         f"≈{scale:g}"
     )
     # Packing is transparent: the unpacked numpy forward is bit-identical.
-    unpacked = run_model(model.build(backend="numpy"), params, ids).numpy()
+    unpacked = run(
+        build(forward_fn(cfg, seq_len=32), cfg, backend="numpy"), params, ids
+    ).numpy()
     assert np.array_equal(got, unpacked), (
         f"packed vs unpacked numpy logits differ (max-abs {_max_abs(got, unpacked):g})"
     )

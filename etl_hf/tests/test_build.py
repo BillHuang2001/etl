@@ -1,4 +1,9 @@
-"""Tests for :mod:`etl_hf.build` — the build / run / placement / load layer.
+"""Tests for the staging layer — :mod:`etl_hf.pipeline` (+ :mod:`etl_hf.program`).
+
+The package API is **functional**: loading (:func:`etl_hf.load_hf` →
+``LoadedModel``), the compute function (:func:`etl_hf.forward_fn` →
+``@etl.defn``), and staging (:func:`etl_hf.build` / :func:`etl_hf.run` /
+:func:`etl_hf.predict`). This file pins those three halves end-to-end.
 
 Self-contained and offline: tiny synthetic Llama and GPT-2 configs plus seeded
 synthetic parameter trees, and one **synthetic HF checkpoint directory** written
@@ -10,15 +15,19 @@ What is pinned here:
 
 * **parity** — the compiled pipeline (numpy interpreter) against each family's
   independent pure-numpy reference;
-* **the default-option matrix** (:func:`etl_hf.build.resolve_build_options`) —
+* **the default-option matrix** (:func:`etl_hf.pipeline.resolve_build_options`) —
   the measured pitfalls (``opt_level`` injection including the **ROCm** ``"O1"``
   rule, and the llvm-cpu-only ``iree_compile_args`` that must reach the
   *compile* stage), including "explicit wins", "``ETL_OPT_LEVEL`` wins", "the
   caller's dict is not mutated" and the ``ETL_BACKEND``/``ETL_TARGET_BACKENDS``
   env defaults;
-* **memoisation** — identical ``build_model`` calls return the identical
+* **memoisation** — identical ``build`` calls return the identical
   ``Executable``; a different ``seq_len``/``batch_size``/option/private cache does
   not;
+* **the static specialisation** — ``seq_len``/``batch_size`` belong to
+  :func:`etl_hf.forward_fn` (the graph), so junk is rejected there and an
+  explicit-but-disagreeing value handed to :func:`etl_hf.build` is rejected
+  instead of silently building a mismatched ids spec;
 * **the activation gate** — an erf-based activation is rejected on a compiled
   backend *before tracing*, with both remedies named, and needs no iree install;
 * **explicit input handling** — the single documented host coercion
@@ -28,10 +37,11 @@ What is pinned here:
   bad params tree;
 * **explicit placement** — ``place_params``/``place_ids`` are one visible
   ``Tensor.to`` each, with their argument error tables;
-* **``HFModel.forward`` is host-facing** — device params are refused with the
+* **``predict`` is host-facing** — device params are refused with the
   device-resident recipe named (never a hidden device-to-host copy);
-* **``load_hf``/``HFModel``** — checkpoint → config + canonical params, the
-  documented default ``seq_len``, shape errors that name the model's length.
+* **``load_hf``/``LoadedModel``** — checkpoint → config + canonical params as
+  plain data, the documented default ``seq_len`` living on the forward (never on
+  the loaded model), and the explicit errors of both.
 """
 
 from __future__ import annotations
@@ -46,24 +56,25 @@ import pytest
 
 import etl
 
-from etl_hf import build as build_module
-from etl_hf import families, ops
-from etl_hf.build import (
-    DEFAULT_LLVM_CPU_COMPILE_ARGS,
-    DEFAULT_ROCM_OPT_LEVEL,
-    DEFAULT_SEQ_LEN,
-    HFModel,
-    build_model,
-    load_hf,
-    place_ids,
-    place_params,
-    resolve_build_options,
-    run_model,
-)
+from etl_hf import ops
+from etl_hf import pipeline as pipeline_module
+from etl_hf import program as program_module
 from etl_hf.config import ModelConfig
-from etl_hf.errors import HFConfigError, HFUnsupportedError
+from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
+from etl_hf.load import LoadedModel, load_config, load_hf, validate_params
 from etl_hf.models import gpt2 as gpt2_module
 from etl_hf.models import llama as llama_module
+from etl_hf.pipeline import (
+    DEFAULT_LLVM_CPU_COMPILE_ARGS,
+    DEFAULT_ROCM_OPT_LEVEL,
+    build,
+    place_ids,
+    place_params,
+    predict,
+    resolve_build_options,
+    run,
+)
+from etl_hf.program import DEFAULT_SEQ_LEN, forward_fn, param_specs, reference_logits
 
 #: Synthetic weight scale: small enough that RMSNorm/LayerNorm/softmax stay
 #: well-conditioned in fp32 (the parity claim is about semantics, not saturation).
@@ -106,7 +117,7 @@ _ATOL = 1e-6
 
 
 # ---------------------------------------------------------------------------
-# helpers: configs, params, ids
+# helpers: configs, params, ids, the graph's stamped specialisation
 # ---------------------------------------------------------------------------
 def llama_config(**overrides) -> ModelConfig:
     """Tiny Llama config (GQA: 4 query heads, 2 KV heads), with overrides."""
@@ -141,6 +152,18 @@ def make_ids(cfg: ModelConfig, batch: int, seq: int, seed: int = 1) -> np.ndarra
 def max_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Max absolute difference (the number reported in parity assertions)."""
     return float(np.max(np.abs(np.asarray(a, np.float64) - np.asarray(b, np.float64))))
+
+
+def specialisation(cfg: ModelConfig, **kwargs) -> dict:
+    """The static specialisation stamped on ``forward_fn(cfg, **kwargs)``.
+
+    A config (plus ``seq_len``/``batch_size``/``pack_weights``) is a static
+    specialisation *value*, so the graph — not the loaded model — is where those
+    numbers live. Reading them back off the forward is how the tests check that
+    ``seq_len=None`` means the documented default.
+    """
+    forward = forward_fn(cfg, **kwargs)
+    return dict(getattr(forward, program_module.SPECIALISATION_ATTR))
 
 
 @pytest.fixture(autouse=True)
@@ -275,7 +298,7 @@ def write_checkpoint_dir(
 
 
 # ---------------------------------------------------------------------------
-# parity: build → run vs the family's numpy reference
+# parity: forward_fn → build → run vs the family's numpy reference
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("family", ["llama", "gpt2"])
 def test_build_and_run_match_the_family_reference(family):
@@ -283,9 +306,9 @@ def test_build_and_run_match_the_family_reference(family):
     cfg = llama_config() if family == "llama" else gpt2_config()
     params = make_params(cfg, seed=3)
     ids = make_ids(cfg, batch=2, seq=6, seed=4)
-    executable = build_model(cfg, 6, batch_size=2)
-    logits = run_model(executable, params, ids)
-    expected = _FAMILY_MODULES[family].reference(cfg, params, ids)
+    executable = build(forward_fn(cfg, seq_len=6, batch_size=2), cfg)
+    logits = run(executable, params, ids)
+    expected = reference_logits(cfg, params, ids)
     assert isinstance(logits, etl.Tensor)
     assert logits.shape == (2, 6, cfg.vocab_size)
     assert logits.dtype == etl.float32
@@ -302,49 +325,107 @@ def test_build_and_run_match_reference_for_untied_and_tied_variants():
     cfg = gpt2_config(tie_word_embeddings=True)
     params = make_params(cfg, seed=11)
     ids = make_ids(cfg, batch=1, seq=5, seed=12)
-    got = run_model(build_model(cfg, 5), params, ids).numpy()
+    got = run(build(forward_fn(cfg, seq_len=5), cfg), params, ids).numpy()
     expected = gpt2_module.reference(cfg, params, ids)
     np.testing.assert_allclose(got, expected, rtol=_RTOL, atol=_ATOL)
 
 
-def test_build_model_rejects_a_bad_family_override():
+# ---------------------------------------------------------------------------
+# build: the program-stage argument checks
+# ---------------------------------------------------------------------------
+def test_build_rejects_a_bad_family_override():
     cfg = llama_config()
     with pytest.raises(HFConfigError) as excinfo:
-        build_model(cfg, 4, family="gpt2")
+        build(forward_fn(cfg, seq_len=4), cfg, family="gpt2")
     message = str(excinfo.value)
     assert "llama" in message and "gpt2" in message
 
 
-def test_build_model_rejects_unknown_family():
+def test_build_rejects_unknown_family():
+    cfg = llama_config()
     with pytest.raises(HFUnsupportedError) as excinfo:
-        build_model(llama_config(), 4, family="bert")
+        build(forward_fn(cfg, seq_len=4), cfg, family="bert")
     assert "unsupported model family" in str(excinfo.value)
 
 
-def test_build_model_rejects_non_config():
+def test_build_rejects_non_config():
     with pytest.raises(TypeError) as excinfo:
-        build_model({"model_type": "llama"}, 4)
+        build(forward_fn(llama_config(), seq_len=4), {"model_type": "llama"})  # type: ignore[arg-type]
     assert "ModelConfig" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("seq_len", [0, -1, 1.5, "4", None, True])
-def test_build_model_rejects_bad_seq_len(seq_len):
+def test_build_rejects_an_already_staged_object():
+    """``build`` takes the graph *definition* — a traced Graph/Executable is past it."""
+    cfg = llama_config()
+    executable = build(forward_fn(cfg, seq_len=4), cfg)
+    with pytest.raises(TypeError) as excinfo:
+        build(executable, cfg)  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert "etl_hf.forward_fn" in message and "etl_hf.run" in message
+
+
+@pytest.mark.parametrize("seq_len", [0, -1, 1.5, "4", True])
+def test_bad_seq_len_is_rejected(seq_len):
+    """``seq_len`` is static: junk is rejected at both stages that accept it."""
+    cfg = llama_config()
     with pytest.raises(HFConfigError) as excinfo:
-        build_model(llama_config(), seq_len)  # type: ignore[arg-type]
+        forward_fn(cfg, seq_len=seq_len)  # type: ignore[arg-type]
+    assert "seq_len" in str(excinfo.value)
+    fwd = forward_fn(cfg, seq_len=4)
+    with pytest.raises(HFConfigError) as excinfo:
+        build(fwd, cfg, seq_len=seq_len)  # type: ignore[arg-type]
     assert "seq_len" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("batch_size", [0, -2, 2.0, None])
-def test_build_model_rejects_bad_batch_size(batch_size):
+def test_seq_len_none_is_the_documented_default():
+    """``seq_len=None`` means ``min(max_position_embeddings, 32)`` — not an error."""
+    assert DEFAULT_SEQ_LEN == 32
+    cfg = llama_config()
+    assert specialisation(cfg)["seq_len"] == min(cfg.max_position_embeddings, 32)
+    # ... and it is the same graph, so the same memo entry
+    assert forward_fn(cfg, seq_len=None) is forward_fn(cfg)
+
+
+@pytest.mark.parametrize("batch_size", [0, -2, 2.0])
+def test_bad_batch_size_is_rejected(batch_size):
+    cfg = llama_config()
     with pytest.raises(HFConfigError) as excinfo:
-        build_model(llama_config(), 4, batch_size=batch_size)  # type: ignore[arg-type]
+        forward_fn(cfg, seq_len=4, batch_size=batch_size)  # type: ignore[arg-type]
+    assert "batch_size" in str(excinfo.value)
+    fwd = forward_fn(cfg, seq_len=4, batch_size=1)
+    with pytest.raises(HFConfigError) as excinfo:
+        build(fwd, cfg, batch_size=batch_size)  # type: ignore[arg-type]
     assert "batch_size" in str(excinfo.value)
 
 
-def test_build_model_rejects_seq_len_beyond_max_position_embeddings():
+def test_batch_size_none_means_one():
+    assert specialisation(llama_config(), seq_len=4)["batch_size"] == 1
+    assert forward_fn(llama_config(), seq_len=4, batch_size=None) is forward_fn(
+        llama_config(), seq_len=4
+    )
+
+
+def test_build_rejects_a_specialisation_that_disagrees_with_the_forward():
+    """The forward's stamped specialisation is authoritative (never silently swapped)."""
+    cfg = llama_config()
+    fwd = forward_fn(cfg, seq_len=4, batch_size=1)
+    with pytest.raises(HFConfigError) as excinfo:
+        build(fwd, cfg, seq_len=5)
+    message = str(excinfo.value)
+    assert "etl_hf.build(seq_len=5)" in message
+    assert "etl_hf.forward_fn" in message and "seq_len=4" in message
+    with pytest.raises(HFConfigError) as excinfo:
+        build(fwd, cfg, batch_size=2)
+    message = str(excinfo.value)
+    assert "etl_hf.build(batch_size=2)" in message and "batch_size=1" in message
+    # agreeing values are fine, and land on the same memoised artifact
+    assert build(fwd, cfg, seq_len=4, batch_size=1) is build(fwd, cfg)
+
+
+def test_build_rejects_seq_len_beyond_max_position_embeddings():
     cfg = llama_config(max_position_embeddings=8)
     with pytest.raises(HFConfigError) as excinfo:
-        build_model(cfg, 9)
+        forward_fn(cfg, seq_len=9)
     message = str(excinfo.value)
     assert "max_position_embeddings (8)" in message
 
@@ -354,8 +435,9 @@ def test_build_model_rejects_seq_len_beyond_max_position_embeddings():
 # ---------------------------------------------------------------------------
 def test_identical_builds_return_the_same_executable():
     cfg = llama_config()
-    first = build_model(cfg, 5, batch_size=2)
-    second = build_model(llama_config(), 5, batch_size=2)  # equal config, new object
+    first = build(forward_fn(cfg, seq_len=5, batch_size=2), cfg)
+    other = llama_config()  # equal config, new object
+    second = build(forward_fn(other, seq_len=5, batch_size=2), other)
     assert first is second
 
 
@@ -364,39 +446,39 @@ def test_equal_configs_with_the_same_digest_share_the_graph():
     a = llama_config()
     b = llama_config()
     assert a is not b and a.digest == b.digest
-    spec = families.get_family("llama")
-    assert build_module._forward_fn(spec, a, 5, 1) is build_module._forward_fn(
-        spec, b, 5, 1
-    )
+    assert program_module.forward_fn(a, seq_len=5) is program_module.forward_fn(b, seq_len=5)
 
 
 def test_explicit_numpy_backend_matches_the_default():
     cfg = llama_config()
-    assert build_model(cfg, 4) is build_model(cfg, 4, backend="numpy")
+    fwd = forward_fn(cfg, seq_len=4)
+    assert build(fwd, cfg) is build(fwd, cfg, backend="numpy")
 
 
 def test_different_seq_len_or_batch_size_gets_its_own_executable():
     cfg = llama_config()
-    base = build_model(cfg, 4)
-    assert build_model(cfg, 5) is not base
-    assert build_model(cfg, 4, batch_size=2) is not base
+    base = build(forward_fn(cfg, seq_len=4), cfg)
+    assert build(forward_fn(cfg, seq_len=5), cfg) is not base
+    assert build(forward_fn(cfg, seq_len=4, batch_size=2), cfg) is not base
 
 
 def test_different_options_get_their_own_executable():
     """Options participate in etl's cache key (so do backend/device names)."""
     cfg = llama_config()
-    base = build_model(cfg, 4)
-    other = build_model(cfg, 4, opt_level="O0")
+    fwd = forward_fn(cfg, seq_len=4)
+    base = build(fwd, cfg)
+    other = build(fwd, cfg, opt_level="O0")
     assert other is not base
-    assert build_model(cfg, 4) is base  # the first entry is still memoised
+    assert build(fwd, cfg) is base  # the first entry is still memoised
 
 
 def test_different_config_gets_its_own_executable():
     cfg = llama_config()
-    base = build_model(cfg, 4)
-    deeper = build_model(llama_config(num_hidden_layers=1), 4)
+    base = build(forward_fn(cfg, seq_len=4), cfg)
+    deeper_cfg = llama_config(num_hidden_layers=1)
+    deeper = build(forward_fn(deeper_cfg, seq_len=4), deeper_cfg)
     assert deeper is not base
-    assert deeper is not build_model(cfg, 4)
+    assert deeper is not build(forward_fn(cfg, seq_len=4), cfg)
 
 
 def test_configs_differing_only_in_raw_share_the_executable():
@@ -404,19 +486,22 @@ def test_configs_differing_only_in_raw_share_the_executable():
     plain = llama_config()
     annotated = llama_config(torch_dtype="float16", architectures=["LlamaForCausalLM"])
     assert annotated.digest == plain.digest
-    assert build_model(annotated, 4) is build_model(plain, 4)
+    assert build(forward_fn(annotated, seq_len=4), annotated) is build(
+        forward_fn(plain, seq_len=4), plain
+    )
 
 
 def test_private_compile_cache_isolates():
     cfg = llama_config()
+    fwd = forward_fn(cfg, seq_len=4)
     private = etl.CompileCache()
-    first = build_model(cfg, 4, cache=private)
-    second = build_model(cfg, 4, cache=private)
+    first = build(fwd, cfg, cache=private)
+    second = build(fwd, cfg, cache=private)
     assert first is second
     assert private.hits >= 1 and private.misses >= 1
-    default_cached = build_model(cfg, 4)
+    default_cached = build(fwd, cfg)
     assert default_cached is not first
-    third = build_model(cfg, 4, cache=private)
+    third = build(fwd, cfg, cache=private)
     assert third is first  # the private cache kept its entry
 
 
@@ -424,8 +509,9 @@ def test_different_backend_gets_its_own_executable():
     """A distinct backend name is a distinct artifact (needs a compiled backend)."""
     pytest.importorskip("iree.compiler", reason="iree is not installed")
     cfg = llama_config()
-    numpy_executable = build_model(cfg, 4)
-    iree_executable = build_model(cfg, 4, backend="iree")
+    fwd = forward_fn(cfg, seq_len=4)
+    numpy_executable = build(fwd, cfg)
+    iree_executable = build(fwd, cfg, backend="iree")
     assert iree_executable is not numpy_executable
     assert iree_executable.backend != numpy_executable.backend
 
@@ -433,10 +519,9 @@ def test_different_backend_gets_its_own_executable():
 def test_forward_memo_is_bounded():
     """The LRU of ``@etl.defn`` forwards stays bounded (documented at 64 entries)."""
     cfg = llama_config(max_position_embeddings=128)
-    spec = families.get_family("llama")
-    for seq_len in range(1, build_module._GRAPH_CACHE_MAX + 8):
-        build_module._forward_fn(spec, cfg, seq_len, 1)
-    assert len(build_module._GRAPH_CACHE) <= build_module._GRAPH_CACHE_MAX
+    for seq_len in range(1, program_module._GRAPH_CACHE_MAX + 8):
+        program_module.forward_fn(cfg, seq_len=seq_len)
+    assert len(program_module._GRAPH_CACHE) <= program_module._GRAPH_CACHE_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +590,7 @@ def test_resolve_never_injects_llvm_cpu_flags_for_cuda_or_rocm():
 def test_default_rocm_opt_level_is_the_codegen_safe_one():
     """The ROCm default is ``O1`` (upstream iree fails at O2/O3 on these shapes)."""
     assert DEFAULT_ROCM_OPT_LEVEL == "O1"
-    assert build_module.DEFAULT_OPT_LEVEL == "O3"
+    assert pipeline_module.DEFAULT_OPT_LEVEL == "O3"
 
 
 def test_resolve_injects_o1_for_a_rocm_device():
@@ -682,8 +767,9 @@ def test_resolve_rejects_unknown_argument_shapes():
 def test_erf_activation_is_rejected_on_a_compiled_backend(activation):
     """No iree install needed: the gate fires before any backend resolution."""
     cfg = llama_config(hidden_act=activation)
+    fwd = forward_fn(cfg, seq_len=4)  # a supported (if unexportable) activation
     with pytest.raises(HFUnsupportedError) as excinfo:
-        build_model(cfg, 4, backend="iree")
+        build(fwd, cfg, backend="iree")
     message = str(excinfo.value)
     assert activation in message
     assert "iree" in message
@@ -696,7 +782,7 @@ def test_erf_activation_still_builds_on_the_numpy_backend():
     cfg = llama_config(hidden_act="gelu")
     params = make_params(cfg, seed=5)
     ids = make_ids(cfg, batch=1, seq=4, seed=6)
-    got = run_model(build_model(cfg, 4), params, ids).numpy()
+    got = run(build(forward_fn(cfg, seq_len=4), cfg), params, ids).numpy()
     expected = llama_module.reference(cfg, params, ids)
     np.testing.assert_allclose(got, expected, rtol=_RTOL, atol=_ATOL)
 
@@ -705,8 +791,9 @@ def test_tanh_gelu_passes_the_gate_for_a_compiled_backend():
     """``gelu_new`` is export-safe: the gate must let it through to the backend."""
     cfg = gpt2_config(activation_function="gelu_new")
     assert ops.activation_is_export_safe(cfg.hidden_act)
+    fwd = forward_fn(cfg, seq_len=4)
     try:
-        build_model(cfg, 4, backend="iree")
+        build(fwd, cfg, backend="iree")
     except HFUnsupportedError:  # pragma: no cover - would be a gate bug
         pytest.fail("the activation gate rejected an export-safe activation")
     except etl.ETLError:
@@ -714,14 +801,15 @@ def test_tanh_gelu_passes_the_gate_for_a_compiled_backend():
 
 
 def test_unknown_activation_is_rejected_even_on_numpy():
+    """The graph builder validates the activation eagerly (before any tracing)."""
     cfg = llama_config(hidden_act="swiglu_magic")
     with pytest.raises(HFUnsupportedError) as excinfo:
-        build_model(cfg, 4)
+        forward_fn(cfg, seq_len=4)
     assert "swiglu_magic" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
-# run_model
+# run
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def llama_case():
@@ -729,85 +817,86 @@ def llama_case():
     cfg = llama_config()
     params = make_params(cfg, seed=21)
     ids = make_ids(cfg, batch=2, seq=5, seed=22)
-    executable = build_model(cfg, 5, batch_size=2)
+    executable = build(forward_fn(cfg, seq_len=5, batch_size=2), cfg)
     return cfg, params, ids, executable
 
 
-def test_run_model_casts_integral_ids_to_int32(llama_case):
+def test_run_casts_integral_ids_to_int32(llama_case):
     cfg, params, ids, executable = llama_case
-    int32 = run_model(executable, params, ids).numpy()
+    int32 = run(executable, params, ids).numpy()
     for dtype in (np.int64, np.int16, np.uint8, np.int8):
-        cast = run_model(executable, params, ids.astype(dtype)).numpy()
+        cast = run(executable, params, ids.astype(dtype)).numpy()
         np.testing.assert_array_equal(cast, int32)
 
 
-def test_run_model_rejects_float_ids(llama_case):
+def test_run_rejects_float_ids(llama_case):
     _, params, ids, executable = llama_case
     with pytest.raises(etl.DTypeError) as excinfo:
-        run_model(executable, params, ids.astype(np.float32))
+        run(executable, params, ids.astype(np.float32))
     message = str(excinfo.value)
     assert "float32" in message and "input_ids" in message
 
 
-def test_run_model_rejects_a_wrong_id_shape(llama_case):
+def test_run_rejects_a_wrong_id_shape(llama_case):
     _, params, ids, executable = llama_case
     with pytest.raises(etl.ShapeError) as excinfo:
-        run_model(executable, params, ids[:, :3])
+        run(executable, params, ids[:, :3])
     message = str(excinfo.value)
     assert str(ids.shape) in message and "(2, 5)" in message
 
 
-def test_run_model_rejects_a_non_2d_id_array(llama_case):
+def test_run_rejects_a_non_2d_id_array(llama_case):
     _, params, ids, executable = llama_case
     with pytest.raises(etl.ShapeError) as excinfo:
-        run_model(executable, params, ids[0])
+        run(executable, params, ids[0])
     assert "2-D" in str(excinfo.value)
 
 
-def test_run_model_rejects_a_bad_params_tree(llama_case):
+def test_run_rejects_a_bad_params_tree(llama_case):
     """A missing/extra param must surface as an etl structure error."""
     _, params, ids, executable = llama_case
     missing = {name: value for name, value in params.items() if not name.startswith("lm_head")}
     with pytest.raises(etl.ETLError) as excinfo:
-        run_model(executable, missing, ids)
+        run(executable, missing, ids)
     assert "structure does not match" in str(excinfo.value)
     assert "lm_head.weight" in str(excinfo.value)
     extra = dict(params)
     extra["not_a_param"] = np.zeros((2, 2), dtype=np.float32)
     with pytest.raises(etl.ETLError) as excinfo:
-        run_model(executable, extra, ids)
+        run(executable, extra, ids)
     assert "structure does not match" in str(excinfo.value)
 
 
-def test_run_model_rejects_wrong_argument_types(llama_case):
+def test_run_rejects_wrong_argument_types(llama_case):
     _, params, ids, executable = llama_case
+    with pytest.raises(TypeError) as excinfo:
+        run("not an executable", params, ids)
+    assert "etl.Executable" in str(excinfo.value)
     with pytest.raises(TypeError):
-        run_model("not an executable", params, ids)
-    with pytest.raises(TypeError):
-        run_model(executable, [params], ids)
+        run(executable, [params], ids)
 
 
-def test_run_model_accepts_placed_device_params(llama_case):
+def test_run_accepts_placed_device_params(llama_case):
     _, params, ids, executable = llama_case
     placed = place_params(params, etl.core.Device("cpu", 0))
     np.testing.assert_array_equal(
-        run_model(executable, placed, ids).numpy(),
-        run_model(executable, params, ids).numpy(),
+        run(executable, placed, ids).numpy(),
+        run(executable, params, ids).numpy(),
     )
 
 
 # ---------------------------------------------------------------------------
-# run_model: ids as an etl.Tensor (the device-resident path)
+# run: ids as an etl.Tensor (the device-resident path)
 # ---------------------------------------------------------------------------
-def test_run_model_accepts_a_cpu_tensor_of_ids(llama_case):
+def test_run_accepts_a_cpu_tensor_of_ids(llama_case):
     _, params, ids, executable = llama_case
     np.testing.assert_array_equal(
-        run_model(executable, params, etl.from_numpy(ids)).numpy(),
-        run_model(executable, params, ids).numpy(),
+        run(executable, params, etl.from_numpy(ids)).numpy(),
+        run(executable, params, ids).numpy(),
     )
 
 
-def test_run_model_forwards_a_tensor_of_ids_verbatim(llama_case, monkeypatch):
+def test_run_forwards_a_tensor_of_ids_verbatim(llama_case, monkeypatch):
     """The tensor reaches ``etl.run`` as the SAME object — no cast, no copy."""
     _, params, ids, executable = llama_case
     tensor_ids = etl.from_numpy(ids)
@@ -819,7 +908,7 @@ def test_run_model_forwards_a_tensor_of_ids_verbatim(llama_case, monkeypatch):
         return real_run(exe, run_params, run_ids)
 
     monkeypatch.setattr(etl, "run", spy)
-    logits = run_model(executable, params, tensor_ids)
+    logits = run(executable, params, tensor_ids)
     assert len(seen) == 1
     exe, run_params, run_ids = seen[0]
     assert exe is executable
@@ -830,7 +919,7 @@ def test_run_model_forwards_a_tensor_of_ids_verbatim(llama_case, monkeypatch):
     np.testing.assert_array_equal(logits.numpy(), np.asarray(expected.numpy()))
 
 
-def test_run_model_does_not_retype_a_tensor_of_ids(llama_case, monkeypatch):
+def test_run_does_not_retype_a_tensor_of_ids(llama_case, monkeypatch):
     """A host array is cast to int32; a Tensor's data is never re-typed.
 
     So an int64 *tensor* reaches etl's dtype-strict run boundary unchanged and
@@ -848,17 +937,17 @@ def test_run_model_does_not_retype_a_tensor_of_ids(llama_case, monkeypatch):
 
     monkeypatch.setattr(etl, "run", spy)
     with pytest.raises(etl.DTypeError) as excinfo:
-        run_model(executable, params, int64_tensor)
-    assert forwarded == [int64_tensor], "run_model must not cast a Tensor"
+        run(executable, params, int64_tensor)
+    assert forwarded == [int64_tensor], "run must not cast a Tensor"
     assert "int64" in str(excinfo.value)
     # the host-array path performs the one documented coercion
     np.testing.assert_array_equal(
-        run_model(executable, params, ids.astype(np.int64)).numpy(),
+        run(executable, params, ids.astype(np.int64)).numpy(),
         real_run(executable, params, ids).numpy(),
     )
 
 
-def test_run_model_host_ids_are_forwarded_as_int32(llama_case, monkeypatch):
+def test_run_host_ids_are_forwarded_as_int32(llama_case, monkeypatch):
     """The unchanged host path still coerces to a contiguous int32 array."""
     _, params, ids, executable = llama_case
     forwarded: list = []
@@ -869,7 +958,7 @@ def test_run_model_host_ids_are_forwarded_as_int32(llama_case, monkeypatch):
         return real_run(exe, run_params, run_ids)
 
     monkeypatch.setattr(etl, "run", spy)
-    run_model(executable, params, ids.astype(np.int64))
+    run(executable, params, ids.astype(np.int64))
     assert len(forwarded) == 1
     forwarded_ids = forwarded[0]
     assert isinstance(forwarded_ids, np.ndarray)
@@ -878,18 +967,18 @@ def test_run_model_host_ids_are_forwarded_as_int32(llama_case, monkeypatch):
     np.testing.assert_array_equal(forwarded_ids, ids)
 
 
-def test_run_model_rejects_bad_tensor_ids(llama_case):
+def test_run_rejects_bad_tensor_ids(llama_case):
     """The Tensor path keeps the same explicit error table as the array path."""
     _, params, ids, executable = llama_case
     with pytest.raises(etl.ShapeError) as excinfo:
-        run_model(executable, params, etl.from_numpy(ids[0]))
+        run(executable, params, etl.from_numpy(ids[0]))
     assert "2-D" in str(excinfo.value) and "etl.Tensor" in str(excinfo.value)
     with pytest.raises(etl.ShapeError) as excinfo:
-        run_model(executable, params, etl.from_numpy(ids[:, :3]))
+        run(executable, params, etl.from_numpy(ids[:, :3]))
     message = str(excinfo.value)
     assert "(2, 3)" in message and "(2, 5)" in message and "Tensor" in message
     with pytest.raises(etl.DTypeError) as excinfo:
-        run_model(executable, params, etl.from_numpy(ids.astype(np.float32)))
+        run(executable, params, etl.from_numpy(ids.astype(np.float32)))
     message = str(excinfo.value)
     assert "float32" in message and "input_ids" in message
 
@@ -945,7 +1034,7 @@ def test_place_ids_is_an_explicit_int32_transfer():
     assert isinstance(placed, etl.Tensor)
     assert placed.device == etl.core.Device("cpu", 0)
     assert placed.shape == (2, 3)
-    # the same single documented id coercion run_model performs on a host array
+    # the same single documented id coercion run performs on a host array
     assert placed.dtype == np.int32
     np.testing.assert_array_equal(placed.numpy(), ids)
 
@@ -980,57 +1069,64 @@ def test_place_ids_drives_a_run(llama_case):
     _, params, ids, executable = llama_case
     device = etl.core.Device("cpu", 0)
     np.testing.assert_array_equal(
-        run_model(executable, place_params(params, device), place_ids(ids, device)).numpy(),
-        run_model(executable, params, ids).numpy(),
+        run(executable, place_params(params, device), place_ids(ids, device)).numpy(),
+        run(executable, params, ids).numpy(),
     )
 
 
 # ---------------------------------------------------------------------------
-# load_hf / HFModel
+# load_hf / LoadedModel
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("family", ["llama", "gpt2"])
 def test_load_hf_reads_config_and_checkpoint(tmp_path, family):
     cfg = llama_config() if family == "llama" else gpt2_config()
     directory = write_checkpoint_dir(tmp_path, cfg)
-    model = load_hf(directory)
-    assert isinstance(model, HFModel)
-    assert model.config.digest == cfg.digest
-    assert model.family == family
-    assert model.model_dir == directory
-    assert set(model.params()) == set(model.param_specs())
-    for name, spec in model.param_specs().items():
-        assert model.params()[name].shape == tuple(spec.shape)
-        assert model.params()[name].dtype == np.float32
-    ids = make_ids(cfg, batch=1, seq=model.seq_len, seed=41)
-    got = model.forward(input_ids=ids)
-    expected = model.reference(input_ids=ids)
+    loaded = load_hf(directory)
+    assert isinstance(loaded, LoadedModel)
+    assert loaded.config.digest == cfg.digest
+    assert loaded.family == family
+    assert loaded.model_dir == directory
+    specs = param_specs(loaded.config)
+    assert set(loaded.params) == set(specs)
+    for name, spec in specs.items():
+        assert loaded.params[name].shape == tuple(spec.shape)
+        assert loaded.params[name].dtype == np.float32
+    seq_len = specialisation(loaded.config)["seq_len"]
+    ids = make_ids(cfg, batch=1, seq=seq_len, seed=41)
+    got = predict(loaded, input_ids=ids)
+    expected = reference_logits(loaded.config, loaded.params, ids)
     np.testing.assert_allclose(got, expected, rtol=_RTOL, atol=_ATOL)
     assert max_abs(got, expected) <= 1e-6
 
 
 def test_load_hf_default_seq_len_is_min_max_positions_capped_at_32(tmp_path):
+    """Loading knows no length: the default lives on the forward's specialisation."""
     short = llama_config(max_position_embeddings=12)
-    model = load_hf(write_checkpoint_dir(tmp_path, short, name="short"))
+    loaded = load_hf(write_checkpoint_dir(tmp_path, short, name="short"))
     assert DEFAULT_SEQ_LEN == 32
-    assert model.seq_len == 12
+    assert specialisation(loaded.config)["seq_len"] == 12
     long = llama_config(max_position_embeddings=64)
-    model = load_hf(write_checkpoint_dir(tmp_path, long, name="long"))
-    assert model.seq_len == DEFAULT_SEQ_LEN
+    loaded = load_hf(write_checkpoint_dir(tmp_path, long, name="long"))
+    assert specialisation(loaded.config)["seq_len"] == DEFAULT_SEQ_LEN
 
 
-def test_load_hf_honours_an_explicit_seq_len(tmp_path):
+def test_predict_honours_an_explicit_seq_len(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=7)
-    assert model.seq_len == 7
-    assert model.forward().shape == (1, 7, cfg.vocab_size)
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
+    assert specialisation(loaded.config, seq_len=7)["seq_len"] == 7
+    assert predict(loaded, seq_len=7).shape == (1, 7, cfg.vocab_size)
 
 
-def test_load_hf_rejects_a_bad_seq_len(tmp_path):
+def test_a_bad_seq_len_is_rejected_at_the_program_stage(tmp_path):
+    """``load_hf`` says nothing about length; the graph builder validates it."""
     directory = write_checkpoint_dir(tmp_path, llama_config(max_position_embeddings=8))
+    cfg = load_config(directory)
     with pytest.raises(HFConfigError):
-        load_hf(directory, seq_len=9)
+        forward_fn(cfg, seq_len=9)
     with pytest.raises(HFConfigError):
-        load_hf(directory, seq_len=0)
+        forward_fn(cfg, seq_len=0)
+    # the checkpoint itself loads fine — the limit is a graph-specialisation fact
+    assert load_hf(directory).config.max_position_embeddings == 8
 
 
 def test_load_hf_family_mismatch_is_explicit(tmp_path):
@@ -1062,83 +1158,93 @@ def test_load_hf_rejects_non_path():
     assert "path-like" in str(excinfo.value)
 
 
-def test_hfmodel_build_is_memoised(tmp_path):
-    model = load_hf(write_checkpoint_dir(tmp_path, llama_config()))
-    assert model.build() is model.build()
-    assert model.build(backend="numpy") is model.build()
+def test_build_is_memoised(tmp_path):
+    loaded = load_hf(write_checkpoint_dir(tmp_path, llama_config()))
+    fwd = forward_fn(loaded.config)
+    assert build(fwd, loaded.config) is build(fwd, loaded.config)
+    assert build(fwd, loaded.config, backend="numpy") is build(fwd, loaded.config)
+    # an equal config from a second load shares the graph (and so the artifact)
+    again = load_hf(write_checkpoint_dir(tmp_path, llama_config(), name="again"))
+    assert build(forward_fn(again.config), again.config) is build(fwd, loaded.config)
 
 
-def test_hfmodel_repr_names_family_model_type_and_shape(tmp_path):
+def test_loaded_model_repr_names_family_model_type_and_dir(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=5)
-    text = repr(model)
-    assert "HFModel(" in text
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
+    text = repr(loaded)
+    assert "LoadedModel(" in text
     assert "family='llama'" in text
     assert f"model_type={cfg.model_type!r}" in text
-    assert "seq_len=5" in text
-    assert "batch_size=1" in text
-    assert str(model.model_dir) in text
+    assert str(loaded.model_dir) in text
+    # the static shape is NOT loading's business any more — it lives on the graph
+    spec = specialisation(loaded.config, seq_len=5)
+    assert spec["seq_len"] == 5 and spec["batch_size"] == 1
 
 
-def test_hfmodel_forward_shape_error_names_the_model_seq_len(tmp_path):
-    model = load_hf(write_checkpoint_dir(tmp_path, llama_config()), seq_len=6)
+def test_predict_shape_error_names_the_static_seq_len(tmp_path):
+    loaded = load_hf(write_checkpoint_dir(tmp_path, llama_config()))
     with pytest.raises(etl.ShapeError) as excinfo:
-        model.forward(input_ids=np.zeros((1, 5), dtype=np.int32))
+        predict(loaded, input_ids=np.zeros((1, 5), dtype=np.int32), seq_len=6)
     message = str(excinfo.value)
     assert "seq_len=6" in message
-    assert "load_hf(model_dir, seq_len=5)" in message
+    assert "etl_hf.forward_fn" in message and "seq_len=5" in message
+    assert "etl_hf.predict" in message
 
 
-def test_hfmodel_forward_defaults_are_shape_only(tmp_path):
+def test_predict_defaults_are_shape_only(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
-    logits = model.forward()
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
+    logits = predict(loaded, seq_len=4)
     assert logits.shape == (1, 4, cfg.vocab_size)
     assert logits.dtype == np.float32
 
 
-def test_hfmodel_forward_and_reference_accept_explicit_params(tmp_path):
+def test_predict_and_reference_accept_explicit_params(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
     other = make_params(cfg, seed=99)
     ids = make_ids(cfg, batch=1, seq=4, seed=98)
-    got = model.forward(params=other, input_ids=ids)
-    expected = model.reference(params=other, input_ids=ids)
+    got = predict(loaded, ids, params=other, seq_len=4)
+    expected = reference_logits(loaded.config, other, ids)
     np.testing.assert_allclose(got, expected, rtol=_RTOL, atol=_ATOL)
     # and it really used `other`, not the checkpoint's own weights
-    assert max_abs(got, model.forward(input_ids=ids)) > 1e-5
+    assert max_abs(got, predict(loaded, ids, seq_len=4)) > 1e-5
 
 
-def test_hfmodel_graph_fn_bakes_the_static_shape(tmp_path):
+def test_forward_fn_bakes_the_static_shape(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4, batch_size=2)
-    forward = model.graph_fn()
-    other = model.graph_fn(seq_len=3)
+    forward = forward_fn(cfg, seq_len=4, batch_size=2)
+    other = forward_fn(cfg, seq_len=3)
     assert forward is not other
     assert callable(forward)
-    # the built graph agrees with the model's own static shape
-    assert model.forward().shape == (2, 4, cfg.vocab_size)
+    # the built graph agrees with the forward's own static shape
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
+    assert predict(loaded, seq_len=4, batch_size=2).shape == (2, 4, cfg.vocab_size)
 
 
-def test_hfmodel_validates_its_parameter_tree(tmp_path):
+def test_validate_params_checks_the_tree():
+    """The pre-flight validator replaces the old constructor's tree check."""
     cfg = llama_config()
     params = make_params(cfg, seed=13)
-    with pytest.raises(Exception) as excinfo:
-        HFModel(cfg, {k: v for k, v in params.items() if k != "embed.weight"}, seq_len=4)
+    with pytest.raises(HFWeightError) as excinfo:
+        validate_params(cfg, {k: v for k, v in params.items() if k != "embed.weight"})
     assert "missing=" in str(excinfo.value) and "embed.weight" in str(excinfo.value)
     wrong = dict(params)
     wrong["embed.weight"] = np.zeros(
         (cfg.vocab_size + 1, cfg.hidden_size), dtype=np.float32
     )
-    with pytest.raises(Exception) as excinfo:
-        HFModel(cfg, wrong, seq_len=4)
+    with pytest.raises(HFWeightError) as excinfo:
+        validate_params(cfg, wrong)
     assert "expected" in str(excinfo.value)
     with pytest.raises(TypeError):
-        HFModel(cfg, [("embed.weight", params["embed.weight"])], seq_len=4)  # type: ignore[arg-type]
+        validate_params(cfg, [("embed.weight", params["embed.weight"])])  # type: ignore[arg-type]
+    # a matching tree comes back as a fresh, equal mapping
+    validated = validate_params(cfg, params)
+    assert validated is not params and set(validated) == set(params)
 
 
 # ---------------------------------------------------------------------------
-# HFModel.forward is host-facing (device params are refused, never copied back)
+# predict is host-facing (device params are refused, never copied back)
 # ---------------------------------------------------------------------------
 class _FakeDevicePayload:
     """Metadata-only non-cpu payload — no data movement is ever attempted.
@@ -1161,9 +1267,9 @@ class _FakeDevicePayload:
         raise AssertionError("a non-cpu payload must never be host-copied")
 
 
-def test_hfmodel_forward_rejects_device_params_with_the_recipe(tmp_path):
+def test_predict_rejects_device_params_with_the_recipe(tmp_path):
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
     params = make_params(cfg, seed=17)
     device = etl.core.Device("cuda", 0)
     device_params = dict(params)
@@ -1172,40 +1278,40 @@ def test_hfmodel_forward_rejects_device_params_with_the_recipe(tmp_path):
     )
     ids = make_ids(cfg, batch=1, seq=4, seed=18)
     with pytest.raises(etl.DeviceError) as excinfo:
-        model.forward(params=device_params, input_ids=ids)
+        predict(loaded, ids, params=device_params, seq_len=4)
     message = str(excinfo.value)
     assert "embed.weight" in message
     assert str(device) in message  # names where the offending leaf lives
-    for named in ("run_model", "place_params", "place_ids"):
+    for named in ("etl_hf.run", "place_params", "place_ids"):
         assert named in message, named
     assert "Device('cpu', 0)" in message  # the one explicit D2H for host logits
 
 
-def test_hfmodel_forward_accepts_cpu_tensors_and_tensor_ids(tmp_path):
+def test_predict_accepts_cpu_tensors_and_tensor_ids(tmp_path):
     """cpu Tensors (etl's own rule: host-addressable) keep working."""
     cfg = llama_config()
-    model = load_hf(write_checkpoint_dir(tmp_path, cfg), seq_len=4)
+    loaded = load_hf(write_checkpoint_dir(tmp_path, cfg))
     ids = make_ids(cfg, batch=1, seq=4, seed=19)
-    expected = model.forward(input_ids=ids)
+    expected = predict(loaded, ids, seq_len=4)
     device = etl.core.Device("cpu", 0)
     np.testing.assert_array_equal(
-        model.forward(params=place_params(model.params(), device), input_ids=ids),
+        predict(loaded, ids, params=place_params(loaded.params, device), seq_len=4),
         expected,
     )
     np.testing.assert_array_equal(
-        model.forward(input_ids=place_ids(ids, device)), expected
+        predict(loaded, place_ids(ids, device), seq_len=4), expected
     )
 
 
 # ---------------------------------------------------------------------------
 # import hygiene
 # ---------------------------------------------------------------------------
-def test_build_module_imports_without_optional_dependencies():
-    """``etl_hf.build`` must not import torch/transformers/safetensors/iree."""
+def test_pipeline_module_imports_without_optional_dependencies():
+    """``etl_hf`` and its load/program/pipeline modules stay numpy-only."""
     import subprocess
 
     code = (
-        "import sys, etl_hf.build;"
+        "import sys, etl_hf, etl_hf.load, etl_hf.pipeline, etl_hf.program;"
         "bad = [m for m in ('torch', 'transformers', 'safetensors') "
         "if m in sys.modules];"
         "bad += [m for m in ('iree', 'iree.compiler') if m in sys.modules];"

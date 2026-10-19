@@ -11,11 +11,11 @@ traced graph is lowered, compiled and executed as one IREE program on the
 
 for both v1 families (``llama`` with GQA+RoPE+SwiGLU, ``gpt2`` with
 LayerNorm+``gelu_new``+tied head) and for a **real** HuggingFace checkpoint
-(``tiny_llama``) loaded through :func:`etl_hf.build.load_hf`.
+(``tiny_llama``) loaded through :func:`etl_hf.load_hf`.
 
 It also pins the two *measured* pitfalls recorded in
 ``./bench_logs/hf_feasibility_findings.md`` and documented in
-:mod:`etl_hf.build`:
+:mod:`etl_hf.pipeline`:
 
 * **pitfall #1 — ``iree_compile_args`` are a COMPILE-stage option.** Passing
   them to ``etl.lower`` alone is silently ineffective; they must reach
@@ -57,16 +57,18 @@ import pytest
 
 import etl
 import etl.pipeline as etl_pipeline
-from etl_hf.build import (
-    DEFAULT_LLVM_CPU_COMPILE_ARGS,
-    build_model,
-    load_hf,
-    resolve_build_options,
-    run_model,
-)
 from etl_hf.config import ModelConfig
+from etl_hf.load import load_hf
 from etl_hf.models import gpt2 as gpt2_module
 from etl_hf.models import llama as llama_module
+from etl_hf.pipeline import (
+    DEFAULT_LLVM_CPU_COMPILE_ARGS,
+    build,
+    predict,
+    resolve_build_options,
+    run,
+)
+from etl_hf.program import forward_fn, param_specs, reference_logits
 
 # ``hf_download`` lives next to this file (stdlib only; importing it is
 # network-free — only ``download_model``/``require_model`` touch the network).
@@ -166,7 +168,7 @@ def make_params(cfg: ModelConfig, seed: int = 0) -> dict[str, np.ndarray]:
     matrices get small seeded gaussians. Exact values do not matter — graph and
     reference consume the same tree, so parity is the claim.
     """
-    specs = _FAMILY_MODULES[cfg.family].param_specs(cfg)
+    specs = param_specs(cfg)
     rng = np.random.default_rng(seed)
     params: dict[str, np.ndarray] = {}
     for name, spec in specs.items():
@@ -241,15 +243,19 @@ _EXECUTABLES: dict[tuple[str, str], etl.Executable] = {}
 def iree_executable(family: str) -> etl.Executable:
     """The IREE/llvm-cpu executable for ``family`` (compiled once, cached).
 
-    The compile wall time is recorded in :data:`MEASURED` on the first build.
+    The static specialisation lives on the forward (:func:`etl_hf.forward_fn`),
+    so the sequence length/batch size are chosen there and :func:`etl_hf.build`
+    reads them back off it. The compile wall time is recorded in :data:`MEASURED`
+    on the first build.
     """
     key = (family, "iree")
     exe = _EXECUTABLES.get(key)
     if exe is not None:
         return exe
     cache = _COMPILE_CACHES.setdefault(key, etl.CompileCache())
+    cfg = config_for(family)
     start = time.perf_counter()
-    exe = build_model(config_for(family), _SEQ, backend="iree", cache=cache)
+    exe = build(forward_fn(cfg, seq_len=_SEQ, batch_size=_BATCH), cfg, backend="iree", cache=cache)
     elapsed = time.perf_counter() - start
     _EXECUTABLES[key] = exe
     MEASURED.setdefault(family, {})["compile_s"] = elapsed
@@ -263,7 +269,8 @@ def numpy_executable(family: str) -> etl.Executable:
     if exe is not None:
         return exe
     cache = _COMPILE_CACHES.setdefault(key, etl.CompileCache())
-    exe = build_model(config_for(family), _SEQ, backend="numpy", cache=cache)
+    cfg = config_for(family)
+    exe = build(forward_fn(cfg, seq_len=_SEQ, batch_size=_BATCH), cfg, backend="numpy", cache=cache)
     _EXECUTABLES[key] = exe
     return exe
 
@@ -278,7 +285,7 @@ def test_llama_whole_graph_compiles_and_runs_on_iree() -> None:
     params, ids = make_params(cfg), make_ids(cfg)
 
     exe = iree_executable("llama")
-    iree_logits = run_model(exe, params, ids).numpy()
+    iree_logits = run(exe, params, ids).numpy()
 
     assert iree_logits.shape == (_BATCH, _SEQ, cfg.vocab_size), (
         f"iree logits shape {iree_logits.shape} != expected "
@@ -286,12 +293,12 @@ def test_llama_whole_graph_compiles_and_runs_on_iree() -> None:
     )
     assert np.isfinite(iree_logits).all(), "iree logits must be finite"
 
-    reference = _FAMILY_MODULES["llama"].reference(cfg, params, ids)
-    numpy_logits = run_model(numpy_executable("llama"), params, ids).numpy()
+    reference = reference_logits(cfg, params, ids)
+    numpy_logits = run(numpy_executable("llama"), params, ids).numpy()
 
     d_ref = max_abs(iree_logits, reference)
     d_numpy = max_abs(iree_logits, numpy_logits)
-    run_best = best_of(lambda: run_model(exe, params, ids))
+    run_best = best_of(lambda: run(exe, params, ids))
     MEASURED["llama"].update(
         run_best_s=run_best,
         max_abs_vs_reference=d_ref,
@@ -319,7 +326,7 @@ def test_gpt2_whole_graph_compiles_and_runs_on_iree() -> None:
     params, ids = make_params(cfg), make_ids(cfg)
 
     exe = iree_executable("gpt2")
-    iree_logits = run_model(exe, params, ids).numpy()
+    iree_logits = run(exe, params, ids).numpy()
 
     assert iree_logits.shape == (_BATCH, _SEQ, cfg.vocab_size), (
         f"iree logits shape {iree_logits.shape} != expected "
@@ -327,12 +334,12 @@ def test_gpt2_whole_graph_compiles_and_runs_on_iree() -> None:
     )
     assert np.isfinite(iree_logits).all(), "iree logits must be finite"
 
-    reference = _FAMILY_MODULES["gpt2"].reference(cfg, params, ids)
-    numpy_logits = run_model(numpy_executable("gpt2"), params, ids).numpy()
+    reference = reference_logits(cfg, params, ids)
+    numpy_logits = run(numpy_executable("gpt2"), params, ids).numpy()
 
     d_ref = max_abs(iree_logits, reference)
     d_numpy = max_abs(iree_logits, numpy_logits)
-    run_best = best_of(lambda: run_model(exe, params, ids))
+    run_best = best_of(lambda: run(exe, params, ids))
     MEASURED["gpt2"].update(
         run_best_s=run_best,
         max_abs_vs_reference=d_ref,
@@ -416,7 +423,8 @@ def test_iree_compile_args_reach_the_compile_stage(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(etl_pipeline, "compile", spy)
 
     # (a) the etl_hf defaults (host llvm-cpu target) — fresh cache => real compile.
-    host_exe = build_model(cfg, _SEQ, backend="iree", cache=etl.CompileCache())
+    fwd = forward_fn(cfg, seq_len=_SEQ, batch_size=_BATCH)
+    host_exe = build(fwd, cfg, backend="iree", cache=etl.CompileCache())
     assert len(records) == 1, (
         f"expected exactly one compile-stage call for a fresh build, saw "
         f"{len(records)}; kwargs forwarded were {records}"
@@ -434,8 +442,8 @@ def test_iree_compile_args_reach_the_compile_stage(monkeypatch: pytest.MonkeyPat
 
     # (b) an explicit override also reaches compile verbatim (only that flag).
     generic_args = ["--iree-llvmcpu-target-cpu=generic"]
-    generic_exe = build_model(
-        cfg, _SEQ, backend="iree", cache=etl.CompileCache(), iree_compile_args=generic_args
+    generic_exe = build(
+        fwd, cfg, backend="iree", cache=etl.CompileCache(), iree_compile_args=generic_args
     )
     assert len(records) == 2, f"expected a second compile-stage call, saw {len(records)}"
     assert records[1].get("iree_compile_args") == generic_args, (
@@ -444,11 +452,11 @@ def test_iree_compile_args_reach_the_compile_stage(monkeypatch: pytest.MonkeyPat
     )
 
     # Behavioural consequence: host and generic targets agree (plumbing intact).
-    host_logits = run_model(host_exe, params, ids).numpy()
-    generic_logits = run_model(generic_exe, params, ids).numpy()
+    host_logits = run(host_exe, params, ids).numpy()
+    generic_logits = run(generic_exe, params, ids).numpy()
     d = max_abs(host_logits, generic_logits)
-    t_host = best_of(lambda: run_model(host_exe, params, ids))
-    t_generic = best_of(lambda: run_model(generic_exe, params, ids))
+    t_host = best_of(lambda: run(host_exe, params, ids))
+    t_generic = best_of(lambda: run(generic_exe, params, ids))
     MEASURED["pitfall1"] = {
         "max_abs_host_vs_generic": d,
         "t_host_best_s": t_host,
@@ -475,8 +483,8 @@ def test_iree_executable_is_deterministic() -> None:
     params, ids = make_params(cfg), make_ids(cfg)
     exe = iree_executable("llama")
 
-    first = run_model(exe, params, ids).numpy()
-    second = run_model(exe, params, ids).numpy()
+    first = run(exe, params, ids).numpy()
+    second = run(exe, params, ids).numpy()
 
     d = max_abs(first, second)
     assert np.array_equal(first, second), (
@@ -497,28 +505,31 @@ def test_real_tiny_llama_checkpoint_through_iree() -> None:
     on any network/filesystem failure, so an offline machine skips cleanly.
     """
     model_dir = hf_download.require_model("tiny_llama")
-    model = load_hf(model_dir, seq_len=_SEQ)
-    params = model.params()
-    ids = np.zeros((model.batch_size, model.seq_len), dtype=np.int32)
+    loaded = load_hf(model_dir)
+    cfg, params = loaded.config, loaded.params
+    ids = np.zeros((_BATCH, _SEQ), dtype=np.int32)
 
     iree_cache = etl.CompileCache()
+    fwd = forward_fn(cfg, seq_len=_SEQ, batch_size=_BATCH)
     start = time.perf_counter()
-    model.build(backend="iree", cache=iree_cache)
+    build(fwd, cfg, backend="iree", cache=iree_cache)
     compile_s = time.perf_counter() - start
 
-    iree_logits = model.forward(input_ids=ids, backend="iree", cache=iree_cache)
-    assert iree_logits.shape == (model.batch_size, model.seq_len, model.config.vocab_size), (
+    iree_logits = predict(loaded, ids, seq_len=_SEQ, backend="iree", cache=iree_cache)
+    assert iree_logits.shape == (_BATCH, _SEQ, cfg.vocab_size), (
         f"real-checkpoint iree logits shape {iree_logits.shape} is wrong"
     )
     assert np.isfinite(iree_logits).all(), "real-checkpoint iree logits must be finite"
 
-    reference = model.reference(input_ids=ids)
-    numpy_logits = model.forward(input_ids=ids, backend="numpy", cache=etl.CompileCache())
+    reference = reference_logits(cfg, params, ids)
+    numpy_logits = predict(
+        loaded, ids, seq_len=_SEQ, backend="numpy", cache=etl.CompileCache()
+    )
 
     d_ref = max_abs(iree_logits, reference)
     d_numpy = max_abs(iree_logits, numpy_logits)
-    run_best = best_of(lambda: run_model(
-        model.build(backend="iree", cache=iree_cache), params, ids
+    run_best = best_of(lambda: run(
+        build(fwd, cfg, backend="iree", cache=iree_cache), params, ids
     ))
     MEASURED["tiny_llama"] = {
         "compile_s": compile_s,
@@ -573,9 +584,9 @@ def test_model_graph_is_a_single_program() -> None:
         f"(an external-call graph is split into IreeExternalExecutable)"
     )
 
-    specs = llama_module.param_specs(cfg)
+    specs = param_specs(cfg)
     graph = etl.trace(
-        llama_module.graph(cfg, _SEQ, _BATCH),
+        _FAMILY_MODULES[cfg.family].graph(cfg, _SEQ, _BATCH),
         specs,
         etl.TensorSpec((_BATCH, _SEQ), etl.int32),
     )

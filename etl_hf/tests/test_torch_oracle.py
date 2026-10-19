@@ -751,10 +751,13 @@ def test_torch_goldens_parity(slug: str):
     directory = _checkpoint_dir(slug, repo_id)
     batch, seq_len = int(input_ids.shape[0]), int(input_ids.shape[-1])
 
-    from etl_hf import load_hf
+    from etl_hf import load_hf, predict
 
-    model = load_hf(directory, seq_len=seq_len, batch_size=batch)
-    got = model.forward(input_ids=input_ids)
+    # Loading says nothing about the graph: the config + host params come from
+    # load_hf, and the (static) sequence length / batch size specialise the
+    # forward at predict time — one graph per (config, seq_len, batch_size).
+    loaded = load_hf(directory)
+    got = predict(loaded, input_ids, seq_len=seq_len, batch_size=batch)
 
     rtol, atol, require_relative = _tolerances(slug)
     _assert_parity(
@@ -813,9 +816,10 @@ def test_hf_in_process_parity(slug: str):
 
     want = _hf_logits(repo_id, input_ids, "float32", source=directory)
 
-    from etl_hf import load_hf
+    from etl_hf import load_hf, predict
 
-    got = load_hf(directory, seq_len=seq_len).forward(input_ids=input_ids)
+    loaded = load_hf(directory)
+    got = predict(loaded, input_ids, seq_len=seq_len)
 
     rtol, atol, require_relative = _tolerances(slug)
     _assert_parity(
@@ -945,10 +949,20 @@ def test_etl_hf_never_imports_torch(tmp_path):
         f"""
         import sys
         import etl_hf
-        model = etl_hf.load_hf({str(directory)!r}, seq_len=4)
-        logits = model.forward()
+        loaded = etl_hf.load_hf({str(directory)!r})
+        logits = etl_hf.predict(loaded, seq_len=4)
         print("SHAPE=" + ",".join(str(int(dim)) for dim in logits.shape))
         print("DTYPE=" + str(logits.dtype))
+        # The explicit staging half too: forward_fn -> build -> run is the same
+        # library surface (etl_hf.program / etl_hf.pipeline), so a leak there
+        # must fail this probe as well.
+        fwd = etl_hf.forward_fn(loaded.config, seq_len=4)
+        exe = etl_hf.build(fwd, loaded.config)
+        print("PARAMS=" + str(len(etl_hf.param_specs(loaded.config))))
+        print("INPUTS=" + str(len(exe.signature.input_specs)))
+        print("RUN_SHAPE=" + ",".join(
+            str(int(dim))
+            for dim in etl_hf.run(exe, loaded.params, [[0, 1, 2, 3]]).shape))
         print("LEAKED=" + ",".join(
             name for name in ("torch", "transformers") if name in sys.modules))
         """
@@ -958,7 +972,14 @@ def test_etl_hf_never_imports_torch(tmp_path):
     )
     assert library["SHAPE"] == f"1,4,{_TINY_CONFIG['vocab_size']}", library["SHAPE"]
     assert library["DTYPE"] == "float32", library["DTYPE"]
-
+    assert library["INPUTS"] == str(int(library["PARAMS"]) + 1), (
+        f"the forward must declare exactly one input per canonical weight plus the "
+        f"id tensor: {library['PARAMS']} weights + ids, declared {library['INPUTS']}"
+    )
+    assert library["RUN_SHAPE"] == library["SHAPE"], (
+        f"the explicit build/run pipeline must return the same (batch, seq_len, "
+        f"vocab) logits as predict: {library['RUN_SHAPE']} vs {library['SHAPE']}"
+    )
     this_file = Path(__file__).resolve()
     gate = _run_probe(
         f"""
