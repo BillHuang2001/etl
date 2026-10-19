@@ -67,7 +67,7 @@ Staging stays honest and kind-neutral: vulkan runs are DEVICE-RESIDENT exactly l
 `Tensor.to(Device("vulkan", N))` goes through a vulkan device-transfer provider the iree adapter registers in BOTH the per-backend and the flat DEFAULT slot; vulkan deliberately does NOT use the CUDA pinned/DMA staging tier (its ordering guarantee is a CUDA-driver property, unverified elsewhere) and takes the plain `asdevicearray` host→device copy instead.
 `etl.devices("vulkan")` enumerates the IREE Vulkan HAL devices (lazy iree import; returns `[]` — never raises, never invents a device — when iree is absent, the driver cannot initialize, or no device is visible).
 `etl.devices()` (kind `None`) deliberately lists `cpu + cuda + rocm` only: enumerating vulkan would instantiate the IREE Vulkan runtime and the system Vulkan loader, and on a software-Vulkan host it would report a CPU rasterizer as an accelerator — ask for `devices("vulkan")` explicitly.
-Software-Vulkan hosts: IREE 3.11 hard-codes a device-NAME denylist that hides Mesa lavapipe (`llvmpipe…`) with no env override, so a lavapipe-only host enumerates nothing unless `VK_ICD_FILENAMES` selects a differently-named ICD (recipe and this host's GPU-Vulkan verdict: `../bench_logs/vulkan_findings.md`; adapter-level known issues: `./backends/adapters/CONTEXT.md`).
+Software-Vulkan hosts: IREE 3.11 hard-codes a device-NAME denylist that hides Mesa lavapipe (`llvmpipe…`) with no env override, so a lavapipe-only host enumerates nothing unless `VK_ICD_FILENAMES` selects a differently-named ICD — recipe, the default-profile budget and this host's GPU-Vulkan verdict: `./backends/adapters/CONTEXT.md` + `../bench_logs/vulkan_findings.md`.
 
 ## Value model (owned by `core`)
 
