@@ -54,22 +54,30 @@ __all__ = [
 # Device kinds the harness accepts: "rocm" is the canonical AMD GPU kind and
 # "hip" is its accepted alias — both derive ``target_backends=["rocm"]`` (see
 # :func:`resolve_backend_options`). The kind is preserved as given ("hip" is
-# not rewritten to "rocm"); the alias is an equivalent spelling.
-_SUPPORTED_DEVICE_KINDS = ("cpu", "cuda", "rocm", "hip")
-_SUPPORTED_DEVICE_KINDS_TEXT = "'cpu', 'cuda', and 'rocm' (alias 'hip')"
+# not rewritten to "rocm"); the alias is an equivalent spelling. "vulkan" is
+# IREE's Vulkan/SPIR-V backend — it derives the compile target spelling
+# ``["vulkan-spirv"]`` and, like every non-cpu kind here, is a device-residency
+# kind (torch has NO vulkan backend, so torch references never run on it).
+# Report the formatted device string as given ("vulkan:0"): the kind names the
+# etl device, NOT the silicon — a lavapipe (software Vulkan) device is a
+# software renderer, so never label vulkan results as GPU hardware.
+_SUPPORTED_DEVICE_KINDS = ("cpu", "cuda", "rocm", "hip", "vulkan")
+_SUPPORTED_DEVICE_KINDS_TEXT = (
+    "'cpu', 'cuda', 'rocm' (alias 'hip'), and 'vulkan'"
+)
 
 
 def resolve_device(device=None) -> core.Device:
     """Normalize a device argument to a :class:`~etl.core.Device`.
 
     ``None`` → ``core.Device("cpu", 0)``. A ``core.Device`` is validated
-    (kind must be ``"cpu"``, ``"cuda"``, ``"rocm"``, or the ``"hip"`` alias)
-    and returned as-is. A string parses as ``"KIND[:INDEX]"`` (e.g.
-    ``"cpu"``, ``"cuda"``, ``"cuda:3"``, ``"rocm"``, ``"rocm:3"``, ``"hip"``,
-    ``"hip:0"``); the kind must be ``"cpu"``, ``"cuda"``, ``"rocm"``, or
-    ``"hip"`` and the index a non-negative integer. Anything else raises
-    ``TypeError``; a bad kind or index raises ``ValueError`` with a clear
-    message.
+    (kind must be ``"cpu"``, ``"cuda"``, ``"rocm"``, the ``"hip"`` alias, or
+    ``"vulkan"``) and returned as-is. A string parses as ``"KIND[:INDEX]"``
+    (e.g. ``"cpu"``, ``"cuda"``, ``"cuda:3"``, ``"rocm"``, ``"rocm:3"``,
+    ``"hip"``, ``"hip:0"``, ``"vulkan"``, ``"vulkan:0"``); the kind must be
+    ``"cpu"``, ``"cuda"``, ``"rocm"``, ``"hip"``, or ``"vulkan"`` and the
+    index a non-negative integer. Anything else raises ``TypeError``; a bad
+    kind or index raises ``ValueError`` with a clear message.
     """
     if device is None:
         return core.Device("cpu", 0)
@@ -148,9 +156,12 @@ def resolve_backend_options(backend, device, backend_options) -> dict:
     (``backend.startswith("iree")`` — the pipeline's own env-default
     convention, see ``etl/pipeline.py``): when the option is absent,
     ``["cuda"]`` for a cuda device, ``["rocm"]`` for a rocm (or its
-    ``"hip"`` alias) device, ``["llvm-cpu"]`` otherwise. An explicit option
-    always wins — never overridden. xla, tvm, and numpy receive NO
-    ``target_backends``.
+    ``"hip"`` alias) device, ``["vulkan-spirv"]`` for a vulkan device (the
+    compile-target spelling of IREE's Vulkan/SPIR-V backend — there is no
+    ``--iree-hal-vulkan-target`` flag; an optional profile is selected with
+    the separate pass-through ``--iree-vulkan-target=<profile>`` flag), and
+    ``["llvm-cpu"]`` otherwise. An explicit option always wins — never
+    overridden. xla, tvm, and numpy receive NO ``target_backends``.
 
     For every non-numpy backend (numpy is the only interpreter backend; all
     others are compiler backends) — iree, xla AND tvm — when ``opt_level``
@@ -168,6 +179,8 @@ def resolve_backend_options(backend, device, backend_options) -> dict:
             options["target_backends"] = ["cuda"]
         elif device.kind in ("rocm", "hip"):
             options["target_backends"] = ["rocm"]
+        elif device.kind == "vulkan":
+            options["target_backends"] = ["vulkan-spirv"]
         else:
             options["target_backends"] = ["llvm-cpu"]
     if backend != "numpy":
@@ -190,12 +203,21 @@ def resolve_torch_device(device, torch_mod):
     A rocm (or ``"hip"`` alias) device additionally requires a ROCm torch
     build (``torch.version.hip`` set — on such a build the ``torch.cuda``
     API addresses AMD GPUs); a non-ROCm torch returns ``None`` so torch
-    references run on CPU. Receives the already imported torch module —
-    never imports torch itself (torch optionality is binding).
+    references run on CPU. A ``"vulkan"`` device has NO torch equivalent (torch
+    ships no Vulkan backend) and is NEVER mapped onto torch cuda — it returns
+    ``None`` for the same reason the other non-cuda kinds do, so torch
+    references degrade to CPU (a documented skip, never a raw error). Receives
+    the already imported torch module — never imports torch itself (torch
+    optionality is binding).
     """
     if device.kind in ("rocm", "hip"):
         if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
             return None
+    elif device.kind == "vulkan":
+        # No torch Vulkan backend exists: an etl vulkan device (real AMD GPU
+        # or a lavapipe software device) is never a torch cuda device, so the
+        # torch reference degrades to CPU rather than raising or aliasing.
+        return None
     elif device.kind != "cuda":
         return None
     if not torch_mod.cuda.is_available():

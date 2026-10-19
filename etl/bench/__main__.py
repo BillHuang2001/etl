@@ -101,8 +101,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--device",
         default="cpu",
         metavar="KIND[:INDEX]",
-        help="device to run on: 'cpu', 'cuda[:INDEX]', or 'rocm[:INDEX]' "
-        "(alias 'hip') (default: cpu; e.g. 'cuda:3', 'rocm:0')",
+        help="device to run on: 'cpu', 'cuda[:INDEX]', 'rocm[:INDEX]' (alias "
+        "'hip'), or 'vulkan[:INDEX]' (default: cpu; e.g. 'cuda:3', 'rocm:0', "
+        "'vulkan:0')",
     )
     parser.add_argument(
         "--backend-option",
