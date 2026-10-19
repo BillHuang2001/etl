@@ -24,10 +24,12 @@ import pytest
 import etl
 from etl_hf import ops
 from etl_hf import reference as numpy_reference
-from etl_hf.build import HFModel, load_hf, run_model
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFWeightError
+from etl_hf.load import LoadedModel, load_hf, validate_params
 from etl_hf.models import gpt2
+from etl_hf.pipeline import build, predict, run
+from etl_hf.program import forward_fn, param_specs, reference_logits
 from etl_hf.tests import hf_download
 
 #: Base synthetic config: tiny but non-degenerate (non-square MLP, 4 heads).
@@ -77,6 +79,16 @@ def run_graph(cfg: ModelConfig, params: Params, ids: np.ndarray) -> np.ndarray:
     """Trace + build + run the GPT-2 graph on the numpy backend; return logits."""
     forward = gpt2.graph(cfg, int(ids.shape[1]), int(ids.shape[0]))
     return np.asarray(etl.evaluate(forward, params, ids).numpy(), dtype=np.float32)
+
+
+def _loaded(cfg: ModelConfig, params: Params, family: str = "gpt2") -> LoadedModel:
+    """Wrap a config + canonical params as the public :class:`LoadedModel` value.
+
+    :class:`~etl_hf.load.LoadedModel` is plain immutable data (config + params +
+    family + source directory), so a test that synthesised its own params can
+    build one directly and use the host-facing :func:`etl_hf.predict` shorthand.
+    """
+    return LoadedModel(config=cfg, params=params, family=family, model_dir=None)
 
 
 def assert_parity(
@@ -891,25 +903,28 @@ def test_untied_checkpoint_with_head_round_trips_unchanged():
     assert_parity(cfg, params, make_ids(cfg, batch=1, seq=4))
 
 
-def test_hfmodel_accepts_a_tied_tree_and_rejects_a_redundant_head():
-    """``HFModel`` mirrors the specs: the tied tree has no head, a redundant one is an error."""
+def test_validate_params_accepts_a_tied_tree_and_rejects_a_redundant_head():
+    """``validate_params`` mirrors the specs: the tied tree has no head, a redundant one is an error."""
     cfg = make_config(n_layer=1)
     params = gpt2.canonicalize_weights(cfg, make_hf_state_dict(cfg))
-    model = HFModel(cfg, params, seq_len=4)
-    assert set(model.params()) == set(model.param_specs()) == set(gpt2.param_specs(cfg))
-    assert "lm_head.weight" not in model.params()
+    validated = validate_params(cfg, params)
+    assert set(validated) == set(param_specs(cfg)) == set(gpt2.param_specs(cfg))
+    assert "lm_head.weight" not in validated
 
     ids = make_ids(cfg, batch=1, seq=4)
     np.testing.assert_allclose(
-        model.forward(input_ids=ids), model.reference(input_ids=ids), rtol=1e-5, atol=1e-6
+        predict(_loaded(cfg, validated), ids, seq_len=4),
+        reference_logits(cfg, validated, ids),
+        rtol=1e-5,
+        atol=1e-6,
     )
 
     redundant = dict(params)
     redundant["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
     with pytest.raises(HFWeightError, match="lm_head.weight"):
-        HFModel(cfg, redundant, seq_len=4)
+        validate_params(cfg, redundant)
     with pytest.raises(etl.ETLError, match="lm_head.weight"):
-        run_model(model.build(), redundant, ids)
+        run(build(forward_fn(cfg, seq_len=4), cfg), redundant, ids)
 
 
 def test_real_tiny_gpt2_tied_checkpoint_dedupes_its_shipped_head():
@@ -919,20 +934,23 @@ def test_real_tiny_gpt2_tied_checkpoint_dedupes_its_shipped_head():
     must consume it (never leave it as an unexpected key) and drop it — the tied
     tree has one fewer key and the graph keeps numpy-interpreter parity.
     """
-    model = load_hf(hf_download.require_model("tiny_gpt2"), seq_len=8)
-    cfg = model.config
+    loaded = load_hf(hf_download.require_model("tiny_gpt2"))
+    cfg = loaded.config
+    assert loaded.family == "gpt2"
     assert cfg.tie_word_embeddings is True
-    params = model.params()
+    params = loaded.params
     assert "lm_head.weight" not in params
-    assert set(params) == set(model.param_specs())
+    assert set(params) == set(param_specs(cfg))
     assert params["embed.weight"].shape == (cfg.vocab_size, cfg.hidden_size)
+    # Loading knows no length: ``seq_len`` is a graph specialisation, so the
+    # forward for this call is built explicitly (and memoised by the program).
+    fwd = forward_fn(cfg, seq_len=8)
     ids = (np.arange(8, dtype=np.int32) * 7 % cfg.vocab_size).reshape(1, 8)
-    got = model.forward(input_ids=ids)
-    want = model.reference(input_ids=ids)
+    got = run(build(fwd, cfg), params, ids).numpy()
+    want = reference_logits(cfg, params, ids)
     max_abs = float(np.max(np.abs(got - want)))
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
     assert max_abs < 1e-6, f"tiny_gpt2 tied parity: max-abs {max_abs:.3e}"
-
 
 # ===========================================================================
 # 6. determinism

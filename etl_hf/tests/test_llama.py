@@ -26,10 +26,12 @@ import pytest
 
 import etl
 from etl_hf import ops
-from etl_hf.build import HFModel, run_model
 from etl_hf.config import ModelConfig
 from etl_hf.errors import HFConfigError, HFUnsupportedError, HFWeightError
+from etl_hf.load import LoadedModel, validate_params
 from etl_hf.models import llama
+from etl_hf.pipeline import build, predict, run
+from etl_hf.program import forward_fn, param_specs, reference_logits
 
 # ---------------------------------------------------------------------------
 # helpers: synthetic configs, checkpoints, params
@@ -153,6 +155,16 @@ def _ids(cfg: ModelConfig, batch: int, seq: int, *, seed: int = 1) -> np.ndarray
 def _specs(cfg: ModelConfig, batch: int, seq: int) -> tuple[dict, etl.TensorSpec]:
     """The trace/build argument tree: (param specs, input_ids spec)."""
     return llama.param_specs(cfg), etl.TensorSpec(shape=(batch, seq), dtype=etl.int32)
+
+
+def _loaded(cfg: ModelConfig, params: dict, family: str = "llama") -> LoadedModel:
+    """Wrap a config + canonical params as the public :class:`LoadedModel` value.
+
+    :class:`~etl_hf.load.LoadedModel` is plain immutable data (config + params +
+    family + source directory), so a test that synthesised its own params can
+    build one directly and use the host-facing :func:`etl_hf.predict` shorthand.
+    """
+    return LoadedModel(config=cfg, params=params, family=family, model_dir=None)
 
 
 def _traced(cfg: ModelConfig, seq: int, batch: int = 1):
@@ -698,20 +710,23 @@ def test_tied_and_untied_graphs_agree():
     assert np.allclose(llama.reference(tied_cfg, params, ids), want, rtol=1e-6, atol=1e-6)
 
 
-def test_hfmodel_accepts_a_tied_tree_and_rejects_a_redundant_head():
-    """``HFModel`` mirrors the specs: no head key for tied, a redundant one is an error."""
+def test_validate_params_accepts_a_tied_tree_and_rejects_a_redundant_head():
+    """``validate_params`` mirrors the specs: no head key for tied, a redundant one is an error."""
     cfg = _cfg(tie_word_embeddings=True)
     params = llama.canonicalize_weights(cfg, _hf_state_dict(cfg, head="absent"))
-    model = HFModel(cfg, params, seq_len=4)
-    assert set(model.params()) == set(model.param_specs()) == set(llama.param_specs(cfg))
-    assert "lm_head.weight" not in model.params()
+    validated = validate_params(cfg, params)
+    assert set(validated) == set(param_specs(cfg)) == set(llama.param_specs(cfg))
+    assert "lm_head.weight" not in validated
     ids = _ids(cfg, 1, 4)
     np.testing.assert_allclose(
-        model.forward(input_ids=ids), model.reference(input_ids=ids), rtol=1e-5, atol=1e-5
+        predict(_loaded(cfg, validated), ids, seq_len=4),
+        reference_logits(cfg, validated, ids),
+        rtol=1e-5,
+        atol=1e-5,
     )
     redundant = dict(params)
     redundant["lm_head.weight"] = np.ascontiguousarray(params["embed.weight"].T)
     with pytest.raises(HFWeightError, match="lm_head.weight"):
-        HFModel(cfg, redundant, seq_len=4)
+        validate_params(cfg, redundant)
     with pytest.raises(etl.ETLError, match="lm_head.weight"):
-        run_model(model.build(), redundant, ids)
+        run(build(forward_fn(cfg, seq_len=4), cfg), redundant, ids)
