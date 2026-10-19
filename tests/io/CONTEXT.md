@@ -55,8 +55,8 @@ order, and worker-thread re-entry raises `RuntimeError`.
   POSITIONALLY — Vulkan HAL ids are UUID hashes, not ordinals, and an out-of-range
   index is a silent no-op; all failures swallowed, devices kept alive
   process-globally, at most once per `(kind, index)`). v1 wording: copies are "async
-  relative to the caller, no strict
-  same-device overlap guarantee" (the single worker serializes everything). Buffer
+  relative to the caller, no strict same-device overlap guarantee" (the single worker
+  serializes everything). Buffer
   lifetime is user-controlled: the worker holds only a bound-method thunk
   (`tensor.to(device)` / `.to(cpu:0)`) — the caller must keep source buffers alive
   until `.wait()`/`.result()`.
