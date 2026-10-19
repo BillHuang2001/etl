@@ -362,9 +362,9 @@ def _name_index(name: str) -> tuple[int, str]:
 def is_packed_tree(tree: object) -> bool:
     """Whether a params tree (mapping or key iterable) uses packed input names.
 
-    Used only for diagnostics: :func:`etl_hf.build.run_model` and
-    :meth:`etl_hf.build.HFModel.forward` name the ``pack_weights`` remedy instead
-    of surfacing a bare etl pytree error when a caller mixes the two tree shapes.
+    Used only for diagnostics: :func:`etl_hf.run` and :func:`etl_hf.predict` name
+    the ``pack_weights`` remedy instead of surfacing a bare etl pytree error when
+    a caller mixes the two tree shapes.
 
     Args:
         tree: a params mapping, or an iterable of keys.
