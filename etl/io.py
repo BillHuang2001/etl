@@ -37,8 +37,8 @@ copy independently (completion removes the handle from the module's
 outstanding set and releases the worker's job references, so buffers are
 held only while a user handle keeps them alive).
 
-CUDA worker bootstrap (decision)
---------------------------------
+CUDA/ROCm/Vulkan worker bootstrap (decision)
+--------------------------------------------
 Concurrent use of an llvm-cpu HAL device from a worker thread is safe, but
 on CUDA a fresh thread's FIRST allocating HAL op fails with
 ``CUDA_ERROR_INVALID_CONTEXT``: iree does not push its stored context per
@@ -48,9 +48,12 @@ throwaway cuda HAL device on the same GPU, which makes the shared primary
 context current there. DECISION: this module performs that bootstrap
 itself — lazily, best-effort, at most once per worker per ``(kind, index)``,
 immediately before the first scheduled copy whose involved device kind is
-not ``"cpu"`` — using the iree adapter's exact 1-based HAL device-id
-mapping (``device_id = device.index + 1``). Rationale: the iree adapter's
-upload (host → device) provider is already foreign-thread-safe — it
+not ``"cpu"`` — using the iree adapter's exact device-address mapping: the
+1-based HAL device id (``device_id = device.index + 1``) for CUDA/ROCm, and
+the QUERIED per-process UUID-hash device for Vulkan
+(``rt.get_driver("vulkan").query_available_devices()[index]``, then
+``create_device(info)`` — Vulkan ids are not ordinals). Rationale: the iree
+adapter's upload (host → device) provider is already foreign-thread-safe — it
 creates its own HAL device on the calling thread per call, establishing
 the context as a side effect — but the download (device → host) path calls
 ``payload.to_host()`` on a main-thread-created device with no worker-side
@@ -65,7 +68,8 @@ Numpy-only workloads
 --------------------
 ``prefetch()``/``sink()`` schedule fine, but a host → device copy needs a
 registered device-transfer provider for the target kind (``etl.backends``
-installs one for cuda; see ``core.register_device_transfer_provider``).
+installs one for cuda/rocm/vulkan; see
+``core.register_device_transfer_provider``).
 Without one the copy fails at ``wait()``/``result()`` with the provider
 ``DeviceError`` — async IO is for real device ↔ host boundaries.
 
@@ -279,7 +283,8 @@ class AsyncCopy:
 
 
 def _bootstrap_worker_context(device):
-    """One-time, best-effort CUDA/ROCm-context bootstrap for the worker thread.
+    """One-time, best-effort CUDA/ROCm/Vulkan-context bootstrap for the worker
+    thread.
 
     A fresh thread's first allocating HAL op on a CUDA/ROCm device created by
     another thread fails with ``CUDA_ERROR_INVALID_CONTEXT`` (iree does not
@@ -297,11 +302,27 @@ def _bootstrap_worker_context(device):
         import iree.runtime as rt  # lazy: only non-cpu-kind copies reach here
 
         # etl device kind -> iree HAL driver name. AMD ROCm devices are kind
-        # "rocm" (aliased "hip") but iree's HIP driver is registered as "hip".
+        # "rocm" (aliased "hip") but iree's HIP driver is registered as "hip";
+        # Vulkan keeps its own driver name.
         driver_name = "hip" if device.kind in ("rocm", "hip") else device.kind
-        # The iree adapter's exact 1-based HAL device-id mapping
-        # (etl/backends/adapters/iree.py, _acquire_runtime_device).
-        dev = rt.get_driver(driver_name).create_device(device_id=device.index + 1)
+        driver = rt.get_driver(driver_name)
+        if device.kind == "vulkan":
+            # Vulkan device ids are NOT ordinals: iree's Vulkan HAL addresses
+            # a device by the per-process UUID HASH it reports in
+            # ``query_available_devices()``, so a ``(kind, index)`` device maps
+            # through that query — exactly the mapping the iree adapter's
+            # ``_acquire_runtime_device`` uses (create the device from the
+            # queried info dict, never from an ``index + 1`` id). An
+            # out-of-range index simply skips the bootstrap: this is a
+            # best-effort context warm-up, not a validation point.
+            infos = driver.query_available_devices()
+            if not 0 <= device.index < len(infos):
+                return
+            dev = driver.create_device(infos[device.index])
+        else:
+            # The iree adapter's exact 1-based HAL device-id mapping
+            # (etl/backends/adapters/iree.py, _acquire_runtime_device).
+            dev = driver.create_device(device_id=device.index + 1)
         _bootstrap_devices.append(dev)  # keep alive: the context stays current
     except Exception:
         pass  # best-effort only — the copy's own error still surfaces

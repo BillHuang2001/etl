@@ -15,6 +15,7 @@ The env-option table (backend, stage) -> (env var, option key, parser):
 |-----------------------------|---------|---------|-----------------------|-----------------------------------------------|
 | ``ETL_IREE_COMPILE_ARGS``   | iree    | compile | ``iree_compile_args`` | space-separated flag list (shlex syntax)      |
 | ``ETL_IREE_RUNTIME_ARGS``   | iree    | load    | ``iree_runtime_args`` | space-separated flag list (shlex syntax)      |
+| ``ETL_IREE_VULKAN_TARGET``  | iree    | compile | ``vulkan_target``     | SPIR-V target profile string (whitespace-stripped; the VALUE is validated by the compiler) |
 | ``ETL_XLA_COMPILE_OPTIONS`` | xla     | compile | ``xla_compile_options`` | base64 of a serialized CompileOptionsProto  |
 | ``ETL_TVM_TARGET``          | tvm     | compile | ``tvm_target``        | TVM target string                             |
 | ``ETL_TVM_PASS_CONFIGS``    | tvm     | compile | ``tvm_pass_configs``  | JSON object (must parse to a dict)            |
@@ -48,6 +49,19 @@ whose value type etl itself defines:
 
 Both keep the same precedence and error contract: explicit > env > default,
 malformed → ``BackendError`` naming the variable and value.
+
+``ETL_IREE_VULKAN_TARGET`` is the iree Vulkan/SPIR-V target-profile knob: it
+feeds the iree adapter's compile-stage ``vulkan_target`` option, which derives
+``--iree-vulkan-target=<profile>`` (the compile TARGET BACKEND is a separate
+knob — ``target_backends=["vulkan-spirv"]``, which an iree-family backend
+infers from a ``vulkan`` device). The profile selects the SPIR-V target
+features (workgroup-memory budget, thread limits, extension set); IREE's
+compiler DEFAULT profile is ``vp_android_baseline_2022`` (16384-byte
+workgroup-memory budget, 128 threads), which CANNOT compile large graphs on
+desktop GPUs — set a real profile (e.g. ``rdna3``, ``gfx1100``, or
+``vulkan-spirv``'s other profiles) for anything beyond trivial modules. Only
+whitespace is stripped here; the compiler validates the profile VALUE (etl
+never parses compiler flags), so an unknown profile fails loudly at compile.
 
 The ``lower``-stage rows were added with the reserved exporter options
 ``eigh_algorithm`` / ``split_reduction`` (declared by all three compiler
@@ -168,6 +182,12 @@ def _parse_bool_option(var: str, value: str) -> bool:
 ENV_OPTION_TABLE: dict[tuple[str, str], tuple[tuple[str, str, object], ...]] = {
     ("iree", "compile"): (
         ("ETL_IREE_COMPILE_ARGS", "iree_compile_args", _parse_flag_list),
+        # The SPIR-V target profile selects workgroup-memory/thread budgets:
+        # the whitespace-stripped string is handed to the adapter, which
+        # derives ``--iree-vulkan-target=<profile>``; the compiler validates
+        # the profile itself (etl never parses compiler flags).
+        ("ETL_IREE_VULKAN_TARGET", "vulkan_target",
+         lambda var, value: value.strip()),
         ("ETL_OPT_LEVEL", "opt_level", _parse_opt_level),
     ),
     ("iree", "load"): (
