@@ -112,10 +112,9 @@
   <rect x="658" y="430" width="240" height="22" rx="11" fill="#0d1117" stroke="#f0b429" stroke-width="1.5"/>
   <text x="674" y="445" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#e6edf3">StableHLO &#8594; native GPU/CPU code</text>
 
-  <!-- feeder arrows going UP into the compile step -->
-  <path d="M 325 344 L 325 306 L 588 306 L 588 256" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowGreen)"/>
-  <path d="M 875 344 L 875 296 L 614 296 L 614 256" fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowAmber)"/>
-
+  <!-- feeder arrows going UP into the compile step (the gap between stage 03 LoweredProgram and stage 04 CompiledArtifact) -->
+  <path d="M 325 344 L 325 302 L 594 302 L 594 256" fill="none" stroke="#34d399" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowGreen)"/>
+  <path d="M 875 344 L 875 292 L 606 292 L 606 256" fill="none" stroke="#f0b429" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowAmber)"/>
   <!-- footer -->
   <path d="M 24 488 L 1176 488" fill="none" stroke="#30363d" stroke-width="1"/>
   <text x="600" y="512" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" letter-spacing="0.6" fill="#8b949e">simple &#183; minimal &#183; explicit &#183; compiler-neutral</text>
