@@ -1,3 +1,7 @@
+---
+skill:
+  - etl-vulkan-device-recipe
+---
 # etl package — public API contract
 
 ## Intent
