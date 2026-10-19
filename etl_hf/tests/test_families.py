@@ -266,6 +266,7 @@ def test_registry_does_not_expose_helper_builders():
         "FamilySpec",
         "family_for_model_type",
         "get_family",
+        "resolve_family",
     }
     # the activation table lives in ops, not here — no duplicate source of truth
     assert not hasattr(families, "ACTIVATIONS")
