@@ -20,8 +20,17 @@ list, the unknown-kind message, and "probe failure → ``[]``") inject FAKE
 ``iree``/``torch`` modules through ``monkeypatch`` so the probe is deterministic
 without any ROCm runtime; a separate real leg skips cleanly when no ROCm runtime
 is detectable in this process.
+
+The ``devices("vulkan")`` pins use the same fake-``iree`` mechanism: they cover
+the documented index contract (per-kind ENUMERATION index, never the iree HAL
+hash ``device_id``), the lenient-probe contract (zero devices / a raising query
+/ a raising ``get_driver`` / an unimportable ``iree`` all ⇒ ``[]``, never an
+exception and never an invented device), and the request-only rule — the
+unfiltered ``devices(None)`` list never includes yet never even queries vulkan.
 """
 
+import ast
+import inspect
 import sys
 import types
 from dataclasses import FrozenInstanceError
@@ -268,6 +277,291 @@ class TestDevices:
         assert devices("hip") == []
         # With both probes neutralized, the unfiltered list is cpu only.
         assert devices(None) == [Device("cpu", 0)]
+
+
+# --- Vulkan device-enumeration pins -----------------------------------------
+#
+# ``devices("vulkan")`` delegates to ``_vulkan_devices()``, whose probe runs
+# *inside* the function (``import iree.runtime as rt``) and which is documented
+# to return ``[]`` whenever nothing is detectable (the whole probe is wrapped,
+# exactly like ``_rocm_devices()``).  Same mechanism as the ROCm pins above: a
+# FAKE ``iree`` / ``iree.runtime`` is installed through ``monkeypatch`` (the
+# in-function import resolves via ``sys.modules``), so the pins hold whether or
+# not the real optional package is installed, and ``monkeypatch`` restores
+# ``sys.modules`` afterwards — the real modules are never mutated and every pin
+# is order-independent.
+#
+# Index contract (binding, see ``_vulkan_devices``' docstring): ``Device(
+# "vulkan", i)`` carries the PER-KIND ENUMERATION index ``i`` — deliberately
+# NOT the IREE HAL ``device_id``, which for Vulkan is a per-process hash/UUID
+# rather than the dense 1-based range the rocm HAL uses.  The fake info dicts
+# therefore carry realistic, distinct, large hash ids, so "index == device_id"
+# and "index == device_id - 1" would both fail loudly.
+
+_VULKAN_FAKE_HASH_IDS = (857002912, 3910271561, 2104832)
+_VULKAN_FAKE_UUIDS = (
+    "8f2a4c1e-6b3d-4f7a-9c05-1de2b8a71344",
+    "c41b9d07-2e58-4a13-bf6c-7d90ae31528b",
+    "0a9f31c5-84d2-47e6-9b1a-532c8e7d6f01",
+)
+_VULKAN_FAKE_NAMES = (
+    "lavapipe (LLVM 20.1.2, 256 bits)",
+    "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+    "llvmpipe (LLVM 20.1.2, 256 bits)",
+)
+
+_VULKAN_FAKE_COUNT = len(_VULKAN_FAKE_HASH_IDS)
+
+
+def _fake_vulkan_info(index: int) -> dict:
+    """One ``iree.runtime`` device-info dict: hash id + UUID path + name."""
+    return {
+        "device_id": _VULKAN_FAKE_HASH_IDS[index],
+        "path": _VULKAN_FAKE_UUIDS[index],
+        "name": _VULKAN_FAKE_NAMES[index],
+    }
+
+
+class _FakeIreeVulkanDriver:
+    """Minimal stand-in for the IREE Vulkan HAL driver.
+
+    Reports ``runtime.vulkan_count`` info dicts, and counts every
+    ``query_available_devices()`` call on its owning fake runtime so a pin can
+    prove the vulkan probe was (or was NOT) reached.
+    """
+
+    def __init__(self, runtime: "_FakeIreeRuntime"):
+        self._runtime = runtime
+
+    def query_available_devices(self):
+        self._runtime.vulkan_query_calls += 1
+        if self._runtime.query_raises:
+            raise RuntimeError("fake iree: vulkan device query failed")
+        return [_fake_vulkan_info(i) for i in range(self._runtime.vulkan_count)]
+
+
+class _FakeIreeRuntime:
+    """Stand-in for ``iree.runtime``: per-driver fakes + call tracking.
+
+    ``get_driver`` mirrors the real API for the only two names the enumeration
+    paths use (``"vulkan"`` and ``"hip"``) and records every request in
+    ``driver_requests``; ``vulkan_query_calls`` counts vulkan device queries.
+    """
+
+    def __init__(
+        self,
+        *,
+        vulkan_count: int = 0,
+        driver_raises: bool = False,
+        query_raises: bool = False,
+        hip_count: int = 0,
+    ):
+        self.vulkan_count = vulkan_count
+        self.driver_raises = driver_raises
+        self.query_raises = query_raises
+        self.hip_count = hip_count
+        self.driver_requests = []
+        self.vulkan_query_calls = 0
+
+    def get_driver(self, name):
+        self.driver_requests.append(name)
+        if name == "vulkan":
+            if self.driver_raises:
+                raise RuntimeError("fake iree: vulkan driver unavailable")
+            return _FakeIreeVulkanDriver(self)
+        if name == "hip":
+            return _FakeIreeHIPDriver(self.hip_count, name)
+        raise AssertionError(f"unexpected driver name {name!r}")
+
+
+def _inject_fake_iree_vulkan(
+    monkeypatch,
+    *,
+    count=_VULKAN_FAKE_COUNT,
+    driver_raises=False,
+    query_raises=False,
+    hip_count=0,
+):
+    """Install a FAKE ``iree.runtime`` whose VULKAN driver reports ``count`` devices.
+
+    ``driver_raises=True`` makes ``get_driver("vulkan")`` raise (driver
+    initialization failure); ``query_raises=True`` makes the driver's
+    ``query_available_devices()`` raise.  ``hip_count`` sets what the HIP
+    driver reports, so the rocm path stays deterministic in the same fake.
+    ``fake_iree.runtime`` is set as an *attribute* as well as a ``sys.modules``
+    entry because ``import iree.runtime as rt`` resolves the attribute on the
+    parent package after the import returns.  Returns the tracker.
+    """
+    runtime = _FakeIreeRuntime(
+        vulkan_count=count,
+        driver_raises=driver_raises,
+        query_raises=query_raises,
+        hip_count=hip_count,
+    )
+    fake_rt = types.ModuleType("iree.runtime")
+    fake_rt.get_driver = runtime.get_driver
+    fake_iree = types.ModuleType("iree")
+    fake_iree.runtime = fake_rt
+    monkeypatch.setitem(sys.modules, "iree", fake_iree)
+    monkeypatch.setitem(sys.modules, "iree.runtime", fake_rt)
+    return runtime
+
+
+def _block_iree_imports(monkeypatch):
+    """Simulate an absent ``iree``: a ``None`` ``sys.modules`` entry halts imports.
+
+    ``import iree.runtime`` then raises ``ImportError`` (Python's
+    ``None``-in-``sys.modules`` mechanism), which is the "optional extra not
+    installed" branch of the probe.  ``monkeypatch`` restores both entries.
+    """
+    monkeypatch.setitem(sys.modules, "iree", None)
+    monkeypatch.setitem(sys.modules, "iree.runtime", None)
+
+
+class TestVulkanDevices:
+    @pytest.mark.parametrize("count", [0, 1, 3])
+    def test_enumeration_index_is_per_kind_and_dense(self, monkeypatch, count):
+        # N info dicts (hash ids!) ⇒ [Device("vulkan", i) for i in range(N)],
+        # in order: the index is the per-kind ENUMERATION index, never the
+        # iree HAL hash `device_id` and never `device_id - 1`.
+        tracker = _inject_fake_iree_vulkan(monkeypatch, count=count)
+        result = devices("vulkan")
+        assert result == [Device("vulkan", i) for i in range(count)]
+        assert all(d.kind == "vulkan" for d in result)
+        assert [d.index for d in result] == list(range(count))
+        assert all(isinstance(d.index, int) for d in result)
+        # No index equals a hash id and none equals `hash id - 1`, whatever
+        # the count (vacuously true for an empty enumeration, pinned below).
+        assert all(d.index not in _VULKAN_FAKE_HASH_IDS for d in result)
+        assert all(d.index + 1 not in _VULKAN_FAKE_HASH_IDS for d in result)
+        if count:
+            assert [d.index for d in result] != list(_VULKAN_FAKE_HASH_IDS[:count])
+            assert [d.index for d in result] != [
+                h - 1 for h in _VULKAN_FAKE_HASH_IDS[:count]
+            ]
+        # One driver request, one query: the count comes from the query alone.
+        assert tracker.driver_requests == ["vulkan"]
+        assert tracker.vulkan_query_calls == 1
+
+    def test_zero_devices_yields_empty_list(self, monkeypatch):
+        # [] is a real ANSWER (empty enumeration), not a swallowed exception:
+        # the driver was queried exactly once and answered with no devices.
+        tracker = _inject_fake_iree_vulkan(monkeypatch, count=0)
+        assert devices("vulkan") == []
+        assert tracker.vulkan_query_calls == 1
+        assert tracker.driver_requests == ["vulkan"]
+
+    def test_query_failure_yields_empty(self, monkeypatch):
+        # A raising query_available_devices() ⇒ [] (best-effort enumeration,
+        # lenient exactly like the rocm probe) — never an exception leak.
+        tracker = _inject_fake_iree_vulkan(
+            monkeypatch, count=_VULKAN_FAKE_COUNT, query_raises=True
+        )
+        assert devices("vulkan") == []
+        assert tracker.vulkan_query_calls == 1
+
+    def test_driver_initialization_failure_yields_empty(self, monkeypatch):
+        # get_driver("vulkan") itself raising (driver init failure) ⇒ []; the
+        # driver's query is never reached.
+        tracker = _inject_fake_iree_vulkan(monkeypatch, driver_raises=True)
+        assert devices("vulkan") == []
+        assert tracker.driver_requests == ["vulkan"]
+        assert tracker.vulkan_query_calls == 0
+
+    def test_missing_iree_yields_empty(self, monkeypatch):
+        # Optional-extra branch: an unimportable iree (None in sys.modules ⇒
+        # ImportError) means "not detectable" ⇒ [], with no exception leak.
+        _block_iree_imports(monkeypatch)
+        # Anti-vacuity: the block really does halt the import the probe needs.
+        with pytest.raises(ImportError):
+            import iree.runtime  # noqa: F401  (deliberately failing import)
+        assert devices("vulkan") == []
+        # Positive control: the same probe DOES report devices once importable.
+        _inject_fake_iree_vulkan(monkeypatch, count=_VULKAN_FAKE_COUNT)
+        assert devices("vulkan") == [
+            Device("vulkan", i) for i in range(_VULKAN_FAKE_COUNT)
+        ]
+
+    def test_iree_is_imported_lazily_not_at_module_scope(self):
+        # `import etl` must never pull iree/torch in (optional extras): the
+        # module-level import graph of etl.core.device names neither.  A
+        # structural AST check is subprocess-free and order-independent —
+        # another suite in this process may already have imported iree.
+        import etl.core.device as device_module
+
+        source = inspect.getsource(device_module)
+        tree = ast.parse(source)
+        top_level = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                top_level.update(alias.name.split(".")[0] for alias in node.names)
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module is not None
+            ):
+                top_level.add(node.module.split(".")[0])
+        assert "iree" not in top_level
+        assert "torch" not in top_level
+        # Anti-vacuity: the probe imports are still present, function-scoped.
+        assert "import iree.runtime" in source
+
+    def test_none_never_includes_or_queries_vulkan(self, monkeypatch):
+        # devices(None) composes cpu + cuda + rocm ONLY: vulkan is queried on
+        # explicit request only (its probe force-instantiates the loader and a
+        # software host would list a CPU rasterizer as an "accelerator").
+        tracker = _inject_fake_iree_vulkan(
+            monkeypatch, count=_VULKAN_FAKE_COUNT, hip_count=0
+        )
+        _inject_fake_host_only_torch(monkeypatch)
+        result = devices(None)
+        assert result == [Device("cpu", 0)]
+        assert result[0] == Device("cpu", 0)
+        assert all(d.kind != "vulkan" for d in result)
+        assert "vulkan" not in tracker.driver_requests
+        assert tracker.vulkan_query_calls == 0
+        # Positive control on the SAME fake: an explicit request does see them
+        # (devices(None) itself only reached the hip probe, never vulkan).
+        assert devices("vulkan") == [
+            Device("vulkan", i) for i in range(_VULKAN_FAKE_COUNT)
+        ]
+        assert tracker.driver_requests == ["hip", "vulkan"]
+        assert tracker.vulkan_query_calls == 1
+
+    def test_vulkan_never_leaks_into_rocm_hip_or_the_unfiltered_list(self, monkeypatch):
+        # The three kind lists are disjoint: a vulkan-reporting driver never
+        # adds devices to the rocm/hip lists nor to devices(None), and the
+        # hip/rocm equivalence is unaffected.
+        tracker = _inject_fake_iree_vulkan(
+            monkeypatch, count=_VULKAN_FAKE_COUNT, hip_count=2
+        )
+        _inject_fake_host_only_torch(monkeypatch)
+        assert devices("vulkan") == [
+            Device("vulkan", i) for i in range(_VULKAN_FAKE_COUNT)
+        ]
+        expected_rocm = [Device("rocm", i) for i in range(2)]
+        assert devices("rocm") == expected_rocm
+        assert devices("hip") == devices("rocm") == expected_rocm
+        unfiltered = devices(None)
+        assert unfiltered[0] == Device("cpu", 0)
+        assert [d for d in unfiltered if d.kind == "vulkan"] == []
+        assert all(
+            Device("vulkan", i) not in unfiltered
+            for i in range(_VULKAN_FAKE_COUNT)
+        )
+        # Only the explicit devices("vulkan") reached the vulkan driver.
+        assert tracker.driver_requests.count("vulkan") == 1
+        assert tracker.vulkan_query_calls == 1
+
+    def test_unknown_kind_error_names_vulkan(self):
+        # The canonical unknown-kind error enumerates every recognized kind,
+        # vulkan included (assert fragments, not the whole sentence).
+        with pytest.raises(DeviceError) as excinfo:
+            devices("vulcan")  # typo: not a recognized kind
+        message = str(excinfo.value)
+        assert "Unknown device kind" in message
+        for fragment in ("'cpu'", "'cuda'", "'rocm'", "'hip'", "'vulkan'"):
+            assert fragment in message
 
 
 # --- split_tensor -----------------------------------------------------------
