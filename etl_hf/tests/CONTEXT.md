@@ -75,7 +75,7 @@ Measured parity (numpy interpreter vs stored HF logits): `tiny_gpt2` bit-exact, 
 Stdlib-only test utility (`pytest` imported only inside `require_model`), runnable standalone from the CLI; the `etl_hf` library never imports it.
 Exports `HF_BASE`, `MODELS` (tiny `hf-internal-testing` repos, `sshleifer/tiny-gpt2`, `distilgpt2`, `openai-community/gpt2`, plus the golden aliases `tiny_random_llama`/`tiny_random_mistral`), `ALIASES`, `BIG_MODELS`, `DEFAULT_SLUGS`, `DownloadUnavailable`, `models_dir`, `fetch`, `download_model`, `is_available`, `require_model`, `ensure_models`, `main`.
 Aliases resolve to the canonical repo id **and** cache dir (import-time invariant); `fetch` is atomic (`<dest>.part` + `os.replace`, capped backoff, HTTP 4xx except 429 fails fast) and raises `DownloadUnavailable` naming the URL.
-`download_model` tries `config.json` then the weight candidates (`model.safetensors` → index+shards → `pytorch_model.bin` → index+shards), raising one error listing all of them; `is_available` never touches the network.
+`download_model` tries `config.json` then the weight candidates in order — `model.safetensors`, its `.index.json` (+ shards), `pytorch_model.bin`, its `.index.json` (+ shards) — raising one error listing all of them; note this ordering differs from the library's `weights.load_checkpoint` (which prefers each plain file before its index); `is_available` never touches the network.
 CLI: `python etl_hf/tests/hf_download.py [--slugs a,b] [--root DIR] [--check]`, one line per model, non-zero exit on failure.
 
 ## Known Issues / quirks
