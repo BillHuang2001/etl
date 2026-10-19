@@ -272,11 +272,15 @@ Facts about the current matrix worth knowing before re-running it:
 - `iree/llvm-cpu` cannot compile `distilgpt2`/`gpt2` at `seq_len=128` (works at 32):
   `'func.func' op exceeded stack allocation limit of 32768 bytes for function` — an upstream
   iree-compile limit, independent of packing and of any harness option.
-- `iree-vulkan` (lavapipe) runs the two tiny checkpoints and fails the rest by construction of the
-  target: the 124M models exceed the default Vulkan target's 16 KiB workgroup-memory budget in the
-  LayerNorm-shaped reduction (or fail `vector.from_elements` legalization at `seq_len=128`), and
-  `tiny_mistral` hits the exact-`erf`-GELU activation gate. Details in the `hf_bench_vulkan.py`
-  section below.
+- `iree-vulkan` (lavapipe, library defaults → `opt_level="O3"`) runs the two tiny checkpoints and
+  fails the other five by construction of the target: the 124M models exceed the default Vulkan
+  target's 16 KiB workgroup-memory budget in the LayerNorm-shaped reduction (`uses 196864 bytes of
+  shared memory; exceeded the limit of 16384 bytes`) or fail `vector.from_elements` legalization at
+  `seq_len=128`, and `tiny_mistral` hits the exact-`erf`-GELU activation gate.
+- `iree-vulkan-o1` (hand-picked `opt_level="O1"`) runs **all seven** cells, including the four
+  124M-class graphs the default level cannot compile; `O2`/`O3` both fail identically, so the two
+  levels are separate legs and their numbers are not comparable. Details in the `hf_bench_vulkan.py`
+  section below; the compile diagnosis is in `./vulkan_findings.md`.
 - Inductor/Triton caches must not live under `$HOME` (a read-only mount here): the harness points
   `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
   `torchcompile-*` legs.
