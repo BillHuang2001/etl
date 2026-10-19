@@ -1,0 +1,404 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "etl",
+  "provenance": {
+    "model": "tiny_gpt2",
+    "golden_slug": "tiny_gpt2",
+    "seq_len": 32,
+    "leg": "iree-rocm",
+    "timestamp": "2026-10-19T11:07:12Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "38a379a21b1eebb61223749c2da8dd0e0a07c343",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "iree-rocm",
+      "--models",
+      "tiny_gpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "iree-rocm",
+    "kind": "etl",
+    "backend": "iree",
+    "device": "rocm:0",
+    "device_resident": true,
+    "options_requested": {
+      "target_backends": [
+        "rocm"
+      ]
+    },
+    "pack": {
+      "mode": "auto",
+      "packed": false,
+      "reason": "auto: unpacked (below the input limit, no staging benefit)"
+    },
+    "resolved_backend": "iree",
+    "options_resolved": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O1"
+    }
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "pack: auto: unpacked (below the input limit, no staging benefit)",
+    "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)",
+    "device-resident: weights and ids are placed ONCE; the measured loop is a same-device loop (nothing is restaged, the output never auto-copies to the host)"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_gpt2",
+    "batch": 1,
+    "family": "gpt2",
+    "model_type": "gpt2",
+    "hidden_act": "gelu_new",
+    "config_digest": "573f391d464ea301",
+    "vocab_size": 50257,
+    "hidden_size": 2,
+    "num_hidden_layers": 2,
+    "tie_word_embeddings": true,
+    "param_count": 102714,
+    "param_bytes": 410856,
+    "weight_keys": [
+      "embed.weight",
+      "final_norm.bias",
+      "final_norm.weight",
+      "layers.0.attn.k.bias",
+      "layers.0.attn.k.weight",
+      "layers.0.attn.o.bias",
+      "layers.0.attn.o.weight",
+      "layers.0.attn.q.bias",
+      "layers.0.attn.q.weight",
+      "layers.0.attn.v.bias",
+      "layers.0.attn.v.weight",
+      "layers.0.attn_norm.bias",
+      "layers.0.attn_norm.weight",
+      "layers.0.mlp.fc1.bias",
+      "layers.0.mlp.fc1.weight",
+      "layers.0.mlp.fc2.bias",
+      "layers.0.mlp.fc2.weight",
+      "layers.0.mlp_norm.bias",
+      "layers.0.mlp_norm.weight",
+      "layers.1.attn.k.bias",
+      "layers.1.attn.k.weight",
+      "layers.1.attn.o.bias",
+      "layers.1.attn.o.weight",
+      "layers.1.attn.q.bias",
+      "layers.1.attn.q.weight",
+      "layers.1.attn.v.bias",
+      "layers.1.attn.v.weight",
+      "layers.1.attn_norm.bias",
+      "layers.1.attn_norm.weight",
+      "layers.1.mlp.fc1.bias",
+      "layers.1.mlp.fc1.weight",
+      "layers.1.mlp.fc2.bias",
+      "layers.1.mlp.fc2.weight",
+      "layers.1.mlp_norm.bias",
+      "layers.1.mlp_norm.weight",
+      "pos_embed.weight"
+    ]
+  },
+  "graph": {
+    "load_hf_ms": 4.7739,
+    "unpacked_graph_inputs": 37,
+    "packed_graph_inputs": 4,
+    "pack_plan_inputs": 3,
+    "param_specs_ms": 0.0426,
+    "weight_inputs": 36,
+    "graph_inputs": 37,
+    "packed_input_names": [
+      "packed.0",
+      "packed.1",
+      "packed.2"
+    ],
+    "trace_ms": 52.5366,
+    "ir_ops": 170,
+    "ir_distinct_ops": 19,
+    "ir_histogram": {
+      "add": 33,
+      "multiply": 30,
+      "constant": 24,
+      "dot": 17,
+      "reshape": 11,
+      "transpose": 11,
+      "reduce_mean": 10,
+      "subtract": 8,
+      "divide": 7,
+      "sqrt": 5,
+      "exp": 2,
+      "gather": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "tanh": 2,
+      "broadcast": 1,
+      "cast": 1,
+      "less_equal": 1,
+      "return": 1
+    },
+    "stablehlo_bytes": 34194,
+    "stablehlo_export_ms": 4.8745
+  },
+  "parity": {
+    "ids_source": "synthesized (i*7+3) % vocab_size=50257 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": false,
+      "reason": "golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 2.2351741790771484e-08,
+      "mean_abs": 2.463568238297853e-10,
+      "rel_to_absmax": 1.7335290181108576e-07,
+      "ref_absmax": 0.12893779575824738,
+      "cand_absmax": 0.12893779575824738,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_gpt2__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 2.9802322387695312e-08,
+      "mean_abs": 6.541496788692314e-10,
+      "rel_to_absmax": 2.3113720715173258e-07,
+      "ref_absmax": 0.12893779575824738,
+      "cand_absmax": 0.12893779575824738,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_gpt2__s32__torch-cpu.logits.npz",
+      "reference_leg": "torch-cpu"
+    },
+    "vs_torch_rocm": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 2.9802322387695312e-08,
+      "mean_abs": 1.1978861236272564e-09,
+      "rel_to_absmax": 2.3113720715173258e-07,
+      "ref_absmax": 0.12893779575824738,
+      "cand_absmax": 0.12893779575824738,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_gpt2__s32__torch-rocm.logits.npz",
+      "reference_leg": "torch-rocm"
+    }
+  },
+  "build": {
+    "stage_timing": "build_total",
+    "build_total_ms": 1106.8322,
+    "executable_device": "Device(kind='rocm', index=0)",
+    "resolved_options": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O1"
+    },
+    "build_total_cached_ms": 3.6475
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "etl_hf.run(exe, place_params(params, device), place_ids(ids, device))",
+    "first_call_ms": 0.7082,
+    "logits_device": "Device(kind='rocm', index=0)",
+    "n": 5,
+    "best_ms": 0.216,
+    "median_ms": 0.2383,
+    "mean_ms": 0.2381,
+    "stdev_ms": 0.016,
+    "warmup": 2,
+    "tokens_per_s": 148148.15,
+    "peak_rss_mb": 1714.2,
+    "d2h": {
+      "n": 3,
+      "best_ms": 5.4514,
+      "median_ms": 7.7677,
+      "mean_ms": 7.0575,
+      "stdev_ms": 1.3941
+    },
+    "warm_with_d2h": {
+      "n": 5,
+      "best_ms": 7.9926,
+      "median_ms": 8.0662,
+      "mean_ms": 8.1449,
+      "stdev_ms": 0.1459
+    }
+  },
+  "staging": {
+    "place_params_ms": 107.5047,
+    "place_params_leaves": 36,
+    "place_ids_ms": 0.1095,
+    "place_params_steady": {
+      "n": 3,
+      "best_ms": 1.821,
+      "median_ms": 1.8994,
+      "mean_ms": 1.9298,
+      "stdev_ms": 0.1268
+    }
+  },
+  "checks": {
+    "checked": true,
+    "asdevicearray_calls": 0,
+    "reason": null,
+    "zero_asdevicearray_after_warmup": true
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      50257
+    ],
+    "absmax": 0.12893779575824738,
+    "mean": -2.771486606434337e-06,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/tiny_gpt2__s32__iree-rocm.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 1.93,
+    "timed_out": false,
+    "stderr_tail": [],
+    "stdout_tail": [
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] d2h",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/tiny_gpt2__s32__iree-rocm.json",
+      "[leg] tiny_gpt2/s32/iree-rocm: ok -> bench_logs/hf_bench_data/tiny_gpt2__s32__iree-rocm.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "iree-rocm",
+      "--models",
+      "tiny_gpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """HF whole-forward perf/parity matrix probe for the ``etl_hf`` package.
 
+Historical probe: this file produced the committed matrix in
+``bench_logs/hf_perf_results.md`` and remains the regeneration path for it;
+``bench_logs/hf_bench.py`` is the current, forward-looking ``etl_hf``
+benchmark harness (do not port new work into this file).
+
 Compares the **whole-model forward pass as ONE etl graph** (``etl_hf``)
 across the execution paths that exist for it, on the four checkpoints whose
 torch goldens are committed in :mod:`bench_logs/hf_goldens/`:
@@ -14,7 +19,7 @@ backend key             what it is
 ``iree-rocm``           IREE compiled for ROCm (the MI300X), **device
                         resident**: weights placed ONCE with
                         ``etl_hf.place_params`` and then a same-device loop
-                        through ``etl_hf.run_model`` (the documented fast
+                        through ``etl_hf.run`` (the documented fast
                         iteration pattern)
 ======================  ==================================================
 
@@ -27,8 +32,9 @@ runtime limit, so the packed keys are the rows that make ``gpt2`` runnable on
 a compiler backend at all; the unpacked keys stay in the matrix as the
 comparison (and as the honest record of the input-count cliff).
 
-Compile options are **the library defaults**: ``etl_hf.resolve_build_options``
-is asked what it would inject — ``opt_level="O3"`` for llvm-cpu,
+Compile options are **the library defaults**:
+``etl_hf.pipeline.resolve_build_options`` is asked what it would inject —
+``opt_level="O3"`` for llvm-cpu,
 ``opt_level="O1"`` for an all-ROCm target set (IREE's ROCm codegen rejects
 O2/O3 on these transformer-shaped graphs; ``--opt-level-evidence`` additionally
 re-attempts the rejected levels so the report can quote the real upstream
@@ -55,7 +61,11 @@ Design (why it looks like this)
   re-running overwrites it. ``--report`` re-renders the markdown from whatever
   JSONs exist, ``--leg`` runs a single child leg (what the parent does), and
   ``--sanity`` re-runs a small subset so a published row can be shown to
-  reproduce (the markdown prints both runs side by side).
+  reproduce (the markdown prints both runs side by side). ``--data-dir`` points
+  both the leg records and ``--report`` at another directory (so a small
+  verification subset never overwrites the committed matrix) and
+  ``--report-out`` sends the rendered markdown somewhere other than
+  ``hf_perf_results.md``.
 * **No downloads.** Checkpoints are resolved from the existing cache
   (``$ETL_HF_MODELS_DIR`` or ``$TMPDIR/etl_hf_models/<slug>``); a missing
   checkpoint is an explicit error naming the path, never a network fetch.
@@ -119,7 +129,7 @@ MODELS: dict[str, str] = {
     "gpt2": "gpt2",
 }
 
-#: Parameter counts above this are "big": their public ``build_model`` total is
+#: Parameter counts above this are "big": their public ``etl_hf.build`` total is
 #: NOT measured separately (it would repeat an expensive compile just to prove
 #: ``sum(stages) == build``); the stage sum is reported instead.
 BIG_PARAMS = 5_000_000
@@ -338,6 +348,21 @@ def _json_default(value):
 # ---------------------------------------------------------------------------
 # one leg = one (model, backend) cell, measured in its own process
 # ---------------------------------------------------------------------------
+def _ensure_checkout_importable() -> None:
+    """Put this checkout's root on ``sys.path`` so ``etl_hf`` is importable.
+
+    ``etl_hf`` is a **sibling** top-level package of ``etl`` in this repository
+    and is deliberately not part of the ``etl`` distribution, so a leg process
+    started as ``python bench_logs/probe_hf_perf.py`` (``sys.path[0]`` =
+    ``bench_logs/``) cannot import it from an installed wheel alone. Prepending
+    the checkout root is exactly what the repository layout provides; nothing is
+    installed, fetched or written.
+    """
+    root = str(HERE.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
 def run_leg(
     model_name: str,
     backend_key: str,
@@ -350,13 +375,15 @@ def run_leg(
     opt_level_evidence: bool = False,
 ) -> dict:
     """Measure one (model, backend) cell and return its record (never raises)."""
+    _ensure_checkout_importable()
+
     import numpy as np
 
     import etl
     import etl_hf
     from etl import core as core
     from etl.backends import stablehlo
-    from etl_hf import build as hf_build
+    from etl_hf import pipeline as hf_pipeline
 
     spec = BACKENDS[backend_key]
     golden_slug = MODELS[model_name]
@@ -399,28 +426,30 @@ def run_leg(
     try:
         ckpt = checkpoint_dir(model_name)
         record["model"]["checkpoint_dir"] = str(ckpt)
-        model, load_s = _timeit(etl_hf.load_hf, ckpt, seq_len=seq_len, batch_size=batch)
+        loaded_model, load_s = _timeit(etl_hf.load_hf, ckpt)
     except Exception as exc:
         record["status"] = "error"
         record["errors"].append(f"load_hf: {type(exc).__name__}: {exc}")
         return record
 
+    cfg = loaded_model.config
     record["model"].update(
         {
-            "family": model.family,
-            "model_type": model.config.model_type,
-            "hidden_act": model.config.hidden_act,
-            "num_hidden_layers": model.config.num_hidden_layers,
-            "hidden_size": model.config.hidden_size,
-            "vocab_size": model.config.vocab_size,
-            "tie_word_embeddings": model.config.tie_word_embeddings,
-            "config_digest": model.config.digest,
+            "family": loaded_model.family,
+            "model_type": cfg.model_type,
+            "hidden_act": cfg.hidden_act,
+            "num_hidden_layers": cfg.num_hidden_layers,
+            "hidden_size": cfg.hidden_size,
+            "vocab_size": cfg.vocab_size,
+            "tie_word_embeddings": cfg.tie_word_embeddings,
+            "config_digest": cfg.digest,
+            "api": "etl_hf functional (load_hf / forward_fn / param_specs / build / run)",
         }
     )
     record["graph"] = {"load_hf_ms": _ms(load_s)}
 
     # -- graph shape: one graph, weights as inputs ---------------------------
-    specs = model.param_specs(pack_weights=spec.packed)
+    specs = etl_hf.param_specs(cfg, pack_weights=spec.packed)
     param_count = 0
     for value in specs.values():
         total = 1
@@ -440,19 +469,17 @@ def run_leg(
 
     _progress("trace")
     try:
-        # The packed forward is the same memoised ``@etl.defn`` the library
-        # builds; it is public behaviour but a private factory, so fall back to
-        # the canonical ``graph_fn`` (unpacked only) if that ever moves.
-        if spec.packed or not hasattr(hf_build, "_forward_fn"):
-            forward = hf_build._forward_fn(
-                model._family_spec,
-                model.config,
-                seq_len,
-                batch,
-                spec.packed,
-            )
-        else:
-            forward = model.graph_fn()
+        # The forward is the library's own memoised ``@etl.defn``:
+        # ``(params, input_ids) -> logits``, every weight a graph input, all
+        # shapes static. ``seq_len`` / ``batch_size`` / ``pack_weights`` are
+        # BUILD-time specialisation values, so they are passed to
+        # ``forward_fn`` (not fields of the loaded record).
+        forward = etl_hf.forward_fn(
+            cfg,
+            seq_len=seq_len,
+            batch_size=batch,
+            pack_weights=spec.packed,
+        )
         graph, trace_s = _timeit(
             etl.trace,
             forward,
@@ -511,7 +538,7 @@ def run_leg(
 
     # -- resolved build options (the etl_hf default matrix) -----------------
     try:
-        resolved_backend, resolved_options = hf_build.resolve_build_options(
+        resolved_backend, resolved_options = hf_pipeline.resolve_build_options(
             spec.backend, device, spec.options
         )
     except Exception as exc:
@@ -525,7 +552,7 @@ def run_leg(
         }
     )
 
-    # -- explicit stage timings (the same composition build_model performs) ---
+    # -- explicit stage timings (the same composition etl_hf.build performs) --
     # The resolved ``opt_level`` is the library default for this target set
     # (``O3`` llvm-cpu, ``O1`` for an all-ROCm target set). It is attempted
     # FIRST — that is the measured row. Only if it is rejected does the probe
@@ -643,13 +670,17 @@ def run_leg(
     if measure_public_build is None:
         measure_public_build = param_count <= BIG_PARAMS
     if measure_public_build:
-        _progress("public build_model")
+        _progress("public etl_hf.build")
         try:
             public_options = dict(spec.options)
             if used_options.get("opt_level"):
                 public_options["opt_level"] = used_options["opt_level"]
             public_exe, public_s = _timeit(
-                model.build,
+                etl_hf.build,
+                forward,
+                cfg,
+                seq_len=seq_len,
+                batch_size=batch,
                 backend=spec.backend,
                 device=device,
                 pack_weights=spec.packed,
@@ -661,22 +692,26 @@ def run_leg(
             record["build"]["public_build_error"] = f"{type(exc).__name__}: {exc}"
     else:
         notes.append(
-            "public build_model total not measured (expensive re-compile); "
-            "stage_sum_ms is the composition build_model performs"
+            "public etl_hf.build total not measured (expensive re-compile); "
+            "stage_sum_ms is the composition etl_hf.build performs"
         )
 
     # -- placement + run ----------------------------------------------------
-    host_params = model.params()
+    host_params = loaded_model.params
     if spec.packed:
         # pack ONCE on the host (never per run): the packed tree is what a
-        # ``pack_weights=True`` executable takes.
-        packed_host, pack_s = _timeit(model.pack_params, host_params)
+        # ``pack_weights=True`` executable takes. The plan comes from the
+        # canonical specs (never a hard-coded input count).
+        plan = etl_hf.pack_plan(etl_hf.param_specs(cfg))
+        packed_host, pack_s = _timeit(etl_hf.pack_params, plan, host_params)
         host_params = packed_host
         record["graph"]["pack_params_ms"] = _ms(pack_s)
         record["graph"]["packed_inputs"] = len(packed_host)
+        record["graph"]["pack_plan_inputs"] = len(plan.specs)
         notes.append(
-            "packed weights: host params concatenated ONCE with HFModel.pack_params "
-            f"({len(packed_host)} inputs); the graph unpacks them with static etl.slice"
+            "packed weights: host params concatenated ONCE with "
+            f"etl_hf.pack_params ({len(packed_host)} inputs); the graph unpacks "
+            "them with static etl.slice"
         )
     run: dict = {"batch": batch, "seq_len": seq_len}
     record["run"] = run
@@ -703,11 +738,11 @@ def run_leg(
             ids_operand, ids_s = _timeit(etl_hf.place_ids, ids, device)
             run["place_ids_ms"] = _ms(ids_s)
             call = _device_call(executable, placed, ids_operand, etl_hf)
-            run["api"] = "etl_hf.run_model(placed params, place_ids(ids))"
+            run["api"] = "etl_hf.run(place_params(params), place_ids(ids))"
             to_host = etl.core.Device("cpu", 0)
         else:
             call = _host_call(executable, host_params, ids, etl, etl_hf)
-            run["api"] = "etl_hf.run_model(host params, host ids)"
+            run["api"] = "etl_hf.run(host params, host ids)"
             to_host = None
     except Exception as exc:
         record["status"] = "error"
@@ -781,7 +816,7 @@ def run_leg(
                 for _ in range(restage_iters):
                     start = time.perf_counter()
                     placed_again = etl_hf.place_params(host_params, device)
-                    etl_hf.run_model(executable, placed_again, ids_operand)
+                    etl_hf.run(executable, placed_again, ids_operand)
                     restage_samples.append(time.perf_counter() - start)
                 # per-call placement cost alone (one H2D per weight input)
                 place_only = []
@@ -791,7 +826,7 @@ def run_leg(
                 run["restage"] = _summarize(restage_samples)
                 run["restage_placement_only"] = _summarize(place_only)
                 notes.append(
-                    "restage = etl_hf.place_params(host params) + etl_hf.run_model per "
+                    "restage = etl_hf.place_params(host params) + etl_hf.run per "
                     "call (the documented per-call restaging anti-pattern)"
                 )
             except Exception as exc:
@@ -838,24 +873,24 @@ def run_leg(
 
 
 def _host_call(executable, params, ids, etl, etl_hf):
-    """Callable for a cpu executable through the public ``run_model`` API."""
+    """Callable for a cpu executable through the public ``etl_hf.run`` API."""
 
     def call():
-        return etl_hf.run_model(executable, params, ids)
+        return etl_hf.run(executable, params, ids)
 
     return call
 
 
 def _device_call(executable, placed, ids_operand, etl_hf):
-    """Callable for a device-resident executable through public ``run_model``.
+    """Callable for a device-resident executable through public ``etl_hf.run``.
 
-    ``run_model`` validates an ``etl.Tensor`` ids argument from its METADATA
+    ``etl_hf.run`` validates an ``etl.Tensor`` ids argument from its METADATA
     only and forwards it verbatim, so this is the documented device-resident
     path — no raw ``etl.run`` short-circuit, no host copy.
     """
 
     def call():
-        return etl_hf.run_model(executable, placed, ids_operand)
+        return etl_hf.run(executable, placed, ids_operand)
 
     return call
 
@@ -974,6 +1009,8 @@ def run_child_leg(
         str(restage_iters),
         "--out",
         str(target),
+        "--data-dir",
+        str(DATA_DIR),
     ]
     if attempt_oversize:
         command.append("--attempt-oversize")
@@ -1103,18 +1140,26 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
 
     add("# `etl_hf` whole-model forward: perf & parity matrix (numpy / IREE-CPU / IREE-ROCm)")
     add("")
+    # Which directory the records were read from (the default renders exactly as
+    # before; a `--data-dir` run names its own path instead of claiming the
+    # committed one).
+    try:
+        data_label = str(DATA_DIR.resolve().relative_to(HERE.parent))
+    except ValueError:
+        data_label = str(DATA_DIR)
     add(
         "Generated by `bench_logs/probe_hf_perf.py` — **do not hand-edit**; re-run the "
-        "probe (or `--report`) instead. Raw per-leg records: `bench_logs/hf_perf_data/*.json`."
+        f"probe (or `--report`) instead. Raw per-leg records: `{data_label}/*.json`."
     )
     add("")
     add("Each cell measures the **whole model forward pass as ONE etl graph** through")
-    add("`etl_hf`'s public API: `load_hf` → `etl_hf.build_model` (trace → lower → compile →")
-    add("load) → run, with the checkpoint weights as ordinary graph **inputs**.")
+    add("`etl_hf`'s public API: `load_hf` → `forward_fn` (`etl_hf.build` = trace → lower →")
+    add("compile → load) → `etl_hf.run`, with the checkpoint weights as ordinary graph")
+    add("**inputs**.")
     add("")
     add("Every backend row exists twice: **unpacked** (one graph input per weight input,")
     add("the canonical tree) and **packed** (`pack_weights=True`; key suffix `-packed`), where")
-    add("`HFModel.pack_params` concatenates the weight tree on the host into a handful of")
+    add("`etl_hf.pack_params` concatenates the weight tree on the host into a handful of")
     add("inputs that the graph unpacks with static `etl.slice`. Packing is what brings the")
     add("124M `gpt2` graph (197 unpacked inputs) under IREE's ~161-consumed-input runtime")
     add("limit — the packed rows are the ones that make it runnable on a compiler backend.")
@@ -1125,7 +1170,7 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
     add("|---|---|")
     add(
         "| latency | `best` of N warm calls (after a warmup) of "
-        "`etl_hf.run_model(exe, params, ids)` — on the device-resident rows with "
+        "`etl_hf.run(exe, params, ids)` — on the device-resident rows with "
         "`place_params`-ed weights and a `place_ids`-ed ids tensor (the documented device "
         "recipe, through the public API). `first` is the very first call after load (includes "
         "the executable's input/output plan building). `median`/`mean` in the JSON. |"
@@ -1141,17 +1186,17 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "documented per-call host→device restaging trap, measured on the same graph. |"
     )
     add(
-        "| packed weights | `HFModel.pack_params` runs ONCE on the host (its cost is recorded "
+        "| packed weights | `etl_hf.pack_params` runs ONCE on the host (its cost is recorded "
         "as `pack_params_ms`); the executable is built with `pack_weights=True`, and every "
         "latency/parity number below is the packed executable's. |"
     )
     add(
         "| build times | explicit `etl.lower` / `etl.compile` / `etl.load` on the traced graph, "
-        "with the options `etl_hf.resolve_build_options` resolves — the **library defaults** "
-        "(`opt_level=\"O3\"` for llvm-cpu, `opt_level=\"O1\"` for an all-ROCm target set, plus "
-        "`--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for llvm-cpu). `stage sum` "
-        "is that composition; the public one-call `build_model` total is measured separately "
-        "where cheap (small models) as a cross-check. |"
+        "with the options `etl_hf.pipeline.resolve_build_options` resolves — the **library "
+        "defaults** (`opt_level=\"O3\"` for llvm-cpu, `opt_level=\"O1\"` for an all-ROCm "
+        "target set, plus `--iree-llvmcpu-target-cpu=host` + `--iree-opt-data-tiling` for "
+        "llvm-cpu). `stage sum` is that composition; the public one-call `etl_hf.build` total "
+        "is measured separately where cheap (small models) as a cross-check. |"
     )
     add(
         "| parity | `max-abs` of this leg's logits vs (a) the **torch/transformers golden** in "
@@ -1176,6 +1221,24 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
             "recorded in each JSON under `measurement`).".format(
                 measurement.get("iters"), measurement.get("warmup"), measurement.get("restage_iters")
             )
+        )
+        add("")
+
+    # Which `etl_hf` API generation wrote the records (older JSONs predate the
+    # `model.api` field, so an absent value is reported as legacy — never
+    # guessed at, and never a crash).
+    api_generations: dict[str, int] = {}
+    for record in records.values():
+        marker = (record.get("model") or {}).get("api") or "legacy (`HFModel` object API)"
+        api_generations[marker] = api_generations.get(marker, 0) + 1
+    if api_generations:
+        add(
+            "`etl_hf` API generation of the recorded legs: "
+            + ", ".join(
+                f"`{marker}` ({count} leg{'s' if count != 1 else ''})"
+                for marker, count in sorted(api_generations.items())
+            )
+            + "."
         )
         add("")
 
@@ -1284,7 +1347,7 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "defaults: `O3` for llvm-cpu, `O1` for an all-ROCm target set — section 7 explains the "
         "O2/O3 ROCm rejection that forces it). Compile time is the IREE compile of the "
         "whole-model graph (the numpy interpreter has no compile step). `public build` is the "
-        "cold `etl_hf.build_model` total where measured — it re-runs the stages, so it should "
+        "cold `etl_hf.build` total where measured — it re-runs the stages, so it should "
         "be ≳ the stage sum (it also does `load_hf`-side work and graph memoisation "
         "bookkeeping)."
     )
@@ -1319,7 +1382,7 @@ def render_report(records: dict, sanity: dict, crash: dict | None = None) -> str
         "call (what you pay if you need the logits on the host); `restage best` = the whole "
         "weight tree re-placed on the device every call — the documented anti-pattern, and "
         "why the device loop above is the fast iteration pattern. Device rows are driven "
-        "through `etl_hf.run_model(exe, place_params(...), place_ids(...))` — the public "
+        "through `etl_hf.run(exe, place_params(...), place_ids(...))` — the public "
         "`etl_hf` API, no raw `etl.run` short-circuit (the leg records `run.api`)."
     )
     add("")
@@ -1882,8 +1945,9 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
         out.append(
             f"- **Compile cost is a one-off**: the largest measured compile is `{value:,.0f} ms` "
             f"(`{model}` / `{backend}`); everything after it is the per-call latency above. "
-            "`etl_hf.build_model` memoises the traced forward per `(family, config, seq_len, "
-            "batch, packed)`, so repeated builds of the same shape reuse the executable."
+            "`etl_hf.forward_fn` memoises the traced forward per `(family, config, seq_len, "
+            "batch, packed)` and `etl_hf.build` memoises the executable, so repeated builds of "
+            "the same shape reuse the executable."
         )
 
     # hypothesis — everything above is measured; this item is explicitly not
@@ -1918,6 +1982,8 @@ def _findings(records: dict, models: list[str], backends: list[str]) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
+    global DATA_DIR, REPORT_PATH
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--models", default=",".join(MODELS),
                         help=f"comma-separated subset of {sorted(MODELS)}")
@@ -1946,10 +2012,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-public-build", action="store_true",
                         help="never measure the public one-call build (stage sum only)")
     parser.add_argument("--report", action="store_true", help="only re-render the markdown")
+    parser.add_argument("--data-dir", default=str(DATA_DIR),
+                        help="directory holding the per-leg JSON records (default: "
+                             "bench_logs/hf_perf_data); point it elsewhere to measure or "
+                             "render a subset without touching the committed matrix")
+    parser.add_argument("--report-out", default=str(REPORT_PATH),
+                        help="path the rendered markdown is written to (default: "
+                             "bench_logs/hf_perf_results.md)")
     parser.add_argument("--leg", help="internal: run one leg in this process")
     parser.add_argument("--backend", help="internal: backend key for --leg")
     parser.add_argument("--out", help="internal: JSON path for --leg")
     args = parser.parse_args(argv)
+
+    DATA_DIR = Path(args.data_dir).expanduser()
+    REPORT_PATH = Path(args.report_out).expanduser()
 
     if args.leg:
         if args.backend not in BACKENDS:

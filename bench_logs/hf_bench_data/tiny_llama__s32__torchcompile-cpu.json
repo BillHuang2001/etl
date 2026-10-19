@@ -1,0 +1,262 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "torch",
+  "provenance": {
+    "model": "tiny_llama",
+    "golden_slug": "tiny_random_llama",
+    "seq_len": 32,
+    "leg": "torchcompile-cpu",
+    "timestamp": "2026-10-19T11:00:38Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "bd092767b813d359499aaf2952f1e98c435b3166",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "torchcompile-cpu",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "1",
+      "--repeat",
+      "3",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": null
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": null,
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "torchcompile-cpu",
+    "kind": "torch",
+    "backend": null,
+    "device": "cpu",
+    "device_resident": false,
+    "torch_compile": true
+  },
+  "measurement": {
+    "warmup": 1,
+    "repeat": 3,
+    "batch": 1
+  },
+  "notes": [
+    "torch.compile compiles lazily: the first measured call includes the Inductor compilation",
+    "CPU wall time per forward call"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_llama",
+    "batch": 1,
+    "from_pretrained_kwargs": {
+      "local_files_only": "True",
+      "dtype": "torch.float32",
+      "attn_implementation": "eager"
+    },
+    "family": "torch",
+    "model_class": "LlamaForCausalLM",
+    "config_model_type": "llama",
+    "param_count": 1032272,
+    "param_bytes": 4129088,
+    "dtype": "torch.float32"
+  },
+  "build": {
+    "stage_timing": "torch",
+    "torch_compile_call_ms": 449.0404
+  },
+  "parity": {
+    "ids_source": "synthesized (i*7+3) % vocab_size=32000 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": false,
+      "reason": "golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 1.043081283569336e-07,
+      "mean_abs": 4.777422013546584e-09,
+      "rel_to_absmax": 2.4974804091471015e-07,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.4176533818244934,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 8.940696716308594e-08,
+      "mean_abs": 3.926878822113622e-09,
+      "rel_to_absmax": 2.1406974326509953e-07,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.4176533818244934,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__torch-cpu.logits.npz",
+      "reference_leg": "torch-cpu"
+    },
+    "vs_torch_rocm": {
+      "comparable": false,
+      "reason": "no logits on disk for the torch-rocm leg"
+    }
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "model(input_ids=ids).logits",
+    "first_call_ms": 27092.4347,
+    "n": 3,
+    "best_ms": 0.323,
+    "median_ms": 0.3735,
+    "mean_ms": 0.4525,
+    "stdev_ms": 0.1823,
+    "warmup": 1,
+    "tokens_per_s": 99071.21,
+    "peak_rss_mb": 3201.4,
+    "d2h": {
+      "applicable": false,
+      "reason": "the output is already host-resident"
+    }
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      32000
+    ],
+    "absmax": 0.4176533818244934,
+    "mean": 6.767003651475534e-05,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/tiny_llama__s32__torchcompile-cpu.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 35.19,
+    "timed_out": false,
+    "stderr_tail": [
+      "[transformers] The following generation flags are not valid and may be ignored: ['pad_token_id']. Set `TRANSFORMERS_VERBOSITY=info` for more details.",
+      "Loading weights:   0%|          | 0/21 [00:00<?, ?it/s]",
+      "Loading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 21/21 [00:00<00:00, 43453.57it/s]",
+      "/root/.local/share/uv/python/cpython-3.14.8-linux-x86_64-gnu/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-jefsuy5m'}",
+      "  warnings.warn("
+    ],
+    "stdout_tail": [
+      "[stage] torch.compile",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/tiny_llama__s32__torchcompile-cpu.json",
+      "[leg] tiny_llama/s32/torchcompile-cpu: ok -> bench_logs/hf_bench_data/tiny_llama__s32__torchcompile-cpu.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "torchcompile-cpu",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "1",
+      "--repeat",
+      "3",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}

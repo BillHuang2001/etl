@@ -1,0 +1,404 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "etl",
+  "provenance": {
+    "model": "tiny_llama",
+    "golden_slug": "tiny_random_llama",
+    "seq_len": 32,
+    "leg": "iree-rocm",
+    "timestamp": "2026-10-19T11:06:54Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "38a379a21b1eebb61223749c2da8dd0e0a07c343",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "iree-rocm",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": "--xla_gpu_enable_command_buffer=",
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "iree-rocm",
+    "kind": "etl",
+    "backend": "iree",
+    "device": "rocm:0",
+    "device_resident": true,
+    "options_requested": {
+      "target_backends": [
+        "rocm"
+      ]
+    },
+    "pack": {
+      "mode": "auto",
+      "packed": false,
+      "reason": "auto: unpacked (below the input limit, no staging benefit)"
+    },
+    "resolved_backend": "iree",
+    "options_resolved": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O1"
+    }
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "pack: auto: unpacked (below the input limit, no staging benefit)",
+    "build stage times are reported as build_total: etl_hf.build runs trace -> lower -> compile -> load through etl.build_cached, so the inner stages are not separately observable (pass --stage-timings for an explicit, additionally-compiled lower/compile/load breakdown)",
+    "device-resident: weights and ids are placed ONCE; the measured loop is a same-device loop (nothing is restaged, the output never auto-copies to the host)"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_llama",
+    "batch": 1,
+    "family": "llama",
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "config_digest": "2d3a50f18a1a185a",
+    "vocab_size": 32000,
+    "hidden_size": 16,
+    "num_hidden_layers": 2,
+    "tie_word_embeddings": false,
+    "param_count": 1032272,
+    "param_bytes": 4129088,
+    "weight_keys": [
+      "embed.weight",
+      "final_norm.weight",
+      "layers.0.attn.k.weight",
+      "layers.0.attn.o.weight",
+      "layers.0.attn.q.weight",
+      "layers.0.attn.v.weight",
+      "layers.0.attn_norm.weight",
+      "layers.0.mlp.down.weight",
+      "layers.0.mlp.gate.weight",
+      "layers.0.mlp.up.weight",
+      "layers.0.mlp_norm.weight",
+      "layers.1.attn.k.weight",
+      "layers.1.attn.o.weight",
+      "layers.1.attn.q.weight",
+      "layers.1.attn.v.weight",
+      "layers.1.attn_norm.weight",
+      "layers.1.mlp.down.weight",
+      "layers.1.mlp.gate.weight",
+      "layers.1.mlp.up.weight",
+      "layers.1.mlp_norm.weight",
+      "lm_head.weight"
+    ]
+  },
+  "graph": {
+    "load_hf_ms": 8.749,
+    "unpacked_graph_inputs": 22,
+    "packed_graph_inputs": 5,
+    "pack_plan_inputs": 4,
+    "param_specs_ms": 0.0358,
+    "weight_inputs": 21,
+    "graph_inputs": 22,
+    "packed_input_names": [
+      "packed.0",
+      "packed.1",
+      "packed.2",
+      "packed.3"
+    ],
+    "trace_ms": 53.1077,
+    "ir_ops": 170,
+    "ir_distinct_ops": 24,
+    "ir_histogram": {
+      "multiply": 32,
+      "reshape": 21,
+      "constant": 19,
+      "dot": 19,
+      "add": 15,
+      "transpose": 10,
+      "slice": 8,
+      "divide": 7,
+      "concatenate": 5,
+      "reduce_mean": 5,
+      "sqrt": 5,
+      "negate": 4,
+      "cast": 3,
+      "subtract": 3,
+      "exp": 2,
+      "reduce_max": 2,
+      "reduce_sum": 2,
+      "sigmoid": 2,
+      "cos": 1,
+      "gather": 1,
+      "less_equal": 1,
+      "power": 1,
+      "return": 1,
+      "sin": 1
+    },
+    "stablehlo_bytes": 29482,
+    "stablehlo_export_ms": 4.8028
+  },
+  "parity": {
+    "ids_source": "synthesized (i*7+3) % vocab_size=32000 [golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs]",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": false,
+      "reason": "golden fixture is 1x8 (input_ids (1, 8)) but this cell is 1x32 \u2014 compare against the torch / numpy legs"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 8.940696716308594e-08,
+      "mean_abs": 5.518063783682692e-09,
+      "rel_to_absmax": 2.1406974326509953e-07,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.4176533818244934,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 1.1920928955078125e-07,
+      "mean_abs": 5.938838310015626e-09,
+      "rel_to_absmax": 2.8542632435346604e-07,
+      "ref_absmax": 0.4176534414291382,
+      "cand_absmax": 0.4176533818244934,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__torch-cpu.logits.npz",
+      "reference_leg": "torch-cpu"
+    },
+    "vs_torch_rocm": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        32000
+      ],
+      "ref_shape": [
+        1,
+        32,
+        32000
+      ],
+      "max_abs": 8.940696716308594e-08,
+      "mean_abs": 5.351004972453666e-09,
+      "rel_to_absmax": 2.1406975747595425e-07,
+      "ref_absmax": 0.4176534116268158,
+      "cand_absmax": 0.4176533818244934,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/tiny_llama__s32__torch-rocm.logits.npz",
+      "reference_leg": "torch-rocm"
+    }
+  },
+  "build": {
+    "stage_timing": "build_total",
+    "build_total_ms": 1178.3549,
+    "executable_device": "Device(kind='rocm', index=0)",
+    "resolved_options": {
+      "target_backends": [
+        "rocm"
+      ],
+      "opt_level": "O1"
+    },
+    "build_total_cached_ms": 0.5241
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "etl_hf.run(exe, place_params(params, device), place_ids(ids, device))",
+    "first_call_ms": 0.7781,
+    "logits_device": "Device(kind='rocm', index=0)",
+    "n": 5,
+    "best_ms": 0.1975,
+    "median_ms": 0.2113,
+    "mean_ms": 0.2157,
+    "stdev_ms": 0.017,
+    "warmup": 2,
+    "tokens_per_s": 162025.32,
+    "peak_rss_mb": 1721.1,
+    "d2h": {
+      "n": 3,
+      "best_ms": 1.5082,
+      "median_ms": 1.5503,
+      "mean_ms": 1.5389,
+      "stdev_ms": 0.0269
+    },
+    "warm_with_d2h": {
+      "n": 5,
+      "best_ms": 1.7621,
+      "median_ms": 1.7994,
+      "mean_ms": 1.8156,
+      "stdev_ms": 0.0444
+    }
+  },
+  "staging": {
+    "place_params_ms": 87.7535,
+    "place_params_leaves": 21,
+    "place_ids_ms": 0.1937,
+    "place_params_steady": {
+      "n": 3,
+      "best_ms": 1.4326,
+      "median_ms": 1.4602,
+      "mean_ms": 1.5064,
+      "stdev_ms": 0.1049
+    }
+  },
+  "checks": {
+    "checked": true,
+    "asdevicearray_calls": 0,
+    "reason": null,
+    "zero_asdevicearray_after_warmup": true
+  },
+  "anti_pattern": {
+    "label": "ANTI-PATTERN: per-call host->device restage of the params tree",
+    "detail": "etl_hf.place_params(host params, device) + etl_hf.run per call",
+    "n": 5,
+    "best_ms": 1.7636,
+    "median_ms": 1.8732,
+    "mean_ms": 1.8944,
+    "stdev_ms": 0.1231
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      32000
+    ],
+    "absmax": 0.4176533818244934,
+    "mean": 6.767008017050102e-05,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/tiny_llama__s32__iree-rocm.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 1.83,
+    "timed_out": false,
+    "stderr_tail": [],
+    "stdout_tail": [
+      "[stage] warm loop",
+      "[stage] d2h",
+      "[stage] anti-pattern restage",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/tiny_llama__s32__iree-rocm.json",
+      "[leg] tiny_llama/s32/iree-rocm: ok -> bench_logs/hf_bench_data/tiny_llama__s32__iree-rocm.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A20/bench_logs/hf_bench.py",
+      "--leg",
+      "iree-rocm",
+      "--models",
+      "tiny_llama",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}

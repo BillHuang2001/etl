@@ -1,0 +1,844 @@
+{
+  "generated": "2026-10-19T10:56:19+00:00",
+  "host": {
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+    "system": "Linux",
+    "machine": "x86_64",
+    "cpu_count": 20,
+    "mem_total_gb": 235.9,
+    "python_system": "3.12.3",
+    "python_system_executable": "/usr/bin/python3",
+    "repo_root": "/root/etl/.genesis/workers/worker_T1_A17",
+    "tmpdir": "/tmp/genesis/task_9ee05e7d6b4cb450",
+    "rocm_smi": {
+      "product": "AMD Instinct MI300X VF",
+      "gfx": "gfx942",
+      "vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+      "driver_version": "6.16.6",
+      "gpu_use_percent": "0",
+      "rocm_smi_version": "ROCM-SMI version: 4.0.0+4179531dcd ROCM-SMI-LIB version: 7.8.0",
+      "rocm_version": "7.1.0",
+      "raw": {
+        "identity": {
+          "exit_code": 0,
+          "stdout_tail": [
+            "{\"card0\": {\"Card Series\": \"AMD Instinct MI300X VF\", \"Card Model\": \"0x74b5\", \"Card Vendor\": \"Advanced Micro Devices, Inc. [AMD/ATI]\", \"Card SKU\": \"M3000100\", \"Subsystem ID\": \"0x74a1\", \"Device Rev\": \"0x00\", \"Node ID\": \"1\", \"GUID\": \"21947\", \"GFX Version\": \"gfx942\"}, \"system\": {\"Driver version\": \"6.16.6\"}}"
+          ],
+          "stderr_tail": [
+            "WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status"
+          ],
+          "error": null
+        },
+        "use": {
+          "exit_code": 0,
+          "stdout_tail": [
+            "{\"card0\": {\"GPU use (%)\": \"0\", \"GFX Activity\": \"397493535\"}}"
+          ],
+          "stderr_tail": [
+            "WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status"
+          ],
+          "error": null
+        },
+        "version": {
+          "exit_code": 0,
+          "stdout_tail": [
+            "ROCM-SMI version: 4.0.0+4179531dcd",
+            "ROCM-SMI-LIB version: 7.8.0"
+          ],
+          "stderr_tail": [],
+          "error": null
+        }
+      }
+    }
+  },
+  "venv": {
+    "path": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv",
+    "python": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "python_version": "Python 3.14.8",
+    "created_this_run": false,
+    "uv_version": "uv 0.13.1 (x86_64-unknown-linux-gnu)",
+    "packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "click": "8.5.0",
+      "filelock": "4.2.4",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.7.0",
+      "httpcore2": "2.14.0",
+      "httpx2": "2.14.0",
+      "huggingface-hub": "2.2.0",
+      "idna": "3.20",
+      "iree-base-compiler": "3.11.0",
+      "iree-base-runtime": "3.11.0",
+      "jax-rocm7-pjrt": "0.11.2",
+      "jinja2": "3.1.6",
+      "markdown-it-py": "4.2.0",
+      "markupsafe": "3.0.4",
+      "mdurl": "0.1.2",
+      "ml-dtypes": "0.6.0",
+      "mpmath": "1.3.0",
+      "networkx": "3.7",
+      "numpy": "2.5.4",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "setuptools": "84.0.0",
+      "shellingham": "1.5.4",
+      "sympy": "1.14.0",
+      "tokenizers": "0.23.3",
+      "torch": "2.13.0+rocm7.1",
+      "tqdm": "4.70.1",
+      "transformers": "5.20.1",
+      "triton-rocm": "3.7.1",
+      "truststore": "0.10.5",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "notes": [
+      "reused the existing venv at /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv (no uv venv command run)",
+      "all required distributions are already present at the pinned versions \u2014 no install command was executed (idempotent re-run)"
+    ]
+  },
+  "install_commands": [
+    "uv pip install --python /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python --index-url https://download.pytorch.org/whl/rocm7.1 --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match torch==2.13.0+rocm7.1",
+    "uv pip install --python /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python numpy transformers safetensors iree-base-compiler==3.11.0 iree-base-runtime==3.11.0 jax-rocm7-pjrt==0.11.2"
+  ],
+  "install_commands_executed": [],
+  "install_runs": [],
+  "versions": {
+    "python": "Python 3.14.8",
+    "rocm_version": "7.1.0",
+    "amdgpu_kernel_driver": "6.16.6",
+    "numpy": "2.5.4",
+    "torch": "2.13.0+rocm7.1",
+    "torch_hip": "7.1.52802",
+    "torch_cuda_device_count": 1,
+    "transformers": "5.20.1",
+    "safetensors": "0.8.0",
+    "iree-base-compiler": "3.11.0",
+    "iree-base-runtime": "3.11.0",
+    "jax-rocm7-pjrt": "0.11.2",
+    "pjrt_plugin_path": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+    "etl": "0.1.0",
+    "etl_hf": "0.1.0",
+    "torch_device_name": "AMD Instinct MI300X VF",
+    "pjrt_plugin": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+    "python_executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "python_implementation": "CPython",
+    "iree_drivers": [
+      "cuda",
+      "hip",
+      "local-sync",
+      "local-task",
+      "vulkan"
+    ],
+    "jax_plugins_package": "namespace package: /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/jax_plugins",
+    "pjrt_plugin_bytes": 482734064,
+    "etl_devices": [
+      "cpu:0",
+      "cuda:0",
+      "rocm:0"
+    ],
+    "uv": "uv 0.13.1 (x86_64-unknown-linux-gnu)",
+    "annotated-doc": "0.0.5",
+    "anyio": "4.15.1",
+    "click": "8.5.0",
+    "filelock": "4.2.4",
+    "fsspec": "2026.9.0",
+    "h11": "0.16.0",
+    "hf-xet": "1.7.0",
+    "httpcore2": "2.14.0",
+    "httpx2": "2.14.0",
+    "huggingface-hub": "2.2.0",
+    "idna": "3.20",
+    "jinja2": "3.1.6",
+    "markdown-it-py": "4.2.0",
+    "markupsafe": "3.0.4",
+    "mdurl": "0.1.2",
+    "ml-dtypes": "0.6.0",
+    "mpmath": "1.3.0",
+    "networkx": "3.7",
+    "packaging": "26.3",
+    "pygments": "2.21.0",
+    "pyyaml": "6.0.3",
+    "regex": "2026.9.29",
+    "rich": "15.0.0",
+    "setuptools": "84.0.0",
+    "shellingham": "1.5.4",
+    "sympy": "1.14.0",
+    "tokenizers": "0.23.3",
+    "tqdm": "4.70.1",
+    "triton-rocm": "3.7.1",
+    "truststore": "0.10.5",
+    "typer": "0.27.3",
+    "typing-extensions": "4.16.0"
+  },
+  "device": {
+    "kind": "rocm",
+    "index": 0,
+    "name": "AMD Instinct MI300X VF",
+    "gfx": "gfx942",
+    "rocm_version": "7.1.0",
+    "amdgpu_kernel_driver": "6.16.6",
+    "hal_device_id": 1,
+    "torch_device_string": "cuda:0 (torch exposes ROCm through its cuda API)",
+    "etl_devices": [
+      {
+        "kind": "cpu",
+        "index": 0
+      },
+      {
+        "kind": "cuda",
+        "index": 0
+      },
+      {
+        "kind": "rocm",
+        "index": 0
+      }
+    ],
+    "iree_drivers": [
+      "cuda",
+      "hip",
+      "local-sync",
+      "local-task",
+      "vulkan"
+    ],
+    "accelerator_kind_probe": {
+      "cuda": {
+        "usable": false,
+        "error": "RuntimeError: Error creating driver: c/runtime/src/iree/hal/drivers/cuda/cuda_dynamic_symbols.c:66: UNAVAILABLE; CUDA driver library 'libcuda.so'/'nvcuda.dll' not available; please ensure installed and in dynamic library search path"
+      },
+      "rocm": {
+        "usable": true,
+        "sum": 12.0
+      }
+    },
+    "rocm_smi_gpu_use_percent": "0",
+    "note": "Use etl.core.Device('rocm', 0). etl.devices() ALSO lists cuda:0, but that kind is not runnable here \u2014 see accelerator_kind_probe for the verbatim error (iree's CUDA driver finds no libcuda.so on this AMD-only host)."
+  },
+  "checks": [
+    {
+      "name": "python",
+      "status": "pass",
+      "detail": "venv interpreter /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python: Python 3.14.8",
+      "versions": {
+        "python": "Python 3.14.8"
+      },
+      "measured": {
+        "python": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python"
+      },
+      "child": "parent"
+    },
+    {
+      "name": "rocm-smi",
+      "status": "pass",
+      "detail": "rocm-smi reports AMD Instinct MI300X VF (gfx gfx942), ROCm toolkit 7.1.0, amdgpu kernel driver 6.16.6, GPU use 0%; ROCM-SMI version: 4.0.0+4179531dcd ROCM-SMI-LIB version: 7.8.0",
+      "versions": {
+        "rocm_version": "7.1.0",
+        "amdgpu_kernel_driver": "6.16.6"
+      },
+      "measured": {
+        "gfx": "gfx942",
+        "product": "AMD Instinct MI300X VF",
+        "gpu_use_percent": "0",
+        "rocm_version": "7.1.0",
+        "amdgpu_kernel_driver": "6.16.6"
+      },
+      "child": "parent"
+    },
+    {
+      "name": "numpy",
+      "status": "pass",
+      "detail": "numpy 2.5.4 (/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/numpy/__init__.py)",
+      "versions": {
+        "numpy": "2.5.4"
+      },
+      "measured": {},
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "torch",
+      "status": "pass",
+      "detail": "torch 2.13.0+rocm7.1; torch.version.hip='7.1.52802'; torch.cuda.device_count()=1",
+      "versions": {
+        "torch": "2.13.0+rocm7.1",
+        "torch_hip": "7.1.52802",
+        "torch_cuda_device_count": 1
+      },
+      "measured": {
+        "cuda_device_count": 1
+      },
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "transformers",
+      "status": "pass",
+      "detail": "transformers 5.20.1 (/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/transformers/__init__.py)",
+      "versions": {
+        "transformers": "5.20.1"
+      },
+      "measured": {},
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "safetensors",
+      "status": "pass",
+      "detail": "safetensors 0.8.0 (/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/safetensors/__init__.py)",
+      "versions": {
+        "safetensors": "0.8.0"
+      },
+      "measured": {},
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "iree",
+      "status": "pass",
+      "detail": "iree-base-compiler 3.11.0 / iree-base-runtime 3.11.0 (matched); drivers=['cuda', 'hip', 'local-sync', 'local-task', 'vulkan']",
+      "versions": {
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0"
+      },
+      "measured": {
+        "drivers": [
+          "cuda",
+          "hip",
+          "local-sync",
+          "local-task",
+          "vulkan"
+        ],
+        "compiler_runtime_matched": true
+      },
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "pjrt-plugin",
+      "status": "pass",
+      "detail": "used=/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so (460.4 MB); wheel=/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so (460.4 MB); staged=/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so (460.4 MB); jax-rocm7-pjrt=0.11.2; jax_plugins=namespace package: /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/jax_plugins; used == wheel copy: True",
+      "versions": {
+        "jax-rocm7-pjrt": "0.11.2",
+        "pjrt_plugin_path": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "measured": {
+        "plugin_bytes": 482734064,
+        "used_matches_wheel": true
+      },
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "etl",
+      "status": "pass",
+      "detail": "etl 0.1.0 from /root/etl/.genesis/workers/worker_T1_A17/etl/__init__.py",
+      "versions": {
+        "etl": "0.1.0"
+      },
+      "measured": {
+        "path": "/root/etl/.genesis/workers/worker_T1_A17/etl/__init__.py",
+        "from_checkout": true
+      },
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "etl_hf",
+      "status": "pass",
+      "detail": "etl_hf 0.1.0 from /root/etl/.genesis/workers/worker_T1_A17/etl_hf/__init__.py",
+      "versions": {
+        "etl_hf": "0.1.0"
+      },
+      "measured": {
+        "path": "/root/etl/.genesis/workers/worker_T1_A17/etl_hf/__init__.py",
+        "from_checkout": true
+      },
+      "child": "versions",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 8.314
+      }
+    },
+    {
+      "name": "torch-cpu",
+      "status": "pass",
+      "detail": "fp32 eager forward of tiny_gpt2 on cpu: logits (1, 8, 50257), finite=True, absmax=0.128424 [(1, 8) int64 ids = np.arange(1, 9)]",
+      "versions": {
+        "torch": "2.13.0+rocm7.1",
+        "torch_hip": "7.1.52802",
+        "transformers": "5.20.1"
+      },
+      "measured": {
+        "shape": [
+          1,
+          8,
+          50257
+        ],
+        "finite": true,
+        "absmax": 0.12842412292957306,
+        "device": "cpu"
+      },
+      "child": "torch",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 18.083
+      }
+    },
+    {
+      "name": "torch-rocm",
+      "status": "pass",
+      "detail": "fp32 eager forward of tiny_gpt2 on cuda:0 (AMD Instinct MI300X VF): logits (1, 8, 50257), finite=True, absmax=0.128424; max-abs difference vs the torch cpu result = 1.49e-08 (rel-to-absmax 1.16e-07, budget 1e-05)",
+      "versions": {
+        "torch": "2.13.0+rocm7.1",
+        "torch_hip": "7.1.52802",
+        "transformers": "5.20.1",
+        "torch_device_name": "AMD Instinct MI300X VF"
+      },
+      "measured": {
+        "shape": [
+          1,
+          8,
+          50257
+        ],
+        "finite": true,
+        "absmax": 0.12842412292957306,
+        "maxabs_diff_vs_cpu": 1.4901161193847656e-08,
+        "rel_vs_cpu": 1.1603085817466984e-07,
+        "device": "cuda:0 (ROCm)",
+        "torch_device_name": "AMD Instinct MI300X VF"
+      },
+      "child": "torch",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 18.083
+      }
+    },
+    {
+      "name": "xla-rocm",
+      "status": "pass",
+      "detail": "xla/rocm device-resident etl_hf tiny_llama (seq_len=32) [default options \u2014 fp32 dots run TF32-class]: logits (1, 32, 32000), finite=True, absmax=0.394485; max-abs parity vs the numpy interpreter = 0.000112 (rel-to-absmax 0.000285, budget 0.01); output device=rocm:0, .numpy() raised DeviceError=True; repeat run bit-identical=True; build=8.65s",
+      "versions": {
+        "numpy": "2.5.4",
+        "etl": "0.1.0",
+        "etl_hf": "0.1.0",
+        "jax-rocm7-pjrt": "0.11.2",
+        "pjrt_plugin": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "measured": {
+        "backend": "xla",
+        "model": "tiny_llama",
+        "seq_len": 32,
+        "options": {},
+        "build_s": 8.653,
+        "shape": [
+          1,
+          32,
+          32000
+        ],
+        "finite": true,
+        "absmax": 0.3944852948188782,
+        "maxabs_parity_vs_numpy": 0.00011233426630496979,
+        "rel_parity_vs_numpy": 0.0002847826477860873,
+        "rel_tol": 0.01,
+        "output_device": "rocm:0",
+        "device_numpy_raises": true,
+        "repeat_bit_identical": true,
+        "numpy_absmax": 0.394456148147583,
+        "env": {
+          "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+          "XLA_FLAGS": "--xla_gpu_enable_command_buffer="
+        }
+      },
+      "child": "xla",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 17.256
+      }
+    },
+    {
+      "name": "xla-rocm-highest-precision",
+      "status": "pass",
+      "detail": "xla/rocm device-resident etl_hf tiny_llama (seq_len=32) [dot_precision=\"HIGHEST\" \u2014 true fp32 dots]: logits (1, 32, 32000), finite=True, absmax=0.394456; max-abs parity vs the numpy interpreter = 8.94e-08 (rel-to-absmax 2.27e-07, budget 1e-05); output device=rocm:0, .numpy() raised DeviceError=True; repeat run bit-identical=True; build=1.82s",
+      "versions": {
+        "numpy": "2.5.4",
+        "etl": "0.1.0",
+        "etl_hf": "0.1.0",
+        "jax-rocm7-pjrt": "0.11.2",
+        "pjrt_plugin": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so"
+      },
+      "measured": {
+        "backend": "xla",
+        "model": "tiny_llama",
+        "seq_len": 32,
+        "options": {
+          "dot_precision": "HIGHEST"
+        },
+        "build_s": 1.821,
+        "shape": [
+          1,
+          32,
+          32000
+        ],
+        "finite": true,
+        "absmax": 0.394456148147583,
+        "maxabs_parity_vs_numpy": 8.940696716308594e-08,
+        "rel_parity_vs_numpy": 2.2665882527868458e-07,
+        "rel_tol": 1e-05,
+        "output_device": "rocm:0",
+        "device_numpy_raises": true,
+        "repeat_bit_identical": true,
+        "numpy_absmax": 0.394456148147583,
+        "env": {
+          "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+          "XLA_FLAGS": "--xla_gpu_enable_command_buffer="
+        }
+      },
+      "child": "xla",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 17.256
+      }
+    },
+    {
+      "name": "xla-plugin-exit",
+      "status": "pass",
+      "detail": "tiny xla/rocm graph built (0.53s) and ran (sum=12, expected 12); the process now exits NORMALLY so the parent can record the plugin's interpreter-exit behaviour; process teardown (expected, AFTER all work): killed by SIGABRT after 6.527s; last stderr: 'malloc_consolidate(): invalid chunk size'",
+      "versions": {},
+      "measured": {
+        "build_s": 0.533,
+        "sum": 12.0,
+        "work_completed": true,
+        "teardown_aborted": true,
+        "teardown_exit_code": null,
+        "teardown_signal": "SIGABRT",
+        "teardown_last_stderr": "malloc_consolidate(): invalid chunk size"
+      },
+      "child": "xla-exit",
+      "child_exit": {
+        "exit_code": null,
+        "signal": "SIGABRT",
+        "timed_out": false,
+        "duration_s": 6.527
+      }
+    },
+    {
+      "name": "iree-device-kinds",
+      "status": "pass",
+      "detail": "tiny iree graph per accelerator kind: cuda=NOT usable: RuntimeError: Error creating driver: c/runtime/src/iree/hal/drivers/cuda/cuda_dynamic_symbols.c:66: UNAVAILABLE; CUDA driver library 'libcuda.so'/'nvcuda.dll' not available; please ensure installed and in dynamic library search path; rocm=usable (sum 12.0)",
+      "versions": {},
+      "measured": {
+        "kinds": {
+          "cuda": {
+            "usable": false,
+            "error": "RuntimeError: Error creating driver: c/runtime/src/iree/hal/drivers/cuda/cuda_dynamic_symbols.c:66: UNAVAILABLE; CUDA driver library 'libcuda.so'/'nvcuda.dll' not available; please ensure installed and in dynamic library search path"
+          },
+          "rocm": {
+            "usable": true,
+            "sum": 12.0
+          }
+        },
+        "etl_devices": [
+          "cpu:0",
+          "cuda:0",
+          "rocm:0"
+        ]
+      },
+      "child": "iree",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 9.331
+      }
+    },
+    {
+      "name": "iree-rocm",
+      "status": "pass",
+      "detail": "iree/rocm device-resident etl_hf tiny_llama (seq_len=32) [library default options]: logits (1, 32, 32000), finite=True, absmax=0.394456; max-abs parity vs the numpy interpreter = 8.94e-08 (rel-to-absmax 2.27e-07, budget 1e-05); output device=rocm:0, .numpy() raised DeviceError=True; repeat run bit-identical=True; build=1.02s",
+      "versions": {
+        "numpy": "2.5.4",
+        "etl": "0.1.0",
+        "etl_hf": "0.1.0",
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0"
+      },
+      "measured": {
+        "backend": "iree",
+        "model": "tiny_llama",
+        "seq_len": 32,
+        "options": {},
+        "build_s": 1.017,
+        "shape": [
+          1,
+          32,
+          32000
+        ],
+        "finite": true,
+        "absmax": 0.394456148147583,
+        "maxabs_parity_vs_numpy": 8.940696716308594e-08,
+        "rel_parity_vs_numpy": 2.2665882527868458e-07,
+        "rel_tol": 1e-05,
+        "output_device": "rocm:0",
+        "device_numpy_raises": true,
+        "repeat_bit_identical": true,
+        "numpy_absmax": 0.394456148147583,
+        "env": {
+          "ETL_PJRT_PLUGIN": null,
+          "XLA_FLAGS": null
+        }
+      },
+      "child": "iree",
+      "child_exit": {
+        "exit_code": 0,
+        "signal": null,
+        "timed_out": false,
+        "duration_s": 9.331
+      }
+    }
+  ],
+  "checks_summary": {
+    "total": 17,
+    "passed": 17,
+    "failed": 0,
+    "failed_names": []
+  },
+  "overall_status": "pass",
+  "xla": {
+    "plugin_path": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+    "plugin_path_candidates": {
+      "used": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "staged": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "wheel": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/jax_plugins/xla_rocm7/xla_rocm_plugin.so"
+    },
+    "plugin_matches_wheel": true,
+    "xla_flags": "--xla_gpu_enable_command_buffer=",
+    "env_vars": {
+      "PYTHONPATH": "/root/etl/.genesis/workers/worker_T1_A17",
+      "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "XLA_FLAGS": "--xla_gpu_enable_command_buffer="
+    },
+    "plugin_exit_behaviour": "A process that created a PJRT client ABORTS during interpreter teardown (SIGABRT / exit 134 with 'malloc_consolidate(): invalid chunk size', or SIGSEGV) AFTER all work succeeded; os._exit(0) is always clean. A benchmark must treat a 134/139 exit that follows completed work as normal and read the work's own output instead of the exit code."
+  },
+  "torch": {
+    "index_url": "https://download.pytorch.org/whl/rocm7.1",
+    "spec": "torch==2.13.0+rocm7.1",
+    "version": "2.13.0+rocm7.1",
+    "hip": "7.1.52802",
+    "device_string": "cuda:0 (torch maps ROCm onto its cuda API)"
+  },
+  "env_vars": {
+    "PYTHONPATH": "/root/etl/.genesis/workers/worker_T1_A17",
+    "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+    "XLA_FLAGS": "--xla_gpu_enable_command_buffer="
+  },
+  "bench_recipe": "Use <venv>/bin/python with PYTHONPATH=<repo root> so etl/etl_hf come from the checkout. For backend='xla' also set ETL_PJRT_PLUGIN and XLA_FLAGS as above and expect the documented teardown abort; run each xla leg in a subprocess and leave via os._exit(0).",
+  "argv": [],
+  "children": {
+    "versions": {
+      "command": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python /root/etl/.genesis/workers/worker_T1_A17/bench_logs/hf_bench_env.py --child versions --child-out /tmp/genesis/task_9ee05e7d6b4cb450/hf_bench_env_children/child_versions.json --models-dir /tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models --plugin /tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_s": 8.314,
+      "stdout_tail": [],
+      "stderr_tail": [],
+      "error": null,
+      "child_meta": {
+        "kind": "versions",
+        "iree_drivers": [
+          "cuda",
+          "hip",
+          "local-sync",
+          "local-task",
+          "vulkan"
+        ],
+        "pjrt_plugin": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+        "pjrt_plugin_matches_wheel": true,
+        "etl_devices": [
+          {
+            "kind": "cpu",
+            "index": 0
+          },
+          {
+            "kind": "cuda",
+            "index": 0
+          },
+          {
+            "kind": "rocm",
+            "index": 0
+          }
+        ],
+        "versions": {
+          "python": "3.14.8",
+          "python_executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+          "python_implementation": "CPython",
+          "numpy": "2.5.4",
+          "torch": "2.13.0+rocm7.1",
+          "torch_hip": "7.1.52802",
+          "torch_cuda_device_count": 1,
+          "transformers": "5.20.1",
+          "safetensors": "0.8.0",
+          "iree-base-compiler": "3.11.0",
+          "iree-base-runtime": "3.11.0",
+          "iree_drivers": [
+            "cuda",
+            "hip",
+            "local-sync",
+            "local-task",
+            "vulkan"
+          ],
+          "jax-rocm7-pjrt": "0.11.2",
+          "jax_plugins_package": "namespace package: /tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/lib/python3.14/site-packages/jax_plugins",
+          "pjrt_plugin_bytes": 482734064,
+          "etl": "0.1.0",
+          "etl_hf": "0.1.0",
+          "etl_devices": [
+            "cpu:0",
+            "cuda:0",
+            "rocm:0"
+          ]
+        }
+      }
+    },
+    "torch": {
+      "command": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python /root/etl/.genesis/workers/worker_T1_A17/bench_logs/hf_bench_env.py --child torch --child-out /tmp/genesis/task_9ee05e7d6b4cb450/hf_bench_env_children/child_torch.json --models-dir /tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_s": 18.083,
+      "stdout_tail": [],
+      "stderr_tail": [
+        "--------------------------------------+------------+--+-",
+        "transformer.h.{0, 1}.attn.masked_bias | UNEXPECTED |  | ",
+        "Notes:",
+        "- UNEXPECTED:\tcan be ignored when loading from different task/architecture; not ok if you expect identical arch.",
+        "/root/.local/share/uv/python/cpython-3.14.8-linux-x86_64-gnu/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-hpfctt69'}",
+        "  warnings.warn("
+      ],
+      "error": null,
+      "child_meta": {
+        "kind": "torch",
+        "model": "tiny_gpt2",
+        "versions": {
+          "torch": "2.13.0+rocm7.1",
+          "torch_hip": "7.1.52802",
+          "transformers": "5.20.1"
+        },
+        "model_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/tiny_gpt2",
+        "ids_recipe": "(1, 8) int64 ids = np.arange(1, 9)"
+      }
+    },
+    "xla": {
+      "command": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python /root/etl/.genesis/workers/worker_T1_A17/bench_logs/hf_bench_env.py --child xla --child-out /tmp/genesis/task_9ee05e7d6b4cb450/hf_bench_env_children/child_xla.json --models-dir /tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models --plugin /tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_s": 17.256,
+      "stdout_tail": [],
+      "stderr_tail": [
+        "I1019 10:55:47.449185 1522554 se_gpu_pjrt_compiler.cc:390] Found GPU target config and a PjRtClient with matching configuration. Performing a JIT compilation.",
+        "I1019 10:55:48.236478 1522630 amdgpu_backend.cc:163] TF_XLA_HSACO_CACHE_DIR is not set: HSACO file cache is disabled!",
+        "I1019 10:55:55.653648 1522554 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+        "I1019 10:55:55.653691 1522554 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator.",
+        "I1019 10:55:55.658801 1522554 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+        "I1019 10:55:55.658842 1522554 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator."
+      ],
+      "error": null,
+      "child_meta": {
+        "kind": "xla",
+        "models_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+        "env": {
+          "ETL_PJRT_PLUGIN": "/tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+          "XLA_FLAGS": "--xla_gpu_enable_command_buffer="
+        }
+      }
+    },
+    "xla-exit": {
+      "command": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python /root/etl/.genesis/workers/worker_T1_A17/bench_logs/hf_bench_env.py --child xla-exit --child-out /tmp/genesis/task_9ee05e7d6b4cb450/hf_bench_env_children/child_xla-exit.json --models-dir /tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models --plugin /tmp/genesis/task_9ee05e7d6b4cb450/pjrt/xla_rocm_plugin.so",
+      "exit_code": null,
+      "signal": "SIGABRT",
+      "timed_out": false,
+      "duration_s": 6.527,
+      "stdout_tail": [],
+      "stderr_tail": [
+        "I1019 10:56:04.691456 1522788 amdgpu_backend.cc:163] TF_XLA_HSACO_CACHE_DIR is not set: HSACO file cache is disabled!",
+        "I1019 10:56:04.703046 1522715 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+        "I1019 10:56:04.703150 1522715 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator.",
+        "I1019 10:56:04.707522 1522715 se_gpu_pjrt_client.cc:1324] Using BFC allocator.",
+        "I1019 10:56:04.707609 1522715 gpu_helpers.cc:162] XLA backend allocating 143.77GiB (154367164416 bytes) on device 0 for BFCAllocator.",
+        "malloc_consolidate(): invalid chunk size"
+      ],
+      "error": null,
+      "child_meta": {
+        "kind": "xla-exit"
+      }
+    },
+    "iree": {
+      "command": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python /root/etl/.genesis/workers/worker_T1_A17/bench_logs/hf_bench_env.py --child iree --child-out /tmp/genesis/task_9ee05e7d6b4cb450/hf_bench_env_children/child_iree.json --models-dir /tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_s": 9.331,
+      "stdout_tail": [],
+      "stderr_tail": [],
+      "error": null,
+      "child_meta": {
+        "kind": "iree",
+        "models_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models"
+      }
+    }
+  },
+  "duration_s": 59.8
+}

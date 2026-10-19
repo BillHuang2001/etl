@@ -1,0 +1,256 @@
+{
+  "schema": 1,
+  "status": "ok",
+  "kind": "torch",
+  "provenance": {
+    "model": "gpt2",
+    "golden_slug": "gpt2",
+    "seq_len": 32,
+    "leg": "torch-cpu",
+    "timestamp": "2026-10-19T10:58:49Z",
+    "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+    "git_commit": "bd092767b813d359499aaf2952f1e98c435b3166",
+    "python": "3.14.8",
+    "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+    "command": [
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "torch-cpu",
+      "--models",
+      "gpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "env": {
+      "python": "3.14.8",
+      "executable": "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "hostname": "rocm-7-1-software-gpu-mi300x1-192gb-devcloud-atl1",
+      "cpu_count": 20,
+      "packages": {
+        "numpy": "2.5.4",
+        "etl": null,
+        "etl_hf": null,
+        "iree-base-compiler": "3.11.0",
+        "iree-base-runtime": "3.11.0",
+        "jaxlib": null,
+        "jax-rocm7-pjrt": "0.11.2",
+        "jax-cuda12-pjrt": null,
+        "apache-tvm": null,
+        "torch": "2.13.0+rocm7.1",
+        "transformers": "5.20.1",
+        "safetensors": "0.8.0",
+        "ETL_PJRT_PLUGIN": null
+      },
+      "ETL_BACKEND": null,
+      "ETL_TARGET_BACKENDS": null,
+      "ETL_OPT_LEVEL": null,
+      "ETL_DEVICE": null,
+      "ETL_HF_MODELS_DIR": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models",
+      "XLA_FLAGS": null,
+      "LD_LIBRARY_PATH": null,
+      "CUDA_VISIBLE_DEVICES": null,
+      "HIP_VISIBLE_DEVICES": null,
+      "ROCR_VISIBLE_DEVICES": null,
+      "TMPDIR": "/tmp/genesis/task_9ee05e7d6b4cb450"
+    }
+  },
+  "leg": {
+    "key": "torch-cpu",
+    "kind": "torch",
+    "backend": null,
+    "device": "cpu",
+    "device_resident": false,
+    "torch_compile": false
+  },
+  "measurement": {
+    "warmup": 2,
+    "repeat": 5,
+    "batch": 1
+  },
+  "notes": [
+    "CPU wall time per forward call"
+  ],
+  "errors": [],
+  "model": {
+    "checkpoint_dir": "/tmp/genesis/task_9ee05e7d6b4cb450/etl_hf_models/gpt2",
+    "batch": 1,
+    "from_pretrained_kwargs": {
+      "local_files_only": "True",
+      "dtype": "torch.float32",
+      "attn_implementation": "eager"
+    },
+    "family": "torch",
+    "model_class": "GPT2LMHeadModel",
+    "config_model_type": "gpt2",
+    "param_count": 124439808,
+    "param_bytes": 497759232,
+    "dtype": "torch.float32"
+  },
+  "parity": {
+    "ids_source": "hf_goldens input_ids",
+    "input_ids": [
+      [
+        3,
+        10,
+        17,
+        24,
+        31,
+        38,
+        45,
+        52,
+        59,
+        66,
+        73,
+        80,
+        87,
+        94,
+        101,
+        108,
+        115,
+        122,
+        129,
+        136,
+        143,
+        150,
+        157,
+        164,
+        171,
+        178,
+        185,
+        192,
+        199,
+        206,
+        213,
+        220
+      ]
+    ],
+    "vs_golden": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rel_to_absmax": 0.0,
+      "ref_absmax": 138.72409057617188,
+      "cand_absmax": 138.72409057617188,
+      "argmax_agreement": 1.0,
+      "reference": "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_goldens/gpt2.npz",
+      "reference_note": "golden fixture (torch/transformers oracle)"
+    },
+    "vs_numpy": {
+      "comparable": true,
+      "shape": [
+        1,
+        32,
+        50257
+      ],
+      "ref_shape": [
+        1,
+        32,
+        50257
+      ],
+      "max_abs": 0.000152587890625,
+      "mean_abs": 2.2211253963178024e-05,
+      "rel_to_absmax": 1.0999378901033197e-06,
+      "ref_absmax": 138.72409057617188,
+      "cand_absmax": 138.72409057617188,
+      "argmax_agreement": 1.0,
+      "reference": "bench_logs/hf_bench_data/gpt2__s32__numpy-cpu.logits.npz",
+      "reference_leg": "numpy-cpu"
+    },
+    "vs_torch_cpu": {
+      "comparable": false,
+      "reason": "same leg"
+    },
+    "vs_torch_rocm": {
+      "comparable": false,
+      "reason": "no logits on disk for the torch-rocm leg"
+    }
+  },
+  "run": {
+    "batch": 1,
+    "seq_len": 32,
+    "api": "model(input_ids=ids).logits",
+    "first_call_ms": 74.5791,
+    "n": 5,
+    "best_ms": 14.99,
+    "median_ms": 15.2719,
+    "mean_ms": 15.4965,
+    "stdev_ms": 0.7238,
+    "warmup": 2,
+    "tokens_per_s": 2134.76,
+    "peak_rss_mb": 3147.0,
+    "d2h": {
+      "applicable": false,
+      "reason": "the output is already host-resident"
+    }
+  },
+  "logits": {
+    "shape": [
+      1,
+      32,
+      50257
+    ],
+    "absmax": 138.72409057617188,
+    "mean": -102.00896453857422,
+    "finite": true,
+    "path": "bench_logs/hf_bench_data/gpt2__s32__torch-cpu.logits.npz"
+  },
+  "process": {
+    "returncode": 0,
+    "signal": null,
+    "duration_s": 8.13,
+    "timed_out": false,
+    "stderr_tail": [
+      "Loading weights:   0%|          | 0/148 [00:00<?, ?it/s]",
+      "Loading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 148/148 [00:00<00:00, 10537.92it/s]",
+      "/root/.local/share/uv/python/cpython-3.14.8-linux-x86_64-gnu/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-8pp74bkg'}",
+      "  warnings.warn("
+    ],
+    "stdout_tail": [
+      "[stage] load checkpoint (transformers)",
+      "[stage] first run",
+      "[stage] warm loop",
+      "[stage] parity",
+      "[record] bench_logs/hf_bench_data/gpt2__s32__torch-cpu.json",
+      "[leg] gpt2/s32/torch-cpu: ok -> bench_logs/hf_bench_data/gpt2__s32__torch-cpu.json"
+    ],
+    "command": [
+      "/tmp/genesis/task_9ee05e7d6b4cb450/hfbench-venv/bin/python",
+      "/root/etl/.genesis/workers/worker_T1_A19/bench_logs/hf_bench.py",
+      "--leg",
+      "torch-cpu",
+      "--models",
+      "gpt2",
+      "--seq-lens",
+      "32",
+      "--out",
+      "bench_logs/hf_bench_data",
+      "--warmup",
+      "2",
+      "--repeat",
+      "5",
+      "--pack",
+      "auto"
+    ],
+    "forced_exit": "os._exit(0) after the record was written"
+  }
+}
