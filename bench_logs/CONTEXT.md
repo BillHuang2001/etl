@@ -2,6 +2,9 @@
 
 One-off compiler/backend probe scripts, notes, and result artifacts for
 experiments on this machine.
+The **current** HuggingFace benchmark is `./hf_bench.py` → `./hf_bench_results.md` (see its own
+section below); `./probe_hf_perf.py` is the older, narrower matrix kept as a working historical
+probe.
 Historical artifacts remain committed here: the 763a415-era xla-vs-iree fused
 4096×50 probes (`probe_xla_gpu.py`, `probe_iree_same_mlir.py`, `probe_parity.py`,
 `de_4096x50_fused_key1.mlir`/`.vmfb`, `clocks_*.log`, `_common.py`) — their
