@@ -280,7 +280,7 @@ Facts about the current matrix worth knowing before re-running it:
   `TRITON_HOME`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `$TMPDIR/hf_bench_cache` for the
   `torchcompile-*` legs.
 - `./hf_bench_data/` commits the JSON records + `parity_digest.json` only: a bench run may write one
-  `.logits.npz` per ok leg (output-sized, ~393 MB total) but that derived bulk is gitignored and
+  `.logits.npz` per ok leg (output-sized, ~460 MB total) but that derived bulk is gitignored and
   regenerated on demand — order-independent parity recomputation comes from the dumps when a run
   left them, else from the records' own parity blocks plus the digest.
 - The environment record's `host.repo_root`/`host.tmpdir` are the worktree/scratch paths at
