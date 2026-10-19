@@ -156,12 +156,17 @@ additionally CPU-only by design (`adapters/tvm.py:304`).
 
 Measures the `etl_hf` full-model forward as ONE graph across **six legs per checkpoint** — three
 backend paths each measured **unpacked** (one graph input per weight) and **packed**
-(`build(...)/HFModel.build(pack_weights=True)` + `HFModel.pack_params`, key suffix `-packed`):
+(`etl_hf.build(forward_fn(cfg, pack_weights=True), cfg)` + `etl_hf.pack_params(pack_plan(...))`,
+key suffix `-packed`):
 `numpy` (interpreter), `iree-llvm-cpu` (host inputs, library default `opt_level="O3"` +
 `--iree-llvmcpu-target-cpu=host`/`--iree-opt-data-tiling`), `iree-rocm` (device-resident on
 `Device("rocm", 0)` — the per-call restage anti-pattern is measured separately). All compiled
-rows are built with the **library defaults from `etl_hf.resolve_build_options`** (the probe no
-longer hard-codes options; the all-ROCm default is `opt_level="O1"`).
+rows are built with the **library defaults from `etl_hf.pipeline.resolve_build_options`** (the
+probe no longer hard-codes options; the all-ROCm default is `opt_level="O1"`). The probe drives
+the **functional** `etl_hf` API — `load_hf` → `forward_fn`/`param_specs` → `build`/`run` with the
+explicit `etl.lower`/`compile`/`load` stage timings in between (a leg records the API generation
+it was measured with in `model.api`; records written by the retired `HFModel` object API predate
+that field and the report labels them legacy).
 Models (goldens in `./hf_goldens/`): `tiny_llama`, `tiny_gpt2`, `distilgpt2`, `gpt2`;
 checkpoints resolve from `$ETL_HF_MODELS_DIR` else `$TMPDIR/etl_hf_models/<slug>` (never downloaded).
 
@@ -179,7 +184,18 @@ the report is regenerated from the JSONs, never hand-edited):
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py                     # full 24-leg matrix (~110 s)
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --opt-level-evidence # + re-attempt rejected opt levels
 uv run --isolated --extra iree python bench_logs/probe_hf_perf.py --report            # markdown only
+# a CPU-only verification subset, written OUTSIDE the committed matrix:
+uv run --isolated --extra iree python bench_logs/probe_hf_perf.py \
+    --models tiny_llama --backends numpy,numpy-packed,iree-llvm-cpu,iree-llvm-cpu-packed \
+    --no-sanity --no-crash-probe --data-dir $TMPDIR/hfperf/data --report-out $TMPDIR/hfperf/report.md
 ```
+
+`--data-dir` redirects the per-leg JSON records (and therefore what `--report` renders) and
+`--report-out` redirects the markdown, so a subset run never overwrites the committed
+`hf_perf_data/` + `hf_perf_results.md` history. Legs need the checkout root on `sys.path` to
+import `etl_hf` (a sibling top-level package, not part of the `etl` distribution) — the probe
+prepends its own repository root before importing, so the documented command works from a plain
+`etl` install without an editable `etl_hf`.
 
 Headline (best warm ms/call, `hf_perf_data/*.json`): unpacked — `tiny_llama` numpy 1.14 /
 llvm-cpu 2.10 / rocm 0.20, `tiny_gpt2` 0.97 / 0.63 / 0.21, `distilgpt2` 17.72 / 258.14 / 1.24;
@@ -200,9 +216,9 @@ Facts pinned by this matrix (all measured, nothing extrapolated):
    `'func.func' op failed to distribute` (upstream `iree-compile` ROCm codegen on the
    LayerNorm-shaped reduce) for `distilgpt2` and `gpt2`, unpacked and packed. Evidence lives in
    each leg's `build.opt_level_sweep`.
-4. **Device rows use the public API** — `etl_hf.run_model(exe, place_params(...),
-   place_ids(...))`; `run.api` records it. No raw `etl.run` short-circuit is needed any more
-   (the old "`run_model` converts ids to host" gap is closed).
+4. **Device rows use the public API** — `etl_hf.run(exe, place_params(...),
+   place_ids(...))`; `run.api` records it. No raw `etl.run` short-circuit is needed (the ids
+   tensor reaches `run` as a metadata-validated `etl.Tensor`, never copied to the host).
 
 ## Known gotchas
 
