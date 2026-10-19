@@ -365,9 +365,20 @@ Facts pinned by this matrix (all measured, nothing extrapolated):
 in the live etl modules — compile-target whitelist (`iree.py:1071`), artifact label (`:460`),
 `_GPU_DEVICE_KINDS` (`:486`), the vulkan device-id resolution (`:536`), the CUDA staging tier
 (`:1817`), the load device-kind whitelist + `expected_target` (`:1326`/`:1346`) and the transfer-provider
-registration (`:2907`), plus `pipeline.py:405` device→`["vulkan-spirv"]` inference — and exposes
-`patched_sites()` / `device_info()` / `--check` (self-check, no model). Deliberately not patched:
-`core/device.py devices()`, `iree.py:1417 _load_segments`, `etl_hf/pipeline.py:193`, `etl.io`.
+registration (`:2907`), plus `pipeline.py:360-412` device→`["vulkan-spirv"]` inference — and exposes
+`patched_sites()` / `device_info()` / `--check` (self-check, no model). Deliberately not patched
+(verified unnecessary for this path): `core/device.py devices()`, `iree.py:1417 _load_segments`,
+`etl_hf/pipeline.py:181`, `etl.io`. `./vulkan_findings.md` is the full record: feasibility/root cause
+(§1), the execution proof (§2), the eight shimmed sites plus the **remaining report-only gap list**
+with file:line for a first-class `vulkan` kind (§3: `core/device.py:122-159`, `iree.py:1417-1429`,
+`etl/io.py:304`, `etl/bench/_util.py:58-59`, `etl_hf/pipeline.py:181-199`), and the benchmark tables
+(§4).
+
+**No AMD-GPU Vulkan path exists on this host** (§1 of the findings): RADV rejects CDNA3 by policy
+(`radv_physical_device.c:2122`, `radv: info: device 'GFX940' is not supported by RADV.`), AMDVLK
+2025.Q2.1 has no `FAMILY_AI` path in PAL, and even a binary-patched RADV cannot initialize because the
+amdgpu DRM device is stuck in a never-completing reset (`READ_MMR_REG 0x263e` → `ENOENT`,
+`close()` blocks; `hipErrorNoDevice`). Every Vulkan number here therefore comes from **lavapipe**.
 
 Device recipe (both files document it): Mesa **lavapipe** (software, device name
 `lavapipe (LLVM 20.1.2, 256 bits)`, apiVersion 1.4.318, Mesa 25.2.8, vendorID 0x10005) reached
