@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="etlMarkTitle">
+  <title id="etlMarkTitle">etl — an SSA dataflow glyph: two input nodes feed one op node, which feeds one output node</title>
+
+  <defs>
+    <linearGradient id="etlMarkStroke" gradientUnits="userSpaceOnUse" x1="20" y1="32" x2="108" y2="96">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="126" height="126" rx="26" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+
+  <!-- edges (drawn first so the nodes sit on top of them) -->
+  <g fill="none" stroke="url(#etlMarkStroke)" stroke-width="2.5" stroke-linecap="round">
+    <path d="M 30 42 L 64 64"/>
+    <path d="M 30 86 L 64 64"/>
+    <path d="M 64 64 L 98 64"/>
+  </g>
+
+  <!-- nodes: two inputs, one op (gradient-filled), one output -->
+  <circle cx="30" cy="42" r="9" fill="#161b22" stroke="url(#etlMarkStroke)" stroke-width="2.5"/>
+  <circle cx="30" cy="86" r="9" fill="#161b22" stroke="url(#etlMarkStroke)" stroke-width="2.5"/>
+  <circle cx="98" cy="64" r="9" fill="#161b22" stroke="url(#etlMarkStroke)" stroke-width="2.5"/>
+  <circle cx="64" cy="64" r="12" fill="url(#etlMarkStroke)"/>
+</svg>
