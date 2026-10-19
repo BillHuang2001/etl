@@ -6,11 +6,18 @@ forward pass as ONE ``etl`` graph" (``./etl_hf/CONTEXT.md``).  The rest of
 checkpoints; this module pins it on **real HuggingFace checkpoints read from
 disk**, i.e. on the last unverified link: a real ``config.json``, its real
 weights, real key names, real transposes, a real legacy ``pytorch_model.bin``, a
-real GQA config and real tied heads::
+real GQA config and real tied heads.  The three halves of the functional API are
+exercised in order::
 
-    require_model (download) → load_hf (config + canonical weights)
-        → forward (trace → lower → compile → load → run, the WHOLE model)
-        → reference (the independent pure-numpy oracle)
+    require_model (download) → load_hf (LoadedModel: config + canonical weights)
+        → forward_fn / build / run (trace → lower → compile → load → run, the
+          WHOLE model) → reference_logits (the independent pure-numpy oracle)
+
+Loading deliberately knows nothing about ``seq_len``/``batch_size``: those are
+*graph* specialisation values, so every test here loads a checkpoint once
+(:func:`etl_hf.load_hf`) and then specialises the graph it wants
+(:func:`etl_hf.forward_fn` → :func:`etl_hf.build` → :func:`etl_hf.run` /
+:func:`etl_hf.predict`).
 
 Coverage per checkpoint: the real config values (asserted, never assumed), the
 canonical param-key count and total parameter count, that every parameter is an
@@ -65,9 +72,13 @@ import pytest
 import etl
 from etl.backends import stablehlo
 from etl_hf import ops as hf_ops
+from etl_hf import program as program_module
 from etl_hf import weights
-from etl_hf.build import load_hf, place_params, run_model
 from etl_hf.errors import HFConfigError, HFWeightError
+from etl_hf.load import LoadedModel, load_hf
+from etl_hf.pack import pack_params, pack_plan
+from etl_hf.pipeline import build, place_params, predict, run
+from etl_hf.program import forward_fn, param_specs, reference_logits
 from etl_hf.tests import hf_download
 from etl_hf.tests.test_export import _count_ops
 
@@ -119,16 +130,19 @@ _BIG_MODEL_MIN_MEMORY = 2 * 1024**3
 # ---------------------------------------------------------------------------
 # helpers — checkpoint loading, parity, parameter accounting
 # ---------------------------------------------------------------------------
-def _load(slug: str, **kwargs: object):
+def _load(slug: str, **kwargs: object) -> LoadedModel:
     """Load a real checkpoint by slug, skipping cleanly when it is unavailable.
 
     Args:
         slug: a key of :data:`etl_hf.tests.hf_download.MODELS`.
-        **kwargs: forwarded to :func:`etl_hf.load_hf` (``seq_len``,
-            ``batch_size``, ``family``).
+        **kwargs: forwarded to :func:`etl_hf.load_hf` (``family``).
 
     Returns:
-        etl_hf.HFModel: the loaded model (nothing compiled yet).
+        etl_hf.LoadedModel: the loaded checkpoint — its static config plus the
+        canonical host params.  Nothing is specialised or compiled yet, and the
+        model carries no ``seq_len``: that is a graph specialisation value, so
+        each test passes it to :func:`etl_hf.forward_fn` / :func:`_trace` /
+        :func:`_check_forward` instead.
     """
     return load_hf(hf_download.require_model(slug), **kwargs)
 
@@ -239,23 +253,38 @@ def _gpt2_param_count(cfg) -> int:
     )
 
 
-def _trace(model):
-    """Trace the model's whole forward as ONE graph and verify it.
+def _specialisation(fwd) -> dict:
+    """The static specialisation ``forward_fn`` stamps on the graph it returns.
 
-    The argument tree is the model's own ``param_specs`` (weights are explicit
+    Answers "which ``seq_len``/``batch_size``/packing does this graph have?"
+    — a question the *loaded* model cannot answer, because loading deliberately
+    knows no length (:class:`etl_hf.LoadedModel` carries none).
+    """
+    return dict(getattr(fwd, program_module.SPECIALISATION_ATTR))
+
+
+def _trace(loaded: LoadedModel, *, seq_len: int, batch_size: int = 1, pack_weights=None):
+    """Trace a checkpoint's whole forward as ONE graph and verify it.
+
+    The argument tree is the config's own ``param_specs`` (weights are explicit
     **inputs**, never ``etl.constant`` payloads) plus the int32 ``input_ids`` spec
-    — the same staging :meth:`etl_hf.HFModel.build` performs.
+    — the same staging :func:`etl_hf.build` performs.
 
     Args:
-        model: an :class:`etl_hf.HFModel`.
+        loaded: the :class:`etl_hf.LoadedModel` whose config pins the graph.
+        seq_len: static sequence length of the graph.
+        batch_size: static batch size of the graph.
+        pack_weights: ``None``/``False`` for the canonical per-weight inputs,
+            ``True`` for the packed tree.
 
     Returns:
         etl.Graph: the verified graph of the whole forward pass.
     """
+    cfg = loaded.config
     graph = etl.trace(
-        model.graph_fn(),
-        model.param_specs(),
-        etl.TensorSpec((model.batch_size, model.seq_len), etl.int32),
+        forward_fn(cfg, seq_len=seq_len, batch_size=batch_size, pack_weights=pack_weights),
+        param_specs(cfg, pack_weights=pack_weights),
+        etl.TensorSpec((batch_size, seq_len), etl.int32),
     )
     graph.verify()
     return graph
@@ -266,81 +295,93 @@ def _ops_total(graph) -> int:
     return sum(_count_ops(graph).values())
 
 
-def _describe(model, graph=None) -> str:
-    """One-line description of a loaded model (plus its graph) for assertion messages.
+def _describe(loaded: LoadedModel, graph=None, *, seq_len=None, batch_size=None) -> str:
+    """One-line description of a loaded checkpoint (plus its graph) for messages.
 
     Args:
-        model: an :class:`etl_hf.HFModel`.
-        graph: optional traced graph; when given, the op and input counts are added.
+        loaded: the :class:`etl_hf.LoadedModel`.
+        graph: optional traced graph; when given, the ids shape, op count and
+            input count are added.
+        seq_len: optional explicit static sequence length (the loaded model
+            carries none — that is a graph specialisation value).
+        batch_size: optional explicit static batch size.
 
     Returns:
-        str: e.g. ``"tiny_llama family=llama seq_len=8 batch=1 keys=21 params=1,032,272
-        ops=170 inputs=22"``.
+        str: e.g. ``"family=llama model_type=llama seq_len=8 batch=1 keys=21
+        params=1,032,272 ops=170 inputs=22 ids(1, 8)"``.
     """
-    params = model.params()
+    params = loaded.params
     parts = [
-        f"family={model.family}",
-        f"model_type={model.config.model_type}",
-        f"seq_len={model.seq_len}",
-        f"batch={model.batch_size}",
-        f"keys={len(params)}",
-        f"params={_total_params(params):,}",
+        f"family={loaded.family}",
+        f"model_type={loaded.config.model_type}",
     ]
+    if seq_len is not None:
+        parts.append(f"seq_len={seq_len}")
+    if batch_size is not None:
+        parts.append(f"batch={batch_size}")
+    parts += [f"keys={len(params)}", f"params={_total_params(params):,}"]
     if graph is not None:
         parts += [f"ops={_ops_total(graph)}", f"inputs={len(graph.tensor_specs)}"]
+        parts.append(f"ids{tuple(graph.tensor_specs[-1].shape)}")
     return " ".join(parts)
 
 
 def _check_forward(
-    model,
+    loaded: LoadedModel,
     input_ids,
     *,
+    seq_len: int,
     atol: float,
     rtol: float,
+    batch_size: int = 1,
     graph=None,
     spread: bool = True,
-    **build_kwargs: object,
+    **predict_kwargs: object,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Run ``forward`` and ``reference``, assert shape/dtype/finiteness/parity.
+    """Run ``predict`` and ``reference_logits``, assert shape/dtype/finite/parity.
 
     Args:
-        model: an :class:`etl_hf.HFModel`.
+        loaded: the :class:`etl_hf.LoadedModel` under test.
         input_ids: ``(batch_size, seq_len)`` integer ids.
+        seq_len: the static sequence length this call specialises to.
         atol: maximum permitted absolute difference.
         rtol: maximum permitted difference **relative to the logit scale**
             (see :func:`_parity`) — the bound that survives a denormal checkpoint.
+        batch_size: the static batch size this call specialises to.
         graph: optional traced graph, only used to enrich the message.
         spread: when True also require the reference logits to be non-constant
             (a graph collapsing to a constant would otherwise pass against a
             collapsed oracle); disable for a genuinely degenerate checkpoint.
-        **build_kwargs: forwarded to :meth:`etl_hf.HFModel.forward` (``backend``…).
+        **predict_kwargs: forwarded to :func:`etl_hf.predict` (``backend``…).
 
     Returns:
         tuple: ``(got, want, max_abs, max_rel_vs_scale)`` — the measured logits
         and their measured numbers (callers report them).
     """
-    got = model.forward(input_ids=input_ids, **build_kwargs)
-    want = model.reference(input_ids=input_ids)
-    expected = (model.batch_size, model.seq_len, model.config.vocab_size)
+    got = predict(loaded, input_ids, seq_len=seq_len, batch_size=batch_size, **predict_kwargs)
+    want = reference_logits(loaded.config, loaded.params, input_ids)
+    expected = (batch_size, seq_len, loaded.config.vocab_size)
     assert got.shape == want.shape == expected, (
         f"logits must be {expected} (batch, seq_len, vocab), got graph {got.shape} "
-        f"vs reference {want.shape} [{_describe(model, graph)}]"
+        f"vs reference {want.shape} "
+        f"[{_describe(loaded, graph, seq_len=seq_len, batch_size=batch_size)}]"
     )
     assert got.dtype == np.dtype(np.float32) and want.dtype == np.dtype(np.float32), (
         f"logits must be float32, got graph {got.dtype} vs reference {want.dtype}"
     )
     max_abs, max_rel = _parity(got, want)
-    assert bool(np.isfinite(got).all()), f"graph logits are not finite [{_describe(model, graph)}]"
-    assert np.isfinite(want).all(), f"reference logits are not finite [{_describe(model, graph)}]"
+    described = _describe(loaded, graph, seq_len=seq_len, batch_size=batch_size)
+    assert bool(np.isfinite(got).all()), f"graph logits are not finite [{described}]"
+    assert np.isfinite(want).all(), f"reference logits are not finite [{described}]"
     if spread:
         assert float(np.std(want)) > 0.0, (
             f"the reference logits are constant — the oracle (and therefore this parity "
-            f"claim) would be vacuous [{_describe(model, graph)}]"
+            f"claim) would be vacuous [{described}]"
         )
     assert max_abs <= atol and max_rel <= rtol, (
         f"parity failure vs the numpy reference: max_abs={max_abs:.3e} "
         f"(budget {atol:.1e}), max_rel_vs_scale={max_rel:.3e} (budget {rtol:.1e}) "
-        f"[{_describe(model, graph)}]"
+        f"[{described}]"
     )
     return got, want, max_abs, max_rel
 
@@ -362,8 +403,8 @@ def _available_memory_bytes() -> int:
 # ---------------------------------------------------------------------------
 def test_tiny_random_llama_matches_the_numpy_reference():
     """An **untied** safetensors checkpoint → 21 canonical tensors (1,032,272 params) → 3e-8."""
-    model = _load("tiny_llama", seq_len=8)
-    cfg = model.config
+    loaded = _load("tiny_llama")
+    cfg = loaded.config
     # The real values from this checkpoint's config.json (asserted, not assumed).
     assert cfg.family == "llama"
     assert cfg.model_type == "llama"
@@ -374,9 +415,9 @@ def test_tiny_random_llama_matches_the_numpy_reference():
     assert cfg.tie_word_embeddings is False
     assert hf_ops.activation_is_export_safe(cfg.hidden_act) is True
 
-    params = model.params()
-    specs = model.param_specs()
-    assert set(params) == set(specs), "params() and param_specs() must describe one tree"
+    params = loaded.params
+    specs = param_specs(cfg)
+    assert set(params) == set(specs), "params and param_specs must describe one tree"
     assert len(params) == 21
     # Untied: the head is its own canonical array, never an alias of the embedding.
     assert "lm_head.weight" in params and "lm_head.weight" in specs, (
@@ -396,25 +437,30 @@ def test_tiny_random_llama_matches_the_numpy_reference():
     assert expected == 1_032_272, f"llama param arithmetic changed: {expected:,}"
     assert _total_params(params) == _total_params(specs) == expected, (
         f"parameter accounting: params={_total_params(params):,} "
-        f"specs={_total_params(specs):,} arithmetic={expected:,} [{_describe(model)}]"
+        f"specs={_total_params(specs):,} arithmetic={expected:,} "
+        f"[{_describe(loaded)}]"
     )
 
-    graph = _trace(model)
+    graph = _trace(loaded, seq_len=8)
     # Every parameter is an explicit graph input; only input_ids is added.
     assert len(graph.tensor_specs) == len(params) + 1, (
         f"weights must be graph inputs (one leaf each) + one ids input: "
         f"{len(graph.tensor_specs)} inputs for {len(params)} parameters"
     )
-    assert _ops_total(graph) > 150, f"suspiciously small graph [{_describe(model, graph)}]"
+    assert _ops_total(graph) > 150, (
+        f"suspiciously small graph [{_describe(loaded, graph, seq_len=8)}]"
+    )
     text = stablehlo.export(graph)
     constants = text.count("stablehlo.constant")
     assert len(text) < 200_000 and constants <= 100, (
         f"the export must stay compact — weights are inputs, never inlined constants: "
         f"{len(text)} bytes / {len(text.splitlines())} lines / {constants} constants "
-        f"[{_describe(model, graph)}]"
+        f"[{_describe(loaded, graph, seq_len=8)}]"
     )
 
-    got, _, max_abs, _ = _check_forward(model, _ids(1, 8), atol=1e-5, rtol=1e-6, graph=graph)
+    got, _, max_abs, _ = _check_forward(
+        loaded, _ids(1, 8), seq_len=8, atol=1e-5, rtol=1e-6, graph=graph
+    )
     assert float(np.abs(got).max()) > 0.0, "the graph's logits are all zero"
     # Measured here: max_abs ≈ 3e-8, max_rel_vs_scale ≈ 8e-8 (fp32 round-off).
     assert max_abs < 1e-6, f"tiny_llama parity regressed: max_abs={max_abs:.3e}"
@@ -435,8 +481,8 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
     raw = weights.load_checkpoint(directory)
     assert len(raw) > 0, f"the legacy .bin reader returned no tensors from {directory}"
 
-    model = load_hf(directory, seq_len=8)
-    cfg = model.config
+    loaded = load_hf(directory)
+    cfg = loaded.config
     assert (cfg.model_type, cfg.family) == ("mistral", "llama")
     assert (cfg.num_hidden_layers, cfg.hidden_size) == (2, 32)
     assert cfg.num_key_value_heads < cfg.num_attention_heads, "this checkpoint is real GQA"
@@ -448,7 +494,7 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
     assert cfg.hidden_act == "gelu"
     assert hf_ops.activation_is_export_safe(cfg.hidden_act) is False
 
-    params = model.params()
+    params = loaded.params
     assert len(params) == 21
     assert "lm_head.weight" in params, "tie_word_embeddings=False keeps a separate head"
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
@@ -456,15 +502,17 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
     assert expected == 2_061_408, f"mistral param arithmetic changed: {expected:,}"
     assert _total_params(params) == expected, (
         f"parameter accounting: params={_total_params(params):,} arithmetic={expected:,} "
-        f"[{_describe(model)}]"
+        f"[{_describe(loaded)}]"
     )
     # GQA really narrows k/v in the canonical tree.
     assert params["layers.0.attn.k.weight"].shape == (32, 16)
     assert params["layers.0.attn.q.weight"].shape == (32, 32)
 
-    graph = _trace(model)
+    graph = _trace(loaded, seq_len=8)
     assert len(graph.tensor_specs) == len(params) + 1
-    assert _ops_total(graph) > 150, f"suspiciously small graph [{_describe(model, graph)}]"
+    assert _ops_total(graph) > 150, (
+        f"suspiciously small graph [{_describe(loaded, graph, seq_len=8)}]"
+    )
     with pytest.raises(etl.BackendError) as excinfo:
         stablehlo.export(graph)
     assert "erf" in str(excinfo.value), (
@@ -472,7 +520,7 @@ def test_tiny_random_mistral_legacy_bin_gqa_matches_the_numpy_reference():
     )
 
     _, _, max_abs, _ = _check_forward(
-        model, _ids(1, 8), atol=1e-5, rtol=1e-6, graph=graph, backend="numpy"
+        loaded, _ids(1, 8), seq_len=8, atol=1e-5, rtol=1e-6, graph=graph, backend="numpy"
     )
     # Measured here: max_abs ≈ 9e-8, max_rel_vs_scale ≈ 1.5e-7.
     assert max_abs < 1e-6, f"tiny_mistral parity regressed: max_abs={max_abs:.3e}"
@@ -497,8 +545,8 @@ def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
     stated relatively. With the prefix consumed the weights are the real ones,
     so the normal absolute budget applies again.
     """
-    model = _load("tiny_gpt2", seq_len=8)
-    cfg = model.config
+    loaded = _load("tiny_gpt2")
+    cfg = loaded.config
     assert (cfg.model_type, cfg.family) == ("gpt2", "gpt2")
     assert (cfg.hidden_size, cfg.num_attention_heads, cfg.num_hidden_layers) == (2, 2, 2)
     assert (cfg.vocab_size, cfg.max_position_embeddings) == (50257, 1024)
@@ -521,8 +569,8 @@ def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
         raw[embed_key],
     )
 
-    params = model.params()
-    specs = model.param_specs()
+    params = loaded.params
+    specs = param_specs(cfg)
     assert set(params) == set(specs)
     assert len(params) == 36
     assert "lm_head.weight" not in params and "lm_head.weight" not in specs, (
@@ -537,19 +585,22 @@ def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
     assert expected == 102_714, f"gpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == _total_params(specs) == expected, (
         f"parameter accounting: params={_total_params(params):,} "
-        f"specs={_total_params(specs):,} arithmetic={expected:,} [{_describe(model)}]"
+        f"specs={_total_params(specs):,} arithmetic={expected:,} "
+        f"[{_describe(loaded)}]"
     )
 
-    graph = _trace(model)
+    graph = _trace(loaded, seq_len=8)
     assert len(graph.tensor_specs) == len(params) + 1, (
         f"the tied head must not add a graph input: {len(graph.tensor_specs)} inputs for "
-        f"{len(params)} parameters [{_describe(model, graph)}]"
+        f"{len(params)} parameters [{_describe(loaded, graph, seq_len=8)}]"
     )
     # Measured here: max|ref| ≈ 0.128 (normal scale — the legacy reader now reads
     # the real weights), max_abs ≈ 1.5e-8, max_rel_vs_scale ≈ 1.2e-7. The scale is
     # pinned so a checkpoint (or a reader) that produced degenerate logits again
     # would be noticed instead of passing a relative-only claim.
-    _, want, max_abs, max_rel = _check_forward(model, _ids(1, 8), atol=1e-5, rtol=1e-6, graph=graph)
+    _, want, max_abs, max_rel = _check_forward(
+        loaded, _ids(1, 8), seq_len=8, atol=1e-5, rtol=1e-6, graph=graph
+    )
     scale = float(np.abs(want).max())
     assert 0.1 < scale < 1.0, (
         f"tiny-gpt2 reference logits should be normal-scale (~0.128), got max|ref|={scale:.3e}"
@@ -562,30 +613,41 @@ def test_tiny_gpt2_legacy_checkpoint_matches_the_numpy_reference():
 # 4. longer context / batch size — one static shape per graph
 # ---------------------------------------------------------------------------
 def test_longer_context_and_batch_size_two_build_and_match():
-    """``seq_len=16`` and ``batch_size=2`` both load, build, run and match."""
-    directory = hf_download.require_model("tiny_llama")
+    """``seq_len=16`` and ``batch_size=2`` both specialise, build, run and match."""
+    loaded = _load("tiny_llama")
+    cfg, params = loaded.config, loaded.params
 
-    longer = load_hf(directory, seq_len=16)
-    assert (longer.seq_len, longer.batch_size) == (16, 1)
-    graph = _trace(longer)
-    assert len(graph.tensor_specs) == len(longer.params()) + 1
-    _check_forward(longer, _ids(1, 16), atol=1e-5, rtol=1e-6, graph=graph)
+    # The loaded model carries no length at all: the shape is a graph value.
+    assert not hasattr(loaded, "seq_len") and not hasattr(loaded, "batch_size"), (
+        "loading a checkpoint says nothing about the graph's static shape"
+    )
+    longer = forward_fn(cfg, seq_len=16)
+    specialisation = _specialisation(longer)
+    assert (specialisation["seq_len"], specialisation["batch_size"]) == (16, 1)
+    graph = _trace(loaded, seq_len=16)
+    assert len(graph.tensor_specs) == len(params) + 1
+    _check_forward(loaded, _ids(1, 16), seq_len=16, atol=1e-5, rtol=1e-6, graph=graph)
 
-    batched = load_hf(directory, seq_len=16, batch_size=2)
-    assert (batched.seq_len, batched.batch_size) == (16, 2)
-    assert batched.build() is not longer.build(), "batch is a static shape, hence a new graph"
-    got, _, _, _ = _check_forward(batched, _ids(2, 16), atol=1e-5, rtol=1e-6)
-    assert got.shape == (2, 16, longer.config.vocab_size)
+    batched = forward_fn(cfg, seq_len=16, batch_size=2)
+    specialisation = _specialisation(batched)
+    assert (specialisation["seq_len"], specialisation["batch_size"]) == (16, 2)
+    assert build(batched, cfg) is not build(longer, cfg), (
+        "batch is a static shape, hence a new graph"
+    )
+    got, _, _, _ = _check_forward(
+        loaded, _ids(2, 16), seq_len=16, batch_size=2, atol=1e-5, rtol=1e-6
+    )
+    assert got.shape == (2, 16, cfg.vocab_size)
     # The two rows run the same graph, so a batch of identical rows must agree.
-    single = load_hf(directory, seq_len=16)
     row = _ids(1, 16)
     assert np.array_equal(
-        batched.forward(input_ids=np.repeat(row, 2, axis=0))[0], single.forward(input_ids=row)[0]
+        predict(loaded, np.repeat(row, 2, axis=0), seq_len=16, batch_size=2)[0],
+        predict(loaded, row, seq_len=16)[0],
     )
 
-    limit = longer.config.max_position_embeddings
+    limit = cfg.max_position_embeddings
     with pytest.raises(HFConfigError) as excinfo:
-        load_hf(directory, seq_len=limit + 1)
+        forward_fn(cfg, seq_len=limit + 1)
     message = str(excinfo.value)
     assert "max_position_embeddings" in message and str(limit) in message, message
 
@@ -595,32 +657,37 @@ def test_longer_context_and_batch_size_two_build_and_match():
 # ---------------------------------------------------------------------------
 def test_static_shape_policy_sequence_length_is_baked_into_the_graph():
     """One ``seq_len`` = one executable; the IR op count is ``seq_len``-independent."""
-    directory = hf_download.require_model("tiny_llama")
-    short = load_hf(directory, seq_len=4)
-    long_ = load_hf(directory, seq_len=8)
-    again = load_hf(directory, seq_len=8)
+    loaded = _load("tiny_llama")
+    cfg = loaded.config
+    short = forward_fn(cfg, seq_len=4)
+    long_ = forward_fn(cfg, seq_len=8)
+    again = forward_fn(cfg, seq_len=8)
+    assert again is long_, "the same specialisation must return the same (memoised) graph"
 
-    executable_short = short.build()
-    executable_long = long_.build()
+    executable_short = build(short, cfg)
+    executable_long = build(long_, cfg)
     assert executable_short is not executable_long, (
         "a different static seq_len must produce a different executable"
     )
-    assert again.build() is executable_long, (
+    assert build(again, cfg) is executable_long, (
         "the same static shape must reuse the memoised executable (no recompile)"
     )
 
-    graph_short = _trace(short)
-    graph_long = _trace(long_)
+    graph_short = _trace(loaded, seq_len=4)
+    graph_long = _trace(loaded, seq_len=8)
     ops_short, ops_long = _ops_total(graph_short), _ops_total(graph_long)
     assert ops_short == ops_long, (
         f"the IR op count must not depend on seq_len: seq4={ops_short} ops, "
-        f"seq8={ops_long} ops [{_describe(short, graph_short)} | {_describe(long_, graph_long)}]"
+        f"seq8={ops_long} ops [{_describe(loaded, graph_short, seq_len=4)} | "
+        f"{_describe(loaded, graph_long, seq_len=8)}]"
     )
-    assert ops_short > 100, f"suspiciously small graph [{_describe(short, graph_short)}]"
+    assert ops_short > 100, (
+        f"suspiciously small graph [{_describe(loaded, graph_short, seq_len=4)}]"
+    )
 
     # The baked-in length is enforced, not silently adapted.
     with pytest.raises(etl.ShapeError) as excinfo:
-        short.forward(input_ids=_ids(1, 8))
+        predict(loaded, _ids(1, 8), seq_len=4)
     assert "seq_len=4" in str(excinfo.value)
 
 
@@ -631,8 +698,8 @@ def test_static_shape_policy_sequence_length_is_baked_into_the_graph():
 def test_real_distilgpt2_end_to_end():
     """distilgpt2 (6 layers / 768 wide / 81,912,576 params) → parity ~1.5e-4 abs."""
     directory = hf_download.require_model("distilgpt2")
-    model = load_hf(directory, seq_len=32)
-    cfg = model.config
+    loaded = load_hf(directory)
+    cfg, params = loaded.config, loaded.params
     assert (cfg.model_type, cfg.family) == ("gpt2", "gpt2")
     assert (cfg.num_hidden_layers, cfg.hidden_size) == (6, 768)
     assert (cfg.num_attention_heads, cfg.head_dim) == (12, 64)
@@ -641,8 +708,7 @@ def test_real_distilgpt2_end_to_end():
     assert cfg.tie_word_embeddings is True
     assert hf_ops.activation_is_export_safe(cfg.hidden_act) is True
 
-    params = model.params()
-    specs = model.param_specs()
+    specs = param_specs(cfg)
     assert set(params) == set(specs)
     assert len(params) == 100
     # Tied: the head IS the embedding, so the canonical tree is exactly the real
@@ -656,35 +722,37 @@ def test_real_distilgpt2_end_to_end():
     assert expected == 81_912_576, f"distilgpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == _total_params(specs) == expected, (
         f"parameter accounting: params={_total_params(params):,} "
-        f"specs={_total_params(specs):,} arithmetic={expected:,} [{_describe(model)}]"
+        f"specs={_total_params(specs):,} arithmetic={expected:,} "
+        f"[{_describe(loaded)}]"
     )
-    graph = _trace(model)
+    graph = _trace(loaded, seq_len=32)
     assert len(graph.tensor_specs) == len(params) + 1, (
         f"graph inputs: {len(graph.tensor_specs)} for {len(params)} parameters "
-        f"[{_describe(model, graph)}]"
+        f"[{_describe(loaded, graph, seq_len=32)}]"
     )
     assert _ops_total(graph) > 400, (
-        f"a 6-layer GPT-2 should be a large graph [{_describe(model, graph)}]"
+        f"a 6-layer GPT-2 should be a large graph [{_describe(loaded, graph, seq_len=32)}]"
     )
     text = stablehlo.export(graph)
     assert len(text) < 400_000 and text.count("stablehlo.constant") <= 200, (
         f"export must not inline weights: {len(text)} bytes / {len(text.splitlines())} lines / "
-        f"{text.count('stablehlo.constant')} constants [{_describe(model, graph)}]"
+        f"{text.count('stablehlo.constant')} constants "
+        f"[{_describe(loaded, graph, seq_len=32)}]"
     )
 
     _, _, max_abs, max_rel = _check_forward(
-        model, _ids(1, 32), atol=1e-3, rtol=1e-5, graph=graph, backend="numpy"
+        loaded, _ids(1, 32), seq_len=32, atol=1e-3, rtol=1e-5, graph=graph, backend="numpy"
     )
     # Measured here: max_abs ≈ 1.6e-4 (≈ 2.3e-6 relative to |logits|max ≈ 68) —
     # fp32 accumulation-order noise, well inside the 1e-5 relative budget, and the
     # reason the absolute bound is 1e-3 rather than 1e-4 (1.6e-4 > 1e-4).
     assert max_rel <= 1e-5, f"distilgpt2 relative parity regressed: {max_rel:.3e}"
     start = time.perf_counter()
-    model.forward(input_ids=_ids(1, 32), backend="numpy")
+    predict(loaded, _ids(1, 32), seq_len=32, backend="numpy")
     elapsed = time.perf_counter() - start
     assert elapsed < 60.0, (
         f"a warm distilgpt2 forward took {elapsed:.2f} s (measured ~0.2 s here) "
-        f"[{_describe(model, graph)}]"
+        f"[{_describe(loaded, graph, seq_len=32)}]"
     )
 
 
@@ -698,17 +766,16 @@ def test_real_gpt2_end_to_end_when_memory_allows():
             f"is available"
         )
     directory = hf_download.require_model("gpt2")
-    model = load_hf(directory, seq_len=32)
-    cfg = model.config
+    loaded = load_hf(directory)
+    cfg, params = loaded.config, loaded.params
     assert (cfg.num_hidden_layers, cfg.hidden_size) == (12, 768)
     assert (cfg.num_attention_heads, cfg.head_dim) == (12, 64)
     assert (cfg.vocab_size, cfg.hidden_act) == (50257, "gelu_new")
     assert cfg.tie_word_embeddings is True
 
-    params = model.params()
     assert len(params) == 196
     # Tied: no duplicate head array, so the canonical tree equals the 124M model.
-    assert "lm_head.weight" not in params and "lm_head.weight" not in model.param_specs(), (
+    assert "lm_head.weight" not in params and "lm_head.weight" not in param_specs(cfg), (
         f"gpt2 is tied: no separate head, got "
         f"{sorted(name for name in params if 'lm_head' in name)}"
     )
@@ -716,19 +783,19 @@ def test_real_gpt2_end_to_end_when_memory_allows():
     assert expected == 124_439_808, f"gpt2 param arithmetic changed: {expected:,}"
     assert _total_params(params) == expected, (
         f"parameter accounting: params={_total_params(params):,} arithmetic={expected:,} "
-        f"[{_describe(model)}]"
+        f"[{_describe(loaded)}]"
     )
-    graph = _trace(model)
+    graph = _trace(loaded, seq_len=32)
     assert len(graph.tensor_specs) == len(params) + 1
     assert _ops_total(graph) > 400, (
-        f"a 12-layer GPT-2 should be a large graph [{_describe(model, graph)}]"
+        f"a 12-layer GPT-2 should be a large graph [{_describe(loaded, graph, seq_len=32)}]"
     )
     assert len(stablehlo.export(graph)) < 600_000, (
-        f"export must not inline weights [{_describe(model, graph)}]"
+        f"export must not inline weights [{_describe(loaded, graph, seq_len=32)}]"
     )
 
     _, _, max_abs, max_rel = _check_forward(
-        model, _ids(1, 32), atol=1e-3, rtol=1e-5, graph=graph, backend="numpy"
+        loaded, _ids(1, 32), seq_len=32, atol=1e-3, rtol=1e-5, graph=graph, backend="numpy"
     )
     # Measured here: max_abs ≈ 2.1e-4 (≈ 1.5e-6 relative to |logits|max ≈ 147).
     assert max_rel <= 1e-5, f"gpt2 relative parity regressed: {max_rel:.3e}"
@@ -776,12 +843,12 @@ MEASURED: dict[str, object] = {
     "canonical_keys": 196,
     "packed_inputs": PACKED_GPT2_INPUTS,
     "declared_inputs": PACKED_GPT2_DECLARED,
-    "load_hf_s": 0.46,
+    "load_s": 0.46,
     "pack_s": 0.12,
     "trace_s": 0.22,
     "lower_s": 0.12,
     "compile_s": 3.2,
-    "load_s": 0.02,
+    "load_artifact_s": 0.02,
     "build_s": 3.4,
     "first_call_ms": 417.0,
     "warm_median_ms": 405.0,
@@ -863,12 +930,12 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
     if input_ids.shape != (1, 32):
         pytest.skip(f"golden gpt2 ids shape {input_ids.shape} is not (1, 32)")
 
-    model = load_hf(hf_download.require_model("gpt2"), seq_len=32)
-    params = model.params()
+    loaded = load_hf(hf_download.require_model("gpt2"))
+    cfg, params = loaded.config, loaded.params
     assert len(params) == 196, f"expected 196 canonical keys, got {len(params)}"
 
     # --- the packed plan: 196 canonical arrays → 3 concatenated inputs -------
-    plan = model.pack_plan()
+    plan = pack_plan(param_specs(cfg))
     assert len(plan.specs) == PACKED_GPT2_INPUTS, (
         f"the 124M gpt2 must pack to {PACKED_GPT2_INPUTS} weight inputs, got "
         f"{len(plan.specs)}: "
@@ -878,7 +945,12 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
         f"packed inputs must be named packed.0..packed.{PACKED_GPT2_INPUTS - 1}, got "
         f"{list(plan.specs)}"
     )
-    assert len(model.param_specs(pack_weights=True)) == PACKED_GPT2_INPUTS
+    packed_specs = param_specs(cfg, pack_weights=True)
+    assert len(packed_specs) == PACKED_GPT2_INPUTS
+    assert set(packed_specs) == set(plan.specs), (
+        f"param_specs(pack_weights=True) must be exactly the packed plan's inputs, got "
+        f"{sorted(packed_specs)} vs the plan's {sorted(plan.specs)}"
+    )
     packed_elements = sum(
         int(np.prod(tuple(map(int, spec.shape)), dtype=np.int64))
         for spec in plan.specs.values()
@@ -888,21 +960,31 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
         f"packing must be lossless: packed={packed_elements:,} vs "
         f"canonical={canonical_elements:,} elements"
     )
-    packed = model.pack_params(params)
+    packed = pack_params(plan, params)
     assert set(packed) == set(plan.specs), (
         f"pack_params must key by the plan's inputs, got {sorted(packed)}"
     )
 
     # --- numpy interpreter reference (packing is exact: no reordering) -------
-    numpy_exe = model.build(backend="numpy", pack_weights=True, cache=etl.CompileCache())
+    numpy_exe = build(
+        forward_fn(cfg, seq_len=32, pack_weights=True),
+        cfg,
+        backend="numpy",
+        cache=etl.CompileCache(),
+    )
     assert len(numpy_exe.signature.input_specs) == PACKED_GPT2_DECLARED
-    want = run_model(numpy_exe, packed, input_ids).numpy()
+    want = run(numpy_exe, packed, input_ids).numpy()
     assert want.shape == want_golden.shape == (1, 32, 50257), (
         f"logits shape: numpy {want.shape} vs golden {want_golden.shape}"
     )
 
     # --- the compiled packed graph ------------------------------------------
-    executable = model.build(backend="iree", pack_weights=True, cache=etl.CompileCache())
+    executable = build(
+        forward_fn(cfg, seq_len=32, pack_weights=True),
+        cfg,
+        backend="iree",
+        cache=etl.CompileCache(),
+    )
     declared = len(executable.signature.input_specs)
     assert declared == PACKED_GPT2_DECLARED, (
         f"the compiled packed executable must declare {PACKED_GPT2_DECLARED} inputs "
@@ -917,14 +999,14 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
 
     # --- 12 consecutive runs: no SIGSEGV, bit-identical logits ---------------
     outputs = []
-    for run in range(PACKED_STABILITY_RUNS):
-        got = run_model(executable, packed, input_ids).numpy()
-        assert got.shape == want.shape, f"run {run}: shape {got.shape} != {want.shape}"
-        assert bool(np.isfinite(got).all()), f"run {run}: compiled logits are not finite"
+    for run_index in range(PACKED_STABILITY_RUNS):
+        got = run(executable, packed, input_ids).numpy()
+        assert got.shape == want.shape, f"run {run_index}: shape {got.shape} != {want.shape}"
+        assert bool(np.isfinite(got).all()), f"run {run_index}: compiled logits are not finite"
         if outputs:
             first = outputs[0]
             assert np.array_equal(got, first), (
-                f"run {run} of the packed iree/llvm-cpu executable is not bit-identical "
+                f"run {run_index} of the packed iree/llvm-cpu executable is not bit-identical "
                 f"to run 0 (max-abs {float(np.max(np.abs(got.astype(np.float64) - first.astype(np.float64)))):g} "
                 f"— same inputs must give the same program output"
             )
@@ -957,8 +1039,8 @@ def test_real_gpt2_packed_runs_on_iree_llvm_cpu():
 # ---------------------------------------------------------------------------
 def test_params_are_float32_transfer_explicitly_and_never_guess():
     """``params`` are float32 host arrays; placement is explicit; a bad config is loud."""
-    model = _load("tiny_llama", seq_len=4)
-    params = model.params()
+    loaded = _load("tiny_llama")
+    params = loaded.params
     assert all(isinstance(value, np.ndarray) for value in params.values())
     assert {value.dtype for value in params.values()} == {np.dtype(np.float32)}
     assert all(value.flags.c_contiguous for value in params.values())
@@ -974,8 +1056,8 @@ def test_params_are_float32_transfer_explicitly_and_never_guess():
     # ... and the placed tree runs the same graph to the same logits.
     ids = _ids(1, 4)
     assert np.array_equal(
-        model.forward(params=placed, input_ids=ids, backend="numpy"),
-        model.forward(input_ids=ids, backend="numpy"),
+        predict(loaded, ids, params=placed, seq_len=4, backend="numpy"),
+        predict(loaded, ids, seq_len=4, backend="numpy"),
     )
 
 
@@ -987,9 +1069,7 @@ def test_a_mutated_config_fails_loudly(tmp_path):
     for name in ("config.json", "model.safetensors"):
         shutil.copy2(source / name, pristine / name)
     # The copy itself must load — otherwise the failure below might be the copy's.
-    assert _total_params(load_hf(pristine, seq_len=4).params()) == _total_params(
-        load_hf(source, seq_len=4).params()
-    )
+    assert _total_params(load_hf(pristine).params) == _total_params(load_hf(source).params)
 
     mutated = tmp_path / "mutated_hidden_size"
     shutil.copytree(pristine, mutated)
@@ -998,7 +1078,7 @@ def test_a_mutated_config_fails_loudly(tmp_path):
     (mutated / "config.json").write_text(json.dumps(raw), encoding="utf-8")
 
     with pytest.raises(HFWeightError) as excinfo:
-        load_hf(mutated, seq_len=4)
+        load_hf(mutated)
     message = str(excinfo.value)
     assert "embed.weight" in message, message
     assert "(32000, 16)" in message and "(32000, 32)" in message, message
@@ -1011,5 +1091,5 @@ def test_a_mutated_config_fails_loudly(tmp_path):
     raw["hidden_size"] = 15
     (broken / "config.json").write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(HFConfigError) as excinfo:
-        load_hf(broken, seq_len=4)
+        load_hf(broken)
     assert "hidden_size (15)" in str(excinfo.value)
