@@ -171,7 +171,10 @@ The phases are run SEQUENTIALLY — the MI300X is shared, so never two GPU legs 
 One subprocess per `(model, seq_len, leg)`, with `--leg-timeout`; the child writes its own JSON and
 `.logits.npz` then `os._exit(0)`, so the xla/ROCm teardown abort cannot lose a record.
 A leg that cannot run is a RECORD (`*.error.json`) with its verbatim error/returncode/signal, never
-an omission: a `—` cell in the report always carries a reason.
+an omission: a `—` cell in the report always carries a reason. The record keeps the error text in
+full; the report's failure sections (6b, 7) quote only its first 3 non-empty lines, each cut at 200
+characters, plus a one-line pointer to that cell's JSON record (`errors[0]`/`notes[0]`) — a compiler
+diagnostic is tens of KB of repeated target-triple/CPU-feature flags.
 
 Device legs use the documented **device-resident same-device loop** (params + ids placed once,
 each run's device outputs fed back) and record `checks.asdevicearray_calls`, which must be `0` after
