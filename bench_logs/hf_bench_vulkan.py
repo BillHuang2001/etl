@@ -117,6 +117,10 @@ USAGE
 
 ``python bench_logs/hf_bench_vulkan.py --check`` installs the shim and prints
 the patch table plus the enumerated Vulkan device (a self-check, no model).
+``device_info()`` is the IREE-side view of that device; ``physical_device_properties()``
+reads the same physical device's ``VkPhysicalDeviceProperties`` straight from the
+loader (name / apiVersion / driverVersion / vendorID / deviceType), which is the
+provenance a benchmark record states alongside its numbers.
 
 Caveats that are *not* the shim's to hide: lavapipe is a **software** Vulkan
 device on the CPU (no hardware acceleration — treat its timings as a Vulkan-path
@@ -137,6 +141,7 @@ __all__ = [
     "is_installed",
     "patched_sites",
     "device_info",
+    "physical_device_properties",
     "VULKAN_KIND",
     "VULKAN_TARGET",
 ]
@@ -238,6 +243,140 @@ def device_info() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - evidence only, never load-bearing
         record["dump_device_info"] = f"<dump_device_info failed: {type(exc).__name__}: {exc}>"
     return record
+
+
+def physical_device_properties(index: int = 0) -> dict[str, Any]:
+    """``VkPhysicalDeviceProperties`` of the enumerated device, read via the loader.
+
+    ``iree.runtime``'s Vulkan ``query_available_devices()`` reports only the name, the
+    path (UUID) and IREE's hashed ``device_id``, so the *apiVersion* / *driverVersion* a
+    record must state come straight from Vulkan itself: this opens the loader
+    (``libvulkan.so.1``, i.e. whatever ``VK_ICD_FILENAMES`` selects), creates a minimal
+    instance, reads the properties of physical device ``index`` and destroys the
+    instance again — ~2 ms, no device, no queue, nothing the IREE path can observe.
+
+    Args:
+        index: which physical device to read (0 = the one the leg runs on).
+
+    Returns:
+        dict: ``name``, ``api_version`` / ``driver_version`` (both as ``M.m.p`` strings
+        decoded with ``VK_MAKE_VERSION``, plus their raw uint32), ``vendor_id``,
+        ``device_id``, ``device_type`` (``CPU`` / ``GPU`` / …) and ``vk_icd_filenames``.
+
+    Raises:
+        RuntimeError: the loader is unavailable, an instance cannot be created, or
+            ``index`` is out of range — never a silently empty answer.
+    """
+    import ctypes
+
+    VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
+    VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
+    #: ``VkPhysicalDeviceType`` (``VK_PHYSICAL_DEVICE_TYPE_*``, in enum order).
+    DEVICE_TYPES = ("other", "integrated GPU", "discrete GPU", "virtual GPU", "CPU")
+
+    class VkApplicationInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_uint32),
+            ("pNext", ctypes.c_void_p),
+            ("pApplicationName", ctypes.c_char_p),
+            ("applicationVersion", ctypes.c_uint32),
+            ("pEngineName", ctypes.c_char_p),
+            ("engineVersion", ctypes.c_uint32),
+            ("apiVersion", ctypes.c_uint32),
+        ]
+
+    class VkInstanceCreateInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_uint32),
+            ("pNext", ctypes.c_void_p),
+            ("flags", ctypes.c_uint32),
+            ("pApplicationInfo", ctypes.POINTER(VkApplicationInfo)),
+            ("enabledLayerCount", ctypes.c_uint32),
+            ("ppEnabledLayerNames", ctypes.c_void_p),
+            ("enabledExtensionCount", ctypes.c_uint32),
+            ("ppEnabledExtensionNames", ctypes.c_void_p),
+        ]
+
+    def decode(version: int) -> str:
+        return f"{(version >> 22) & 0x7FF}.{(version >> 12) & 0x3FF}.{version & 0xFFF}"
+
+    try:
+        loader = ctypes.CDLL("libvulkan.so.1")
+    except OSError as exc:
+        raise RuntimeError(f"libvulkan.so.1 is not loadable: {exc}") from None
+    loader.vkCreateInstance.restype = ctypes.c_int32
+    loader.vkEnumeratePhysicalDevices.restype = ctypes.c_int32
+    loader.vkDestroyInstance.restype = None
+    application = VkApplicationInfo(
+        sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        pNext=None,
+        pApplicationName=b"etl-hf-bench",
+        applicationVersion=1,
+        pEngineName=b"etl-hf-bench",
+        engineVersion=1,
+        # ``VK_API_VERSION_1_0`` — an instance (not a device) only needs the baseline
+        # version, and 0 is explicitly rejected by the loader's validation layer.
+        apiVersion=(1 << 22) | (0 << 12) | 0,
+    )
+    create_info = VkInstanceCreateInfo(
+        sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        pNext=None,
+        flags=0,
+        pApplicationInfo=ctypes.pointer(application),
+        enabledLayerCount=0,
+        ppEnabledLayerNames=None,
+        enabledExtensionCount=0,
+        ppEnabledExtensionNames=None,
+    )
+    instance = ctypes.c_void_p()
+    result = loader.vkCreateInstance(ctypes.byref(create_info), None, ctypes.byref(instance))
+    if result != 0:
+        # VK_ERROR_INCOMPATIBLE_DRIVER (-9) is what a stale VK_ICD_FILENAMES produces.
+        raise RuntimeError(f"vkCreateInstance failed with VkResult {result}")
+    try:
+        count = ctypes.c_uint32(0)
+        result = loader.vkEnumeratePhysicalDevices(
+            instance, ctypes.byref(count), None
+        )
+        if result != 0:
+            raise RuntimeError(f"vkEnumeratePhysicalDevices failed with VkResult {result}")
+        if index >= count.value:
+            raise RuntimeError(
+                f"only {count.value} physical Vulkan device(s) enumerated, index {index} "
+                "does not exist"
+            )
+        devices = (ctypes.c_void_p * count.value)()
+        result = loader.vkEnumeratePhysicalDevices(
+            instance, ctypes.byref(count), devices
+        )
+        if result != 0:
+            raise RuntimeError(f"vkEnumeratePhysicalDevices(2) failed with VkResult {result}")
+        # ``VkPhysicalDeviceProperties`` is apiVersion, driverVersion, vendorID,
+        # deviceID, deviceType (u32 each), deviceName[256], ... — a raw 4096-byte
+        # buffer is comfortably larger than the real struct, and only its leading
+        # fields are read here.
+        props = ctypes.create_string_buffer(4096)
+        loader.vkGetPhysicalDeviceProperties(devices[index], props)
+        api_version, driver_version, vendor_id, device_id, device_type = (
+            ctypes.c_uint32.from_buffer_copy(props, offset).value
+            for offset in (0, 4, 8, 12, 16)
+        )
+        name = props.raw[20:20 + 256].split(b"\x00", 1)[0].decode("utf-8", "replace")
+    finally:
+        loader.vkDestroyInstance(instance, None)
+    return {
+        "name": name,
+        "api_version": decode(api_version),
+        "api_version_raw": api_version,
+        "driver_version": decode(driver_version),
+        "driver_version_raw": driver_version,
+        "driver_version_scheme": "VK_MAKE_VERSION (Mesa/lavapipe spelling)",
+        "vendor_id": f"0x{vendor_id:04x}",
+        "device_id": device_id,
+        "device_type": DEVICE_TYPES[device_type] if device_type < len(DEVICE_TYPES)
+        else f"unknown ({device_type})",
+        "vk_icd_filenames": os.environ.get("VK_ICD_FILENAMES"),
+    }
 
 
 # ---------------------------------------------------------------------------

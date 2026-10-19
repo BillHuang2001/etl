@@ -14,6 +14,10 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
     numpy-cpu           the numpy interpreter backend (host arrays)
     iree-llvmcpu        IREE compiled for llvm-cpu, host-resident inputs
     iree-rocm           IREE compiled for ROCm (the MI300X), **device resident**
+    iree-vulkan         IREE compiled for Vulkan (``vulkan-spirv``) on **lavapipe**,
+                        i.e. SOFTWARE Vulkan on the CPU (not a GPU measurement),
+                        device resident; needs the benchmark-only shim
+                        ``bench_logs/hf_bench_vulkan.py`` and ``$ETL_VULKAN_ICD``
     xla-rocm            PJRT/XLA on ROCm (needs ``ETL_PJRT_PLUGIN``), device resident
     xla-rocm-fp32       the same with ``dot_precision="HIGHEST"`` — opt-in variant
                         (``--legs`` only), isolates XLA/ROCm's default TF32-class
@@ -24,9 +28,11 @@ Legs (``--legs``) — one leg = one execution path, and the file/record key belo
     torchcompile-rocm   ``torch.compile(model)`` on ``cuda:0``
     ==================  ==========================================================
 
-``--phase`` expands to two default leg sets — ``cpu`` = ``numpy-cpu,iree-llvmcpu,
-torch-cpu`` and ``gpu`` = ``iree-rocm,xla-rocm,torch-rocm``.  The two phases are run
-**separately and sequentially, never concurrently**, because the GPU is shared.
+``--phase`` expands to the default leg sets — ``cpu`` = ``numpy-cpu,iree-llvmcpu,
+torch-cpu``, ``gpu`` = ``iree-rocm,xla-rocm,torch-rocm`` and ``vulkan`` =
+``iree-vulkan``.  The phases are run **separately and sequentially, never
+concurrently**, because the GPU is shared (and a software-Vulkan leg would steal the
+CPU cores the ``cpu`` phase assumes it has).
 
 Running it
 ----------
@@ -38,6 +44,16 @@ iree + ``jax-rocm7-pjrt``) — **never** the repo ``.venv``::
     $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --phase cpu
     $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --phase gpu
     $TMPDIR/hfbench-venv/bin/python bench_logs/hf_bench.py --report
+
+The ``vulkan`` phase runs from the smaller ``$TMPDIR/vk-venv`` (iree 3.11 + numpy,
+no torch) and needs the ICD **path** — the harness never hard-codes one::
+
+    export ETL_VULKAN_ICD=$TMPDIR/vk-lvp/lavapipe_icd.json   # forwarded as VK_ICD_FILENAMES
+    $TMPDIR/vk-venv/bin/python bench_logs/hf_bench.py --phase vulkan
+
+A vulkan leg requested without ``$ETL_VULKAN_ICD`` writes a record naming that
+variable (never a silently empty device list), and the loader is always pinned so it
+cannot dlopen the radeon ICD, which blocks on this host.
 
 Without a torch install only the ``etl``/torch-less legs run (``uv run --extra iree
 python bench_logs/hf_bench.py --phase cpu --models tiny_llama`` is the CPU smoke
@@ -327,7 +343,64 @@ def measure_etl_leg(
         record["traceback_tail"] = traceback.format_exc().splitlines()[-8:]
         return record
 
-    # -- checkpoint + config + ids -----------------------------------------
+    # -- the Vulkan shim + the device it lands on (benchmark-only) ----------
+    # ``etl`` has no ``vulkan`` device kind, so a vulkan leg installs the runtime shim of
+    # ``bench_logs/hf_bench_vulkan.py`` (which widens eight string/dialect gates in the
+    # live iree adapter plus the device→target inference) BEFORE anything is built, and
+    # records what it patched plus the device it actually enumerated.  Nothing under
+    # ``./etl/`` or ``./etl_hf/`` knows the shim exists.  A vulkan leg without
+    # ``ETL_VULKAN_ICD`` fails HERE, as a record naming the variable — never as a
+    # silently empty device list.
+    if spec.device_kind == "vulkan":
+        _progress("vulkan shim")
+        try:
+            import hf_bench_vulkan
+
+            icd = lib.vulkan_icd()
+            seen = os.environ.get("VK_ICD_FILENAMES")
+            if seen != icd:
+                raise RuntimeError(
+                    f"{lib.VULKAN_ICD_ENV}={icd!r} but this process's VK_ICD_FILENAMES is "
+                    f"{seen!r}; the driver forwards one to the other "
+                    "(hf_bench.child_env) — run the leg through bench_logs/hf_bench.py"
+                )
+            patched = hf_bench_vulkan.install()
+            enumerated = hf_bench_vulkan.device_info()
+            properties = hf_bench_vulkan.physical_device_properties(spec.device_index)
+            record["vulkan"] = {
+                "shim": "bench_logs/hf_bench_vulkan.py install()",
+                "shim_patched_sites": sorted(patched),
+                "shim_patch_count": len(patched),
+                "icd_env_var": lib.VULKAN_ICD_ENV,
+                "icd_path": icd,
+                "vk_icd_filenames": seen,
+                "device_name": properties.get("name"),
+                "device_api_version": properties.get("api_version"),
+                "device_driver_version": properties.get("driver_version"),
+                "device_driver_version_scheme": properties.get("driver_version_scheme"),
+                "device_vendor_id": properties.get("vendor_id"),
+                "device_type": properties.get("device_type"),
+                "iree_device_count": enumerated.get("count"),
+                "iree_device_id": enumerated.get("device_id"),
+                "iree_device_path": enumerated.get("path"),
+                "compile_target": hf_bench_vulkan.VULKAN_TARGET,
+                "note": (
+                    "lavapipe = software Vulkan on CPU; not a GPU measurement. The AMD "
+                    "GPU of this host cannot run Vulkan (Mesa RADV refuses CDNA3) — see "
+                    "bench_logs/vulkan_findings.md"
+                ),
+            }
+            notes.append(
+                "ran on IREE's Vulkan HAL through the benchmark-only shim "
+                f"{record['vulkan']['shim']} ({len(patched)} patched site(s), never a "
+                "library change); the device is "
+                f"{properties.get('name')!r} (apiVersion "
+                f"{properties.get('api_version')}, driver {properties.get('driver_version')},"
+                f" type {properties.get('device_type')}) = SOFTWARE Vulkan on the CPU, so "
+                "its timings are a Vulkan-path datapoint, never a GPU number"
+            )
+        except Exception as exc:
+            return fail("vulkan shim", exc)    # -- checkpoint + config + ids -----------------------------------------
     _progress("load checkpoint")
     try:
         ckpt = lib.checkpoint_dir(model)
@@ -948,6 +1021,20 @@ def child_env(leg_key: str) -> dict:
         flags = (env.get("XLA_FLAGS") or "").strip()
         if required not in flags:
             env["XLA_FLAGS"] = f"{flags} {required}".strip()
+    if lib.leg_spec(leg_key).device_kind == "vulkan":
+        # The Vulkan ICD is a machine-local path, so the harness never hard-codes one:
+        # the runner exports ``ETL_VULKAN_ICD`` (the renamed lavapipe ICD of
+        # bench_logs/vulkan_findings.md) and the leg subprocess gets it as the
+        # ``VK_ICD_FILENAMES`` the Vulkan loader reads.  Always pin it explicitly —
+        # without it the loader also dlopens the radeon ICD, which BLOCKS on this host.
+        # Unset/invalid ⇒ the leg writes a record naming the variable (never an omission).
+        try:
+            icd = lib.vulkan_icd()
+        except RuntimeError as exc:
+            env.pop("VK_ICD_FILENAMES", None)
+            print(f"[warn] {leg_key}: {exc}", file=sys.stderr)
+        else:
+            env["VK_ICD_FILENAMES"] = icd
     return env
 
 
@@ -1209,10 +1296,12 @@ def refresh_parity_digest(out_dirs) -> None:
             return
         target = Path(out_dirs[0]) / PARITY_DIGEST_NAME
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, indent=2) + "\n")
+        merged = merge_parity_digests(payload, load_parity_digest(out_dirs))
+        target.write_text(json.dumps(merged, indent=2) + "\n")
         print(
             f"[digest] {target} refreshed from {payload['dumps']} logits dump(s) "
-            f"({len(payload['cells'])} cell(s)); commit it, not the dumps",
+            f"({len(payload['cells'])} cell(s) recomputed, "
+            f"{len(merged['cells'])} cell(s) in the merged digest); commit it, not the dumps",
             flush=True,
         )
     except Exception as exc:  # never lose a run over the derived digest
@@ -1556,11 +1645,48 @@ def build_parity_digest(records, out_dirs) -> dict:
     }
 
 
+def merge_parity_digests(fresh: dict, existing: dict | None) -> dict:
+    """Union a freshly computed digest with the committed one — fresher pairs win.
+
+    The digest is the frozen form of the ``*.logits.npz`` dumps, and the dumps are
+    derived bulk that only exists while a run leaves them on disk.  A later run of a
+    *subset* of the matrix therefore sees only its own cells' dumps; replacing the file
+    wholesale would silently drop the pairs earlier runs froze.  So the cells are
+    merged per pair (a recomputed pair replaces the frozen one — same numbers, they come
+    from the same logits — and every pair this run could not recompute is kept), while
+    the existing key order is preserved and new cells are appended in
+    ``_cell_order`` sequence so the file's layout stays deterministic.
+    """
+    if not existing or not isinstance(existing.get("cells"), dict):
+        return fresh
+    merged_cells = dict(existing["cells"])
+    added = 0
+    for base, entry in (fresh.get("cells") or {}).items():
+        if base in merged_cells:
+            merged_cells[base] = {**merged_cells[base], **entry}
+        else:
+            merged_cells[base] = entry
+            added += 1
+    payload = dict(fresh)
+    payload["cells"] = merged_cells
+    if len(merged_cells) != len(fresh.get("cells") or {}):
+        payload["merged_from_previous_digest"] = len(merged_cells) - added
+        payload["source"] = (
+            f"{fresh.get('source')}. MERGED: the `dumps` count says how many dumps THIS "
+            f"write recomputed from; the {len(merged_cells) - added} cell(s) listed under "
+            "`merged_from_previous_digest` are pairs frozen by an earlier write whose dumps "
+            "(derived, gitignored bulk) are no longer on disk — kept verbatim so a partial "
+            "re-run never drops a committed parity number"
+        )
+    return payload
+
+
 def write_parity_digest(records, out_dirs) -> Path:
     """Write ``parity_digest.json`` next to the records; returns its path."""
     target = Path(out_dirs[0]) / PARITY_DIGEST_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = build_parity_digest(records, out_dirs)
+    existing = load_parity_digest(out_dirs)
+    payload = merge_parity_digests(build_parity_digest(records, out_dirs), existing)
     target.write_text(json.dumps(payload, indent=2) + "\n")
     return target
 
@@ -2061,6 +2187,177 @@ def _xla_lines(records, out_dirs, digest) -> list[str]:
     return lines
 
 
+def _vulkan_lines(records, out_dirs, digest) -> list[str]:
+    """Section 5c: the ``iree-vulkan`` leg — IREE's Vulkan HAL on **lavapipe**.
+
+    lavapipe is Mesa's **software** Vulkan implementation running on the CPU, so these
+    are Vulkan-path correctness/perf datapoints and never GPU numbers. Every number is
+    read from a record, and the device facts (name / apiVersion / driverVersion / the
+    shim that made the path reachable) come from each record's own ``vulkan`` block, so
+    the section states what actually ran rather than what the harness hoped for.
+    """
+    lines: list[str] = []
+    add = lines.append
+    cells = [key for key in _cell_order(records) if key[2] == "iree-vulkan"]
+    add(
+        f"`{lib.leg_display('iree-vulkan')}` — the whole forward as ONE `etl_hf` graph on "
+        "IREE's **Vulkan** HAL. The only Vulkan device this host exposes is **lavapipe** "
+        "(Mesa's software Vulkan implementation, `deviceType = CPU`), reached through the "
+        "benchmark-only runtime shim `bench_logs/hf_bench_vulkan.py` (`install()` widens "
+        "eight string/dialect gates of the live iree adapter; nothing under `etl/` or "
+        "`etl_hf/` is modified) with the Vulkan loader pinned to a renamed lavapipe ICD by "
+        f"`VK_ICD_FILENAMES`, forwarded from `${lib.VULKAN_ICD_ENV}`. "
+        "**These are not GPU numbers** — the same work runs on the CPU, slower than the "
+        "interpreter on the large models."
+    )
+    add("")
+    device = next(
+        (
+            (_record_at(records, *key) or {}).get("vulkan")
+            for key in cells
+            if (_record_at(records, *key) or {}).get("vulkan")
+        ),
+        None,
+    )
+    if device:
+        add(
+            "Device the leg actually enumerated (recorded per cell under `vulkan`): "
+            f"**{device.get('device_name')}** — apiVersion "
+            f"`{device.get('device_api_version')}`, driverVersion "
+            f"`{device.get('device_driver_version')}` "
+            f"({device.get('device_driver_version_scheme')}), vendorID "
+            f"`{device.get('device_vendor_id')}`, `deviceType = "
+            f"{device.get('device_type')}`; IREE compile target "
+            f"`{device.get('compile_target')}`; shim `{device.get('shim')}` "
+            f"({lib.fmt(device.get('shim_patch_count'))} patched site(s)); ICD from "
+            f"`${device.get('icd_env_var')}`."
+        )
+        add("")
+    rows = []
+    for model, seq_len in _matrix_cells(records):
+        record = _record_at(records, model, seq_len, "iree-vulkan")
+        run = (record or {}).get("run") or {}
+        best = _best_ms(record)
+        d2h = (run.get("d2h") or {}).get("best_ms")
+        checks = (record or {}).get("checks") or {}
+        zero = checks.get("zero_asdevicearray_after_warmup")
+        uploads = (
+            "0"
+            if zero is True
+            else (f"{checks.get('asdevicearray_calls')} (VIOLATION)" if zero is False else "n/a")
+        )
+        references = {
+            key: _best_ms(_record_at(records, model, seq_len, key))
+            for key in ("numpy-cpu", "iree-llvmcpu", "torch-cpu", "iree-rocm", "xla-rocm",
+                        "torch-rocm")
+        }
+        rows.append(
+            [
+                model,
+                seq_len,
+                _packed_cell(record),
+                lib.fmt(run.get("first_call_ms")),
+                lib.fmt(best),
+                lib.fmt(run.get("median_ms")),
+                lib.fmt(d2h),
+                uploads,
+                lib.fmt_ratio(_speedup(best, references["numpy-cpu"])),
+                lib.fmt_ratio(_speedup(best, references["iree-llvmcpu"])),
+                lib.fmt_ratio(_speedup(best, references["torch-cpu"])),
+                lib.fmt(references["iree-rocm"]),
+                lib.fmt(references["xla-rocm"]),
+                lib.fmt(references["torch-rocm"]),
+                _status_reason(record),
+            ]
+        )
+    lines.extend(lib.md_table(
+        [
+            "model",
+            "seq",
+            "weights",
+            "first ms",
+            "best ms",
+            "median ms",
+            "+d2h best ms",
+            "asdevicearray",
+            "×numpy-cpu",
+            "×iree-llvmcpu",
+            "×torch-cpu",
+            "iree-rocm ms (reused)",
+            "xla-rocm ms (reused)",
+            "torch-rocm ms (reused)",
+            "note / reason",
+        ],
+        rows,
+    ))
+    add("")
+    add(
+        "The three `×` columns are the **CPU-vs-CPU** comparison — `that leg's best ms / "
+        "iree-vulkan's best ms`, so **>1 means iree-vulkan is faster**. The three `(reused)` "
+        "columns carry the raw best ms of the **real-GPU** records (measured before the AMD "
+        "GPU of this host stopped accepting Vulkan/ROCm work; that hardware cannot be "
+        "re-measured) shown for reference only: they are a GPU's numbers next to a software "
+        "rasterizer's, so no ratio is formed from them here (e.g. `torch-rocm` on a *tiny* "
+        "model is launch-overhead-bound and says nothing about GPU throughput)."
+    )
+    add("")
+    parity = []
+    for model, seq_len in _matrix_cells(records):
+        record = _record_at(records, model, seq_len, "iree-vulkan")
+        if record is None or record.get("status") != "ok":
+            continue
+        numpy_stats, numpy_note = _leg_parity(
+            records, out_dirs, digest, model, seq_len, "iree-vulkan", "numpy-cpu"
+        )
+        golden_stats, _golden_note = _leg_parity(
+            records, out_dirs, digest, model, seq_len, "iree-vulkan", "golden"
+        )
+        parity.append((model, seq_len, numpy_stats, numpy_note, golden_stats))
+    if parity:
+        add(
+            "Parity of the Vulkan logits — against the **numpy interpreter** (the reference "
+            "that is always available for a cell) and against the torch/transformers golden "
+            "(only where the fixture's `input_ids` shape matches the cell):"
+        )
+        add("")
+        rows = []
+        for model, seq_len, numpy_stats, numpy_note, golden_stats in parity:
+            rows.append(
+                [
+                    model,
+                    seq_len,
+                    _fmt_sci(numpy_stats["max_abs"]) if numpy_stats else "—",
+                    _fmt_sci(numpy_stats["rel_to_absmax"]) if numpy_stats else "—",
+                    lib.fmt(numpy_stats["argmax_agreement"]) if numpy_stats else "—",
+                    _fmt_sci(golden_stats["max_abs"]) if golden_stats else "—",
+                    lib.fmt(golden_stats["argmax_agreement"]) if golden_stats else "—",
+                    numpy_note or "",
+                ]
+            )
+        lines.extend(lib.md_table(
+            [
+                "model",
+                "seq",
+                "max_abs (numpy)",
+                "rel_to_absmax (numpy)",
+                "argmax (numpy)",
+                "max_abs (golden)",
+                "argmax (golden)",
+                "note / reason",
+            ],
+            rows,
+        ))
+        add("")
+        add(
+            "The numpy reference is the `numpy-cpu` leg's own logits: its `*.logits.npz` "
+            "dump is derived bulk (`.gitignore`d), so it is re-created on demand and the "
+            "numbers above are frozen in the committed `parity_digest.json` — `--report` "
+            "renders them identically with or without the dumps on disk."
+        )
+        add("")
+    return lines
+
+
 def _protocol_flags(records, leg_keys, models, seq_len) -> str:
     """The recorded ``--warmup/--repeat`` flags of a group of cells, when uniform."""
     seen = set()
@@ -2091,6 +2388,11 @@ def _reproduction_lines(records) -> list[str]:
     add("#    (--verify-only: checks only, no installs; --force: recreate the venv)")
     add("# 2. run the benchmark phases — etl + etl_hf come from the checkout")
     add("export PYTHONPATH=\"$(git rev-parse --show-toplevel)\"")
+    if any(key[2] == "iree-vulkan" for key in records):
+        add(
+            f"export {lib.VULKAN_ICD_ENV}=/path/to/renamed-lavapipe-icd.json"
+            "   # required by --phase vulkan; forwarded to the leg as VK_ICD_FILENAMES"
+        )
     phase_commands: list[str] = []
     for phase in sorted(lib.PHASES):
         phase_legs = set(lib.PHASES[phase])
@@ -2188,6 +2490,10 @@ def _reproduction_lines(records) -> list[str]:
         "numpy-cpu": "numpy interpreter backend, host arrays (no compilation)",
         "iree-llvmcpu": "IREE compiled for llvm-cpu, host-resident inputs",
         "iree-rocm": "IREE compiled for ROCm, device-resident same-device loop",
+        "iree-vulkan": "IREE compiled for Vulkan (`vulkan-spirv`) on lavapipe — "
+        "**software** Vulkan on the CPU, device-resident; needs the benchmark-only shim "
+        "`bench_logs/hf_bench_vulkan.py` and `ETL_VULKAN_ICD` (forwarded as "
+        "`VK_ICD_FILENAMES`)",
         "xla-rocm": "PJRT/XLA on ROCm (needs `ETL_PJRT_PLUGIN`), device-resident",
         "xla-rocm-fp32": "the same with `dot_precision=\"HIGHEST\"` (true fp32 dot) — "
         "opt-in, `--legs` only",
@@ -2278,6 +2584,22 @@ def render_report(records, out_dirs) -> str:
         f"Harness git commit: `{git or 'unknown'}`."
     )
     add("")
+    if "iree-vulkan" in legs:
+        add(
+            f"**`iree-vulkan` is `{lib.leg_display('iree-vulkan')}`** — Mesa's *software* "
+            "Vulkan implementation, i.e. work executed on the CPU through a Vulkan driver. "
+            "The AMD GPU of this host **cannot run Vulkan at all** (Mesa RADV refuses "
+            "CDNA3, the MI300X compute part is not a Vulkan device — see "
+            "`bench_logs/vulkan_findings.md`), so this leg is a Vulkan-path "
+            "correctness/performance datapoint, never a GPU number. Every other GPU column "
+            "in this report (`iree-rocm`, `xla-rocm`, `xla-rocm-fp32`, `torch-rocm`) comes "
+            "from records **measured earlier on the real GPU before it stopped accepting "
+            "work** and is reused verbatim — that hardware cannot be re-measured, so those "
+            "columns are reference data, not a comparison with the Vulkan leg. The "
+            "`numpy-cpu` / `iree-llvmcpu` / `torch-cpu` columns are the CPU-vs-CPU "
+            "comparison. Full section: 5c."
+        )
+        add("")
     # ---- headline --------------------------------------------------------
     add("## Headline (every ratio computed from the records)")
     add("")
@@ -2698,6 +3020,14 @@ def render_report(records, out_dirs) -> str:
             rows,
         ))
         add("")
+    # ---- the Vulkan HAL leg ----------------------------------------------
+    if any(key[2] == "iree-vulkan" for key in ordered):
+        add(
+            "## 5c. `iree-vulkan` — IREE's Vulkan HAL on **lavapipe** "
+            "(software Vulkan on the CPU)"
+        )
+        add("")
+        lines.extend(_vulkan_lines(records, out_dirs, digest))
     # ---- parity ----------------------------------------------------------
     add("## 6. Parity")
     add("")
@@ -2853,6 +3183,23 @@ def render_report(records, out_dirs) -> str:
         "`opt_level=\"O1\"`, llvm-cpu → `opt_level=\"O3\"` + `--iree-llvmcpu-target-cpu=host` + "
         "`--iree-opt-data-tiling`); the resolved set is recorded in every leg JSON."
     )
+    if "iree-vulkan" in legs:
+        add(
+            "* The `iree-vulkan` leg needs the benchmark-only runtime shim "
+            "`bench_logs/hf_bench_vulkan.py` (installed by the measuring path, never by the "
+            "library: `etl` has no `vulkan` device kind) and a Vulkan ICD pinned by "
+            f"`VK_ICD_FILENAMES`, which the driver forwards from `${lib.VULKAN_ICD_ENV}` — a "
+            "vulkan leg requested without it fails as a record naming that variable. The "
+            "device is lavapipe (**software** Vulkan on the CPU), so no row in this report "
+            "moves work to an accelerator for that leg; the shim's patched sites and the "
+            "device's apiVersion/driverVersion are recorded per cell under `vulkan`."
+        )
+        add(
+            "* The GPU columns of this report (`iree-rocm`, `xla-rocm`, `torch-rocm`, …) are "
+            "**reused records** measured before the AMD GPU of this host stopped accepting "
+            "work; they were not re-measured, and no number here was extrapolated from the "
+            "Vulkan leg."
+        )
     add(
         "* The torch legs are the baseline, not the reference: parity versus the stored "
         "torch/transformers golden is the absolute check (only where the golden's ids shape "
@@ -2899,10 +3246,12 @@ def digest_main(args) -> int:
         return 1
     target = Path(args.out[0]) / PARITY_DIGEST_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2) + "\n")
+    merged = merge_parity_digests(payload, load_parity_digest(args.out))
+    target.write_text(json.dumps(merged, indent=2) + "\n")
     print(
         f"[digest] wrote {target} from {payload['dumps']} logits dump(s) "
-        f"({len(payload['cells'])} cell(s)); the dumps themselves are not committed",
+        f"({len(payload['cells'])} cell(s) recomputed, {len(merged['cells'])} cell(s) in "
+        "the merged digest); the dumps themselves are not committed",
         flush=True,
     )
     return 0
@@ -2970,8 +3319,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--phase",
         default=None,
         help="phase leg set(s): cpu = numpy-cpu,iree-llvmcpu,torch-cpu; "
-        "gpu = iree-rocm,xla-rocm,torch-rocm (run the two phases separately, never "
-        "concurrently — the GPU is shared)",
+        "gpu = iree-rocm,xla-rocm,torch-rocm; vulkan = iree-vulkan (lavapipe, software "
+        "Vulkan on the CPU; needs $ETL_VULKAN_ICD) — run the phases separately, never "
+        "concurrently (the GPU is shared and a software-Vulkan leg would steal the CPU "
+        "cores the cpu phase assumes)",
     )
     parser.add_argument(
         "--out",

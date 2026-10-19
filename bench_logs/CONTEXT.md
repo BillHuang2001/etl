@@ -167,11 +167,30 @@ PyTorch baselines. Environment provisioning is `./hf_bench_env.py`; raw records 
 `./hf_bench_data/`; the rendered report is `./hf_bench_results.md` (generated, never hand-edited).
 `./probe_hf_perf.py` below is the older narrower matrix — new measurements belong here.
 
-Legs: `numpy-cpu` (interpreter reference), `iree-llvmcpu`, `iree-rocm`, `xla-rocm`, `torch-cpu`,
-`torch-rocm` (fp32 eager `.eval()`/`no_grad()`, `torch.cuda.synchronize()` around each call), plus
-the opt-in `xla-rocm-fp32` (`dot_precision="HIGHEST"`), `torchcompile-cpu`, `torchcompile-rocm`.
-`--phase cpu` = `numpy-cpu,iree-llvmcpu,torch-cpu`; `--phase gpu` = `iree-rocm,xla-rocm,torch-rocm`.
-The phases are run SEQUENTIALLY — the MI300X is shared, so never two GPU legs at once.
+Legs: `numpy-cpu` (interpreter reference), `iree-llvmcpu`, `iree-rocm`, `iree-vulkan`, `xla-rocm`,
+`torch-cpu`, `torch-rocm` (fp32 eager `.eval()`/`no_grad()`, `torch.cuda.synchronize()` around each
+call), plus the opt-in `xla-rocm-fp32` (`dot_precision="HIGHEST"`), `torchcompile-cpu`,
+`torchcompile-rocm`.
+`--phase cpu` = `numpy-cpu,iree-llvmcpu,torch-cpu`; `--phase gpu` = `iree-rocm,xla-rocm,torch-rocm`;
+`--phase vulkan` = `iree-vulkan`. The phases are run SEQUENTIALLY — the MI300X is shared, so never two
+GPU legs at once, and a software-Vulkan leg would steal the cores the cpu phase assumes.
+
+**`iree-vulkan` (lavapipe, software Vulkan on CPU).** IREE's Vulkan HAL, on the only Vulkan device this
+host exposes: **lavapipe**, Mesa's *software* Vulkan implementation (`deviceType = CPU`) — a Vulkan-path
+correctness/perf datapoint, never a GPU number (the AMD GPU cannot run Vulkan: Mesa RADV refuses CDNA3;
+see `./vulkan_findings.md`). `etl` has no `vulkan` device kind, so the leg needs the benchmark-only shim
+`./hf_bench_vulkan.py` (`install()` widens eight live-adapter string/dialect gates; nothing under
+`./etl/` or `./etl_hf/` knows it exists) plus the loader pinned to a renamed lavapipe ICD. The ICD is a
+**machine-local path and is never hard-coded**: the runner exports `ETL_VULKAN_ICD`, `child_env`
+forwards it to the leg as `VK_ICD_FILENAMES`, and a vulkan leg requested without it writes a record
+naming that variable (never a silently empty device list). Each record carries a `vulkan` provenance
+block — device name / apiVersion / driverVersion (read from `VkPhysicalDeviceProperties` via
+`hf_bench_vulkan.physical_device_properties()`), vendorID, `deviceType`, IREE device id/path, the ICD
+used, the shim and its patched sites, and an explicit `"note": "lavapipe = software Vulkan on CPU; not
+a GPU measurement"`. Compile options stay library defaults (`opt_level="O3"` for a non-rocm target set);
+`--pack auto` applies unchanged (tiny models unpacked, the 124M models packed). The GPU columns of the
+report are **reused records** measured before the GPU wedged — they are reference data, not a
+comparison with the software leg.
 One subprocess per `(model, seq_len, leg)`, with `--leg-timeout`; the child writes its own JSON and
 `.logits.npz` then `os._exit(0)`, so the xla/ROCm teardown abort cannot lose a record.
 A leg that cannot run is a RECORD (`*.error.json`) with its verbatim error/returncode/signal, never

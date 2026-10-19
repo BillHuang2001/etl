@@ -9,7 +9,9 @@ need them, so ``--report`` (which needs nothing but JSON + ``numpy`` to read the
 What lives here (and therefore *not* in the CLI module):
 
 * the **leg table** (:class:`LegSpec`, :data:`LEGS`, :data:`PHASES`) — one entry per
-  execution path, plus the model → golden-fixture-slug map;
+  execution path, plus the model → golden-fixture-slug map, the human labels of
+  :data:`LEG_DISPLAY` and the ``ETL_VULKAN_ICD`` lookup (:func:`vulkan_icd`) the
+  ``iree-vulkan`` leg needs;
 * **checkpoint / golden resolution** (never downloads);
 * the **record file naming convention** (:func:`leg_paths`, :func:`read_record`) —
   one JSON per ``(model, seq_len, leg)`` cell, so cross-leg parity can be recomputed
@@ -46,6 +48,21 @@ DEFAULT_REPORT_PATH = HERE / "hf_bench_results.md"
 GOLDENS_DIR = HERE / "hf_goldens"
 #: Version table written by ``bench_logs/hf_bench_env.py`` (provisioning artifact).
 ENV_JSON_NAME = "hf_bench_env.json"
+#: Environment variable naming the **Vulkan ICD json** the ``iree-vulkan`` leg needs.
+#: The harness never hard-codes a machine path: the runner points this at the renamed
+#: lavapipe ICD (see ``bench_logs/vulkan_findings.md``) and ``hf_bench.child_env``
+#: forwards it to the leg subprocess as the ``VK_ICD_FILENAMES`` the Vulkan loader
+#: reads. A vulkan leg requested without it fails with an explicit error naming this
+#: variable (it is a RECORD, never a silent omission) — the alternative would be
+#: silently enumerating 0 devices or, worse, letting the loader dlopen the wedged
+#: radeon ICD.
+VULKAN_ICD_ENV = "ETL_VULKAN_ICD"
+#: Human labels for legs whose bare key would misrepresent what was measured. Used by
+#: ``--report`` wherever a leg is named in prose or in a section heading; tables keep
+#: the key itself so every row stays machine-mappable to a record file.
+LEG_DISPLAY: dict[str, str] = {
+    "iree-vulkan": "iree-vulkan (lavapipe, software Vulkan on CPU)",
+}
 
 #: Bumped whenever the record schema below changes in a way a reader cares about.
 SCHEMA = 1
@@ -145,6 +162,22 @@ LEGS: dict[str, LegSpec] = {
         backend="xla",
         device_kind="rocm",
     ),
+    # IREE's **Vulkan** HAL.  The only Vulkan device on this host is **lavapipe** (Mesa's
+    # software Vulkan implementation running on the CPU — a correctness/perf datapoint,
+    # never a GPU number), reached through a renamed ICD pinned by ``VK_ICD_FILENAMES``,
+    # which the driver forwards from :data:`VULKAN_ICD_ENV`.  ``etl`` has no ``vulkan``
+    # device kind, so the leg also needs the benchmark-only runtime shim
+    # ``bench_logs/hf_bench_vulkan.py`` installed before the build (the measuring path
+    # does that for every vulkan leg and records the shim in ``record["vulkan"]``).
+    # Options stay empty: the library defaults apply (``etl_hf.pipeline`` injects
+    # ``opt_level="O3"`` for a non-rocm target set, which compiles fine for vulkan-spirv).
+    "iree-vulkan": LegSpec(
+        key="iree-vulkan",
+        kind="etl",
+        backend="iree",
+        device_kind="vulkan",
+        device_index=0,
+    ),
     # Additive variant of ``xla-rocm``: the ONE place the harness passes a
     # precision option, because XLA/ROCm's default fp32 ``dot`` runs at
     # TF32-class precision (10-bit mantissa) while the explicit
@@ -174,6 +207,7 @@ LEG_ORDER: tuple[str, ...] = (
     "numpy-cpu",
     "iree-llvmcpu",
     "iree-rocm",
+    "iree-vulkan",
     "xla-rocm",
     "xla-rocm-fp32",
     "torch-cpu",
@@ -182,10 +216,14 @@ LEG_ORDER: tuple[str, ...] = (
     "torchcompile-rocm",
 )
 #: ``--phase`` expansions.  ``cpu`` and ``gpu`` are run **separately and
-#: sequentially** because the GPU is shared with other work on this host.
+#: sequentially** because the GPU is shared with other work on this host.  ``vulkan`` is
+#: its own phase for the same reason plus one more: lavapipe is a CPU software device,
+#: so a vulkan leg must never overlap a leg that is meant to be measured on the CPU
+#: (``cpu``) — it would steal the cores both measurements assume they have.
 PHASES: dict[str, tuple[str, ...]] = {
     "cpu": ("numpy-cpu", "iree-llvmcpu", "torch-cpu"),
     "gpu": ("iree-rocm", "xla-rocm", "torch-rocm"),
+    "vulkan": ("iree-vulkan",),
 }
 #: Legs that exist for a documented, additive *comparison* and are therefore never
 #: part of a phase or of the default leg set — they run only when named explicitly
@@ -209,6 +247,40 @@ def sort_legs(keys) -> list[str]:
     """Order leg keys deterministically (``LEG_ORDER``, unknown keys last)."""
     rank = {key: index for index, key in enumerate(LEG_ORDER)}
     return sorted(set(keys), key=lambda key: (rank.get(key, len(rank)), key))
+
+
+def leg_display(key: str) -> str:
+    """A leg's human label — the bare key unless :data:`LEG_DISPLAY` qualifies it."""
+    return LEG_DISPLAY.get(key, key)
+
+
+def vulkan_icd(var: str = VULKAN_ICD_ENV) -> str:
+    """The Vulkan ICD json path the runner exported, or an explicit error naming it.
+
+    The path is **machine-local** (a renamed lavapipe ICD under a scratch dir), so it
+    is never hard-coded here: the harness reads :data:`VULKAN_ICD_ENV` in the driver
+    and re-exports it to the leg subprocess as ``VK_ICD_FILENAMES``.
+
+    Raises:
+        RuntimeError: the variable is unset/blank or points at a missing file — the
+            message names the variable and what it must contain.
+    """
+    value = (os.environ.get(var) or "").strip()
+    if not value:
+        raise RuntimeError(
+            f"the iree-vulkan leg needs {var} set to the Vulkan ICD json to use "
+            "(the renamed lavapipe ICD of bench_logs/vulkan_findings.md), and it is "
+            f"empty/unset; export {var}=/path/to/lavapipe_icd.json — the driver forwards "
+            "it to the leg as VK_ICD_FILENAMES"
+        )
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise RuntimeError(
+            f"{var} points at {value!r}, which is not a readable file; it must be the "
+            "Vulkan ICD json of the device the leg should enumerate "
+            "(bench_logs/vulkan_findings.md builds one for the renamed lavapipe ICD)"
+        )
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
