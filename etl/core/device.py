@@ -1,7 +1,8 @@
 """Device model and explicit multi-device data-preparation helpers.
 
 A tensor is always a *local* physical tensor. ``Device`` identifies a
-physical device; ``devices()`` enumerates what is actually available;
+physical device; ``devices()`` enumerates what is actually available
+(``"cpu"``, ``"cuda"``, ``"rocm"``; ``"vulkan"`` on explicit request);
 ``split_tensor``/``replicate_tensor`` are *explicit* data-preparation
 utilities that produce ordinary local ``Tensor``\\s — they do no graph
 rewriting, no implicit communication, and never shard inside the graph
@@ -36,13 +37,14 @@ __all__ = ["Device", "devices", "split_tensor", "replicate_tensor"]
 class Device:
     """A physical device: a kind plus an optional index.
 
-    v1 kinds: ``"cpu"`` (always available); ``"cuda"`` and ``"rocm"`` may be
-    listed by ``devices()`` when a CUDA / ROCm runtime is detectable (see
-    ``devices``; ``"hip"`` is accepted as an alias/equivalent filter for the
-    ``"rocm"`` kind).
+    v1 kinds: ``"cpu"`` (always available); ``"cuda"``, ``"rocm"`` and
+    ``"vulkan"`` may be listed by ``devices()`` when a CUDA / ROCm / Vulkan
+    runtime is detectable (see ``devices``; ``"hip"`` is accepted as an
+    alias/equivalent filter for the ``"rocm"`` kind).
 
     Attributes:
-        kind: Device kind string, e.g. ``"cpu"``, ``"cuda"`` or ``"rocm"``.
+        kind: Device kind string, e.g. ``"cpu"``, ``"cuda"``, ``"rocm"`` or
+            ``"vulkan"``.
         index: Device index within the kind (default 0).
     """
 
@@ -119,18 +121,71 @@ def _rocm_devices() -> List[Device]:
     return [Device("rocm", i) for i in range(count)]
 
 
+def _vulkan_devices() -> List[Device]:
+    """Detect Vulkan devices through the IREE Vulkan HAL driver.
+
+    One source decides the count: ``iree.runtime.get_driver("vulkan")`` — the
+    runtime the etl iree adapter drives for device payloads — whose
+    ``query_available_devices()`` returns one info dict per visible device and
+    allocates no device (side-effect free). ``iree`` is imported *inside* this
+    function (optional extra, lazy activation): ``import etl`` must never pull
+    iree in.
+
+    Index mapping: etl's ``Device.index`` is the **per-kind enumeration index**
+    here (``[Device("vulkan", i) for i in range(N)]``). It is deliberately NOT
+    ``hal_device_id``: IREE's Vulkan HAL device ids are queried per-process
+    hashes/UUIDs, not a dense ``index + 1`` range (unlike the rocm HAL's
+    1-based ids), and resolving an etl index to a HAL device id/UUID is the
+    iree adapter's job — do not "fix" this mapping into ``index + 1``.
+
+    Every probe failure (missing ``iree`` — ``ImportError``/
+    ``ModuleNotFoundError`` —, a driver that fails to initialize, a query
+    error) yields ``[]``, exactly as ``_rocm_devices()`` behaves when no
+    runtime/device is present: enumeration never raises and never invents a
+    device. Only enumeration is this lenient — a device that is actually
+    *used* gets an explicit, actionable error from the adapter/provider.
+    The broad ``except Exception`` mirrors that neighbour; it is deliberately
+    scoped to this best-effort, side-effect-free runtime query and can never
+    mask a caller-visible failure, because the query's only output is a count.
+
+    Hint (runtime fact, not an etl policy — no paths are hard-coded here):
+    IREE 3.11 hard-codes a device-NAME denylist that hides Mesa's software
+    Vulkan rasterizer ``lavapipe`` (its device name starts with ``llvmpipe``),
+    so a software-Vulkan host honestly enumerates ``[]`` unless
+    ``VK_ICD_FILENAMES`` selects a differently-named ICD manifest.
+    """
+    count: Optional[int] = None
+    try:
+        import iree.runtime as rt  # lazy: iree is an optional extra
+
+        count = len(rt.get_driver("vulkan").query_available_devices())
+    except Exception:  # defensive probe: any failure means "not detectable"
+        count = None
+    if not count:
+        return []
+    return [Device("vulkan", i) for i in range(count)]
+
 def devices(kind: Optional[str] = None) -> List[Device]:
     """Enumerate the devices actually available to this process.
 
     v1 semantics (honest, minimal): ``kind=None`` lists all detectable
     devices; the CPU device (``Device("cpu", 0)``) is *always* present;
     ``"cuda"`` devices are listed only if a CUDA runtime is detectable in
-    this process (e.g. torch with CUDA) and ``"rocm"`` devices only if a
-    ROCm runtime is detectable (the IREE HIP HAL driver, else a
-    ROCm-capable torch build) — otherwise the corresponding list is empty.
-    ``"hip"`` is accepted as an alias/equivalent filter for the ``"rocm"``
-    kind (both return the canonical ``Device("rocm", i)`` list). No devices
-    are invented, and etl never requires a GPU.
+    this process (e.g. torch with CUDA), ``"rocm"`` devices only if a ROCm
+    runtime is detectable (the IREE HIP HAL driver, else a ROCm-capable torch
+    build) and ``"vulkan"`` devices only if the IREE Vulkan HAL driver sees
+    any — otherwise the corresponding list is empty. ``"hip"`` is accepted as
+    an alias/equivalent filter for the ``"rocm"`` kind (both return the
+    canonical ``Device("rocm", i)`` list). No devices are invented, and etl
+    never requires a GPU.
+
+    ``"vulkan"`` is queried only when asked for explicitly
+    (``devices("vulkan")``): the probe force-instantiates the IREE Vulkan
+    runtime plus the system Vulkan loader, and on a software-Vulkan host it
+    would list a CPU rasterizer among the "accelerators" — so the unfiltered
+    ``devices(None)`` list stays ``cpu + cuda + rocm`` and deliberately
+    excludes vulkan. ``devices("vulkan")`` reports the per-kind enumeration
+    index; the HAL device-id/UUID mapping lives in the iree adapter.
 
     Args:
         kind: Optional filter; only devices of this kind are returned.
@@ -153,13 +208,14 @@ def devices(kind: Optional[str] = None) -> List[Device]:
         return []
     if kind == "rocm" or kind == "hip":
         return _rocm_devices()
+    if kind == "vulkan":
+        return _vulkan_devices()
     if kind is None:
         return [Device("cpu", 0)] + devices("cuda") + devices("rocm")
     raise DeviceError(
-        f"Unknown device kind {kind!r}; recognized kinds are 'cpu', 'cuda' and "
-        f"'rocm' (alias 'hip')."
+        f"Unknown device kind {kind!r}; recognized kinds are 'cpu', 'cuda', "
+        f"'rocm' (alias 'hip') and 'vulkan'."
     )
-
 
 def _invalid_axis_error(axis: Any) -> DeviceError:
     """Canonical invalid-axis error: name the bad value and its type."""
