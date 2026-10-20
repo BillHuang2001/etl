@@ -107,4 +107,4 @@ ROCm: `Device("rocm", 0)` maps to HAL `device_id = 1` (1-based; `create_device(0
 | `./test_torch_oracle.py` | Optional torch/transformers oracle + golden-fixture contract. |
 | `./hf_download.py` | Guarded downloader/cache helper + slug tables + CLI (stdlib only). |
 | `../` | The package under test (`config`, `weights`, `ops`, `reference`, `families`, `load`, `program`, `pipeline`, `pack`). |
-| `../../etl/` | The tensor library it builds on (read-only from here). |
+| `../../etl/` | The tensor language it builds on (read-only from here). |
