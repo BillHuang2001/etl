@@ -2,7 +2,7 @@
 
 ## Intent
 
-A **minimal, explicit, compiler-neutral tensor graph runtime** (Python-first). etl provides an ergonomic tensor language for constructing, transforming, inspecting, caching, loading, and executing computational graphs. It deliberately does **not** own optimization, kernel scheduling, memory planning, or hardware code generation — those belong to external compilers (IREE, XLA via PJRT, TVM).
+A **minimal, explicit, compiler-neutral tensor graph runtime** (Python-first), named **EvoX Tensor Language**. etl provides an ergonomic tensor language for constructing, transforming, inspecting, caching, loading, and executing computational graphs. It deliberately does **not** own optimization, kernel scheduling, memory planning, or hardware code generation — those belong to external compilers (IREE, XLA via PJRT, TVM).
 
 **Defining principle: Make computation explicit, require large tensors to be explicit inputs, keep `vmap` as transparent function-side sugar over `vectorize`, keep binding as transparent argument-passing sugar, keep communication, multi-device tensor preparation, and tensor placement/transfer explicit, expose and persist the graph, and let compilers do the compilation.**
 
