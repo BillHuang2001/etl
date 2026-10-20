@@ -1,4 +1,4 @@
-"""etl — EvoX Tensor Library.
+"""etl — EvoX Tensor Language.
 
 A minimal, explicit, compiler-neutral tensor graph runtime.
 

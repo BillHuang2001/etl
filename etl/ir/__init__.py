@@ -1,4 +1,4 @@
-"""EvoXIR — the compiler-neutral, region-based SSA IR of the EvoX Tensor Library.
+"""EvoXIR — the compiler-neutral, region-based SSA IR of the EvoX Tensor Language.
 
 What lives here:
 

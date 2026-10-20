@@ -1,4 +1,4 @@
-"""etl.core — the value-model foundation of the EvoX Tensor Library.
+"""etl.core — the value-model foundation of the EvoX Tensor Language.
 
 This package sits at the bottom of the etl import DAG
 (``core ← ir ← ops ← trace ← ...``): it imports **nothing** from etl — only
