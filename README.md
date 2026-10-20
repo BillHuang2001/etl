@@ -3,7 +3,7 @@
 
 <h1 align="center">etl</h1>
 
-<p><strong>EvoX Tensor Library</strong> — a minimal, explicit, compiler-neutral tensor graph runtime.</p>
+<p><strong>EvoX Tensor Language</strong> — a minimal, explicit, compiler-neutral tensor graph runtime.</p>
 
 <p>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.11%2B-7c5cff?style=flat-square" alt="python 3.11+"></a>
@@ -13,7 +13,7 @@
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-555566?style=flat-square" alt="license: Apache-2.0"></a>
 </p>
 
-<p><a href="#why-etl-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#backends">Backends</a> · <a href="#measured">Measured</a> · <a href="#how-etl-compares">vs others</a> · <a href="#install">Install</a></p>
+<p><a href="#why-etl-exists">Why</a> · <a href="#the-stack-from-a-python-graph-to-an-ml-compiler">The stack</a> · <a href="#quickstart--sixty-seconds">Quickstart</a> · <a href="#features">Features</a> · <a href="#backends">Backends</a> · <a href="#how-etl-compares">vs others</a> · <a href="#install">Install</a></p>
 </div>
 
 etl is a Python tensor <em>language</em> whose program is an explicit SSA graph. You build the graph; etl owns the frontend (trace → transform → IR → StableHLO); external ML compilers own the optimization, scheduling, memory planning and code generation. With no compiler installed it still runs — on a reference numpy interpreter.
@@ -335,6 +335,8 @@ python -m etl.bench                              # 98 examples, numpy/cpu confor
 python -m etl.bench --examples matmul,attention  # filter by name, category, or tag
 ```
 
+Committed results, raw records and the probe scripts live in [`etl/bench/`](etl/bench) and [`bench_logs/`](bench_logs).
+
 ## Backends
 
 | backend | how to enable | what it owns | validated on |
@@ -346,35 +348,6 @@ python -m etl.bench --examples matmul,attention  # filter by name, category, or 
 | **TVM** | `pip install etl[tvm]`, `backend="tvm"` | StableHLO frontend + Relax VM (jaxlib only for its MLIR bindings) | CPU end-to-end; ROCm compile-only |
 
 **`opt_level`** is a first-class compile option (`"O0"`–`"O3"`, `"0"`–`"3"`, ints), one spelling, env `ETL_OPT_LEVEL`, per-adapter mapping — and an explicit raw compiler flag with the same name always wins over the derived one, never both. **`Capabilities`** lets an adapter state what it can and cannot do (custom calls, blocks, native RNG algorithms, …), so callers read the limits instead of finding them by crashing. And **a backend that cannot do something raises an explicit `BackendError` naming the op** and suggesting the remedy — never a silent fallback. Device kinds are `cpu`, `cuda`, `rocm` (alias `hip`) and `vulkan`; `etl.devices()` enumerates what this host actually has.
-
-## Measured
-
-The 98-example matrix, best-of-20, on one AMD Instinct MI300X VF (gfx942, ROCm 7.1):
-
-| backend / device | numeric pass | deferrals (explicit errors) | numeric fails |
-|---|---|---|---|
-| numpy / cpu | 98 / 98 | 0 | 0 |
-| iree / llvm-cpu | 75 | 23 | 0 |
-| iree / rocm | 70 | 27 | 0 |
-| xla / rocm (`dot_precision="HIGHEST"`) | 59 | 39 | 0 |
-
-Where the compilers have something to work with the gap is large; where the graph is sub-millisecond it is not:
-
-| example | numpy/cpu | iree/llvm-cpu | iree/rocm |
-|---|---|---|---|
-| `matmul_1024` | 1.25 ms | 4.02e3 ms | 1.01 ms |
-| `transformer` | 25.6 ms | 1.05e4 ms | 3.76 ms |
-| `conv2d_large` | 40.7 ms | 1.12e3 ms | 1.02 ms |
-| `nbody` | 41.0 ms | 42.9 ms | 0.31 ms |
-| `vmap_elementwise` | 0.016 ms | 0.036 ms | 0.120 ms |
-
-Whole-model HuggingFace forward as one graph (`etl_hf`, device-resident loop, same GPU): **xla/rocm beats torch-rocm in 6/6 measured cells (7.18×–9.99×)** and **iree/rocm in 5/6 (0.73×–9.13×)**; both are 3.4×–35.6× faster than torch-cpu there. Three honest caveats:
-
-- **CPU numpy/OpenBLAS still wins large CPU matmuls.** `gpt2` at `seq_len=32`: 28.9 ms interpreted vs 403 ms on iree-llvm-cpu. A compiler's value here is the accelerator, not the CPU.
-- **Sub-millisecond steps are dispatch-bound.** The per-call host floor is ~0.13 ms on cuda and ~0.15–0.45 ms for small ROCm steps, so a 0.03 ms graph loses to torch eager regardless of codegen quality; the same cells narrow to 0.62–0.76× at larger sizes.
-- **XLA/ROCm lowers fp32 `dot` to a TF32-class path by default.** True fp32 is the opt-in `dot_precision="HIGHEST"` (bit-accurate legs, 3%–29% more latency).
-
-Raw data, probe scripts and full reports: [`etl/bench/`](etl/bench) and [`bench_logs/`](bench_logs).
 
 ## Built on etl: `etl_hf`
 

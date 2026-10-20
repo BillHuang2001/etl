@@ -1,4 +1,4 @@
-# etl — EvoX Tensor Library
+# etl — EvoX Tensor Language
 
 ## Intent
 
@@ -149,4 +149,4 @@ The API is **functional**, split along etl's value model into three layers: `loa
 
 **README (`./README.md`) is the front page and a derived document.** It states the four defining properties (simple / minimal / explicit / compiler-neutral), the pipeline `defn → trace → Graph → transform → lower → LoweredProgram → compile → CompiledArtifact → load → Executable → run → Tensor`, and the per-feature sections. Every claim and number in it must trace back to a `CONTEXT.md` (this file, `./etl/CONTEXT.md`) or a committed bench results file — when those change, update the README in the same change, and never introduce a number that is not in those sources. The "How etl compares" section is deliberately charitable (PyTorch/JAX/Nx are described by their own documented designs, no strawmen); keep it that way.
 
-**Naming is an open question.** The distribution is `etl` ("EvoX Tensor Library") and the PyPI name is unclaimed, but "ETL" collides with extract-transform-load in search and in import namespace, so the link to EvoX is invisible to new readers. Researched candidate: `evot` (EvoX **T**ensor) — free on PyPI, pronounceable, and matching the ecosystem's `Evo*` naming convention (`EvoRL`, `EvoCmo`, `EvoXBench`); runner-up `evotl` (EvoX Tensor Language) keeps the `tl` suffix. No rename has been performed: it is a mechanical but repo-wide change (`etl` → e.g. `evot` everywhere, `etl_hf` → `evot_hf`, `./tests/test_packaging.py` pins and every `import etl`). Do not rename as a side effect of an unrelated task.
+**Naming is settled.** `etl` expands to **EvoX Tensor Language** — always the word "language", never "library": etl is a tensor *language*, whose program is an explicit SSA graph that is built, transformed, inspected, saved and shipped, on a runtime that is explicit, minimal and compiler-neutral; it is not a library of tensor functions. The distribution/PyPI name `etl` is unclaimed. A rename is never a side effect of an unrelated task: it would be a repo-wide mechanical change touching every `import etl`, the `etl_hf` package, the packaging pins in `./tests/test_packaging.py`, and the `.etlgraph`/`.etlartifact` persisted-format ids.

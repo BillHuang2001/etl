@@ -1,4 +1,4 @@
-"""etl.block — custom operations for the EvoX tensor library.
+"""etl.block — custom operations for the EvoX tensor language.
 
 Declares user-defined operations (`block_call` ops), registers backend
 implementations and portable decompositions, and bridges batching and

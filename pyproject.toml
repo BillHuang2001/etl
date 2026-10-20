@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "etl"
 version = "0.1.0"
-description = "EvoX Tensor Library — a minimal, explicit, compiler-neutral tensor graph runtime"
+description = "EvoX Tensor Language — a minimal, explicit, compiler-neutral tensor graph runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
