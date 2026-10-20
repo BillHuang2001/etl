@@ -108,4 +108,4 @@ Checkpoint tensors are validated (presence, dtype, shape) before the graph ever 
 | `../program.py` / `../load.py` | `forward_fn`/`param_specs`/`reference_logits`/`resolve_seq_len` and `load_config`/`load_params`/`load_hf`/`validate_params` — call `graph`/`param_specs`/`reference`/`canonicalize_weights` through the family spec. |
 | `../pipeline.py` | `build`/`run`/`predict`/`place_params`/`place_ids` + the resolved default-option matrix; owns the pre-trace activation export gate. |
 | `../tests/` | Family suites: `test_llama.py`/`test_gpt2.py` (canonicalisation, parity, no-constant pins), `test_families.py`, `test_export.py`, `test_pack.py`, `test_public_api.py`. |
-| `../../etl/` | The tensor library whose public ops and `@etl.defn` this package composes (read-only from here). |
+| `../../etl/` | The tensor language whose public ops and `@etl.defn` this package composes (read-only from here). |
