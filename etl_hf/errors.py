@@ -18,7 +18,7 @@ class HFError(ETLError):
     """Base class for every error raised by ``etl_hf``.
 
     Catch this to handle any HuggingFace-integration failure without also
-    catching unrelated errors from the underlying ``etl`` library.
+    catching unrelated errors from the underlying ``etl`` package.
     """
 
 

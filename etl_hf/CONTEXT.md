@@ -316,7 +316,7 @@ Pure host-side argument errors (a non-positive `n_heads` to `ops.split_heads`, a
 | `./etl_hf/_validate.py` | Internal argument guards shared by `load`/`program`/`pipeline`. |
 | `./etl_hf/tests/` | pytest suite (parity, export, iree/llvm-cpu + iree/ROCm device-resident gates, packed-weight pins, real-checkpoint gates, and the functional-API design pins in `test_public_api.py`); `tests/hf_download.py` is the guarded checkpoint downloader used by the network-dependent tests. |
 
-Cross-references (read-only): `../etl/` → the tensor library this package builds on (public API contract in `../etl/CONTEXT.md`); `../bench_logs/` → the HF feasibility spike, probe scripts and measured results — notably the current HF-vs-PyTorch benchmark harness `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `../bench_logs/hf_bench_data/`) and its report `../bench_logs/hf_bench_results.md`, the older `../bench_logs/hf_perf_results.md`, and `../bench_logs/hf_goldens/`, the torch-golden fixtures read by `tests/test_torch_oracle.py`.
+Cross-references (read-only): `../etl/` → the tensor language this package builds on (public API contract in `../etl/CONTEXT.md`); `../bench_logs/` → the HF feasibility spike, probe scripts and measured results — notably the current HF-vs-PyTorch benchmark harness `../bench_logs/hf_bench.py` (+ `hf_bench_env.py`, records in `../bench_logs/hf_bench_data/`) and its report `../bench_logs/hf_bench_results.md`, the older `../bench_logs/hf_perf_results.md`, and `../bench_logs/hf_goldens/`, the torch-golden fixtures read by `tests/test_torch_oracle.py`.
 
 ## Notes for Agents
 
